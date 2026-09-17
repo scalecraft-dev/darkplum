@@ -9,8 +9,16 @@ TF_DIR := terraform/$(CLOUD)
 K8S_DIR := k8s
 NAMESPACE := darkplum-inference
 DEV_CLUSTER := darkplum-dev
+# Host port the local dev stack is published on. Override when 8080 is taken:
+#   make dev-up DEV_PORT=5174
+DEV_PORT ?= 8080
+# DEV_AWS=1 mounts your AWS credential files into the dev gateway and enables
+# Bedrock (uses DEV_AWS_PROFILE). Off by default: no credentials leave the host.
+DEV_AWS ?=
+DEV_AWS_PROFILE ?= default
+DEV_OVERLAY := $(if $(DEV_AWS),dev-aws,dev)
 
-PROD_TARGETS := deploy deploy-infra deploy-k8s deploy-platform build-images push-images configure-sso test status destroy
+PROD_TARGETS := deploy deploy-infra deploy-k8s deploy-platform build-images push-images configure-sso test status destroy deploy-model remove-model list-models
 ifneq ($(filter $(PROD_TARGETS),$(MAKECMDGOALS)),)
 # Read from the normalized output contract — never reconstruct cloud-specific
 # values (e.g. the ECR host from `aws sts get-caller-identity`) in the Makefile.
@@ -19,12 +27,15 @@ ifneq ($(filter $(PROD_TARGETS),$(MAKECMDGOALS)),)
 # value. -json yields "{}" so these stay empty and the _require-outputs guard fires.
 PROVIDER_REGION := $(shell cd $(TF_DIR) && terraform output -json 2>/dev/null | jq -r '.provider_region.value // empty')
 CONTAINER_REGISTRY := $(shell cd $(TF_DIR) && terraform output -json 2>/dev/null | jq -r '.container_registry.value // empty')
+INFERENCE_REGION := $(shell cd $(TF_DIR) && terraform output -json 2>/dev/null | jq -r '.inference_region.value // empty')
+BEDROCK_MODEL_FILTER := $(shell cd $(TF_DIR) && terraform output -json 2>/dev/null | jq -r '.bedrock_model_filter.value // empty')
 endif
 
 export DOCKER_CLI_HINTS = false
 export DOCKER_CLI_HOOKS = 0
 
 .PHONY: help check-prereqs _require-outputs deploy deploy-infra deploy-k8s deploy-platform build-images push-images configure-sso test status destroy \
+       deploy-model remove-model list-models \
        dev-up dev-down dev-build-gateway dev-build-api dev-build-web dev-status dev-logs dev-test
 
 help: ## Show this help
@@ -171,8 +182,19 @@ deploy-platform: build-images push-images ## Build, push, and deploy gateway + w
 			--from-literal=SESSION_SIGNING_KEY="$$SESSION_SIGNING_KEY" \
 			--dry-run=client -o yaml | kubectl apply -f -
 	@echo "Deploying gateway..."
-	@sed "s|darkplum-gateway:latest|$(CONTAINER_REGISTRY)/darkplum-gateway:latest|" \
-		$(K8S_DIR)/base/gateway/deployment.yaml | kubectl apply -f -
+	@# Bedrock region + catalog filter come from Terraform so the catalog matches
+	@# the IAM allowlist. VLLM_UPSTREAMS is owned by deploy-model/remove-model:
+	@# carry the live value over so re-running this target does not drop models.
+	@CURRENT_UPSTREAMS=$$(kubectl get deploy darkplum-gateway -n darkplum-system \
+		-o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="VLLM_UPSTREAMS")].value}' 2>/dev/null); \
+	sed -e "s|darkplum-gateway:latest|$(CONTAINER_REGISTRY)/darkplum-gateway:latest|" \
+		$(K8S_DIR)/base/gateway/deployment.yaml | \
+	BEDROCK_REGION="$(INFERENCE_REGION)" BEDROCK_MODEL_FILTER="$(BEDROCK_MODEL_FILTER)" VLLM_UPSTREAMS="$$CURRENT_UPSTREAMS" \
+	awk ' \
+		/- name: BEDROCK_REGION$$/       { print; getline; if (ENVIRON["BEDROCK_REGION"] != "") sub(/value: .*/, "value: \"" ENVIRON["BEDROCK_REGION"] "\""); print; next } \
+		/- name: BEDROCK_MODEL_FILTER$$/ { print; getline; sub(/value: .*/, "value: \"" ENVIRON["BEDROCK_MODEL_FILTER"] "\""); print; next } \
+		/- name: VLLM_UPSTREAMS$$/       { print; getline; sub(/value: .*/, "value: \"" ENVIRON["VLLM_UPSTREAMS"] "\""); print; next } \
+		{ print }' | kubectl apply -f -
 	@kubectl apply -f $(K8S_DIR)/base/gateway/service.yaml
 	@echo "Deploying api..."
 	@sed "s|darkplum-api:latest|$(CONTAINER_REGISTRY)/darkplum-api:latest|" \
@@ -294,6 +316,7 @@ destroy: ## Tear down all resources
 	@kubectl delete -f $(K8S_DIR)/base/web/deployment.yaml --ignore-not-found 2>/dev/null || true
 	@kubectl delete -f $(K8S_DIR)/base/network-policies/vllm-ingress.yaml --ignore-not-found 2>/dev/null || true
 	@kubectl delete -f $(K8S_DIR)/base/network-policies/gateway-egress.yaml --ignore-not-found 2>/dev/null || true
+	@kubectl delete deploy,svc -n $(NAMESPACE) -l darkplum.ai/model-instance --ignore-not-found 2>/dev/null || true
 	@kubectl delete -f $(K8S_DIR)/overlays/prod/resources/vllm-service.yaml --ignore-not-found 2>/dev/null || true
 	@kubectl delete -f $(K8S_DIR)/overlays/prod/resources/vllm-deployment.yaml --ignore-not-found 2>/dev/null || true
 	@kubectl delete -f $(K8S_DIR)/overlays/prod/resources/vllm-service-account.yaml --ignore-not-found 2>/dev/null || true
@@ -307,10 +330,71 @@ destroy: ## Tear down all resources
 	@echo "All resources destroyed."
 
 # =============================================================================
+# Additional self-hosted open-source models (one vLLM deployment + GPU each)
+# =============================================================================
+
+MAX_LEN ?= 8192
+_GW_UPSTREAMS = kubectl get deploy darkplum-gateway -n darkplum-system \
+	-o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="VLLM_UPSTREAMS")].value}' 2>/dev/null
+
+deploy-model: ## Add a self-hosted model: make deploy-model NAME=qwen MODEL=Qwen/Qwen2.5-7B-Instruct [SERVED=qwen-2.5-7b] [MAX_LEN=8192]
+	@[[ "$(NAME)" =~ ^[a-z0-9][a-z0-9-]{0,30}$$ ]] || { echo "ERROR: NAME is required: lowercase letters, digits and dashes (max 31 chars). Got '$(NAME)'."; exit 1; }
+	@[ "$(NAME)" != "default" ] && [ "$(NAME)" != "inference" ] || { echo "ERROR: NAME '$(NAME)' is reserved for the default vLLM deployment."; exit 1; }
+	@[ -n "$(MODEL)" ] || { echo "ERROR: MODEL is required (Hugging Face model ID, e.g. Qwen/Qwen2.5-7B-Instruct)."; exit 1; }
+	@kubectl get deploy darkplum-gateway -n darkplum-system >/dev/null 2>&1 || { echo "ERROR: gateway not deployed. Run 'make deploy' first."; exit 1; }
+	@SERVED="$(if $(SERVED),$(SERVED),$(NAME))"; \
+	TOTAL=$$(kubectl get nodes -l darkplum.ai/node-type=gpu-inference -o json | jq '[.items[].status.allocatable["nvidia.com/gpu"] // "0" | tonumber] | add // 0'); \
+	USED=$$(kubectl get pods -n $(NAMESPACE) -o json | jq '[.items[] | select(.status.phase=="Running" or .status.phase=="Pending") | .spec.containers[].resources.requests["nvidia.com/gpu"] // "0" | tonumber] | add // 0'); \
+	EXISTS=$$(kubectl get deploy vllm-$(NAME) -n $(NAMESPACE) -o name 2>/dev/null); \
+	if [ -z "$$EXISTS" ] && [ $$((TOTAL - USED)) -lt 1 ]; then \
+		echo "WARNING: no free GPU ($$USED of $$TOTAL allocated). vllm-$(NAME) will stay Pending until the GPU"; \
+		echo "         node group grows: raise gpu_desired_size in $(TF_DIR)/terraform.tfvars and run 'make deploy-infra'."; \
+	fi; \
+	echo "Deploying vllm-$(NAME): $(MODEL) served as '$$SERVED'..."; \
+	sed -e "s|MODEL_INSTANCE|$(NAME)|g" \
+		-e "s|PLACEHOLDER_MODEL_NAME|$(MODEL)|g" \
+		-e "s|PLACEHOLDER_SERVED_MODEL_NAME|$$SERVED|g" \
+		-e "s|PLACEHOLDER_MAX_MODEL_LEN|$(MAX_LEN)|g" \
+		$(K8S_DIR)/templates/vllm-model.yaml | kubectl apply -f -
+	@CURRENT=$$($(_GW_UPSTREAMS)); \
+	ENTRY="$(NAME)=http://vllm-$(NAME).$(NAMESPACE).svc.cluster.local:8000"; \
+	UPDATED=$$(echo "$$CURRENT" | tr ',' '\n' | grep -v "^$(NAME)=" | grep -v '^$$' | { cat; echo "$$ENTRY"; } | paste -sd, -); \
+	if [ "$$UPDATED" != "$$CURRENT" ]; then \
+		echo "Registering upstream with the gateway..."; \
+		kubectl set env deploy/darkplum-gateway -n darkplum-system VLLM_UPSTREAMS="$$UPDATED" >/dev/null; \
+		kubectl rollout status deploy/darkplum-gateway -n darkplum-system --timeout=120s; \
+	fi
+	@echo ""
+	@echo "Model download + load takes 15-25 minutes. Monitor:"
+	@echo "  kubectl logs -f -n $(NAMESPACE) deploy/vllm-$(NAME) -c model-download"
+	@echo "Once ready, the gateway discovers it within a minute; then enable it under Admin > Models."
+
+remove-model: ## Remove a self-hosted model added with deploy-model: make remove-model NAME=qwen
+	@[[ "$(NAME)" =~ ^[a-z0-9][a-z0-9-]{0,30}$$ ]] || { echo "ERROR: NAME is required."; exit 1; }
+	@CURRENT=$$($(_GW_UPSTREAMS)); \
+	UPDATED=$$(echo "$$CURRENT" | tr ',' '\n' | grep -v "^$(NAME)=" | grep -v '^$$' | paste -sd, -); \
+	if [ "$$UPDATED" != "$$CURRENT" ]; then \
+		echo "Unregistering upstream from the gateway..."; \
+		kubectl set env deploy/darkplum-gateway -n darkplum-system VLLM_UPSTREAMS="$$UPDATED" >/dev/null; \
+		kubectl rollout status deploy/darkplum-gateway -n darkplum-system --timeout=120s; \
+	fi
+	@kubectl delete deploy,svc -n $(NAMESPACE) -l darkplum.ai/model-instance=$(NAME) --ignore-not-found
+	@echo "Removed vllm-$(NAME). Aliases pointing at its model now refuse requests until retargeted."
+
+list-models: ## List self-hosted model deployments and the gateway's registered upstreams
+	@echo "=== Self-hosted model deployments ==="
+	@kubectl get deploy -n $(NAMESPACE) -l app.kubernetes.io/component=inference-backend \
+		-o custom-columns='NAME:.metadata.name,READY:.status.readyReplicas,MODEL:.spec.template.spec.initContainers[0].env[0].value' 2>/dev/null || true
+	@kubectl get deploy vllm-inference -n $(NAMESPACE) -o name >/dev/null 2>&1 && echo "(vllm-inference is the default deployment from 'make deploy')" || true
+	@echo ""
+	@echo "=== Gateway VLLM_UPSTREAMS ==="
+	@U=$$($(_GW_UPSTREAMS)); [ -n "$$U" ] && echo "$$U" | tr ',' '\n' || echo "(none beyond the default upstream)"
+
+# =============================================================================
 # Local Development (kind)
 # =============================================================================
 
-dev-up: ## Create local kind cluster and deploy all services
+dev-up: ## Create local kind cluster and deploy all services [DEV_PORT=8080] [DEV_AWS=1 DEV_AWS_PROFILE=default]
 	@command -v kind >/dev/null 2>&1 || { echo "ERROR: kind not found. Install: https://kind.sigs.k8s.io/docs/user/quick-start/#installation"; exit 1; }
 	@command -v kubectl >/dev/null 2>&1 || { echo "ERROR: kubectl not found."; exit 1; }
 	@command -v docker >/dev/null 2>&1 || { echo "ERROR: docker not found."; exit 1; }
@@ -318,11 +402,27 @@ dev-up: ## Create local kind cluster and deploy all services
 		echo "Cluster $(DEV_CLUSTER) already exists. Run 'make dev-down' first to recreate."; \
 		exit 1; \
 	fi
-	@echo "Creating kind cluster..."
+	@if command -v lsof >/dev/null 2>&1 && lsof -nP -iTCP:$(DEV_PORT) -sTCP:LISTEN >/dev/null 2>&1; then \
+		echo "ERROR: port $(DEV_PORT) is already in use on this machine. Pick another: make dev-up DEV_PORT=5174"; \
+		exit 1; \
+	fi
+	@echo "Creating kind cluster (http://localhost:$(DEV_PORT))..."
 	@TMPCONFIG=$$(mktemp) && \
-		sed "s|\$${HOME}|$$HOME|" $(K8S_DIR)/overlays/dev/kind-config.yaml > $$TMPCONFIG && \
-		kind create cluster --name $(DEV_CLUSTER) --config $$TMPCONFIG; \
-		rm -f $$TMPCONFIG
+		sed "s|hostPort: 8080|hostPort: $(DEV_PORT)|" $(K8S_DIR)/overlays/dev/kind-config.yaml > $$TMPCONFIG && \
+		if [ -n "$(DEV_AWS)" ]; then \
+			echo "DEV_AWS: mounting AWS credential files (read-only) for profile '$(DEV_AWS_PROFILE)'"; \
+			echo "    extraMounts:" >> $$TMPCONFIG; \
+			FOUND=0; \
+			for f in config credentials sso; do \
+				if [ -e "$$HOME/.aws/$$f" ]; then \
+					FOUND=1; \
+					printf '      - hostPath: %s\n        containerPath: /host-users/.aws/%s\n        readOnly: true\n' "$$HOME/.aws/$$f" "$$f" >> $$TMPCONFIG; \
+				fi; \
+			done; \
+			[ $$FOUND -eq 1 ] || { echo "ERROR: DEV_AWS=1 but no ~/.aws/config, credentials or sso found."; rm -f $$TMPCONFIG; exit 1; }; \
+		fi; \
+		kind create cluster --name $(DEV_CLUSTER) --config $$TMPCONFIG; RC=$$?; \
+		rm -f $$TMPCONFIG; exit $$RC
 	@echo "Building gateway image..."
 	@docker build -t darkplum-gateway:latest services/gateway/
 	@echo "Building api image..."
@@ -331,8 +431,11 @@ dev-up: ## Create local kind cluster and deploy all services
 	@docker build -t darkplum-web:latest services/web/
 	@echo "Loading images into kind..."
 	@kind load docker-image --name $(DEV_CLUSTER) darkplum-gateway:latest darkplum-api:latest darkplum-web:latest
-	@echo "Deploying all services..."
-	@kubectl apply -k $(K8S_DIR)/overlays/dev
+	@echo "Deploying all services ($(DEV_OVERLAY) overlay)..."
+	@kubectl kustomize $(K8S_DIR)/overlays/$(DEV_OVERLAY) | \
+		sed -e "s|http://localhost:8080|http://localhost:$(DEV_PORT)|g" \
+		    -e "s|PLACEHOLDER_AWS_PROFILE|$(DEV_AWS_PROFILE)|g" | \
+		kubectl apply -f -
 	@echo "Waiting for services to be ready..."
 	@sleep 5
 	@kubectl wait --namespace=darkplum-system --for=condition=ready pod -l app.kubernetes.io/name=postgres --timeout=60s
@@ -342,16 +445,17 @@ dev-up: ## Create local kind cluster and deploy all services
 	@echo ""
 	@echo "========================================="
 	@echo "  Local dev cluster ready."
-	@echo "  http://localhost:8080"
+	@echo "  http://localhost:$(DEV_PORT)"
 	@echo "========================================="
 	@echo ""
-	@echo "First run: create an admin account at http://localhost:8080"
-	@echo "LLM responses are mocked."
+	@echo "First run: create an admin account at http://localhost:$(DEV_PORT),"
+	@echo "then enable a model under Admin > Models (new models start disabled)."
+	@echo "LLM responses are mocked. LM Studio on :1234 is picked up automatically if running."
 	@echo ""
 	@echo "Useful commands:"
 	@echo "  make dev-status   Show pod status"
 	@echo "  make dev-logs     Tail service logs"
-	@echo "  make dev-test     Send a test chat request"
+	@echo "  make dev-test     Smoke-test the stack (DEV_EMAIL/DEV_PASSWORD for the full chat test)"
 
 dev-down: ## Delete the local kind cluster
 	@kind delete cluster --name $(DEV_CLUSTER) 2>/dev/null || true
@@ -392,27 +496,41 @@ dev-logs: ## Tail logs from all local dev services
 	@echo "=== Web (last 20) ==="
 	@kubectl logs -n darkplum-system deploy/darkplum-web --tail=20 2>/dev/null || true
 
-dev-test: ## Send a test chat completion through the full local stack
-	@echo "Testing health endpoint..."
-	@HTTP_CODE=$$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/health); \
-	if [ "$$HTTP_CODE" != "200" ]; then \
-		echo "FAIL: /health returned HTTP $$HTTP_CODE (is the cluster running?)"; \
-		exit 1; \
+dev-test: ## Smoke-test the local stack [DEV_PORT=8080] [DEV_EMAIL=.. DEV_PASSWORD=.. for the authenticated chat test] [MODEL=..]
+	@BASE=http://localhost:$(DEV_PORT); \
+	H1='Content-Type: application/json'; H2='X-Requested-With: XMLHttpRequest'; \
+	fail() { echo "  FAIL: $$1"; exit 1; }; \
+	echo "Testing $$BASE ..."; \
+	CODE=$$(curl -s -o /dev/null -w "%{http_code}" $$BASE/health); \
+	[ "$$CODE" = "200" ] || fail "/health returned HTTP $$CODE (is the cluster running on DEV_PORT=$(DEV_PORT)?)"; \
+	echo "  /health OK"; \
+	CODE=$$(curl -s -o /dev/null -w "%{http_code}" $$BASE/v1/chat/completions -H "$$H1" -H "$$H2" \
+		-d '{"model":"mock-model","messages":[{"role":"user","content":"Hello"}]}'); \
+	[ "$$CODE" = "401" ] || fail "unauthenticated chat returned HTTP $$CODE, expected 401"; \
+	echo "  unauthenticated chat is refused (401) OK"; \
+	SETUP=$$(curl -s $$BASE/auth/config | jq -r '.setup_required'); \
+	if [ "$$SETUP" = "true" ]; then \
+		echo "  First-run setup not done yet: create your admin at $$BASE, then re-run with DEV_EMAIL/DEV_PASSWORD."; exit 0; \
 	fi; \
-	echo "  /health OK"
-	@echo "Testing chat completions (end-to-end)..."
-	@RESPONSE=$$(curl -s -w "\n%{http_code}" http://localhost:8080/v1/chat/completions \
-		-H "Content-Type: application/json" \
-		-H "X-Requested-With: XMLHttpRequest" \
-		-d '{"model": "mock-model", "messages": [{"role": "user", "content": "Hello"}]}'); \
-	HTTP_CODE=$$(echo "$$RESPONSE" | tail -1); \
-	BODY=$$(echo "$$RESPONSE" | sed '$$d'); \
-	if [ "$$HTTP_CODE" = "200" ]; then \
-		CONTENT=$$(echo "$$BODY" | jq -r '.choices[0].message.content // empty'); \
-		echo "  SUCCESS: HTTP $$HTTP_CODE"; \
-		echo "  Response: $$CONTENT"; \
-	else \
-		echo "  FAIL: HTTP $$HTTP_CODE"; \
-		echo "  Body: $$BODY"; \
-		exit 1; \
-	fi
+	if [ -z "$$DEV_EMAIL" ] || [ -z "$$DEV_PASSWORD" ]; then \
+		echo "  Skipping authenticated chat test. Run: DEV_EMAIL=you@example.com DEV_PASSWORD=... make dev-test"; exit 0; \
+	fi; \
+	JAR=$$(mktemp); trap 'rm -f $$JAR' EXIT; \
+	CODE=$$(jq -n --arg e "$$DEV_EMAIL" --arg p "$$DEV_PASSWORD" '{email:$$e,password:$$p}' | \
+		curl -s -o /dev/null -w "%{http_code}" -c $$JAR $$BASE/auth/login -H "$$H1" -H "$$H2" -d @-); \
+	[ "$$CODE" = "200" ] || fail "login returned HTTP $$CODE"; \
+	echo "  login OK"; \
+	M="$(MODEL)"; \
+	[ -n "$$M" ] || M=$$(curl -s -b $$JAR $$BASE/v1/models -H "$$H2" | jq -r '.data[0].id // empty'); \
+	[ -n "$$M" ] || fail "no models are enabled. Enable one under Admin > Models."; \
+	RESP=$$(jq -n --arg m "$$M" '{model:$$m,messages:[{role:"user",content:"Say hello in one sentence."}],max_tokens:50}' | \
+		curl -s -w "\n%{http_code}" -b $$JAR $$BASE/v1/chat/completions -H "$$H1" -H "$$H2" -d @-); \
+	CODE=$$(echo "$$RESP" | tail -1); BODY=$$(echo "$$RESP" | sed '$$d'); \
+	[ "$$CODE" = "200" ] || fail "chat with '$$M' returned HTTP $$CODE: $$BODY"; \
+	echo "  chat with '$$M' OK: $$(echo "$$BODY" | jq -r '.choices[0].message.content // empty' | head -c 120)"; \
+	RESP=$$(curl -s -w "\n%{http_code}" -b $$JAR $$BASE/v1/chat/completions -H "$$H1" -H "$$H2" \
+		-d '{"model":"darkplum-no-such-model","messages":[{"role":"user","content":"x"}]}'); \
+	CODE=$$(echo "$$RESP" | tail -1); ERRCODE=$$(echo "$$RESP" | sed '$$d' | jq -r '.error.code // empty'); \
+	[ "$$CODE" = "404" ] && [ "$$ERRCODE" = "model_not_found" ] || fail "unknown model returned HTTP $$CODE code='$$ERRCODE', expected 404 model_not_found"; \
+	echo "  unknown model is refused (404 model_not_found) OK"; \
+	echo "All checks passed."

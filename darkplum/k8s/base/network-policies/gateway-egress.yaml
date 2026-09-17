@@ -48,7 +48,7 @@ spec:
               kubernetes.io/metadata.name: darkplum-inference
           podSelector:
             matchLabels:
-              app.kubernetes.io/name: vllm-inference
+              app.kubernetes.io/component: inference-backend
       ports:
         - protocol: TCP
           port: 8000

@@ -27,20 +27,8 @@ spec:
               value: "true"
             - name: LMSTUDIO_UPSTREAM
               value: http://host.docker.internal:1234
-            - name: HOME
-              value: /home
-            - name: AWS_PROFILE
-              value: "scalecraft"
-            - name: AWS_CONFIG_FILE
-              value: /home/.aws/config
-            - name: AWS_SHARED_CREDENTIALS_FILE
-              value: /home/.aws/credentials
-          volumeMounts:
-            - name: aws-credentials
-              mountPath: /home/.aws
-              readOnly: true
-      volumes:
-        - name: aws-credentials
-          hostPath:
-            path: /host-users/.aws
-            type: Directory
+            # Bedrock is off in the default dev stack: it needs the developer's AWS
+            # credentials inside the pod. `make dev-up DEV_AWS=1` applies the
+            # dev-aws overlay, which mounts them and turns this back on.
+            - name: BEDROCK_ENABLED
+              value: "false"

@@ -1,5 +1,7 @@
 # Not a Kubernetes resource — used by `kind create cluster --config`.
-# Update hostPath below to your local AWS credentials directory.
+# The host port is rewritten by `make dev-up DEV_PORT=<port>`. With DEV_AWS=1 the
+# Makefile appends extraMounts for the AWS credential files that exist under
+# ~/.aws (config, credentials, sso/) — never the whole directory.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 nodes:
@@ -8,7 +10,3 @@ nodes:
       - containerPort: 30080
         hostPort: 8080
         protocol: TCP
-    extraMounts:
-      - hostPath: ${HOME}/.aws
-        containerPath: /host-users/.aws
-        readOnly: true

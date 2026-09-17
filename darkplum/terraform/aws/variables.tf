@@ -75,11 +75,27 @@ variable "bedrock_region" {
   default     = "us-east-1"
 }
 
-variable "bedrock_model_arns" {
-  description = "Foundation-model ARNs the gateway is allowed to invoke. This IAM allowlist is the Layer 1 (cloud IAM) enforcement boundary for model access."
+variable "bedrock_model_patterns" {
+  description = <<-EOT
+    Bedrock model-ID patterns the gateway may invoke, e.g. "anthropic.claude-*" or
+    "meta.llama*". This IAM allowlist is the Layer 1 (cloud IAM) enforcement
+    boundary for cloud-managed model access: each pattern expands to the
+    foundation-model ARNs (any region, because cross-region inference profiles
+    fan out) AND the system inference-profile ARNs in this account, which is what
+    the gateway actually invokes (e.g. "us.anthropic.claude-..."). The same
+    patterns are emitted as the bedrock_model_filter output so the gateway's
+    catalog only lists models this role can call. Model access must still be
+    granted per model in the Bedrock console. Set to [] to allow no Bedrock models.
+  EOT
   type        = list(string)
   default = [
-    "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-5-sonnet-20241022-v2:0",
-    "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-haiku-20240307-v1:0",
+    "anthropic.claude-*", # frontier
+    "meta.llama*",        # open-weight
+    "mistral.*",          # open-weight
   ]
+
+  validation {
+    condition     = alltrue([for p in var.bedrock_model_patterns : can(regex("^[a-z0-9][a-z0-9.*:_-]*$", p))])
+    error_message = "Each pattern must be a Bedrock model ID or glob such as \"anthropic.claude-*\" (lowercase letters, digits, . * : _ -). Do not pass ARNs."
+  }
 }

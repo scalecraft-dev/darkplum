@@ -21,9 +21,9 @@
 # model_name        = "mistralai/Mistral-7B-Instruct-v0.3"
 # served_model_name = "mistral-7b"
 
-# Bedrock (Layer 1 IAM allowlist — the gateway can ONLY invoke these ARNs).
-# bedrock_region     = "us-east-1"
-# bedrock_model_arns = [
-#   "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-5-sonnet-20241022-v2:0",
-#   "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-haiku-20240307-v1:0",
-# ]
+# Bedrock (Layer 1 IAM allowlist — the gateway can ONLY invoke models matching
+# these patterns; they also become the gateway's catalog filter). Open-weight
+# families (Llama, Mistral) are included by default alongside Claude. Model
+# access must still be granted per model in the Bedrock console.
+# bedrock_region         = "us-east-1"
+# bedrock_model_patterns = ["anthropic.claude-*", "meta.llama*", "mistral.*"]

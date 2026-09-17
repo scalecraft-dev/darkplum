@@ -16,6 +16,9 @@ spec:
       labels:
         app.kubernetes.io/name: vllm-inference
         app.kubernetes.io/part-of: darkplum
+        # Shared by every self-hosted model backend (this default one and any
+        # added with `make deploy-model`). NetworkPolicies select on it.
+        app.kubernetes.io/component: inference-backend
     spec:
       serviceAccountName: darkplum-vllm
       tolerations:

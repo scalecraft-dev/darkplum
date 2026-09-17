@@ -52,6 +52,11 @@ output "inference_region" {
   value       = var.bedrock_region
 }
 
+output "bedrock_model_filter" {
+  description = "Comma-separated catalog globs for the gateway's BEDROCK_MODEL_FILTER, derived from bedrock_model_patterns so the catalog matches the IAM allowlist. Empty when no Bedrock models are allowed."
+  value       = local.bedrock_model_filter
+}
+
 output "model_name" {
   description = "Hugging Face model ID served by vLLM."
   value       = var.model_name

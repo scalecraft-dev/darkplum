@@ -6,9 +6,12 @@ metadata:
   labels:
     app.kubernetes.io/part-of: darkplum
 spec:
+  # Every self-hosted model backend carries this label (the default
+  # vllm-inference deployment and any added with `make deploy-model`), so one
+  # policy locks all of them down to gateway-only ingress.
   podSelector:
     matchLabels:
-      app.kubernetes.io/name: vllm-inference
+      app.kubernetes.io/component: inference-backend
   policyTypes:
     - Ingress
   ingress:

@@ -14,6 +14,20 @@ locals {
   # the right gateway Provider (bedrock vs. vertex) without branching on cloud.
   inference_backend = "bedrock"
 
+  # Layer 1 allowlist for cloud-managed models. The gateway invokes system
+  # inference-profile IDs ("us.anthropic.claude-..."), which IAM authorises
+  # against BOTH the profile ARN in this account and the underlying
+  # foundation-model ARN in every region the profile can route to — hence the
+  # region wildcard on the foundation-model side only.
+  bedrock_invoke_arns = concat(
+    [for p in var.bedrock_model_patterns : "arn:aws:bedrock:*::foundation-model/${p}"],
+    [for p in var.bedrock_model_patterns : "arn:aws:bedrock:${var.bedrock_region}:${data.aws_caller_identity.current.account_id}:inference-profile/*.${p}"],
+  )
+
+  # Same patterns as gateway catalog globs (geo prefix + model ID), so the
+  # catalog never lists a Bedrock model this role cannot invoke.
+  bedrock_model_filter = join(",", [for p in var.bedrock_model_patterns : "*.${p}"])
+
   tags = {
     Project   = "darkplum"
     ManagedBy = "terraform"
@@ -60,20 +74,26 @@ module "pod_identity_gateway" {
   inline_policies = {
     bedrock-invoke = jsonencode({
       Version = "2012-10-17"
-      Statement = [
-        {
-          Sid      = "InvokeModels"
-          Effect   = "Allow"
-          Action   = ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"]
-          Resource = var.bedrock_model_arns
-        },
-        {
-          Sid      = "DiscoverModels"
-          Effect   = "Allow"
-          Action   = ["bedrock:ListInferenceProfiles"]
-          Resource = "*"
-        }
-      ]
+      # An IAM statement cannot have an empty Resource list, so the invoke
+      # statement is omitted entirely when no patterns are allowed.
+      Statement = concat(
+        length(local.bedrock_invoke_arns) == 0 ? [] : [
+          {
+            Sid      = "InvokeModels"
+            Effect   = "Allow"
+            Action   = ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"]
+            Resource = local.bedrock_invoke_arns
+          }
+        ],
+        [
+          {
+            Sid      = "DiscoverModels"
+            Effect   = "Allow"
+            Action   = ["bedrock:ListInferenceProfiles"]
+            Resource = "*"
+          }
+        ]
+      )
     })
   }
   tags = local.tags

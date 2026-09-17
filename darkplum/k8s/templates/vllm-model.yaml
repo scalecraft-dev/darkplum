@@ -1,0 +1,138 @@
+# Not applied directly — rendered by `make deploy-model NAME=<instance> MODEL=<hf-id>`.
+#
+# One additional self-hosted open-source model: a vLLM Deployment + Service in
+# darkplum-inference, named vllm-<instance>. Each instance takes one GPU, so the
+# GPU node group needs a free GPU (raise gpu_desired_size in terraform.tfvars).
+#
+# The gateway reaches it through VLLM_UPSTREAMS ("<instance>=http://vllm-<instance>...")
+# and picks up its served model on the next discovery tick. The shared
+# app.kubernetes.io/component label puts it under the same gateway-only
+# NetworkPolicies as the default vllm-inference deployment.
+#
+# Placeholders: MODEL_INSTANCE, PLACEHOLDER_MODEL_NAME, PLACEHOLDER_SERVED_MODEL_NAME,
+# PLACEHOLDER_MAX_MODEL_LEN.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vllm-MODEL_INSTANCE
+  namespace: darkplum-inference
+  labels:
+    app.kubernetes.io/name: vllm-MODEL_INSTANCE
+    app.kubernetes.io/part-of: darkplum
+    app.kubernetes.io/component: inference-backend
+    darkplum.ai/model-instance: MODEL_INSTANCE
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: vllm-MODEL_INSTANCE
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: vllm-MODEL_INSTANCE
+        app.kubernetes.io/part-of: darkplum
+        app.kubernetes.io/component: inference-backend
+        darkplum.ai/model-instance: MODEL_INSTANCE
+    spec:
+      serviceAccountName: darkplum-vllm
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      nodeSelector:
+        darkplum.ai/node-type: gpu-inference
+      initContainers:
+        - name: model-download
+          image: python:3.11-slim
+          command:
+            - /bin/sh
+            - -c
+            - |
+              pip install -q huggingface-hub && \
+              hf download $(MODEL_NAME) --local-dir /model
+          env:
+            - name: MODEL_NAME
+              value: PLACEHOLDER_MODEL_NAME
+          volumeMounts:
+            - name: model-storage
+              mountPath: /model
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              memory: 8Gi
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:v0.6.6
+          args:
+            - --model
+            - /model
+            - --served-model-name
+            - PLACEHOLDER_SERVED_MODEL_NAME
+            - --port
+            - "8000"
+            - --max-model-len
+            - "PLACEHOLDER_MAX_MODEL_LEN"
+            - --gpu-memory-utilization
+            - "0.90"
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 300
+            periodSeconds: 30
+            failureThreshold: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 600
+            periodSeconds: 30
+            failureThreshold: 5
+          resources:
+            requests:
+              cpu: "2"
+              memory: 12Gi
+              nvidia.com/gpu: "1"
+            limits:
+              memory: 14Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: model-storage
+              mountPath: /model
+              readOnly: true
+            - name: shm
+              mountPath: /dev/shm
+      volumes:
+        - name: model-storage
+          emptyDir:
+            sizeLimit: 30Gi
+        - name: shm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm-MODEL_INSTANCE
+  namespace: darkplum-inference
+  labels:
+    app.kubernetes.io/name: vllm-MODEL_INSTANCE
+    app.kubernetes.io/part-of: darkplum
+    app.kubernetes.io/component: inference-backend
+    darkplum.ai/model-instance: MODEL_INSTANCE
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: vllm-MODEL_INSTANCE
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000
+      protocol: TCP

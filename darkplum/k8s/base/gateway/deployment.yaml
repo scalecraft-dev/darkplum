@@ -40,6 +40,16 @@ spec:
               value: "true"
             - name: BEDROCK_REGION
               value: "us-east-1"
+            # Catalog globs for Bedrock models (e.g. "*.anthropic.claude-*").
+            # `make deploy-platform` fills this from the Terraform
+            # bedrock_model_filter output so the catalog matches the IAM
+            # allowlist. Empty = list every discovered inference profile.
+            - name: BEDROCK_MODEL_FILTER
+              value: ""
+            # Additional self-hosted vLLM backends as "name=url,name2=url2".
+            # Managed by `make deploy-model` / `make remove-model`.
+            - name: VLLM_UPSTREAMS
+              value: ""
           readinessProbe:
             httpGet:
               path: /health
