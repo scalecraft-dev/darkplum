@@ -41,13 +41,18 @@ type BedrockProvider struct {
 // from the default AWS config chain (IRSA → env → instance profile). An empty
 // region is rejected immediately. Any config-load failure should be treated as
 // fatal at startup — if we cannot obtain credentials the provider is unusable.
-func New(region string) (*BedrockProvider, error) {
+//
+// ctx bounds the config load. With an explicit region the default chain does
+// not normally touch the network here (credentials resolve lazily, per call),
+// but the discovery loop calls New from a goroutine it waits on, so a load that
+// did block must be cancellable rather than freezing discovery until restart.
+func New(ctx context.Context, region string) (*BedrockProvider, error) {
 	if region == "" {
 		return nil, fmt.Errorf("bedrock: region must not be empty")
 	}
 
 	cfg, err := awsconfig.LoadDefaultConfig(
-		context.Background(),
+		ctx,
 		awsconfig.WithRegion(region),
 	)
 	if err != nil {

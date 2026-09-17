@@ -34,7 +34,7 @@ var _ bedrockDiscoverer = (*bedrock.BedrockProvider)(nil)
 type bedrockSourceState struct {
 	region  string
 	filters []string
-	newFn   func(region string) (bedrockDiscoverer, error)
+	newFn   func(ctx context.Context, region string) (bedrockDiscoverer, error)
 	// onReady is invoked exactly once, synchronously, the first time a
 	// Bedrock client is successfully constructed — before discover returns
 	// any model ids for it. Callers use this to register the provider in
@@ -52,8 +52,8 @@ func NewBedrockSource(region string, filters []string, onReady func(provider.Pro
 	state := &bedrockSourceState{
 		region:  region,
 		filters: filters,
-		newFn: func(region string) (bedrockDiscoverer, error) {
-			return bedrock.New(region)
+		newFn: func(ctx context.Context, region string) (bedrockDiscoverer, error) {
+			return bedrock.New(ctx, region)
 		},
 		onReady: onReady,
 	}
@@ -79,7 +79,7 @@ func (s *bedrockSourceState) discover(ctx context.Context) ([]string, error) {
 	s.mu.Unlock()
 
 	if prov == nil {
-		p, err := s.newFn(s.region)
+		p, err := s.newFn(ctx, s.region)
 		if err != nil {
 			return nil, fmt.Errorf("bedrock: provider init failed (will retry next tick): %w", err)
 		}

@@ -38,7 +38,7 @@ func TestBedrockSource_RetriesInitOnLaterTick(t *testing.T) {
 
 	state := &bedrockSourceState{
 		region: "us-east-1",
-		newFn: func(region string) (bedrockDiscoverer, error) {
+		newFn: func(_ context.Context, region string) (bedrockDiscoverer, error) {
 			initCalls++
 			if initCalls < 3 {
 				return nil, errors.New("expired sso credentials")
@@ -90,7 +90,7 @@ func TestBedrockSource_OnReadyCalledOnceOnFirstSuccess(t *testing.T) {
 
 	state := &bedrockSourceState{
 		region: "us-east-1",
-		newFn: func(region string) (bedrockDiscoverer, error) {
+		newFn: func(_ context.Context, region string) (bedrockDiscoverer, error) {
 			return fake, nil
 		},
 		onReady: func(p provider.Provider) {
@@ -119,7 +119,7 @@ func TestBedrockSource_DiscoveryFailureAfterInitKeepsRetrying(t *testing.T) {
 	fake := &fakeBedrockProvider{name: "bedrock", discErr: errors.New("access denied")}
 	state := &bedrockSourceState{
 		region: "us-east-1",
-		newFn:  func(region string) (bedrockDiscoverer, error) { return fake, nil },
+		newFn:  func(_ context.Context, region string) (bedrockDiscoverer, error) { return fake, nil },
 	}
 	src := newBedrockSourceFromState(state)
 
@@ -149,7 +149,7 @@ func TestBedrockSource_AppliesModelFilter(t *testing.T) {
 	state := &bedrockSourceState{
 		region:  "us-east-1",
 		filters: []string{"us.anthropic.*"},
-		newFn:   func(region string) (bedrockDiscoverer, error) { return fake, nil },
+		newFn:   func(_ context.Context, region string) (bedrockDiscoverer, error) { return fake, nil },
 	}
 	src := newBedrockSourceFromState(state)
 
@@ -170,7 +170,7 @@ func TestManager_BedrockVsVLLMCollision(t *testing.T) {
 	fake := &fakeBedrockProvider{name: "bedrock", models: map[string]bool{"shared-model": true}}
 	state := &bedrockSourceState{
 		region: "us-east-1",
-		newFn:  func(region string) (bedrockDiscoverer, error) { return fake, nil },
+		newFn:  func(_ context.Context, region string) (bedrockDiscoverer, error) { return fake, nil },
 	}
 	brk := newBedrockSourceFromState(state)
 	vllm := staticSource("vllm-default", "vllm", ClassSelfHosted, "vllm-default", []string{"shared-model"})
