@@ -1,0 +1,17 @@
+# Terraform — never commit state (contains secrets: DB passwords, endpoints,
+# account IDs) or local provider caches. The .lock.hcl IS committed.
+**/.terraform/
+*.tfstate
+*.tfstate.*
+crash.log
+crash.*.log
+
+# Terraform variable files may hold secrets; keep the example only.
+*.tfvars
+!*.tfvars.example
+
+# Build output
+/bin/
+
+# OS cruft
+.DS_Store

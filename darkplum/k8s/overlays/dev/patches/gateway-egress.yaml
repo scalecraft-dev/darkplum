@@ -1,0 +1,23 @@
+# Dev-only egress exception for the gateway.
+#
+# In dev, the gateway runs LM Studio as its OpenAI-compatible upstream on the
+# host at host.docker.internal:1234 (see patches/gateway-deployment.yaml:
+# LMSTUDIO_ENABLED=true, LMSTUDIO_UPSTREAM=http://host.docker.internal:1234).
+#
+# The base gateway-egress NetworkPolicy only permits :443 (AWS/Bedrock), :8000
+# (in-cluster vllm-inference), :5432 (Postgres), and :53 (DNS). kindnet enforces
+# NetworkPolicy, so without this rule the gateway's traffic to :1234 is dropped
+# at egress — LM Studio never sees the request and the gateway hangs to its 120s
+# header timeout (chat shows "no response"). This rule is NOT in base: production
+# inference is the in-cluster vllm-inference backend on :8000, never the host.
+- op: add
+  path: /spec/egress/-
+  value:
+    to:
+      - ipBlock:
+          cidr: 0.0.0.0/0
+          except:
+            - 169.254.0.0/16   # keep the IMDS SSRF block, consistent with the :443 rule
+    ports:
+      - protocol: TCP
+        port: 1234

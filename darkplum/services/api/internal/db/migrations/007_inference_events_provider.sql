@@ -1,0 +1,3 @@
+ALTER TABLE inference_events
+    ADD COLUMN IF NOT EXISTS provider TEXT NOT NULL DEFAULT 'vllm',
+    ADD COLUMN IF NOT EXISTS region TEXT;

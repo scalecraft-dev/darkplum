@@ -1,0 +1,29 @@
+# Copy to terraform.tfvars and edit. All values have working defaults; override
+# only what you need. See variables.tf for the full list and descriptions.
+
+# AWS CLI profile to authenticate with. Leave commented to use the default
+# credential chain (env vars / SSO / instance profile).
+# aws_profile = "scalecraft"
+
+# Region for the cluster and supporting infrastructure.
+# aws_region = "us-east-2"
+# azs        = ["us-east-2a", "us-east-2b", "us-east-2c"]  # must match aws_region
+
+# Cluster identity.
+# cluster_name    = "darkplum"
+# cluster_version = "1.35"
+
+# GPU node group. Set gpu_desired_size = 0 to scale to zero when idle.
+# gpu_instance_types = ["g5.xlarge"]
+# gpu_desired_size   = 1
+
+# Self-hosted model served by vLLM.
+# model_name        = "mistralai/Mistral-7B-Instruct-v0.3"
+# served_model_name = "mistral-7b"
+
+# Bedrock (Layer 1 IAM allowlist — the gateway can ONLY invoke these ARNs).
+# bedrock_region     = "us-east-1"
+# bedrock_model_arns = [
+#   "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-5-sonnet-20241022-v2:0",
+#   "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-3-haiku-20240307-v1:0",
+# ]

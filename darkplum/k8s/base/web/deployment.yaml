@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: darkplum-web
+  namespace: darkplum-system
+  labels:
+    app.kubernetes.io/name: darkplum-web
+    app.kubernetes.io/part-of: darkplum
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: darkplum-web
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: darkplum-web
+        app.kubernetes.io/part-of: darkplum
+    spec:
+      containers:
+        - name: web
+          image: darkplum-web:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 80
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 80
+            initialDelaySeconds: 2
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              memory: 32Mi
+              cpu: 10m
+            limits:
+              memory: 64Mi
+              cpu: 100m

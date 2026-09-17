@@ -1,0 +1,14 @@
+# Not a Kubernetes resource — used by `kind create cluster --config`.
+# Update hostPath below to your local AWS credentials directory.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+  - role: control-plane
+    extraPortMappings:
+      - containerPort: 30080
+        hostPort: 8080
+        protocol: TCP
+    extraMounts:
+      - hostPath: ${HOME}/.aws
+        containerPath: /host-users/.aws
+        readOnly: true

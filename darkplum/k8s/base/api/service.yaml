@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: darkplum-api
+  namespace: darkplum-system
+  labels:
+    app.kubernetes.io/name: darkplum-api
+    app.kubernetes.io/part-of: darkplum
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: darkplum-api
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+      protocol: TCP

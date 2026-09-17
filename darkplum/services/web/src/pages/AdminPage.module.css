@@ -1,0 +1,54 @@
+/* Shared layout classes (.page, .header, .title, .subtitle) live in
+   PageLayout.module.css — import that file for the shared definitions. */
+
+/* --- Tabs --- */
+
+.tabs {
+  display: flex;
+  gap: 0;
+  border-bottom: 1px solid var(--border-default);
+  margin-bottom: var(--space-6);
+}
+
+.tab {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  color: var(--fg-muted);
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  transition: color var(--transition-fast), border-color var(--transition-fast);
+}
+
+.tab:hover {
+  color: var(--fg-default);
+}
+
+.tabActive {
+  color: var(--fg-default);
+  border-bottom-color: var(--brand-default);
+}
+
+.tabCount {
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--fg-subtle);
+  background: var(--bg-surface-raised);
+  padding: 1px 7px;
+  border-radius: var(--radius-full);
+  font-variant-numeric: tabular-nums;
+}
+
+.tabActive .tabCount {
+  background: var(--brand-muted);
+  color: var(--brand-default);
+}
+
+/* --- Tab content --- */
+
+.tabContent {
+  min-height: 0;
+}

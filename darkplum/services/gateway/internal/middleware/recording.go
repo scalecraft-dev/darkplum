@@ -1,0 +1,130 @@
+package middleware
+
+import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"net/http"
+	"time"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/scalecraft/darkplum/gateway/internal/recorder"
+)
+
+// statusWriter wraps gin.ResponseWriter to capture the HTTP status code after
+// the handler chain completes. gin.ResponseWriter.Status() returns the written
+// status, but we need it after the proxy handler sets it.
+type statusWriter struct {
+	gin.ResponseWriter
+	status int
+}
+
+func (sw *statusWriter) WriteHeader(code int) {
+	sw.status = code
+	sw.ResponseWriter.WriteHeader(code)
+}
+
+func (sw *statusWriter) WriteHeaderNow() {
+	if sw.status == 0 {
+		sw.status = sw.ResponseWriter.Status()
+	}
+	sw.ResponseWriter.WriteHeaderNow()
+}
+
+// chatBodyFields holds the fields we parse from the request body.
+type chatBodyFields struct {
+	Model  string `json:"model"`
+	Stream bool   `json:"stream"`
+}
+
+// Recording returns a Gin middleware that captures inference metrics and sends
+// them to rec after the downstream handler (the proxy) returns.
+//
+// X-Darkplum-User-Id is trusted unconditionally here because the NetworkPolicy
+// ensures only the web service can reach the gateway on its cluster-internal
+// address. The APIKey middleware has already resolved the key-level user_id;
+// X-Darkplum-User-Id overrides it when present so the web service's session
+// user ID is attributed rather than the system service-key user ID.
+func Recording(rec *recorder.Recorder) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if c.Request.Method != http.MethodPost {
+			c.Next()
+			return
+		}
+
+		start := time.Now()
+
+		// Buffer the request body so we can parse it for model/stream, then
+		// restore it for the proxy handler which will read it again.
+		var fields chatBodyFields
+		if c.Request.Body != nil {
+			bodyBytes, err := io.ReadAll(c.Request.Body)
+			if err == nil {
+				// Best-effort parse — if it fails, fields stays zero-valued.
+				_ = json.Unmarshal(bodyBytes, &fields)
+				c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			}
+		}
+
+		// Wrap the response writer so we can read the status code afterwards.
+		sw := &statusWriter{ResponseWriter: c.Writer, status: 200}
+		c.Writer = sw
+
+		c.Next()
+
+		latencyMS := int(time.Since(start).Milliseconds())
+		statusCode := sw.status
+		if statusCode == 0 {
+			statusCode = c.Writer.Status()
+		}
+
+		// Resolve user ID: prefer X-Darkplum-User-Id (set by web service for
+		// session-authenticated requests), fall back to context user_id from key lookup.
+		userID := c.GetHeader("X-Darkplum-User-Id")
+		if userID == "" {
+			userID = c.GetString(ContextUserID)
+		}
+
+		requestID := c.GetHeader("X-Request-Id")
+		keyID := c.GetString(ContextKeyID)
+
+		// The routing handler sets provider metadata in the Gin context after it
+		// has decided which backend to use. resolved_model may differ from the
+		// request body model when the handler rewrites it (e.g. Bedrock requires
+		// the full model ARN/ID while the client sends a short alias).
+		providerName := c.GetString("provider_name")
+		providerRegion := c.GetString("provider_region")
+
+		model := fields.Model
+		if resolved := c.GetString("resolved_model"); resolved != "" {
+			model = resolved
+		}
+
+		// Token counts are available when the backend returns them in a
+		// non-streaming response (Bedrock always does; vLLM streaming does not).
+		// Leave nil when not set so the DB column stays NULL rather than zero.
+		var promptTokens, completionTokens *int
+		if pt := c.GetInt("prompt_tokens"); pt != 0 {
+			promptTokens = &pt
+		}
+		if ct := c.GetInt("completion_tokens"); ct != 0 {
+			completionTokens = &ct
+		}
+
+		rec.Record(recorder.InferenceEvent{
+			RequestID:        requestID,
+			APIKeyID:         keyID,
+			UserID:           userID,
+			Model:            model,
+			StatusCode:       statusCode,
+			LatencyMS:        latencyMS,
+			Stream:           fields.Stream,
+			IP:               c.ClientIP(),
+			Provider:         providerName,
+			Region:           providerRegion,
+			PromptTokens:     promptTokens,
+			CompletionTokens: completionTokens,
+		})
+	}
+}

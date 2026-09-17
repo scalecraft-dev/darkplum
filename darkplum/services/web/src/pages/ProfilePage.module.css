@@ -1,0 +1,236 @@
+.page {
+  padding: var(--space-8) var(--space-10);
+  overflow-y: auto;
+  height: 100%;
+  /* Cap content width and center on very wide screens */
+  max-width: 960px;
+  margin-left: auto;
+  margin-right: auto;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.header {
+  margin-bottom: var(--space-8);
+}
+
+.title {
+  font-size: var(--fs-xl);
+  font-weight: var(--fw-semibold);
+  color: var(--fg-default);
+  letter-spacing: -0.01em;
+}
+
+.subtitle {
+  font-size: var(--fs-sm);
+  color: var(--fg-muted);
+  margin-top: var(--space-1);
+}
+
+.sections {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+}
+
+.card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+
+.cardTitle {
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+  color: var(--fg-default);
+  padding: var(--space-4) var(--space-5);
+  border-bottom: 1px solid var(--border-default);
+  background: var(--bg-surface-raised);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: var(--fs-xs);
+}
+
+.accountHeader {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-5);
+  border-bottom: 1px solid var(--border-default);
+  background: var(--bg-surface-raised);
+}
+
+.accountHeader .cardTitle {
+  padding: 0;
+  border-bottom: none;
+  background: none;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-4) var(--space-5);
+  border-bottom: 1px solid var(--border-muted);
+}
+
+.row:last-child {
+  border-bottom: none;
+}
+
+.rowLabel {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.rowTitle {
+  font-size: var(--fs-sm);
+  color: var(--fg-default);
+  font-weight: var(--fw-medium);
+}
+
+.rowDesc {
+  font-size: var(--fs-xs);
+  color: var(--fg-muted);
+}
+
+/* --- Theme toggle --- */
+
+.themeToggle {
+  display: flex;
+  background: var(--bg-surface-raised);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  padding: 3px;
+  gap: 2px;
+}
+
+.themeOption {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-sm);
+  color: var(--fg-muted);
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.themeOption:hover {
+  color: var(--fg-default);
+}
+
+.themeOption:focus-visible {
+  outline: 2px solid var(--brand-default);
+  outline-offset: 2px;
+}
+
+.themeActive {
+  background: var(--bg-primary);
+  color: var(--fg-default);
+  box-shadow: var(--shadow-sm);
+}
+
+/* --- Status badge --- */
+
+.statusBadge {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--fs-sm);
+  color: var(--success-fg);
+  background: var(--success-bg);
+  border: 1px solid var(--success-border);
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-full);
+}
+
+.statusDot {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-full);
+  background: var(--success-fg);
+}
+
+/* --- Values --- */
+
+.idValue {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  color: var(--fg-muted);
+}
+
+.valueText {
+  font-size: var(--fs-sm);
+  color: var(--fg-muted);
+}
+
+/* --- Change Password form --- */
+
+.formError {
+  color: var(--danger-fg);
+  font-size: var(--fs-sm);
+  margin-bottom: var(--space-2);
+}
+
+.formSuccess {
+  color: var(--success-fg);
+  font-size: var(--fs-sm);
+  margin-bottom: var(--space-2);
+}
+
+.passwordInput {
+  width: 240px;
+}
+
+.rowEnd {
+  justify-content: flex-end;
+}
+
+/* ============================================================
+   Responsive
+   ============================================================ */
+
+@media (max-width: 1023px) {
+  .page {
+    padding: var(--space-6) var(--space-6);
+  }
+}
+
+@media (max-width: 767px) {
+  .page {
+    /* Room for hamburger button */
+    padding: calc(var(--space-8) + 44px) var(--space-4) var(--space-6);
+  }
+
+  /* Stack row label above the value on phones */
+  .row {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--space-2);
+  }
+
+  /* Password inputs go full-width */
+  .passwordInput {
+    width: 100%;
+  }
+
+  /* Theme toggle wraps below its label */
+  .themeToggle {
+    align-self: flex-start;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .themeOption {
+    transition-duration: 0.01ms !important;
+  }
+}

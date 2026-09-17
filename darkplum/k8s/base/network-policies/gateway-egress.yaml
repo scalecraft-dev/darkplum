@@ -1,0 +1,58 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-egress
+  namespace: darkplum-system
+  labels:
+    app.kubernetes.io/name: darkplum-gateway
+    app.kubernetes.io/part-of: darkplum
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: darkplum-gateway
+  policyTypes:
+    - Egress
+  egress:
+    # DNS — scoped to kube-dns only (not "any destination on :53")
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+    # Outbound HTTPS (Bedrock, OpenAI-compatible upstreams over TLS).
+    # IPv4 default-allow EXCEPT link-local — blocks the IMDS SSRF surface
+    # (169.254.169.254). No IPv6 allow-rule is present, so all IPv6 egress
+    # (including fe80::/10 link-local) is denied by default. `except` entries
+    # must share the block's address family, so an fe80::/10 entry cannot live
+    # under 0.0.0.0/0 — the Go startup validator covers IPv6 link-local upstreams.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.0.0/16   # IPv4 link-local (AWS/GCP/Azure IMDS)
+      ports:
+        - protocol: TCP
+          port: 443
+
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: darkplum-inference
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: vllm-inference
+      ports:
+        - protocol: TCP
+          port: 8000
+
+    - ports:
+        - protocol: TCP
+          port: 5432

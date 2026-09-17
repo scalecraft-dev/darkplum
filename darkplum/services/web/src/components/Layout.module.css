@@ -1,0 +1,389 @@
+/* ============================================================
+   Shell
+   ============================================================ */
+
+.shell {
+  display: flex;
+  height: 100%;
+}
+
+/* ============================================================
+   Sidebar — base (expanded, desktop)
+   ============================================================ */
+
+.sidebar {
+  width: 240px;
+  flex-shrink: 0;
+  background: var(--bg-base);
+  border-right: 1px solid var(--border-default);
+  display: flex;
+  flex-direction: column;
+  padding: 0;
+  /* Smooth width collapse */
+  transition: width var(--transition-normal);
+  overflow: hidden;
+  position: relative;
+}
+
+/* ============================================================
+   Brand header
+   ============================================================ */
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-6) var(--space-5) var(--space-5);
+  border-bottom: 1px solid var(--border-default);
+  flex-shrink: 0;
+  /* Prevent wrapping during collapse transition */
+  white-space: nowrap;
+  overflow: hidden;
+  min-width: 0;
+}
+
+.brandName {
+  display: block;
+  font-family: var(--font-serif);
+  font-size: var(--fs-xl);
+  font-weight: var(--fw-medium);
+  color: var(--fg-default);
+  letter-spacing: -0.01em;
+  transition: opacity var(--transition-normal), width var(--transition-normal);
+  overflow: hidden;
+}
+
+.brandTagline {
+  display: block;
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+  margin-top: 2px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  transition: opacity var(--transition-normal);
+  overflow: hidden;
+}
+
+/* ============================================================
+   Mobile close button (X) — only visible in overlay mode
+   ============================================================ */
+
+.mobileClose {
+  display: none;
+  margin-left: auto;
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  align-items: center;
+  justify-content: center;
+  color: var(--fg-subtle);
+  border-radius: var(--radius-sm);
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+
+.mobileClose:hover {
+  color: var(--fg-default);
+  background: var(--bg-surface);
+}
+
+/* ============================================================
+   Hamburger button — only visible at < 768px
+   ============================================================ */
+
+.hamburger {
+  display: none;
+  position: fixed;
+  top: var(--space-4);
+  left: var(--space-4);
+  z-index: var(--z-modal);
+  width: 36px;
+  height: 36px;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  color: var(--fg-muted);
+  cursor: pointer;
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+
+.hamburger:hover {
+  color: var(--fg-default);
+  background: var(--bg-surface-raised);
+}
+
+/* ============================================================
+   Backdrop — tap-to-dismiss overlay behind the sidebar
+   ============================================================ */
+
+.backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  z-index: var(--z-overlay);
+}
+
+/* ============================================================
+   Nav
+   ============================================================ */
+
+.nav {
+  flex: 1;
+  padding: var(--space-3) var(--space-2);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  overflow: hidden;
+}
+
+.navSection {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.navSectionAdmin {
+  border-top: 1px solid var(--border-muted);
+  padding-top: var(--space-4);
+  margin-top: var(--space-2);
+}
+
+.navHeading {
+  display: block;
+  padding: var(--space-1) var(--space-3);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--fg-subtle);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+  overflow: hidden;
+  transition: opacity var(--transition-normal);
+}
+
+.navLink {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  font-size: var(--fs-sm);
+  color: var(--fg-muted);
+  transition: background var(--transition-fast), color var(--transition-fast);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.navLink:hover {
+  background: var(--bg-surface);
+  color: var(--fg-default);
+}
+
+.navLinkActive {
+  background: var(--brand-muted);
+  color: var(--fg-default);
+}
+
+.navLinkActive:hover {
+  background: var(--brand-muted);
+}
+
+/* Text labels — hidden when collapsed */
+.navLinkText {
+  overflow: hidden;
+  transition: opacity var(--transition-normal), max-width var(--transition-normal);
+  max-width: 200px;
+  opacity: 1;
+}
+
+/* ============================================================
+   Footer
+   ============================================================ */
+
+.footer {
+  border-top: 1px solid var(--border-default);
+  padding: var(--space-2);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.footerBtn {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-md);
+  font-size: var(--fs-sm);
+  color: var(--fg-muted);
+  transition: background var(--transition-fast), color var(--transition-fast);
+  width: 100%;
+  text-align: left;
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.footerBtn:hover {
+  background: var(--bg-surface);
+  color: var(--fg-default);
+}
+
+.footerBtnActive {
+  background: var(--brand-muted);
+  color: var(--fg-default);
+}
+
+/* Keyboard focus ring for sidebar controls (inset so it stays inside the
+   row's rounded corners). These were previously missing a focus style. */
+.navLink:focus-visible,
+.footerBtn:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: -2px;
+}
+
+.version {
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 100%;
+  transition: opacity var(--transition-normal);
+}
+
+.accountBtn {
+  padding: var(--space-1) var(--space-3);
+}
+
+/* ============================================================
+   Main content area
+   ============================================================ */
+
+.content {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ============================================================
+   COLLAPSED state — 56px icon-only rail
+   ============================================================ */
+
+.collapsed {
+  width: 56px;
+}
+
+.collapsed .brandName,
+.collapsed .brandTagline,
+.collapsed .navHeading,
+.collapsed .navLinkText,
+.collapsed .version {
+  opacity: 0;
+  max-width: 0;
+  pointer-events: none;
+}
+
+/* Center icons when collapsed */
+.collapsed .navLink,
+.collapsed .footerBtn {
+  padding: var(--space-2);
+  justify-content: center;
+  gap: 0;
+}
+
+/* Center the PlumMark in the brand strip */
+.collapsed .brand {
+  justify-content: center;
+  padding-left: var(--space-2);
+  padding-right: var(--space-2);
+  gap: 0;
+}
+
+/* ============================================================
+   Reduced motion
+   ============================================================ */
+
+@media (prefers-reduced-motion: reduce) {
+  .sidebar,
+  .brandName,
+  .brandTagline,
+  .mobileClose,
+  .hamburger,
+  .navHeading,
+  .navLink,
+  .navLinkText,
+  .footerBtn,
+  .version {
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ============================================================
+   TABLET breakpoint (< 1024px)
+   Sidebar becomes a fixed overlay — default to closed.
+   Hamburger appears to open it.
+   ============================================================ */
+
+@media (max-width: 1023px) {
+  .sidebar {
+    position: fixed;
+    top: 0;
+    left: 0;
+    height: 100%;
+    /* Must be above the backdrop (--z-overlay: 45) */
+    z-index: var(--z-modal);
+    /* Off-screen by default */
+    transform: translateX(-100%);
+    transition: transform var(--transition-normal), width var(--transition-normal);
+    /* Always show full expanded width in overlay mode */
+    width: 240px;
+  }
+
+  /* Sidebar is open in overlay mode */
+  .sidebar.mobileOpen {
+    transform: translateX(0);
+  }
+
+  /* Collapsed width override is irrelevant in overlay mode */
+  .collapsed {
+    width: 240px;
+  }
+
+  /* Collapsing is a no-op in the full-width overlay drawer — hide the toggle
+     so it isn't a button that does nothing. Other footer items stay visible. */
+  .collapseBtn {
+    display: none;
+  }
+
+  /* Content takes full width since the sidebar is overlaid */
+  .content {
+    margin-left: 0;
+  }
+
+  /* Hamburger and close button become visible */
+  .hamburger {
+    display: flex;
+  }
+
+  .mobileClose {
+    display: flex;
+  }
+}
+
+/* ============================================================
+   MOBILE breakpoint (< 768px)
+   Tighten hamburger position on small screens
+   ============================================================ */
+
+@media (max-width: 767px) {
+  .hamburger {
+    top: var(--space-3);
+    left: var(--space-3);
+  }
+}

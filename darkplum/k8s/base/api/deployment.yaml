@@ -1,0 +1,90 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: darkplum-api
+  namespace: darkplum-system
+  labels:
+    app.kubernetes.io/name: darkplum-api
+    app.kubernetes.io/part-of: darkplum
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: darkplum-api
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: darkplum-api
+        app.kubernetes.io/part-of: darkplum
+    spec:
+      containers:
+        - name: api
+          image: darkplum-api:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: WEB_PORT
+              value: "8080"
+            - name: DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-credentials
+                  key: DATABASE_URL
+            - name: GATEWAY_URL
+              value: http://darkplum-gateway.darkplum-system.svc.cluster.local:8080
+            - name: OIDC_ISSUER
+              valueFrom:
+                secretKeyRef:
+                  name: darkplum-auth
+                  key: OIDC_ISSUER
+                  optional: true
+            - name: OIDC_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: darkplum-auth
+                  key: OIDC_CLIENT_ID
+                  optional: true
+            - name: OIDC_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: darkplum-auth
+                  key: OIDC_CLIENT_SECRET
+                  optional: true
+            - name: OIDC_REDIRECT_URL
+              valueFrom:
+                secretKeyRef:
+                  name: darkplum-auth
+                  key: OIDC_REDIRECT_URL
+                  optional: true
+            - name: SESSION_SIGNING_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: darkplum-auth
+                  key: SESSION_SIGNING_KEY
+            - name: SECURE_COOKIES
+              valueFrom:
+                secretKeyRef:
+                  name: darkplum-auth
+                  key: SECURE_COOKIES
+                  optional: true
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3
+          resources:
+            requests:
+              memory: 128Mi
+              cpu: 100m

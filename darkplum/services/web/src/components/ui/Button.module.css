@@ -1,0 +1,84 @@
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  font-family: var(--font-sans);
+  font-weight: var(--fw-medium);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast),
+    border-color var(--transition-fast);
+  white-space: nowrap;
+  border: 1px solid transparent;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+/* --- Sizes --- */
+
+.sm {
+  padding: var(--space-1) var(--space-3);
+  font-size: var(--fs-xs);
+}
+
+.md {
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--fs-sm);
+}
+
+.lg {
+  padding: var(--space-3) var(--space-5);
+  font-size: var(--fs-base);
+}
+
+/* --- Variants --- */
+
+.primary {
+  background: var(--brand-default);
+  color: var(--fg-on-emphasis);
+}
+
+.primary:hover:not(:disabled) {
+  background: var(--brand-hover);
+}
+
+.secondary {
+  background: var(--bg-surface-raised);
+  color: var(--fg-muted);
+  border-color: var(--border-default);
+}
+
+.secondary:hover:not(:disabled) {
+  color: var(--fg-default);
+  background: var(--bg-surface);
+}
+
+.ghost {
+  background: transparent;
+  color: var(--fg-muted);
+}
+
+.ghost:hover:not(:disabled) {
+  background: var(--bg-surface);
+  color: var(--fg-default);
+}
+
+.danger {
+  background: transparent;
+  color: var(--danger-fg);
+  border-color: var(--danger-fg);
+}
+
+.danger:hover:not(:disabled) {
+  background: var(--danger-bg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .btn {
+    transition-duration: 0.01ms !important;
+  }
+}

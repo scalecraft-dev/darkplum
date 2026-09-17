@@ -1,0 +1,17 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+  - resources/postgres.yaml
+  - resources/auth-secret.yaml
+
+patches:
+  - path: patches/gateway-deployment.yaml
+  - path: patches/api-deployment.yaml
+  - path: patches/web-deployment.yaml
+  - path: patches/web-service.yaml
+  - path: patches/gateway-egress.yaml
+    target:
+      kind: NetworkPolicy
+      name: gateway-egress

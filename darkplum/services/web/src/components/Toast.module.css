@@ -1,0 +1,89 @@
+.container {
+  position: fixed;
+  bottom: var(--space-6);
+  right: var(--space-6);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  z-index: var(--z-toast);
+  max-width: 360px;
+}
+
+.toast {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  background: var(--bg-surface-raised);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  border-left-width: 4px;
+  font-size: var(--fs-sm);
+  color: var(--fg-default);
+  box-shadow: var(--shadow-md);
+  animation: slideIn 0.2s ease;
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+
+.toast.exiting {
+  opacity: 0;
+  transform: translateX(16px);
+}
+
+.success {
+  border-left-color: var(--success-fg);
+}
+
+.error {
+  border-left-color: var(--danger-fg);
+}
+
+.warning {
+  border-left-color: var(--warning-fg);
+}
+
+.info {
+  border-left-color: var(--info-fg);
+}
+
+.dismiss {
+  color: var(--fg-subtle);
+  line-height: 1;
+  flex-shrink: 0;
+  padding: 2px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+
+.dismiss:hover {
+  color: var(--fg-default);
+  background: var(--bg-surface-hover);
+}
+
+.dismissIcon {
+  width: 14px;
+  height: 14px;
+  display: block;
+}
+
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: translateX(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .toast {
+    animation: none;
+    transition: none;
+  }
+}

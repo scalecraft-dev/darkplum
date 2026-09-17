@@ -1,0 +1,11 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: darkplum-web
+  namespace: darkplum-system
+spec:
+  template:
+    spec:
+      containers:
+        - name: web
+          imagePullPolicy: Never

@@ -1,0 +1,68 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgres-credentials
+  namespace: darkplum-system
+stringData:
+  DATABASE_URL: "postgres://darkplum:darkplum@postgres.darkplum-system.svc.cluster.local:5432/darkplum?sslmode=disable"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: darkplum-system
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: darkplum
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/part-of: darkplum
+    spec:
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+          env:
+            - name: POSTGRES_DB
+              value: darkplum
+            - name: POSTGRES_USER
+              value: darkplum
+            - name: POSTGRES_PASSWORD
+              value: darkplum
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "darkplum"]
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: darkplum-system
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: darkplum
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: 5432
+      protocol: TCP

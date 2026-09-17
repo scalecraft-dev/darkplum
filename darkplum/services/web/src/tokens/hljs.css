@@ -1,0 +1,108 @@
+/* highlight.js theme — darkplum */
+.hljs {
+  color: var(--fg-default);
+  background: transparent;
+}
+
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-built_in,
+.hljs-name,
+.hljs-tag {
+  color: var(--color-lilac);
+}
+
+.hljs-string,
+.hljs-title,
+.hljs-section,
+.hljs-attribute,
+.hljs-literal,
+.hljs-template-tag,
+.hljs-template-variable,
+.hljs-type,
+.hljs-addition {
+  color: var(--color-sage);
+}
+
+.hljs-comment,
+.hljs-quote,
+.hljs-deletion,
+.hljs-meta {
+  color: var(--fg-subtle);
+}
+
+.hljs-number,
+.hljs-regexp,
+.hljs-selector-id,
+.hljs-selector-class {
+  color: var(--warning-fg);
+}
+
+.hljs-variable,
+.hljs-params,
+.hljs-selector-pseudo,
+.hljs-selector-attr {
+  color: #8faa7a;
+}
+
+.hljs-symbol,
+.hljs-bullet,
+.hljs-link {
+  color: var(--color-lilac);
+}
+
+.hljs-emphasis {
+  font-style: italic;
+}
+
+.hljs-strong {
+  font-weight: var(--fw-semibold);
+}
+
+/* --- Light mode syntax theme --- */
+:root.light .hljs-keyword,
+:root.light .hljs-selector-tag,
+:root.light .hljs-built_in,
+:root.light .hljs-name,
+:root.light .hljs-tag {
+  color: var(--color-grape);
+}
+
+:root.light .hljs-string,
+:root.light .hljs-title,
+:root.light .hljs-section,
+:root.light .hljs-attribute,
+:root.light .hljs-literal,
+:root.light .hljs-template-tag,
+:root.light .hljs-template-variable,
+:root.light .hljs-type,
+:root.light .hljs-addition {
+  color: var(--color-moss);
+}
+
+:root.light .hljs-comment,
+:root.light .hljs-quote,
+:root.light .hljs-deletion,
+:root.light .hljs-meta {
+  color: var(--fg-subtle);
+}
+
+:root.light .hljs-number,
+:root.light .hljs-regexp,
+:root.light .hljs-selector-id,
+:root.light .hljs-selector-class {
+  color: var(--warning-fg);
+}
+
+:root.light .hljs-variable,
+:root.light .hljs-params,
+:root.light .hljs-selector-pseudo,
+:root.light .hljs-selector-attr {
+  color: var(--brand-hover);
+}
+
+:root.light .hljs-symbol,
+:root.light .hljs-bullet,
+:root.light .hljs-link {
+  color: var(--color-midnight);
+}

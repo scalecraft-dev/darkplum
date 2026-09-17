@@ -1,0 +1,46 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: darkplum-gateway
+  namespace: darkplum-system
+spec:
+  template:
+    spec:
+      containers:
+        - name: gateway
+          imagePullPolicy: Never
+          env:
+            - name: VLLM_UPSTREAM
+              value: mock
+            # Dev-only LM Studio backend. NOT present in the prod overlay — this
+            # is the structural gate that keeps a laptop backend out of prod.
+            # DEV_MODE lets the startup URL validator accept a loopback/host URL.
+            - name: DEV_MODE
+              value: "true"
+            # Opt-in: flip to "true" and point LMSTUDIO_UPSTREAM at your machine.
+            # host.docker.internal:1234 reaches LM Studio on the dev laptop from a
+            # kind pod on macOS/Docker Desktop. On Linux kind it does NOT resolve
+            # by default — add `--add-host=host.docker.internal:host-gateway` (or
+            # use the docker bridge IP). Darkplum operates no tunnel infra;
+            # reachability is the developer's responsibility.
+            - name: LMSTUDIO_ENABLED
+              value: "true"
+            - name: LMSTUDIO_UPSTREAM
+              value: http://host.docker.internal:1234
+            - name: HOME
+              value: /home
+            - name: AWS_PROFILE
+              value: "scalecraft"
+            - name: AWS_CONFIG_FILE
+              value: /home/.aws/config
+            - name: AWS_SHARED_CREDENTIALS_FILE
+              value: /home/.aws/credentials
+          volumeMounts:
+            - name: aws-credentials
+              mountPath: /home/.aws
+              readOnly: true
+      volumes:
+        - name: aws-credentials
+          hostPath:
+            path: /host-users/.aws
+            type: Directory

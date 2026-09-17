@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 120 120" width="120" height="120">
+  <defs>
+    <clipPath id="circle-clip">
+      <circle cx="60" cy="60" r="50"/>
+    </clipPath>
+  </defs>
+  <!-- Plum body -->
+  <circle cx="60" cy="60" r="50" fill="#6B2FA8"/>
+  <!-- Green cap with curved bottom edge -->
+  <path d="M10 10 L110 10 L110 34 Q60 22 10 34 Z" fill="#5C7048" clip-path="url(#circle-clip)"/>
+</svg>

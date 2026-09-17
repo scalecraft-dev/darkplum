@@ -1,0 +1,54 @@
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-full);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+}
+
+.success {
+  background: var(--success-bg);
+  color: var(--success-fg);
+}
+
+.danger {
+  background: var(--danger-bg);
+  color: var(--danger-fg);
+}
+
+.warning {
+  background: var(--warning-bg);
+  color: var(--warning-fg);
+}
+
+.info {
+  background: var(--info-bg);
+  color: var(--info-fg);
+}
+
+.neutral {
+  background: var(--bg-surface-raised);
+  color: var(--fg-muted);
+}
+
+/* bordered variant — adds a 1px solid semantic border for each variant */
+.bordered.success {
+  border: 1px solid var(--success-border);
+}
+
+.bordered.danger {
+  border: 1px solid var(--danger-border);
+}
+
+.bordered.warning {
+  border: 1px solid var(--warning-border);
+}
+
+.bordered.info {
+  border: 1px solid var(--info-border);
+}
+
+.bordered.neutral {
+  border: 1px solid var(--border-default);
+}

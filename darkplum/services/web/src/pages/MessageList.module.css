@@ -1,0 +1,267 @@
+.container {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--space-6) var(--space-6) var(--space-2);
+}
+
+.inner {
+  max-width: 900px;
+  margin: 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+/* --- Messages --- */
+
+.message {
+  display: flex;
+}
+
+.user {
+  justify-content: flex-end;
+}
+
+.assistant {
+  justify-content: flex-start;
+}
+
+.bubble {
+  max-width: 85%;
+  padding: var(--space-3) var(--space-4);
+  border-radius: var(--radius-lg);
+  font-size: var(--fs-base);
+  line-height: var(--lh-relaxed);
+  word-break: break-word;
+}
+
+.user .bubble {
+  background: var(--bg-user-message);
+  color: var(--fg-default);
+  border-bottom-right-radius: var(--radius-sm);
+  white-space: pre-wrap;
+}
+
+.assistant .bubble {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  color: var(--fg-default);
+  border-bottom-left-radius: var(--radius-sm);
+}
+
+/* --- Markdown content inside assistant bubbles --- */
+
+.assistant .bubble p {
+  margin: var(--space-2) 0;
+}
+
+.assistant .bubble p:first-child {
+  margin-top: 0;
+}
+
+.assistant .bubble p:last-child {
+  margin-bottom: 0;
+}
+
+.assistant .bubble h1,
+.assistant .bubble h2,
+.assistant .bubble h3,
+.assistant .bubble h4 {
+  margin: var(--space-4) 0 var(--space-2);
+  font-weight: var(--fw-semibold);
+  color: var(--fg-default);
+}
+
+.assistant .bubble h1:first-child,
+.assistant .bubble h2:first-child,
+.assistant .bubble h3:first-child {
+  margin-top: 0;
+}
+
+.assistant .bubble h1 { font-size: var(--fs-xl); }
+.assistant .bubble h2 { font-size: var(--fs-lg); }
+.assistant .bubble h3 { font-size: var(--fs-md); }
+.assistant .bubble h4 { font-size: var(--fs-base); }
+
+.assistant .bubble ul,
+.assistant .bubble ol {
+  margin: var(--space-2) 0;
+  padding-left: var(--space-6);
+}
+
+.assistant .bubble li {
+  margin: var(--space-1) 0;
+}
+
+.assistant .bubble li > ul,
+.assistant .bubble li > ol {
+  margin: var(--space-1) 0;
+}
+
+.assistant .bubble blockquote {
+  margin: var(--space-2) 0;
+  padding-left: var(--space-4);
+  border-left: 3px solid var(--border-default);
+  color: var(--fg-muted);
+}
+
+.assistant .bubble hr {
+  border: none;
+  border-top: 1px solid var(--border-default);
+  margin: var(--space-4) 0;
+}
+
+.assistant .bubble strong {
+  font-weight: var(--fw-semibold);
+}
+
+.inlineCode {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  background: var(--bg-surface-raised);
+  padding: 1px 5px;
+  border-radius: var(--radius-sm);
+  color: var(--fg-default);
+}
+
+.link {
+  color: var(--brand-default);
+  text-decoration: underline;
+  text-decoration-color: var(--brand-muted);
+  text-underline-offset: 2px;
+}
+
+.link:hover {
+  text-decoration-color: var(--brand-default);
+}
+
+/* --- Markdown table --- */
+
+.tableWrap {
+  overflow-x: auto;
+  margin: var(--space-2) 0;
+}
+
+.mdTable {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: var(--fs-sm);
+}
+
+.mdTable th,
+.mdTable td {
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-default);
+  text-align: left;
+}
+
+.mdTable th {
+  background: var(--bg-surface-raised);
+  font-weight: var(--fw-medium);
+  font-size: var(--fs-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--fg-muted);
+}
+
+.mdTable tbody tr:hover {
+  background: var(--bg-surface-hover);
+}
+
+/* --- Actions (copy, regenerate) --- */
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--border-muted);
+}
+
+.regenerate {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 5px var(--space-3);
+  font-size: var(--fs-xs);
+  color: var(--fg-muted);
+  border-radius: var(--radius-sm);
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+
+.regenerate:hover {
+  color: var(--fg-default);
+  background: var(--bg-surface-raised);
+}
+
+/* --- Streaming cursor --- */
+
+.cursor {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--brand-default);
+  margin-left: 4px;
+  vertical-align: middle;
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  0%, 100% { opacity: 0.9; transform: scale(1); }
+  50%       { opacity: 0.3; transform: scale(0.75); }
+}
+
+/* --- Thinking indicator --- */
+
+.thinking {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: var(--space-1) 0;
+}
+
+.thinkingLabel {
+  font-size: var(--fs-sm);
+  color: var(--fg-subtle);
+}
+
+.thinkingDots {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.thinkingDot {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: var(--fg-subtle);
+  animation: thinkingBounce 1.2s ease-in-out infinite;
+}
+
+.thinkingDot:nth-child(2) {
+  animation-delay: 0.2s;
+}
+
+.thinkingDot:nth-child(3) {
+  animation-delay: 0.4s;
+}
+
+@keyframes thinkingBounce {
+  0%, 80%, 100% { transform: scale(0.6); opacity: 0.4; }
+  40%           { transform: scale(1);   opacity: 1;   }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cursor {
+    animation: none;
+    opacity: 1;
+  }
+
+  .thinkingDot {
+    animation: none;
+    opacity: 0.6;
+  }
+}

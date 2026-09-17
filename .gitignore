@@ -1,0 +1,10 @@
+# OS cruft
+.DS_Store
+
+# Claude Code local state (per-machine permissions, session data)
+.claude/settings.local.json
+.claude/projects/
+
+# Dependencies and build output
+node_modules/
+dist/

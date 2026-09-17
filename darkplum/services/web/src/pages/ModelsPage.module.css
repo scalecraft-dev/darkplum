@@ -1,0 +1,350 @@
+/* --- Search + filter toolbar --- */
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-5);
+  flex-wrap: wrap;
+}
+
+.searchWrap {
+  position: relative;
+  flex: 1;
+  min-width: 200px;
+  max-width: 360px;
+}
+
+.searchIcon {
+  position: absolute;
+  left: var(--space-3);
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--fg-subtle);
+  pointer-events: none;
+  width: 14px;
+  height: 14px;
+}
+
+.searchInput {
+  width: 100%;
+  padding: var(--space-2) var(--space-3) var(--space-2) calc(var(--space-3) + 14px + var(--space-2));
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  color: var(--fg-default);
+  font-size: var(--fs-sm);
+  outline: none;
+  transition: border-color var(--transition-fast);
+}
+
+.searchInput:focus {
+  border-color: var(--border-focus);
+}
+
+.searchInput::placeholder {
+  color: var(--fg-subtle);
+}
+
+/* --- Filter chips --- */
+
+.filters {
+  display: flex;
+  gap: var(--space-1);
+}
+
+.chip {
+  padding: var(--space-1) var(--space-3);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--fg-muted);
+  background: transparent;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-full);
+  cursor: pointer;
+  transition: color var(--transition-fast), background var(--transition-fast),
+    border-color var(--transition-fast);
+}
+
+.chip:hover {
+  color: var(--fg-default);
+  background: var(--bg-surface);
+}
+
+.chipActive {
+  color: var(--brand-fg);
+  background: var(--brand-muted);
+  border-color: var(--brand-default);
+}
+
+.chipActive:hover {
+  background: var(--brand-muted);
+}
+
+/* --- Summary bar --- */
+
+.summary {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-5);
+}
+
+.summaryText {
+  font-size: var(--fs-sm);
+  color: var(--fg-muted);
+}
+
+/* --- Provider section --- */
+
+.providerSection {
+  margin-bottom: var(--space-5);
+}
+
+.providerSection:last-child {
+  margin-bottom: 0;
+}
+
+.providerCard {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+
+.providerHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--space-3) var(--space-5);
+  background: var(--bg-surface);
+  border-bottom: 1px solid var(--border-default);
+  cursor: pointer;
+  user-select: none;
+  transition: background var(--transition-fast);
+}
+
+.providerHeader:hover {
+  background: var(--bg-surface-raised);
+}
+
+.providerHeaderLeft {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.providerName {
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+  color: var(--fg-default);
+}
+
+.providerCount {
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--fg-subtle);
+  background: var(--bg-surface-raised);
+  padding: 1px 7px;
+  border-radius: var(--radius-full);
+  font-variant-numeric: tabular-nums;
+}
+
+.collapseChevron {
+  width: 14px;
+  height: 14px;
+  color: var(--fg-subtle);
+  transition: transform var(--transition-fast);
+  flex-shrink: 0;
+}
+
+.collapseChevronOpen {
+  transform: rotate(180deg);
+}
+
+.providerBody {
+  /* No extra padding — table fills edge-to-edge */
+}
+
+.providerBodyCollapsed {
+  display: none;
+}
+
+/* --- Vendor sub-group --- */
+
+.vendorHeading {
+  padding: var(--space-2) var(--space-5);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--fg-subtle);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  background: var(--bg-base);
+  border-bottom: 1px solid var(--border-default);
+}
+
+/* --- Model row --- */
+
+.modelCell {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.modelName {
+  font-weight: var(--fw-medium);
+  color: var(--fg-default);
+}
+
+.modelId {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+  word-break: break-all;
+}
+
+.modelIdCell {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+/* --- Toggle switch --- */
+
+.toggle {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 20px;
+  border-radius: var(--radius-full);
+  border: none;
+  cursor: pointer;
+  padding: 0;
+  background: var(--bg-surface-raised);
+  /* fg-subtle (not border-default) so the off-state reads as a control —
+     border-default was ~1.2:1 against the card and effectively invisible. */
+  border: 1px solid var(--fg-subtle);
+  transition: background var(--transition-fast), border-color var(--transition-fast);
+}
+
+.toggle:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
+.toggle:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.toggleEnabled {
+  background: var(--success-bg);
+  border-color: var(--success-fg);
+}
+
+.toggleKnob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: var(--radius-full);
+  background: var(--fg-subtle);
+  transition: transform var(--transition-fast), background var(--transition-fast);
+}
+
+.toggleEnabled .toggleKnob {
+  transform: translateX(16px);
+  background: var(--success-fg);
+}
+
+/* --- Spinner inside toggle --- */
+
+.toggleSpinner {
+  animation: spin 0.8s linear infinite;
+  color: var(--fg-subtle);
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* --- Status column --- */
+
+.statusCol {
+  width: 80px;
+  text-align: center;
+}
+
+/* --- Empty state --- */
+
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-10) 0;
+  color: var(--fg-subtle);
+}
+
+.emptyTitle {
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  color: var(--fg-muted);
+}
+
+.emptyHint {
+  font-size: var(--fs-xs);
+}
+
+/* --- Loading skeleton rows --- */
+
+.skeletonRow {
+  display: flex;
+  align-items: center;
+  padding: var(--space-3) var(--space-5);
+  gap: var(--space-4);
+  border-bottom: 1px solid var(--border-default);
+}
+
+.skeletonRow:last-child {
+  border-bottom: none;
+}
+
+/* --- Responsive --- */
+
+@media (max-width: 767px) {
+  .toolbar {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .searchWrap {
+    max-width: none;
+  }
+
+  .providerHeader {
+    padding: var(--space-3) var(--space-4);
+  }
+
+  .vendorHeading {
+    padding: var(--space-2) var(--space-4);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .toggle,
+  .toggleKnob,
+  .collapseChevron,
+  .searchInput,
+  .chip,
+  .providerHeader {
+    transition-duration: 0.01ms !important;
+  }
+
+  .toggleSpinner {
+    animation: none;
+  }
+}

@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: darkplum-inference
+  labels:
+    app.kubernetes.io/part-of: darkplum
+    kubernetes.io/metadata.name: darkplum-inference

@@ -1,0 +1,137 @@
+.panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: 260px;
+  flex-shrink: 0;
+  background: var(--bg-base);
+  border-right: 1px solid var(--border-default);
+}
+
+.newBtn {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--fs-sm);
+  color: var(--fg-default);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  transition: background var(--transition-fast), border-color var(--transition-fast);
+}
+
+.newBtn:hover {
+  background: var(--bg-surface-raised);
+  border-color: var(--fg-subtle);
+}
+
+.list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 var(--space-2);
+  list-style: none;
+  margin: 0;
+}
+
+/* Row — the <li> wrapper; owns background, border-radius, and the accent border */
+.itemRow {
+  display: flex;
+  align-items: center;
+  border-radius: var(--radius-md);
+  /* Offset left padding by border width so content column stays stable */
+  padding-left: calc(var(--space-3) - 2px);
+  border-left: 2px solid transparent;
+  transition: background var(--transition-fast), border-left-color var(--transition-fast);
+}
+
+.itemRow:hover {
+  background: var(--bg-surface);
+  border-left-color: var(--brand-default);
+}
+
+.active {
+  background: var(--brand-muted);
+  border-left-color: var(--brand-default);
+}
+
+.active:hover {
+  background: var(--brand-muted);
+  border-left-color: var(--brand-default);
+}
+
+/* Button that selects the conversation */
+.itemBtn {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  padding: var(--space-2) var(--space-2) var(--space-2) 0;
+  background: none;
+  border: none;
+  text-align: left;
+  font-family: var(--font-sans);
+  font-size: inherit;
+  color: inherit;
+  cursor: pointer;
+}
+
+.itemBtn:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: -2px;
+  border-radius: var(--radius-sm);
+}
+
+.title {
+  flex: 1;
+  font-size: var(--fs-sm);
+  color: var(--fg-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.active .title {
+  color: var(--fg-default);
+}
+
+.deleteBtn {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  margin-right: var(--space-2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--fg-subtle);
+  background: none;
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity var(--transition-fast), color var(--transition-fast), background var(--transition-fast);
+}
+
+.itemRow:hover .deleteBtn {
+  opacity: 1;
+}
+
+.deleteBtn:hover {
+  color: var(--danger-fg);
+  background: var(--danger-bg);
+}
+
+.deleteBtn:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 1px;
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .newBtn,
+  .itemRow,
+  .deleteBtn {
+    transition-duration: 0.01ms !important;
+  }
+}

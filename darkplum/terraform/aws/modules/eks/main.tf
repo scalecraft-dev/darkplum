@@ -1,0 +1,47 @@
+module "eks" {
+  source  = "terraform-aws-modules/eks/aws"
+  version = "~> 20.31"
+
+  cluster_name    = var.cluster_name
+  cluster_version = var.cluster_version
+
+  vpc_id     = var.vpc_id
+  subnet_ids = var.subnet_ids
+
+  # Public access is intentional for this tracer bullet.
+  # For production, restrict cluster_endpoint_public_access_cidrs to known CIDR ranges.
+  cluster_endpoint_public_access  = true
+  cluster_endpoint_private_access = true
+
+  # IRSA is kept enabled to avoid destroying the OIDC provider (destructive state
+  # change). Remove when confirmed nothing else uses the OIDC provider.
+  enable_irsa = true
+
+  cluster_addons = {
+    vpc-cni = {
+      most_recent = true
+      # Enable Kubernetes NetworkPolicy enforcement. Without this the VPC CNI
+      # admits NetworkPolicy objects but does NOT enforce them — the
+      # gateway-egress policy (IMDS/SSRF egress block) would be decorative.
+      # The flag is an env var on the aws-node DaemonSet, nested under `env`.
+      configuration_values = jsonencode({
+        env = {
+          ENABLE_NETWORK_POLICY = "true"
+        }
+      })
+    }
+    coredns = {
+      most_recent = true
+    }
+    kube-proxy = {
+      most_recent = true
+    }
+    eks-pod-identity-agent = {
+      most_recent = true
+    }
+  }
+
+  enable_cluster_creator_admin_permissions = true
+
+  tags = var.tags
+}

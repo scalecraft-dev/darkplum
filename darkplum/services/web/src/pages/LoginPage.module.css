@@ -1,0 +1,113 @@
+.page {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  background:
+    radial-gradient(ellipse at center, rgba(107, 47, 168, 0.06) 0%, transparent 70%),
+    var(--bg-base);
+  padding: var(--space-8);
+}
+
+.card {
+  width: 100%;
+  max-width: 400px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  padding: var(--space-10);
+}
+
+.brand {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-6);
+}
+
+.brandName {
+  font-family: var(--font-serif);
+  font-size: var(--fs-2xl);
+  font-weight: var(--fw-medium);
+  color: var(--fg-default);
+  letter-spacing: -0.01em;
+}
+
+.brandTagline {
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+  margin-top: var(--space-1);
+}
+
+.subtitle {
+  text-align: center;
+  color: var(--fg-muted);
+  font-size: var(--fs-sm);
+  margin-bottom: var(--space-6);
+  line-height: var(--lh-relaxed);
+}
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.error {
+  padding: var(--space-2) var(--space-3);
+  background: var(--danger-bg);
+  border: 1px solid var(--danger-border);
+  border-radius: var(--radius-md);
+  color: var(--danger-fg);
+  font-size: var(--fs-xs);
+}
+
+/* Branded loading state */
+.loadingState {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-4);
+}
+
+.loadingMark {
+  animation: markPulse 1.6s ease-in-out infinite;
+}
+
+.loadingText {
+  font-size: var(--fs-sm);
+  color: var(--fg-subtle);
+}
+
+.divider {
+  display: flex;
+  align-items: center;
+  text-align: center;
+  color: var(--fg-subtle);
+  font-size: var(--fs-xs);
+  margin: var(--space-5) 0;
+}
+
+.divider::before,
+.divider::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--border-default);
+}
+
+.divider span {
+  padding: 0 var(--space-3);
+}
+
+@keyframes markPulse {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.4; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .loadingMark {
+    animation: none;
+  }
+}

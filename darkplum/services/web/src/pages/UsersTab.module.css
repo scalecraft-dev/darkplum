@@ -1,0 +1,218 @@
+/* --- Toolbar --- */
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--space-4);
+}
+
+.toolbarInfo {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.count {
+  font-size: var(--fs-sm);
+  color: var(--fg-muted);
+}
+
+/* --- Table card --- */
+
+.tableCard {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+
+.actionsCol {
+  width: 48px;
+  text-align: center;
+}
+
+/* --- User cell --- */
+
+.userCell {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+.avatar {
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-full);
+  background: var(--brand-muted);
+  color: var(--brand-default);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+  flex-shrink: 0;
+}
+
+.userName {
+  font-weight: var(--fw-medium);
+  color: var(--fg-default);
+}
+
+.badgeSso {
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+  padding: 1px 6px;
+  border-radius: var(--radius-full);
+  background: var(--brand-muted);
+  color: var(--brand-default);
+}
+
+.badgeManual {
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-semibold);
+  padding: 1px 6px;
+  border-radius: var(--radius-full);
+  background: var(--bg-surface-raised);
+  color: var(--fg-subtle);
+}
+
+/* --- Role selector --- */
+
+.roleSelect {
+  appearance: none;
+  background: var(--bg-surface-raised);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  padding: 2px 24px 2px 8px;
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--fg-default);
+  cursor: pointer;
+  background-image: url("data:image/svg+xml,%3Csvg width='10' height='6' viewBox='0 0 10 6' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1l4 4 4-4' stroke='%23888' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 6px center;
+  transition: border-color var(--transition-fast);
+}
+
+.roleSelect:hover {
+  border-color: var(--brand-default);
+}
+
+.roleSelect:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.muted {
+  color: var(--fg-muted);
+}
+
+.date {
+  color: var(--fg-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- Action button --- */
+
+.actionBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-sm);
+  color: var(--fg-subtle);
+  font-size: var(--fs-xs);
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+
+.actionBtn:hover {
+  color: var(--danger-fg);
+  background: var(--danger-bg);
+}
+
+.actionBtn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.actionConfirm {
+  width: auto;
+  padding: 0 var(--space-2);
+  color: var(--danger-fg);
+  background: var(--danger-bg);
+  font-weight: var(--fw-semibold);
+}
+
+.spinner {
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+/* --- Empty state --- */
+
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-6) 0;
+  color: var(--fg-subtle);
+}
+
+.emptyTitle {
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  color: var(--fg-muted);
+}
+
+.emptyHint {
+  font-size: var(--fs-xs);
+}
+
+/* --- Modal form --- */
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.formFooter {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  padding-top: var(--space-2);
+}
+
+/* --- Reset password inline form --- */
+
+.resetPasswordForm {
+  display: flex;
+  gap: var(--space-1);
+  align-items: center;
+}
+
+.resetPasswordInput {
+  width: 120px;
+  padding: var(--space-1) var(--space-2);
+  font-size: var(--fs-xs);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-default);
+  background: var(--bg-surface);
+  color: var(--fg-default);
+  outline: none;
+  transition: border-color var(--transition-fast);
+}
+
+.resetPasswordInput:focus {
+  border-color: var(--border-focus);
+}
+
+.resetPasswordInput::placeholder {
+  color: var(--fg-subtle);
+}

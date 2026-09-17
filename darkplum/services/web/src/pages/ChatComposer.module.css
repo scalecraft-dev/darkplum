@@ -1,0 +1,101 @@
+.wrapper {
+  flex-shrink: 0;
+  padding: var(--space-3) var(--space-6) var(--space-4);
+  border-top: 1px solid var(--border-default);
+  background: var(--bg-primary);
+}
+
+.composer {
+  max-width: 900px;
+  margin: 0 auto;
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-2);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  padding: var(--space-3) var(--space-3);
+  transition: border-color var(--transition-fast);
+}
+
+.composer:focus-within {
+  border-color: var(--border-focus);
+}
+
+.textarea {
+  flex: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--fg-default);
+  font-size: var(--fs-base);
+  line-height: var(--lh-normal);
+  resize: none;
+  min-height: 24px;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.textarea::placeholder {
+  color: var(--fg-subtle);
+}
+
+.textarea:disabled {
+  opacity: 0.6;
+}
+
+.sendBtn {
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--brand-default);
+  color: var(--fg-on-emphasis);
+  border-radius: var(--radius-sm);
+  transition: background var(--transition-fast);
+}
+
+.sendBtn:hover:not(:disabled) {
+  background: var(--brand-hover);
+}
+
+.sendBtn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.stopBtn {
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--danger-bg);
+  color: var(--danger-fg);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--danger-fg);
+  transition: background var(--transition-fast);
+}
+
+.stopBtn:hover {
+  background: var(--danger-border);
+}
+
+.disclaimer {
+  max-width: 900px;
+  margin: var(--space-2) auto 0;
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+  text-align: center;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .composer,
+  .sendBtn,
+  .stopBtn {
+    transition-duration: 0.01ms !important;
+  }
+}
