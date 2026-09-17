@@ -57,6 +57,11 @@ output "bedrock_model_filter" {
   value       = local.bedrock_model_filter
 }
 
+output "gpu_desired_size" {
+  description = "Number of GPU nodes. 0 = cloud-managed models only; the deploy step skips self-hosted vLLM."
+  value       = var.gpu_desired_size
+}
+
 output "model_name" {
   description = "Hugging Face model ID served by vLLM."
   value       = var.model_name

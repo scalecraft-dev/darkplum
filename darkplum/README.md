@@ -68,7 +68,7 @@ make destroy
 | NAT Gateway | $0.05 | $33 |
 | **Total** | **~$1.25** | **~$900** |
 
-The GPU node group supports scaling to zero (`gpu_desired_size = 0`) when not in use. **Remember to run `make destroy` when done testing.**
+The GPU node group supports scaling to zero (`gpu_desired_size = 0`). With zero GPUs, `make deploy` skips self-hosted vLLM entirely and installs a Bedrock-only platform with no GPU cost (the $1.01/hr line above) — the cheapest way to get to first chat; raise `gpu_desired_size` and re-run `make deploy` to add self-hosted models later. **Remember to run `make destroy` when done testing.**
 
 ## Cloud selection
 

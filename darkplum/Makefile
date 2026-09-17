@@ -34,7 +34,7 @@ endif
 export DOCKER_CLI_HINTS = false
 export DOCKER_CLI_HOOKS = 0
 
-.PHONY: help check-prereqs _require-outputs deploy deploy-infra deploy-k8s deploy-platform build-images push-images configure-sso test status destroy \
+.PHONY: help check-prereqs _require-outputs _deploy-vllm deploy deploy-infra deploy-k8s deploy-platform build-images push-images configure-sso test status destroy \
        deploy-model remove-model list-models verify-bedrock-iam \
        dev-up dev-down dev-build-gateway dev-build-api dev-build-web dev-status dev-logs dev-test
 
@@ -68,9 +68,23 @@ deploy-infra: check-prereqs ## Provision cloud infrastructure with Terraform (CL
 	@eval "$$(cd $(TF_DIR) && terraform output -raw kube_config_command)"
 	@echo "Infrastructure provisioned."
 
-deploy-k8s: ## Deploy Kubernetes workloads (vLLM inference)
+deploy-k8s: ## Deploy Kubernetes workloads (self-hosted vLLM inference; skipped when gpu_desired_size = 0)
 	@echo "Applying namespaces..."
 	@kubectl apply -f $(K8S_DIR)/base/namespaces/darkplum-inference.yaml
+	@kubectl apply -f $(K8S_DIR)/base/network-policies/vllm-ingress.yaml
+	@kubectl apply -f $(K8S_DIR)/base/network-policies/inference-egress.yaml
+	@# gpu_desired_size = 0 is the cheap, Bedrock-only install: no GPU node will
+	@# ever register, so waiting for one would fail the whole deploy before the
+	@# platform is installed. Self-hosted models can be added later by raising
+	@# gpu_desired_size and re-running `make deploy`.
+	@GPUS=$$(cd $(TF_DIR) && terraform output -json | jq -r '.gpu_desired_size.value // 1'); \
+	if [ "$$GPUS" = "0" ]; then \
+		echo "gpu_desired_size = 0: skipping self-hosted vLLM. Cloud-managed (Bedrock) models only."; \
+	else \
+		$(MAKE) --no-print-directory _deploy-vllm CLOUD=$(CLOUD); \
+	fi
+
+_deploy-vllm:
 	@echo "NOTE: NVIDIA device plugin is a cluster prerequisite."
 	@echo "Ensure it is installed on GPU nodes before proceeding."
 	@echo "Waiting for GPU node to be ready..."
