@@ -97,8 +97,10 @@ cp terraform.tfvars.example terraform.tfvars   # edit, then `terraform apply` or
 | `cluster_name` | darkplum | EKS cluster name |
 | `gpu_instance_types` | ["g5.xlarge"] | GPU instance type |
 | `gpu_desired_size` | 1 | Number of GPU nodes |
-| `model_name` | mistralai/Mistral-7B-Instruct-v0.3 | Hugging Face model ID |
+| `model_name` | mistralai/Mistral-7B-Instruct-v0.3 | Hugging Face model ID (default self-hosted model) |
 | `served_model_name` | mistral-7b | API model name |
+| `bedrock_region` | us-east-1 | Region the gateway calls Bedrock in |
+| `bedrock_model_patterns` | Claude, Llama, Mistral | Bedrock model-ID globs the gateway may invoke (IAM allowlist + catalog filter) |
 
 See `terraform/aws/variables.tf` for the full list.
 
@@ -119,21 +121,73 @@ See `terraform/aws/variables.tf` for the full list.
 | `make deploy` | Full deploy: infrastructure + workloads |
 | `make deploy-infra` | Provision AWS infrastructure only |
 | `make deploy-k8s` | Deploy K8s workloads only (requires infra) |
+| `make deploy-model NAME= MODEL=` | Add another self-hosted open-source model (one GPU each) |
+| `make remove-model NAME=` | Remove a model added with `deploy-model` |
+| `make list-models` | List self-hosted model deployments and gateway upstreams |
 | `make test` | Send a test chat completion request |
 | `make status` | Show cluster, node, pod, and GPU status |
 | `make destroy` | Tear down all resources |
 | `make check-prereqs` | Validate required tools are installed |
+| `make dev-up [DEV_PORT=8080] [DEV_AWS=1]` | Local kind stack with mocked inference (no cloud account needed) |
+| `make dev-test` | Smoke-test the local stack |
+| `make dev-down` | Delete the local kind cluster |
 
-## Using a Different Model
+## Models and Routing
 
-Any vLLM-supported, ungated Hugging Face model that fits in 24GB VRAM (A10G) works. Set the variables in `terraform/aws/terraform.tfvars`:
+Every model sits behind one OpenAI-compatible endpoint. The gateway resolves each
+request to a backend and refuses anything it cannot place — an unknown, disabled
+or policy-blocked model gets an error, never a silent redirect.
+
+**Two kinds of backend**
+
+- **Self-hosted** — open-source models served by vLLM on your own GPU nodes.
+  Prompts and completions never leave the cluster.
+- **Cloud-managed** — Bedrock models (Claude, plus open-weight Llama and Mistral)
+  called under your own AWS account through the gateway's IAM role.
+
+If the same model ID is served by both, the self-hosted backend always wins.
+
+**Changing the default self-hosted model.** Any vLLM-supported, ungated Hugging
+Face model that fits in 24GB VRAM (A10G) works. Set in `terraform/aws/terraform.tfvars`:
 
 ```hcl
 model_name        = "Qwen/Qwen2.5-7B-Instruct"
 served_model_name = "qwen-2.5-7b"
 ```
 
-Gated models (Llama, etc.) require HF token wiring that is not yet implemented. Support is planned for a future release.
+**Running more than one self-hosted model.** Each model is its own vLLM
+deployment and takes one GPU, so grow the GPU node group first
+(`gpu_desired_size = 2`, then `make deploy-infra`), then:
+
+```bash
+make deploy-model NAME=qwen MODEL=Qwen/Qwen2.5-7B-Instruct SERVED=qwen-2.5-7b
+make list-models
+make remove-model NAME=qwen
+```
+
+The gateway re-discovers models every minute; a new model shows up under
+**Admin > Models**, disabled until an administrator enables it.
+
+**Choosing which Bedrock models are reachable.** `bedrock_model_patterns` is the
+IAM allowlist for the gateway's role and also filters the catalog, so the admin
+UI only lists models the role can actually invoke. Model access must still be
+granted per model in the Bedrock console.
+
+```hcl
+bedrock_model_patterns = ["anthropic.claude-*", "meta.llama*"]   # [] = no Bedrock
+```
+
+**Routing policy and aliases** (Admin > Models):
+
+- *Residency* — `any`, or `self-hosted only`, which refuses every request that
+  would go to a cloud-managed model. This is one org-wide setting today, not
+  per-workspace policy.
+- *Aliases* — stable names such as `default-chat` that point at a model, so
+  swapping models is an admin change rather than a code change. The usage log
+  records both the alias requested and the model that served it.
+
+Gated models (Llama weights on Hugging Face, etc.) require HF token wiring that is
+not yet implemented for self-hosted deployments.
 
 ## Troubleshooting
 

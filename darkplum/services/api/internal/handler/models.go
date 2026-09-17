@@ -43,17 +43,22 @@ type modelRow struct {
 	Provider     string    `json:"provider"`
 	DisplayName  *string   `json:"display_name,omitempty"`
 	Enabled      bool      `json:"enabled"`
+	BackendClass string    `json:"backend_class"`
 	DiscoveredAt time.Time `json:"discovered_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
 }
 
 // openAIModelEntry is the wire shape for one model in the OpenAI-compatible
-// /v1/models response.
+// /v1/models response. It doubles as the decode target for the gateway's own
+// GET /v1/models response in SyncModels — the gateway sends the same fields
+// (minus alias_of, which only the api's chat-facing endpoint produces).
 type openAIModelEntry struct {
-	ID      string `json:"id"`
-	Object  string `json:"object"`
-	Created int64  `json:"created"`
-	OwnedBy string `json:"owned_by"`
+	ID           string  `json:"id"`
+	Object       string  `json:"object"`
+	Created      int64   `json:"created"`
+	OwnedBy      string  `json:"owned_by"`
+	BackendClass string  `json:"backend_class"`
+	AliasOf      *string `json:"alias_of,omitempty"`
 }
 
 // openAIModelsResponse is the OpenAI-compatible envelope for the models list.
@@ -62,52 +67,96 @@ type openAIModelsResponse struct {
 	Data   []openAIModelEntry `json:"data"`
 }
 
-// ListModels handles GET /v1/models — chat-facing, returns only enabled models
-// in OpenAI-compatible format so existing clients don't break.
+// ListModels handles GET /v1/models — chat-facing, returns enabled models plus
+// aliases whose target is enabled, in OpenAI-compatible format. Under the
+// self_hosted_only residency policy, cloud_managed models (and aliases
+// pointing at them) are omitted entirely — this is a UX convenience for the
+// picker, not the enforcement point (that's the gateway; see policy.Snapshot).
 func (h *ModelHandler) ListModels(c *gin.Context) {
-	rows, err := h.pool.Query(c.Request.Context(), `
-		SELECT model_id, provider
+	ctx := c.Request.Context()
+
+	residency, err := h.getResidency(ctx)
+	if err != nil {
+		slog.ErrorContext(ctx, "list models: read routing policy failed", "err", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "list models failed"})
+		return
+	}
+
+	modelRows, err := h.pool.Query(ctx, `
+		SELECT model_id, provider, backend_class
 		FROM models
 		WHERE enabled = true
 		ORDER BY provider, model_id
 	`)
 	if err != nil {
-		slog.ErrorContext(c.Request.Context(), "list models query failed", "err", err)
+		slog.ErrorContext(ctx, "list models query failed", "err", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "list models failed"})
 		return
 	}
-	defer rows.Close()
+	defer modelRows.Close()
 
-	now := time.Now().Unix()
-	data := make([]openAIModelEntry, 0)
-	for rows.Next() {
-		var modelID, providerName string
-		if err := rows.Scan(&modelID, &providerName); err != nil {
-			slog.ErrorContext(c.Request.Context(), "scan model row failed", "err", err)
+	var models []modelDBRow
+	for modelRows.Next() {
+		var m modelDBRow
+		if err := modelRows.Scan(&m.ModelID, &m.Provider, &m.BackendClass); err != nil {
+			slog.ErrorContext(ctx, "scan model row failed", "err", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "scan models failed"})
 			return
 		}
-		data = append(data, openAIModelEntry{
-			ID:      modelID,
-			Object:  "model",
-			Created: now,
-			OwnedBy: providerName,
-		})
+		models = append(models, m)
 	}
-	if err := rows.Err(); err != nil {
-		slog.ErrorContext(c.Request.Context(), "models rows error", "err", err)
+	if err := modelRows.Err(); err != nil {
+		slog.ErrorContext(ctx, "models rows error", "err", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "rows error"})
 		return
 	}
 
+	aliasRows, err := h.pool.Query(ctx, `
+		SELECT a.alias, a.target_model_id, m.provider, m.backend_class
+		FROM model_aliases a
+		JOIN models m ON m.model_id = a.target_model_id
+		WHERE m.enabled = true
+		ORDER BY a.alias
+	`)
+	if err != nil {
+		slog.ErrorContext(ctx, "list model aliases query failed", "err", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "list models failed"})
+		return
+	}
+	defer aliasRows.Close()
+
+	var aliases []aliasDBRow
+	for aliasRows.Next() {
+		var a aliasDBRow
+		if err := aliasRows.Scan(&a.Alias, &a.TargetModelID, &a.OwnedBy, &a.BackendClass); err != nil {
+			slog.ErrorContext(ctx, "scan model alias row failed", "err", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "scan models failed"})
+			return
+		}
+		aliases = append(aliases, a)
+	}
+	if err := aliasRows.Err(); err != nil {
+		slog.ErrorContext(ctx, "model aliases rows error", "err", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "rows error"})
+		return
+	}
+
+	data := buildModelsList(models, aliases, residency, time.Now().Unix())
 	c.JSON(http.StatusOK, openAIModelsResponse{Object: "list", Data: data})
+}
+
+// getResidency reads the routing_policy singleton's current residency value.
+func (h *ModelHandler) getResidency(ctx context.Context) (string, error) {
+	var residency string
+	err := h.pool.QueryRow(ctx, `SELECT residency FROM routing_policy WHERE id = true`).Scan(&residency)
+	return residency, err
 }
 
 // ListAdminModels handles GET /api/v1/models — admin view, returns all models
 // with full metadata including the enabled flag.
 func (h *ModelHandler) ListAdminModels(c *gin.Context) {
 	rows, err := h.pool.Query(c.Request.Context(), `
-		SELECT id, model_id, provider, display_name, enabled, discovered_at, updated_at
+		SELECT id, model_id, provider, display_name, enabled, backend_class, discovered_at, updated_at
 		FROM models
 		ORDER BY provider, model_id
 	`)
@@ -121,7 +170,7 @@ func (h *ModelHandler) ListAdminModels(c *gin.Context) {
 	models := make([]modelRow, 0)
 	for rows.Next() {
 		var m modelRow
-		if err := rows.Scan(&m.ID, &m.ModelID, &m.Provider, &m.DisplayName, &m.Enabled, &m.DiscoveredAt, &m.UpdatedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.ModelID, &m.Provider, &m.DisplayName, &m.Enabled, &m.BackendClass, &m.DiscoveredAt, &m.UpdatedAt); err != nil {
 			slog.ErrorContext(c.Request.Context(), "scan admin model row failed", "err", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "scan models failed"})
 			return
@@ -175,9 +224,9 @@ func (h *ModelHandler) ToggleModel(c *gin.Context) {
 	// separate GET.
 	var m modelRow
 	if err := h.pool.QueryRow(c.Request.Context(), `
-		SELECT id, model_id, provider, display_name, enabled, discovered_at, updated_at
+		SELECT id, model_id, provider, display_name, enabled, backend_class, discovered_at, updated_at
 		FROM models WHERE id = $1
-	`, id).Scan(&m.ID, &m.ModelID, &m.Provider, &m.DisplayName, &m.Enabled, &m.DiscoveredAt, &m.UpdatedAt); err != nil {
+	`, id).Scan(&m.ID, &m.ModelID, &m.Provider, &m.DisplayName, &m.Enabled, &m.BackendClass, &m.DiscoveredAt, &m.UpdatedAt); err != nil {
 		slog.ErrorContext(c.Request.Context(), "fetch updated model failed", "id", id, "err", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "fetch updated model failed"})
 		return
@@ -194,8 +243,10 @@ type gatewayModelsResponse struct {
 
 // SyncModels fetches the model list from the gateway and upserts each model
 // into the models table. Re-discovered models do not have their enabled flag
-// overwritten — only discovered_at is refreshed so we know the model is still
-// present upstream. New models default to enabled = false per the schema.
+// or display_name overwritten — only discovered_at, backend_class and
+// provider are refreshed, so admin settings survive a resync while a model
+// that changes backend (e.g. a Bedrock filter change) is reclassified. New
+// models default to enabled = false per the schema.
 //
 // Called once at startup and then on a periodic ticker in main.
 func (h *ModelHandler) SyncModels(ctx context.Context) {
@@ -236,24 +287,34 @@ func (h *ModelHandler) SyncModels(ctx context.Context) {
 		if providerName == "" {
 			providerName = "vllm"
 		}
+		backendClass := normalizeBackendClass(m.BackendClass)
 
 		// INSERT new rows with enabled = false (schema default). On conflict,
-		// only refresh discovered_at — never touch enabled or display_name so
-		// admin settings survive a resync.
-		tag, err := h.pool.Exec(ctx, `
-			INSERT INTO models (model_id, provider, discovered_at, updated_at)
-			VALUES ($1, $2, now(), now())
+		// refresh discovered_at, backend_class and provider — never enabled or
+		// display_name, so admin settings survive a resync.
+		//
+		// "xmax = 0" is true only for the row version created by this INSERT
+		// (xmax is unset on a freshly inserted tuple); the ON CONFLICT UPDATE
+		// path always sets a nonzero xmax. CommandTag can't distinguish
+		// INSERT-from-conflict-update because both report "INSERT 0 1" under
+		// ON CONFLICT DO UPDATE ... RETURNING, so RETURNING (xmax = 0) is the
+		// reliable way to tell which branch actually ran.
+		var wasInsert bool
+		err := h.pool.QueryRow(ctx, `
+			INSERT INTO models (model_id, provider, backend_class, discovered_at, updated_at)
+			VALUES ($1, $2, $3, now(), now())
 			ON CONFLICT (model_id) DO UPDATE
-				SET discovered_at = now()
-		`, m.ID, providerName)
+				SET discovered_at = now(),
+					backend_class = EXCLUDED.backend_class,
+					provider = EXCLUDED.provider
+			RETURNING (xmax = 0)
+		`, m.ID, providerName, backendClass).Scan(&wasInsert)
 		if err != nil {
 			slog.ErrorContext(ctx, "sync models: upsert failed", "model_id", m.ID, "err", err)
 			continue
 		}
 
-		// CommandTag reports "INSERT 0 1" for new rows and "UPDATE 1" for the
-		// conflict path. Use the tag string to distinguish them.
-		if tag.String() == "INSERT 0 1" {
+		if wasInsert {
 			inserted++
 		} else {
 			updated++

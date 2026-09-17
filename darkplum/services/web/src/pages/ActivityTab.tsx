@@ -26,6 +26,12 @@ import type {
   UsageSummary,
   UserUsageSummary,
 } from '../types'
+import {
+  eventLabel,
+  eventVariant,
+  formatEventDetail,
+  type EventVariant,
+} from '../lib/activityEvents'
 import { useToast } from '../components/Toast'
 import { Badge, Button, Skeleton, Table, TableEmpty } from '../components/ui'
 import { ActivityDrawer } from './ActivityDrawer'
@@ -36,19 +42,6 @@ import styles from './ActivityTab.module.css'
 // ---------------------------------------------------------------------------
 
 const PAGE_SIZE = 50
-
-const EVENT_LABELS: Record<string, { label: string; variant: 'neutral' | 'info' | 'warning' | 'danger' | 'success' }> = {
-  'user.login':            { label: 'Login',            variant: 'neutral'  },
-  'user.login_failed':     { label: 'Login Failed',     variant: 'danger'   },
-  'user.logout':           { label: 'Logout',           variant: 'neutral'  },
-  'user.created':          { label: 'User Created',     variant: 'info'     },
-  'user.deleted':          { label: 'User Deleted',     variant: 'info'     },
-  'user.role_changed':     { label: 'Role Changed',     variant: 'info'     },
-  'user.password_reset':   { label: 'Password Reset',   variant: 'info'     },
-  'user.password_changed': { label: 'Password Changed', variant: 'info'     },
-  'apikey.created':        { label: 'Key Created',      variant: 'warning'  },
-  'apikey.revoked':        { label: 'Key Revoked',      variant: 'warning'  },
-}
 
 const TIME_RANGES: { label: string; value: TimeRange }[] = [
   { label: '24h', value: '24h' },
@@ -91,7 +84,7 @@ interface UnifiedEvent {
   user_id: string | null
   user_display: string
   action_label: string
-  action_variant: 'neutral' | 'info' | 'warning' | 'danger' | 'success'
+  action_variant: EventVariant
   detail_text: string
   ip_address: string | null
 }
@@ -155,19 +148,15 @@ function pctChange(current: number, previous: number): { value: number; up: bool
 }
 
 function adminEventToUnified(e: ActivityEvent): UnifiedEvent {
-  const lbl = EVENT_LABELS[e.event_type]
-  const detail = e.detail
-    ? Object.entries(e.detail).map(([k, v]) => `${k}: ${v}`).join(', ')
-    : '—'
   return {
     id:             e.id,
     created_at:     e.created_at,
     source:         'admin',
     user_id:        e.actor_id,
     user_display:   e.actor_name ?? e.actor_email ?? e.actor_id ?? '—',
-    action_label:   lbl?.label ?? e.event_type,
-    action_variant: lbl?.variant ?? 'neutral',
-    detail_text:    detail || '—',
+    action_label:   eventLabel(e.event_type),
+    action_variant: eventVariant(e.event_type),
+    detail_text:    formatEventDetail(e.detail),
     ip_address:     e.ip_address,
   }
 }

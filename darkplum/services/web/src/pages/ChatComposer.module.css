@@ -84,12 +84,41 @@
   background: var(--danger-border);
 }
 
+/* Unusable composer: dashed edge + flat surface so it reads as switched off
+   rather than merely unfocused. The reason below it says why. */
+.composerDisabled {
+  background: var(--bg-base);
+  border-style: dashed;
+  border-color: var(--border-default);
+}
+
+.composerDisabled:focus-within {
+  border-color: var(--border-default);
+}
+
 .disclaimer {
   max-width: 900px;
   margin: var(--space-2) auto 0;
   font-size: var(--fs-xs);
   color: var(--fg-subtle);
   text-align: center;
+}
+
+.reason {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  max-width: 900px;
+  margin: var(--space-2) auto 0;
+  font-size: var(--fs-xs);
+  color: var(--fg-muted);
+  text-align: center;
+}
+
+.reason svg {
+  flex-shrink: 0;
+  color: var(--fg-subtle);
 }
 
 @media (prefers-reduced-motion: reduce) {

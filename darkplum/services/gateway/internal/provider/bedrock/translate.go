@@ -1,8 +1,9 @@
 // Package bedrock handles all format translation between the OpenAI-compatible
-// ChatRequest/ChatResponse types and the Bedrock Anthropic Messages API wire
-// format. No HTTP or AWS SDK logic lives here — bedrock.go owns that layer.
-// All translation functions are pure so they can be tested without any AWS
-// SDK involvement.
+// ChatRequest/ChatResponse types and the Bedrock Converse / ConverseStream API.
+// No HTTP or AWS SDK client-construction logic lives here — bedrock.go owns
+// that layer. All translation functions are pure so they can be tested without
+// any AWS SDK involvement (only the Converse* input/output/types structs are
+// used, never a live client).
 package bedrock
 
 import (
@@ -12,192 +13,202 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
+	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
+
 	"github.com/scalecraft/darkplum/gateway/internal/provider"
 )
 
-// bedrockRequest is the JSON body sent to InvokeModel /
-// InvokeModelWithResponseStream for Anthropic Claude models on Bedrock.
-type bedrockRequest struct {
-	AnthropicVersion string           `json:"anthropic_version"`
-	MaxTokens        int              `json:"max_tokens"`
-	System           string           `json:"system,omitempty"`
-	Temperature      *float64         `json:"temperature,omitempty"`
-	Messages         []bedrockMessage `json:"messages"`
-}
+// defaultMaxTokens is used when the caller does not specify max_tokens.
+// Converse requires an explicit value for some models; this matches the
+// default used by the previous InvokeModel-based implementation.
+const defaultMaxTokens = 4096
 
-type bedrockMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-// bedrockResponse is the non-streaming JSON body returned by InvokeModel.
-type bedrockResponse struct {
-	Content    []bedrockContentBlock `json:"content"`
-	StopReason string                `json:"stop_reason"`
-	Usage      bedrockUsage          `json:"usage"`
-}
-
-type bedrockContentBlock struct {
-	Type string `json:"type"`
-	Text string `json:"text"`
-}
-
-type bedrockUsage struct {
-	InputTokens  int `json:"input_tokens"`
-	OutputTokens int `json:"output_tokens"`
-}
-
-// streamEvent is the discriminated union for all Bedrock streaming event
-// payloads. All event types arrive as raw JSON bytes inside
-// ResponseStreamMemberChunk.Value.Bytes; we decode into this struct and switch
-// on Type.
-type streamEvent struct {
-	Type string `json:"type"`
-
-	// message_start: carries input token count.
-	Message *struct {
-		Usage bedrockUsage `json:"usage"`
-	} `json:"message,omitempty"`
-
-	// content_block_delta: carries the token text.
-	Delta *struct {
-		Type       string `json:"type"`
-		Text       string `json:"text"`        // present when type == "text_delta"
-		StopReason string `json:"stop_reason"` // present in message_delta
-	} `json:"delta,omitempty"`
-
-	// message_delta: carries output token count alongside delta.
-	Usage *bedrockUsage `json:"usage,omitempty"`
-}
-
-// translateRequest converts a provider.ChatRequest to the Bedrock Anthropic
-// Messages API wire format.
+// translateRequest converts a provider.ChatRequest into the fields needed for
+// a Converse/ConverseStream call: the system blocks, the message list, and the
+// inference config. It is shared by Complete and Stream since both APIs take
+// the same shape.
 //
 // Translation rules:
-//   - A message with role "system" is extracted and placed in the top-level
-//     system field; multiple system messages are concatenated with "\n".
-//   - Only "user" and "assistant" roles appear in the messages array.
-//   - MaxTokens of 0 defaults to 4096 (Bedrock requires max_tokens).
+//   - A message with role "system" is extracted into a System content block;
+//     multiple system messages are concatenated with "\n" into a single block
+//     (matching the previous InvokeModel behaviour of one system field).
+//   - Only "user" and "assistant" roles enter the Messages list; other roles
+//     are dropped, as before.
+//   - Messages with empty (or whitespace-only) content are dropped entirely —
+//     Converse rejects empty text content blocks.
+//   - Consecutive messages with the same role are merged into a single
+//     message (content joined with "\n"), because Converse requires roles to
+//     strictly alternate.
+//   - Converse also requires the first message to have role "user". Leading
+//     assistant messages (before the first user message) have no addressed
+//     user turn to respond to and are dropped rather than rejected outright —
+//     this tolerates a caller that opens a conversation with a canned
+//     assistant greeting before any user input. If no user message remains
+//     after this filtering, translateRequest returns a 400-style
+//     BedrockAPIError rather than sending Converse a request guaranteed to
+//     fail validation.
+//   - MaxTokens of 0 defaults to defaultMaxTokens (Converse's per-model
+//     default is not always what we want as a floor).
 //   - Temperature is forwarded only when non-nil.
-func translateRequest(req provider.ChatRequest) ([]byte, error) {
-	br := bedrockRequest{
-		AnthropicVersion: "bedrock-2023-05-31",
-		MaxTokens:        req.MaxTokens,
-		Temperature:      req.Temperature,
+func translateRequest(req provider.ChatRequest) (system []types.SystemContentBlock, messages []types.Message, inferenceConfig *types.InferenceConfiguration, err error) {
+	var systemText strings.Builder
+	type turn struct {
+		role    types.ConversationRole
+		content string
 	}
-
-	if br.MaxTokens == 0 {
-		br.MaxTokens = 4096
-	}
+	var turns []turn
 
 	for _, m := range req.Messages {
 		switch m.Role {
 		case "system":
-			// Bedrock takes exactly one system prompt as a top-level field.
-			// Concatenate multiple system messages with a newline rather than
-			// silently discarding all but the first.
-			if br.System == "" {
-				br.System = m.Content
-			} else {
-				br.System += "\n" + m.Content
+			if strings.TrimSpace(m.Content) == "" {
+				continue
 			}
+			if systemText.Len() > 0 {
+				systemText.WriteString("\n")
+			}
+			systemText.WriteString(m.Content)
 		case "user", "assistant":
-			br.Messages = append(br.Messages, bedrockMessage{
-				Role:    m.Role,
-				Content: m.Content,
-			})
+			if strings.TrimSpace(m.Content) == "" {
+				// Empty-content messages must not produce empty text blocks —
+				// Converse rejects them. Drop rather than send a blank turn.
+				continue
+			}
+			role := types.ConversationRoleUser
+			if m.Role == "assistant" {
+				role = types.ConversationRoleAssistant
+			}
+			if len(turns) > 0 && turns[len(turns)-1].role == role {
+				// Merge consecutive same-role turns — Converse requires strict
+				// alternation.
+				turns[len(turns)-1].content += "\n" + m.Content
+			} else {
+				turns = append(turns, turn{role: role, content: m.Content})
+			}
 		default:
-			// Unknown roles are dropped — Bedrock only accepts "user" and
-			// "assistant" in the messages array.
+			// Unknown roles are dropped — Converse only accepts "user" and
+			// "assistant" turns.
 		}
 	}
 
-	// If the caller sends only system messages (degenerate input), we let
-	// Bedrock return the ValidationException rather than masking it here.
-
-	return json.Marshal(br)
-}
-
-// translateResponse converts the raw Bedrock InvokeModel response body to a
-// provider.ChatResponse. modelID must be passed in because Bedrock does not
-// echo it back in the response body.
-func translateResponse(body []byte, modelID string) (*provider.ChatResponse, error) {
-	var br bedrockResponse
-	if err := json.Unmarshal(body, &br); err != nil {
-		return nil, fmt.Errorf("bedrock: unmarshal response: %w", err)
+	// Drop any leading assistant turn(s). After the merge above there can be at
+	// most one leading assistant turn (its neighbour, if any, is a different
+	// role by construction).
+	for len(turns) > 0 && turns[0].role == types.ConversationRoleAssistant {
+		turns = turns[1:]
 	}
 
-	// Collect all text content blocks. In practice Claude returns exactly one
-	// for a basic completion, but the spec allows multiples.
+	if len(turns) == 0 {
+		statusCode, body := TranslateBedrockError("ValidationException", "at least one user message is required")
+		return nil, nil, nil, &BedrockAPIError{StatusCode: statusCode, Body: body}
+	}
+
+	for _, t := range turns {
+		messages = append(messages, types.Message{
+			Role:    t.role,
+			Content: []types.ContentBlock{&types.ContentBlockMemberText{Value: t.content}},
+		})
+	}
+
+	if systemText.Len() > 0 {
+		system = []types.SystemContentBlock{
+			&types.SystemContentBlockMemberText{Value: systemText.String()},
+		}
+	}
+
+	maxTokens := int32(req.MaxTokens)
+	if maxTokens == 0 {
+		maxTokens = defaultMaxTokens
+	}
+	inferenceConfig = &types.InferenceConfiguration{
+		MaxTokens: int32Ptr(maxTokens),
+	}
+	if req.Temperature != nil {
+		temp := float32(*req.Temperature)
+		inferenceConfig.Temperature = &temp
+	}
+
+	return system, messages, inferenceConfig, nil
+}
+
+// int32Ptr is a tiny local helper (avoids importing the aws package just for
+// aws.Int32 in this file, which otherwise deals only in SDK "types").
+func int32Ptr(v int32) *int32 { return &v }
+
+// translateResponse converts a Converse response into a provider.ChatResponse.
+// modelID must be passed in because Converse does not echo the model ID back
+// on the response.
+func translateResponse(out *bedrockruntime.ConverseOutput, modelID string) (*provider.ChatResponse, error) {
+	if out == nil {
+		return nil, fmt.Errorf("bedrock: nil Converse output")
+	}
+
 	var content string
-	for _, block := range br.Content {
-		if block.Type == "text" {
-			content += block.Text
+	if msgOutput, ok := out.Output.(*types.ConverseOutputMemberMessage); ok {
+		for _, block := range msgOutput.Value.Content {
+			if textBlock, ok := block.(*types.ContentBlockMemberText); ok {
+				content += textBlock.Value
+			}
+		}
+	}
+
+	var promptTokens, completionTokens int
+	if out.Usage != nil {
+		if out.Usage.InputTokens != nil {
+			promptTokens = int(*out.Usage.InputTokens)
+		}
+		if out.Usage.OutputTokens != nil {
+			completionTokens = int(*out.Usage.OutputTokens)
 		}
 	}
 
 	return &provider.ChatResponse{
-		// Bedrock does not return a completion ID; the gateway assigns one at a
-		// higher layer if needed.
+		// Converse does not return a completion ID; the gateway assigns one at
+		// a higher layer if needed.
 		ID:               "",
 		Model:            modelID,
 		Content:          content,
-		PromptTokens:     br.Usage.InputTokens,
-		CompletionTokens: br.Usage.OutputTokens,
-		FinishReason:     convertFinishReason(br.StopReason),
+		PromptTokens:     promptTokens,
+		CompletionTokens: completionTokens,
+		FinishReason:     convertFinishReason(string(out.StopReason)),
 	}, nil
 }
 
-// translateStreamEvent processes one raw event JSON payload from the Bedrock
-// response stream. It writes zero or more SSE chunks to w using the shared
-// provider SSE helpers (provider.BuildStreamingChunkSSE,
-// provider.BuildFinalChunkSSE) and updates stats in place.
+// translateStreamEvent processes one decoded ConverseStream event. It writes
+// zero or more SSE chunks to w using the shared provider SSE helpers
+// (provider.BuildStreamingChunkSSE, provider.BuildFinalChunkSSE) and updates
+// stats in place.
 //
-// Returns done=true when a "message_stop" event is received, signalling the
-// caller should exit the event loop.
+// Returns done=true when a MessageStop event is received: the final SSE chunk
+// carrying finish_reason is written here. done is informational only — the
+// caller (BedrockProvider.Stream) does NOT exit its loop on done=true, because
+// Converse sends the trailing Metadata event (token usage) *after*
+// MessageStop; the caller instead exits when the events channel closes, so
+// that event is not missed and streaming usage is not silently dropped.
 func translateStreamEvent(
-	rawEvent []byte,
+	event types.ConverseStreamOutput,
 	completionID string,
 	modelID string,
 	stats *provider.StreamStats,
 	w io.Writer,
 ) (done bool, err error) {
-	var ev streamEvent
-	if err := json.Unmarshal(rawEvent, &ev); err != nil {
-		return false, fmt.Errorf("bedrock: unmarshal stream event: %w", err)
-	}
-
-	switch ev.Type {
-	case "message_start":
-		if ev.Message != nil {
-			stats.PromptTokens = ev.Message.Usage.InputTokens
+	switch ev := event.(type) {
+	case *types.ConverseStreamOutputMemberContentBlockDelta:
+		textDelta, ok := ev.Value.Delta.(*types.ContentBlockDeltaMemberText)
+		if !ok || textDelta.Value == "" {
+			return false, nil
+		}
+		chunk, err := provider.BuildStreamingChunkSSE(completionID, modelID, textDelta.Value)
+		if err != nil {
+			return false, fmt.Errorf("bedrock: build SSE chunk: %w", err)
+		}
+		if _, err := w.Write(chunk); err != nil {
+			return false, fmt.Errorf("bedrock: write SSE chunk: %w", err)
 		}
 
-	case "content_block_start":
-		// Marks the opening of a content block. No SSE output needed.
-
-	case "content_block_delta":
-		if ev.Delta != nil && ev.Delta.Type == "text_delta" {
-			chunk, err := provider.BuildStreamingChunkSSE(completionID, modelID, ev.Delta.Text)
-			if err != nil {
-				return false, fmt.Errorf("bedrock: build SSE chunk: %w", err)
-			}
-			if _, err := w.Write(chunk); err != nil {
-				return false, fmt.Errorf("bedrock: write SSE chunk: %w", err)
-			}
-		}
-
-	case "content_block_stop":
-		// Marks the end of a content block. No SSE output needed.
-
-	case "message_delta":
-		if ev.Delta != nil {
-			stats.FinishReason = convertFinishReason(ev.Delta.StopReason)
-		}
-		if ev.Usage != nil {
-			stats.CompletionTokens = ev.Usage.OutputTokens
-		}
-		// Emit the terminal chunk with finish_reason and accumulated usage.
+	case *types.ConverseStreamOutputMemberMessageStop:
+		stats.FinishReason = convertFinishReason(string(ev.Value.StopReason))
 		finalChunk, err := provider.BuildFinalChunkSSE(completionID, modelID, stats.FinishReason, stats)
 		if err != nil {
 			return false, fmt.Errorf("bedrock: build final SSE chunk: %w", err)
@@ -205,9 +216,26 @@ func translateStreamEvent(
 		if _, err := w.Write(finalChunk); err != nil {
 			return false, fmt.Errorf("bedrock: write final SSE chunk: %w", err)
 		}
-
-	case "message_stop":
 		return true, nil
+
+	case *types.ConverseStreamOutputMemberMetadata:
+		if ev.Value.Usage != nil {
+			if ev.Value.Usage.InputTokens != nil {
+				stats.PromptTokens = int(*ev.Value.Usage.InputTokens)
+			}
+			if ev.Value.Usage.OutputTokens != nil {
+				stats.CompletionTokens = int(*ev.Value.Usage.OutputTokens)
+			}
+		}
+
+	case *types.ConverseStreamOutputMemberMessageStart,
+		*types.ConverseStreamOutputMemberContentBlockStart,
+		*types.ConverseStreamOutputMemberContentBlockStop:
+		// No SSE output needed for these markers.
+
+	default:
+		// Forward-compatible: future event types (e.g. tool-use deltas) are
+		// silently ignored rather than erroring the whole stream.
 	}
 
 	return false, nil
@@ -237,7 +265,7 @@ func TranslateBedrockError(errorCode string, rawMessage string) (statusCode int,
 	case "AccessDeniedException":
 		statusCode = http.StatusForbidden
 		detail = errDetail{
-			Message: "Model access denied - check IAM permissions",
+			Message: "Access denied invoking this model — the gateway's IAM role bedrock:InvokeModel allowlist may not include this model",
 			Type:    "permission_error",
 		}
 	case "ValidationException":
@@ -250,12 +278,6 @@ func TranslateBedrockError(errorCode string, rawMessage string) (statusCode int,
 			Message: msg,
 			Type:    "invalid_request_error",
 		}
-	case "ModelNotReadyException":
-		statusCode = http.StatusServiceUnavailable
-		detail = errDetail{
-			Message: "Model not available",
-			Type:    "server_error",
-		}
 	case "ResourceNotFoundException":
 		statusCode = http.StatusNotFound
 		msg := rawMessage
@@ -266,8 +288,20 @@ func TranslateBedrockError(errorCode string, rawMessage string) (statusCode int,
 			Message: msg,
 			Type:    "invalid_request_error",
 		}
+	case "ModelNotReadyException", "ServiceUnavailableException":
+		statusCode = http.StatusServiceUnavailable
+		detail = errDetail{
+			Message: "Model not available",
+			Type:    "server_error",
+		}
+	case "ModelTimeoutException":
+		statusCode = http.StatusGatewayTimeout
+		detail = errDetail{
+			Message: "Model timed out generating a response",
+			Type:    "server_error",
+		}
 	default:
-		statusCode = http.StatusInternalServerError
+		statusCode = http.StatusBadGateway
 		detail = errDetail{
 			Message: "Model service error",
 			Type:    "server_error",
@@ -278,24 +312,28 @@ func TranslateBedrockError(errorCode string, rawMessage string) (statusCode int,
 	return statusCode, body
 }
 
-// convertFinishReason maps Bedrock stop reasons to OpenAI finish_reason values.
-// Bedrock uses "end_turn", "max_tokens", etc.; OpenAI clients expect "stop",
-// "length", "tool_calls".
+// convertFinishReason maps Bedrock/Converse stop reasons to OpenAI
+// finish_reason values.
 func convertFinishReason(reason string) string {
 	if reason == "" {
 		return ""
 	}
 	mapping := map[string]string{
-		"end_turn":         "stop",
-		"stop_sequence":    "stop",
-		"finished":         "stop",
-		"complete":         "stop",
-		"max_tokens":       "length",
-		"tool_use":         "tool_calls",
-		"content_filtered": "content_filter",
+		"end_turn":             "stop",
+		"stop_sequence":        "stop",
+		"finished":             "stop",
+		"complete":             "stop",
+		"max_tokens":           "length",
+		"tool_use":             "tool_calls",
+		"content_filtered":     "content_filter",
+		"guardrail_intervened": "content_filter",
 	}
-	if mapped, ok := mapping[strings.ToLower(reason)]; ok {
+	lower := strings.ToLower(reason)
+	if mapped, ok := mapping[lower]; ok {
 		return mapped
 	}
-	return strings.ToLower(reason)
+	// Unknown stop reasons (including malformed_model_output,
+	// malformed_tool_use, model_context_window_exceeded) map to "stop" rather
+	// than leaking a Bedrock-specific string to an OpenAI-compatible client.
+	return "stop"
 }

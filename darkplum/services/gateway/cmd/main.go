@@ -2,13 +2,13 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
-	"net"
 	"net/http"
 	"net/http/httputil"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -19,12 +19,13 @@ import (
 	"github.com/scalecraft/darkplum/gateway/internal/handler"
 	"github.com/scalecraft/darkplum/gateway/internal/health"
 	"github.com/scalecraft/darkplum/gateway/internal/middleware"
+	"github.com/scalecraft/darkplum/gateway/internal/policy"
 	"github.com/scalecraft/darkplum/gateway/internal/provider"
-	"github.com/scalecraft/darkplum/gateway/internal/provider/bedrock"
 	"github.com/scalecraft/darkplum/gateway/internal/provider/mock"
 	"github.com/scalecraft/darkplum/gateway/internal/provider/openaicompat"
 	"github.com/scalecraft/darkplum/gateway/internal/proxy"
 	"github.com/scalecraft/darkplum/gateway/internal/recorder"
+	"github.com/scalecraft/darkplum/gateway/internal/routing"
 )
 
 func main() {
@@ -46,30 +47,27 @@ func main() {
 		log.Fatalf("database: ping failed: %v", err)
 	}
 
-	// modelRoute maps each discovered model ID to the instance name of the
-	// openai-compatible provider that serves it. Built at startup from the
-	// /v1/models discovery call to each upstream. DB-free: no per-request lookups.
-	modelRoute := make(map[string]string)
+	// reg is the dispatch-time provider registry: routing.Route.ProviderKey ->
+	// provider.Provider. Entries for statically-configured backends (mock,
+	// vllm-default, extra vLLMs, LM Studio) are set once below; the Bedrock
+	// entry is set lazily by routing.NewBedrockSource's onReady callback the
+	// first time its client construction succeeds (which may be on a later
+	// discovery tick, not necessarily at startup).
+	reg := provider.NewRegistry()
 
-	// openaiProviders holds all openai-compatible instances in registration order.
-	// The first element is always the default provider.
-	var openaiProviders []provider.Provider
+	// sources drives routing.Manager's periodic discovery. Registration order
+	// is significant: it is the tie-break among self-hosted sources that
+	// claim the same model id (self_hosted always beats cloud_managed
+	// regardless of position).
+	var sources []routing.Source
 
-	var defaultProv provider.Provider
 	var rp *httputil.ReverseProxy
 	mockMode := cfg.VLLMUpstream == "mock"
 
 	if mockMode {
 		mockProv := mock.New()
-		defaultProv = mockProv
-		for _, id := range mockProv.Models() {
-			if _, exists := modelRoute[id]; exists {
-				log.Printf("gateway: model ID %q already registered, keeping first-registered winner", id)
-			} else {
-				modelRoute[id] = mockProv.Name()
-			}
-		}
-		openaiProviders = append(openaiProviders, mockProv)
+		reg.Set(mockProv.Name(), mockProv)
+		sources = append(sources, routing.NewMockSource(mockProv.Name(), mockProv.Models()))
 		log.Println("gateway: mock mode enabled — no upstream required")
 	} else {
 		// Validate the vLLM upstream URL before attempting to connect.
@@ -86,22 +84,21 @@ func main() {
 		if err != nil {
 			log.Fatalf("vllm: failed to create provider: %v", err)
 		}
-		defaultProv = vllmProv
-		openaiProviders = append(openaiProviders, vllmProv)
+		reg.Set("vllm-default", vllmProv)
+		sources = append(sources, routing.NewHTTPModelSource("vllm-default", "vllm", routing.ClassSelfHosted, "vllm-default", cfg.VLLMUpstream))
+	}
 
-		vllmModels := fetchOpenAICompatModels(ctx, cfg.VLLMUpstream, "vllm-default")
-		if len(vllmModels) == 0 {
-			log.Printf("WARNING: vllm-default: discovered 0 models from %s — upstream may be unreachable; check NetworkPolicy egress rules and probe /health", cfg.VLLMUpstream)
-		} else {
-			log.Printf("vllm: discovered %d models from %s", len(vllmModels), cfg.VLLMUpstream)
+	// Extra named vLLM upstreams (VLLM_UPSTREAMS). Each is its own routing
+	// source and dispatch target, independent of whether the primary
+	// VLLM_UPSTREAM is mock or real.
+	for _, u := range cfg.VLLMUpstreams {
+		instanceName := "vllm-" + u.Name
+		p, err := openaicompat.New(instanceName, "vllm", u.URL)
+		if err != nil {
+			log.Fatalf("vllm(%s): failed to create provider: %v", u.Name, err)
 		}
-		for _, id := range vllmModels {
-			if _, exists := modelRoute[id]; exists {
-				log.Printf("gateway: model ID %q already registered (vllm-default), keeping first-registered winner", id)
-			} else {
-				modelRoute[id] = "vllm-default"
-			}
-		}
+		reg.Set(instanceName, p)
+		sources = append(sources, routing.NewHTTPModelSource(instanceName, "vllm", routing.ClassSelfHosted, instanceName, u.URL))
 	}
 
 	// Build LM Studio provider if enabled.
@@ -114,46 +111,47 @@ func main() {
 		if err != nil {
 			log.Fatalf("lmstudio: failed to create provider: %v", err)
 		}
-		openaiProviders = append(openaiProviders, lmsProv)
-
-		lmsModels := fetchOpenAICompatModels(ctx, cfg.LMStudioUpstream, "lmstudio-dev")
-		if len(lmsModels) == 0 {
-			log.Printf("WARNING: lmstudio-dev: discovered 0 models from %s — upstream may be unreachable; check NetworkPolicy egress rules and probe /health", cfg.LMStudioUpstream)
-		} else {
-			log.Printf("lmstudio: discovered %d models from %s", len(lmsModels), cfg.LMStudioUpstream)
-		}
-		for _, id := range lmsModels {
-			if _, exists := modelRoute[id]; exists {
-				log.Printf("gateway: model ID %q already registered (lmstudio-dev conflicts), keeping first-registered winner", id)
-			} else {
-				modelRoute[id] = "lmstudio-dev"
-			}
-		}
+		reg.Set("lmstudio-dev", lmsProv)
+		sources = append(sources, routing.NewHTTPModelSource("lmstudio-dev", "lmstudio", routing.ClassSelfHosted, "lmstudio-dev", cfg.LMStudioUpstream))
 	}
 
-	var bedrockProv provider.Provider
-	bedrockModels := make(map[string]bool)
+	// Bedrock. Unlike the other backends, provider construction happens
+	// lazily inside the Source's Discover closure so that a failed init (e.g.
+	// expired SSO creds, VPC endpoint not yet reachable) is retried on every
+	// later discovery tick instead of leaving Bedrock unavailable until the
+	// pod restarts. onReady registers the constructed client in reg the
+	// moment it exists, strictly before any model from it can appear in the
+	// route table.
 	if cfg.BedrockEnabled {
-		bp, err := bedrock.New(cfg.BedrockRegion)
-		if err != nil {
-			// Non-fatal: treat as "no Bedrock models available this run". Mirrors
-			// the vLLM/LM Studio pattern where an unreachable upstream at startup
-			// logs a warning and continues rather than crashing the entire gateway.
-			log.Printf("bedrock: WARNING — provider init failed, Bedrock models unavailable until restart: %v", err)
-		} else {
-			discovered, discErr := bp.DiscoverModels(ctx)
-			if discErr != nil {
-				// Non-fatal: expired SSO creds, VPC endpoint not yet reachable, etc.
-				// bedrockProv stays nil, bedrockModels stays empty — no Bedrock routes
-				// are registered. All other providers (vllm, lmstudio, mock) are
-				// unaffected. /health continues to serve 200.
-				log.Printf("bedrock: WARNING — model discovery failed, Bedrock models unavailable until restart: %v", discErr)
-			} else {
-				bedrockProv = bp
-				bedrockModels = discovered
-				log.Printf("bedrock: discovered %d models in %s", len(bedrockModels), cfg.BedrockRegion)
-			}
+		onReady := func(p provider.Provider) {
+			reg.Set("bedrock", p)
+			log.Printf("bedrock: client ready (region=%s)", cfg.BedrockRegion)
 		}
+		sources = append(sources, routing.NewBedrockSource(cfg.BedrockRegion, cfg.BedrockModelFilter, onReady))
+	}
+
+	sourceDescriptions := make([]string, 0, len(sources))
+	for _, s := range sources {
+		sourceDescriptions = append(sourceDescriptions, fmt.Sprintf("%s(%s/%s)", s.Name, s.Kind, s.Class))
+	}
+	log.Printf("gateway: routing sources configured: %s", strings.Join(sourceDescriptions, ", "))
+
+	routeMgr := routing.NewManager(sources)
+	routeMgr.Run(ctx, time.Duration(cfg.DiscoveryIntervalSeconds)*time.Second)
+	log.Printf("gateway: initial discovery complete, %d models routable (refreshing every %ds)",
+		len(routeMgr.Snapshot().IDs()), cfg.DiscoveryIntervalSeconds)
+
+	// Policy store: models.enabled, model_aliases, routing_policy. Fails
+	// closed (503 policy_unavailable) until the first successful load — which
+	// may not happen until the api runs migration 010 against a freshly
+	// onboarded database — then keeps serving the last-good snapshot on later
+	// refresh failures.
+	polStore := policy.NewPgStore(dbPool)
+	polStore.Run(ctx, time.Duration(cfg.PolicyRefreshSeconds)*time.Second)
+	if _, loaded := polStore.Current(); loaded {
+		log.Printf("policy: initial load succeeded (refreshing every %ds)", cfg.PolicyRefreshSeconds)
+	} else {
+		log.Printf("policy: WARNING initial load failed — chat completions will 503 policy_unavailable until a refresh succeeds (retrying every %ds)", cfg.PolicyRefreshSeconds)
 	}
 
 	// Build upstream health entries for observability.
@@ -169,6 +167,12 @@ func main() {
 			ProbeURL: cfg.VLLMUpstream + "/v1/models",
 		})
 	}
+	for _, u := range cfg.VLLMUpstreams {
+		healthEntries = append(healthEntries, health.Entry{
+			Name:     "vllm-" + u.Name,
+			ProbeURL: u.URL + "/v1/models",
+		})
+	}
 	if cfg.LMStudioEnabled {
 		healthEntries = append(healthEntries, health.Entry{
 			Name:     "lmstudio-dev",
@@ -177,13 +181,7 @@ func main() {
 	}
 	upstreamChecker := health.NewChecker(healthEntries)
 
-	chatHandler := handler.NewChatHandler(
-		defaultProv,
-		bedrockProv,
-		bedrockModels,
-		openaiProviders,
-		modelRoute,
-	)
+	chatHandler := handler.NewChatHandler(reg, routeMgr, polStore)
 
 	rec := recorder.New(dbPool)
 
@@ -225,11 +223,12 @@ func main() {
 	v1.Use(middleware.APIKey(dbPool))
 	v1.Use(middleware.Recording(rec))
 
-	// Chat completions are handled by ChatHandler, which selects the backend
-	// provider based on the discovered Bedrock model set and model-route table.
-	// GET /v1/models is served by HandleListModels, which combines openai-compat
-	// and Bedrock model lists. All other /v1/* GET paths are forwarded to the
-	// vLLM upstream via the reverse proxy.
+	// Chat completions are handled by ChatHandler, which enforces model
+	// routing (alias resolve -> route lookup -> enabled -> residency ->
+	// dispatch) using the live routing.Table and policy.Snapshot. GET
+	// /v1/models is served by HandleListModels, which lists every discovered
+	// model with its backend_class. All other /v1/* GET paths are forwarded
+	// to the vLLM upstream via the reverse proxy.
 	//
 	// NOTE: gin/httprouter does not allow registering both a static segment
 	// (/models) and a catch-all (/*path) under the same parent. The wildcard
@@ -289,58 +288,4 @@ func main() {
 
 	rec.Drain()
 	log.Println("gateway: recorder drained, exiting")
-}
-
-// fetchOpenAICompatModels calls the upstream's GET /v1/models and returns the
-// list of model IDs. Errors are logged and an empty slice is returned so an
-// upstream startup delay does not prevent the gateway from starting.
-// instanceName is used only for log messages.
-func fetchOpenAICompatModels(ctx context.Context, upstreamURL, instanceName string) []string {
-	target := upstreamURL + "/v1/models"
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
-	if err != nil {
-		log.Printf("%s: build models request failed: %v", instanceName, err)
-		return nil
-	}
-
-	// Use a DialContext with a 5s TCP connect timeout so a NetworkPolicy-dropped
-	// SYN fails in ~5s rather than after the OS default (~120s). A generous
-	// overall client Timeout is retained so slow-responding upstreams don't hang
-	// startup indefinitely either.
-	discoveryDialer := &net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}
-	client := &http.Client{
-		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			DialContext: discoveryDialer.DialContext,
-		},
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		log.Printf("%s: models request failed: %v", instanceName, err)
-		return nil
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("%s: models request returned %d", instanceName, resp.StatusCode)
-		return nil
-	}
-
-	var body struct {
-		Data []struct {
-			ID string `json:"id"`
-		} `json:"data"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
-		log.Printf("%s: decode models response failed: %v", instanceName, err)
-		return nil
-	}
-
-	ids := make([]string, 0, len(body.Data))
-	for _, m := range body.Data {
-		if m.ID != "" {
-			ids = append(ids, m.ID)
-		}
-	}
-	return ids
 }

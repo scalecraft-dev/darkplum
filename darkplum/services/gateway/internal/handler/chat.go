@@ -1,7 +1,8 @@
 // Package handler contains the HTTP handlers for the gateway's OpenAI-compatible
-// API surface. ChatHandler is the routing layer that dispatches chat completion
-// requests to the appropriate backend provider (vLLM, LM Studio, or Bedrock)
-// based on the model field in the request body.
+// API surface. ChatHandler is the enforcement point for model routing: every
+// caller (session or API key) passes through HandleChatCompletions, which
+// resolves aliases, looks up the route table, and enforces the enabled and
+// residency policy checks before dispatching to a backend provider.
 package handler
 
 import (
@@ -10,13 +11,14 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"sort"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/scalecraft/darkplum/gateway/internal/policy"
 	"github.com/scalecraft/darkplum/gateway/internal/provider"
 	"github.com/scalecraft/darkplum/gateway/internal/provider/bedrock"
+	"github.com/scalecraft/darkplum/gateway/internal/routing"
 )
 
 // openAIError is the wire format for error responses on the OpenAI-compatible surface.
@@ -43,90 +45,47 @@ type chatCompletionRequest struct {
 	Temperature *float64           `json:"temperature,omitempty"`
 }
 
-// modelInfo holds the model ID and the instance name of the provider that
-// serves it. Used by HandleListModels to emit the correct owned_by kind.
-type modelInfo struct {
-	id           string
-	instanceName string // key into providers map
+// providerLookup is the subset of *provider.Registry the handler needs.
+// Defined as an interface so tests can substitute a fake registry.
+type providerLookup interface {
+	Get(key string) (provider.Provider, bool)
 }
 
-// ChatHandler routes POST /v1/chat/completions to the correct backend provider
-// based on the model field in the request. Routing precedence:
-//  1. bedrockModels set (discovered at startup) -> "bedrock"
-//  2. modelRoute map (model-id -> instance name, built from upstream discovery) -> that instance
-//  3. defaultProvider (instance name fallback)
+// routeSnapshotter supplies the current route table. Satisfied by
+// *routing.Manager; defined as an interface so tests can substitute a static
+// table built with routing.NewTable without spinning up discovery.
+type routeSnapshotter interface {
+	Snapshot() *routing.Table
+}
+
+// ChatHandler is the model-routing enforcement point for
+// POST /v1/chat/completions and GET /v1/models.
+//
+// Request order for HandleChatCompletions:
+//  1. parse body; model required (400)
+//  2. policy snapshot must be loaded, else fail closed (503 policy_unavailable)
+//  3. alias resolve (admin intent wins over a same-named discovered model; no chains)
+//  4. route lookup on the resolved id (404 model_not_found — no default fall-through, ever)
+//  5. enabled check (403 model_not_enabled)
+//  6. residency check (403 model_residency_violation)
+//  7. dispatch
 type ChatHandler struct {
-	providers       map[string]provider.Provider
-	bedrockModels   map[string]bool
-	// openaiModels is the ordered list of {model-id, instance-name} pairs for
-	// all openai-compatible upstreams, used by HandleListModels.
-	openaiModels    []modelInfo
-	modelRoute      map[string]string // model-id -> instance name
-	defaultProvider string            // instance name
+	providers providerLookup
+	routes    routeSnapshotter
+	policy    policy.Store
 }
 
 // NewChatHandler constructs a ChatHandler.
-//
-//   - defaultProv must not be nil; it is used when no model-specific route matches.
-//   - bedrockProv may be nil (Bedrock disabled).
-//   - bedrockModels is the set of model IDs discovered from Bedrock at startup.
-//   - openaiProviders is a slice of all openai-compatible provider instances
-//     (vllm-default, lmstudio-dev, etc.) in registration order.
-//   - modelRoute maps each discovered model-id to the instance name that serves it.
-func NewChatHandler(
-	defaultProv provider.Provider,
-	bedrockProv provider.Provider,
-	bedrockModels map[string]bool,
-	openaiProviders []provider.Provider,
-	modelRoute map[string]string,
-) *ChatHandler {
-	h := &ChatHandler{
-		providers:       make(map[string]provider.Provider),
-		bedrockModels:   bedrockModels,
-		modelRoute:      modelRoute,
-		defaultProvider: defaultProv.Name(),
-	}
-
-	// Register default provider first.
-	h.providers[defaultProv.Name()] = defaultProv
-
-	// Register all openai-compatible instances and record their model lists
-	// for HandleListModels. Default provider is already registered above; skip
-	// re-registering it if it appears in openaiProviders.
-	for _, p := range openaiProviders {
-		if _, exists := h.providers[p.Name()]; !exists {
-			h.providers[p.Name()] = p
-		}
-	}
-
-	// Build openaiModels from modelRoute (model-id -> instance-name).
-	// Iterate in a stable order (sorted model IDs) so HandleListModels output
-	// is deterministic.
-	sortedModelIDs := make([]string, 0, len(modelRoute))
-	for id := range modelRoute {
-		sortedModelIDs = append(sortedModelIDs, id)
-	}
-	sort.Strings(sortedModelIDs)
-	for _, id := range sortedModelIDs {
-		h.openaiModels = append(h.openaiModels, modelInfo{
-			id:           id,
-			instanceName: modelRoute[id],
-		})
-	}
-
-	if bedrockProv != nil {
-		h.providers[bedrockProv.Name()] = bedrockProv
-	}
-	return h
+func NewChatHandler(providers providerLookup, routes routeSnapshotter, pol policy.Store) *ChatHandler {
+	return &ChatHandler{providers: providers, routes: routes, policy: pol}
 }
 
-// HandleChatCompletions handles POST /v1/chat/completions. It parses the
-// request body, selects the appropriate provider based on the discovered
-// Bedrock model set and the model-route table, then calls either Stream or Complete.
+// HandleChatCompletions handles POST /v1/chat/completions. See the ChatHandler
+// doc comment for the exact enforcement order.
 //
-// Provider metadata (provider_name, provider_region, resolved_model) and token
-// counts (prompt_tokens, completion_tokens) are written to the Gin context so
-// the Recording middleware can include them in the InferenceEvent without
+// Provider metadata (provider_name, provider_region), resolved_model,
+// requested_model, and token counts are written to the Gin context so the
+// Recording middleware can include them in the InferenceEvent without
 // re-parsing the body.
 //
 // provider_name is set to the backend KIND ("vllm", "lmstudio", "bedrock"),
@@ -155,16 +114,49 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 		return
 	}
 
-	// Route: (1) Bedrock model set; (2) per-model route; (3) default provider.
-	providerKey := h.resolveProviderKey(req.Model)
+	snap, loaded := h.policy.Current()
+	if !loaded {
+		respondPolicyUnavailable(c)
+		return
+	}
 
-	prov, ok := h.providers[providerKey]
+	// Alias resolution: admin intent is authoritative — an alias wins over a
+	// same-named discovered model. No chains: the target is looked up as-is
+	// below, never re-resolved through Aliases again (model_aliases
+	// guarantees a target is never itself an alias).
+	requestedModel := ""
+	resolvedModel := req.Model
+	if target, isAlias := snap.Aliases[req.Model]; isAlias {
+		requestedModel = req.Model
+		resolvedModel = target
+	}
+
+	route, ok := h.routes.Snapshot().Lookup(resolvedModel)
 	if !ok {
-		c.JSON(http.StatusBadRequest, openAIError{
+		respondModelNotFound(c, resolvedModel)
+		return
+	}
+
+	if !snap.Enabled[resolvedModel] {
+		respondModelNotEnabled(c, resolvedModel)
+		return
+	}
+
+	if snap.Residency == policy.ResidencySelfHostedOnly && route.Class == routing.ClassCloudManaged {
+		respondResidencyViolation(c, resolvedModel)
+		return
+	}
+
+	prov, ok := h.providers.Get(route.ProviderKey)
+	if !ok {
+		// Should never happen: a model only appears in the route table once
+		// its source has successfully discovered it, and every source
+		// registers its provider before Discover can return that model id.
+		// Surface loudly rather than silently egressing anywhere.
+		c.JSON(http.StatusInternalServerError, openAIError{
 			Error: openAIErrorBody{
-				Message: fmt.Sprintf("model %q requires the %q provider which is not enabled on this gateway", req.Model, providerKey),
-				Type:    "invalid_request_error",
-				Code:    "provider_not_enabled",
+				Message: fmt.Sprintf("model %q resolved to provider %q which is not registered", resolvedModel, route.ProviderKey),
+				Type:    "internal_error",
 			},
 		})
 		return
@@ -181,7 +173,9 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 		c.Set("provider_name", prov.Name())
 	}
 
-	c.Set("resolved_model", req.Model)
+	c.Set("resolved_model", resolvedModel)
+	c.Set("requested_model", requestedModel)
+
 	providerRegion := ""
 	if bp, ok := prov.(*bedrock.BedrockProvider); ok {
 		providerRegion = bp.Region()
@@ -189,7 +183,7 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 	c.Set("provider_region", providerRegion)
 
 	chatReq := provider.ChatRequest{
-		Model:       req.Model,
+		Model:       resolvedModel,
 		Messages:    req.Messages,
 		Stream:      req.Stream,
 		MaxTokens:   req.MaxTokens,
@@ -279,39 +273,18 @@ func (h *ChatHandler) handleComplete(c *gin.Context, prov provider.Provider, cha
 	c.Data(http.StatusOK, "application/json", body)
 }
 
-// resolveProviderKey returns the provider key (instance name or "bedrock") for
-// the given model ID using the routing precedence documented on ChatHandler:
-//  1. bedrockModels set  -> "bedrock"
-//  2. modelRoute entry   -> that instance name
-//  3. defaultProvider    -> fallback
-//
-// This is a pure helper extracted so that routing logic can be unit-tested
-// independently of the full HTTP handler.
-func (h *ChatHandler) resolveProviderKey(model string) string {
-	if h.bedrockModels[model] {
-		return "bedrock"
-	}
-	if instanceName, ok := h.modelRoute[model]; ok {
-		return instanceName
-	}
-	return h.defaultProvider
-}
-
-// HandleListModels returns all available models from openai-compatible upstreams
-// and Bedrock in OpenAI-compatible format. OpenAI-compatible models come from
-// the modelRoute table populated at startup; Bedrock models come from the
-// bedrockModels set discovered via the AWS API. Both sets are sorted for
-// deterministic output.
-//
-// The owned_by field for openai-compatible models is set to the KIND of the
-// serving instance ("vllm" or "lmstudio"), not the instance name, so that
-// clients can group models by backend type.
+// HandleListModels returns every model currently in the route table,
+// regardless of enabled status — the api's SyncModels needs the full
+// discovered set, not just what's currently enabled. Each entry reports
+// owned_by (the backend kind) and backend_class (self_hosted/cloud_managed)
+// straight from the route, so this handler never needs a provider lookup.
 func (h *ChatHandler) HandleListModels(c *gin.Context) {
 	type modelEntry struct {
-		ID      string `json:"id"`
-		Object  string `json:"object"`
-		Created int64  `json:"created"`
-		OwnedBy string `json:"owned_by"`
+		ID           string `json:"id"`
+		Object       string `json:"object"`
+		Created      int64  `json:"created"`
+		OwnedBy      string `json:"owned_by"`
+		BackendClass string `json:"backend_class"`
 	}
 	type modelsResponse struct {
 		Object string       `json:"object"`
@@ -319,37 +292,22 @@ func (h *ChatHandler) HandleListModels(c *gin.Context) {
 	}
 
 	now := time.Now().Unix()
-	var models []modelEntry
+	table := h.routes.Snapshot()
+	ids := table.IDs() // already sorted
 
-	// OpenAI-compatible models — fetched from upstreams at startup.
-	// openaiModels is already sorted by model ID (done in NewChatHandler).
-	for _, m := range h.openaiModels {
-		ownedBy := m.instanceName // fallback: use instance name
-		if prov, ok := h.providers[m.instanceName]; ok {
-			if kp, ok := prov.(interface{ Kind() string }); ok {
-				ownedBy = kp.Kind()
-			}
+	models := make([]modelEntry, 0, len(ids))
+	for _, id := range ids {
+		route, ok := table.Lookup(id)
+		if !ok {
+			// Defensive: IDs() is always derived from the same table snapshot.
+			continue
 		}
 		models = append(models, modelEntry{
-			ID:      m.id,
-			Object:  "model",
-			Created: now,
-			OwnedBy: ownedBy,
-		})
-	}
-
-	// Bedrock models — discovered from the customer's AWS account at startup.
-	bedrockIDs := make([]string, 0, len(h.bedrockModels))
-	for id := range h.bedrockModels {
-		bedrockIDs = append(bedrockIDs, id)
-	}
-	sort.Strings(bedrockIDs)
-	for _, id := range bedrockIDs {
-		models = append(models, modelEntry{
-			ID:      id,
-			Object:  "model",
-			Created: now,
-			OwnedBy: "bedrock",
+			ID:           id,
+			Object:       "model",
+			Created:      now,
+			OwnedBy:      route.Kind,
+			BackendClass: route.Class,
 		})
 	}
 
@@ -362,6 +320,56 @@ func (h *ChatHandler) HandleListModels(c *gin.Context) {
 // ---------------------------------------------------------------------------
 // Error helpers
 // ---------------------------------------------------------------------------
+
+// respondModelNotFound writes the 404 for a model with no route table entry.
+// There is no default-provider fall-through: an unrecognised model id is
+// always refused rather than silently sent to whichever backend happens to be
+// primary.
+func respondModelNotFound(c *gin.Context, model string) {
+	c.JSON(http.StatusNotFound, openAIError{
+		Error: openAIErrorBody{
+			Message: fmt.Sprintf("model %q is not available on this gateway", model),
+			Type:    "invalid_request_error",
+			Code:    "model_not_found",
+		},
+	})
+}
+
+// respondModelNotEnabled writes the 403 for a model that has a route but is
+// not enabled in policy (models.enabled).
+func respondModelNotEnabled(c *gin.Context, model string) {
+	c.JSON(http.StatusForbidden, openAIError{
+		Error: openAIErrorBody{
+			Message: fmt.Sprintf("model %q is not enabled on this gateway", model),
+			Type:    "permission_error",
+			Code:    "model_not_enabled",
+		},
+	})
+}
+
+// respondResidencyViolation writes the 403 for a cloud_managed route refused
+// by a self_hosted_only residency policy.
+func respondResidencyViolation(c *gin.Context, model string) {
+	c.JSON(http.StatusForbidden, openAIError{
+		Error: openAIErrorBody{
+			Message: fmt.Sprintf("model %q is cloud-managed, which the current residency policy (self-hosted only) does not permit", model),
+			Type:    "permission_error",
+			Code:    "model_residency_violation",
+		},
+	})
+}
+
+// respondPolicyUnavailable writes the 503 for the fail-closed case: no policy
+// snapshot has ever loaded successfully.
+func respondPolicyUnavailable(c *gin.Context) {
+	c.JSON(http.StatusServiceUnavailable, openAIError{
+		Error: openAIErrorBody{
+			Message: "routing policy is not yet available; try again shortly",
+			Type:    "service_unavailable",
+			Code:    "policy_unavailable",
+		},
+	})
+}
 
 // handleProviderError maps provider errors to HTTP responses. BedrockAPIError
 // carries a pre-translated status code and body; all other errors become 502.

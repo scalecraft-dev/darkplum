@@ -1,5 +1,7 @@
+import { useMemo } from 'react'
 import type { Model } from '../types'
 import { formatModelName } from '../lib/formatModelName'
+import { backendClassChatLabel, backendClassOf } from '../lib/modelRouting'
 import { Skeleton } from '../components/ui/Skeleton'
 import styles from './ModelSelector.module.css'
 
@@ -11,52 +13,99 @@ interface Props {
   onChange: (modelId: string) => void
 }
 
+/** Label for one entry. Aliases lead with the alias and name their target. */
+function optionLabel(m: Model): string {
+  if (m.alias_of) return `${m.id} — ${formatModelName(m.alias_of)}`
+  return formatModelName(m.id)
+}
+
 export function ModelSelector({ models, isLoading, error, value, onChange }: Props) {
-  if (isLoading) {
+  const groups = useMemo(() => {
+    const aliases = models.filter((m) => m.alias_of)
+    const direct = models.filter((m) => !m.alias_of)
+    return {
+      aliases,
+      selfHosted: direct.filter((m) => backendClassOf(m) === 'self_hosted'),
+      cloud: direct.filter((m) => backendClassOf(m) === 'cloud_managed'),
+    }
+  }, [models])
+
+  if (isLoading && models.length === 0) {
     return (
       <div className={styles.wrapper}>
-        <Skeleton width="140px" height="30px" />
+        <Skeleton width="180px" height="30px" />
       </div>
     )
   }
 
-  const hasModels = models.length > 0
-  const hasError = error !== null && !hasModels
-
-  let dotClass = styles.dotGreen
-  let statusText = 'Running in your infrastructure'
-
-  if (hasError) {
-    dotClass = styles.dotRed
-    statusText = 'Model unavailable — check gateway status'
-  } else if (!hasModels) {
-    dotClass = styles.dotAmber
-    statusText = 'Model starting up'
+  // No picker without models: an empty <select> is a dead control. The body of
+  // the page carries the explanation and the next step.
+  if (models.length === 0) {
+    const unreachable = error !== null
+    return (
+      <div className={styles.wrapper}>
+        <span className={styles.status} role="status">
+          <span
+            className={`${styles.dot} ${unreachable ? styles.dotRed : styles.dotAmber}`}
+            aria-hidden="true"
+          />
+          <span className={styles.statusLabel}>
+            {unreachable ? 'Model gateway unreachable' : 'No models available'}
+          </span>
+        </span>
+      </div>
+    )
   }
+
+  const selected = models.find((m) => m.id === value) ?? null
+  const selectedClass = selected ? backendClassOf(selected) : 'self_hosted'
+  const isCloud = selectedClass === 'cloud_managed'
 
   return (
     <div className={styles.wrapper}>
       <select
         className={styles.select}
-        aria-label="Select model"
-        value={hasModels ? value : ''}
+        aria-label="Model"
+        value={selected ? value : ''}
         onChange={(e) => onChange(e.target.value)}
-        disabled={!hasModels}
       >
-        {hasModels ? (
-          models.map((m) => (
-            <option key={m.id} value={m.id}>
-              {formatModelName(m.id)}
-            </option>
-          ))
-        ) : (
-          <option value="">{hasError ? 'Unavailable' : 'Model loading...'}</option>
+        {!selected && <option value="">Choose a model</option>}
+        {groups.aliases.length > 0 && (
+          <optgroup label="Shortcuts">
+            {groups.aliases.map((m) => (
+              <option key={m.id} value={m.id}>{optionLabel(m)}</option>
+            ))}
+          </optgroup>
+        )}
+        {groups.selfHosted.length > 0 && (
+          <optgroup label="Self-hosted">
+            {groups.selfHosted.map((m) => (
+              <option key={m.id} value={m.id}>{optionLabel(m)}</option>
+            ))}
+          </optgroup>
+        )}
+        {groups.cloud.length > 0 && (
+          <optgroup label="Cloud-managed">
+            {groups.cloud.map((m) => (
+              <option key={m.id} value={m.id}>{optionLabel(m)}</option>
+            ))}
+          </optgroup>
         )}
       </select>
+
       <span className={styles.status}>
-        <span className={`${styles.dot} ${dotClass}`} role="status" aria-label={statusText} />
-        <span className={styles.statusLabel}>{statusText}</span>
+        <span
+          className={`${styles.dot} ${isCloud ? styles.dotCloud : styles.dotGreen}`}
+          aria-hidden="true"
+        />
+        <span className={styles.statusLabel}>{backendClassChatLabel(selectedClass)}</span>
       </span>
+
+      {selected?.alias_of && (
+        <span className={styles.aliasTarget}>
+          Shortcut for <code className={styles.aliasTargetId}>{selected.alias_of}</code>
+        </span>
+      )}
     </div>
   )
 }

@@ -49,6 +49,57 @@
   margin-bottom: var(--space-6);
 }
 
+/* --- Model-state notice (error / empty) ---
+   Same width as the starter grid so the centre column keeps its rhythm when
+   the page swaps one block for the other. */
+
+.notice {
+  max-width: 460px;
+  width: 100%;
+  margin-top: var(--space-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-5) var(--space-5);
+  padding-left: calc(var(--space-5) - 2px);
+  text-align: left;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-left: 2px solid var(--brand-default);
+  border-radius: var(--radius-md);
+}
+
+.noticeError {
+  border-left-color: var(--danger-fg);
+}
+
+.noticeTitle {
+  font-size: var(--fs-md);
+  font-weight: var(--fw-semibold);
+  color: var(--fg-default);
+  letter-spacing: -0.01em;
+}
+
+.noticeBody {
+  font-size: var(--fs-sm);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-muted);
+}
+
+.noticeDetail {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-normal);
+  color: var(--fg-subtle);
+  word-break: break-word;
+}
+
+.noticeActions {
+  display: flex;
+  gap: var(--space-2);
+  margin-top: var(--space-1);
+}
+
 .starters {
   display: grid;
   grid-template-columns: 1fr 1fr;

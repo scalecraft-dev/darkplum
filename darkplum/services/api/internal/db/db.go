@@ -2,7 +2,7 @@ package db
 
 import (
 	"context"
-	"crypto/rand"
+	"crypto/hmac"
 	"crypto/sha256"
 	"embed"
 	"encoding/hex"
@@ -148,10 +148,83 @@ func EnsurePartitions(ctx context.Context, pool *pgxpool.Pool) error {
 
 const base62Chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
-// BootstrapServiceKey ensures a service API key exists in the service_keys
-// table. Returns the raw API key for the web service to use when proxying chat
-// requests to the gateway. Rotates the key on every startup.
-func BootstrapServiceKey(ctx context.Context, pool *pgxpool.Pool) (string, error) {
+// serviceKeyHMACLabel is the fixed, non-secret context string that domain-
+// separates the service-key derivation from every other use of
+// SESSION_SIGNING_KEY (currently: HS256 session JWT signing in auth/jwt.go).
+//
+// Reusing one secret as an HMAC key for two purposes is safe here because HMAC
+// is a PRF: with a fixed key, HMAC(key, m1) and HMAC(key, m2) are
+// computationally independent as long as the message spaces don't collide.
+// Session JWTs are HMAC'd over a header+claims JSON blob that always differs
+// from this label (it contains "typ":"JWT", per-user claims, expiry
+// timestamps, ...); it can never equal the constant string
+// "darkplum/service-key/v1". So an attacker who can influence or observe JWT
+// inputs/outputs learns nothing about HMAC(secret, serviceKeyHMACLabel), and
+// vice versa. This is the same "derive a subkey via HMAC over a fixed context
+// string" pattern used by HKDF-Expand; we don't need a full HKDF-Extract step
+// because SESSION_SIGNING_KEY is already a high-entropy, uniformly random
+// server secret rather than a low-entropy input.
+const serviceKeyHMACLabel = "darkplum/service-key/v1"
+
+// serviceKeyBodyLen is the length of the base62 body after the "dp_" prefix,
+// matching the format api-keys.go's generateAPIKey uses for user-created keys.
+const serviceKeyBodyLen = 43
+
+// deriveServiceKey deterministically computes the "_service" API key from the
+// session-signing secret: every pod (and every replica) derives the identical
+// key without coordination, so overlapping startups and N replicas never
+// disagree, and rotating SESSION_SIGNING_KEY rotates the service key as a side
+// effect. It is a pure function so it can be unit tested without a database.
+func deriveServiceKey(secret []byte) string {
+	mac := hmac.New(sha256.New, secret)
+	mac.Write([]byte(serviceKeyHMACLabel))
+	digest := mac.Sum(nil)
+	return "dp_" + base62EncodeDigest(digest, serviceKeyBodyLen)
+}
+
+// base62EncodeDigest deterministically encodes digest (big-endian bytes) as a
+// base62 string of exactly length characters.
+//
+// A 256-bit HMAC-SHA256 digest interpreted as a big-endian integer usually
+// base62-encodes to 43 or 44 characters (62^43 ~= 2^256.06), but a digest that
+// happens to have enough leading zero bits encodes shorter — math/big drops
+// leading zeros the same way fmt.Sprintf("%d", 007) would. Left-pad with the
+// alphabet's zero digit ('0') before truncating so the output is always
+// exactly `length` characters regardless of the digest's leading-zero-bit
+// count, rather than occasionally emitting a short or out-of-range key.
+func base62EncodeDigest(digest []byte, length int) string {
+	n := new(big.Int).SetBytes(digest)
+	if n.Sign() == 0 {
+		return strings.Repeat(string(base62Chars[0]), length)
+	}
+
+	base := big.NewInt(int64(len(base62Chars)))
+	mod := new(big.Int)
+	encoded := make([]byte, 0, length+1)
+	for n.Sign() > 0 {
+		n.DivMod(n, base, mod)
+		encoded = append(encoded, base62Chars[mod.Int64()])
+	}
+	// DivMod produces digits least-significant-first; reverse to
+	// most-significant-first.
+	for i, j := 0, len(encoded)-1; i < j; i, j = i+1, j-1 {
+		encoded[i], encoded[j] = encoded[j], encoded[i]
+	}
+
+	for len(encoded) < length {
+		encoded = append([]byte{base62Chars[0]}, encoded...)
+	}
+	return string(encoded[:length])
+}
+
+// BootstrapServiceKey ensures the deterministically-derived "_service" API key
+// (see deriveServiceKey) is present and unrevoked in service_keys, and puts
+// any other, now-superseded "_service" row (from a previous
+// SESSION_SIGNING_KEY) into a 10-minute revocation grace window rather than
+// revoking it immediately, so in-flight requests signed with the old key
+// during a rolling restart don't fail. Returns the raw API key for the web
+// service to use when proxying chat requests to the gateway.
+func BootstrapServiceKey(ctx context.Context, pool *pgxpool.Pool, sessionSigningKey []byte) (string, error) {
 	// Clean up legacy system user if it still exists from before the
 	// service_keys table was introduced. ON DELETE CASCADE on api_keys.user_id
 	// removes its api_keys rows automatically.
@@ -161,41 +234,27 @@ func BootstrapServiceKey(ctx context.Context, pool *pgxpool.Pool) (string, error
 		slog.WarnContext(ctx, "legacy system user cleanup failed", "err", err)
 	}
 
-	_, _ = pool.Exec(ctx, `
-		UPDATE service_keys SET revoked_at = now()
-		WHERE name = '_service' AND revoked_at IS NULL
-	`)
-
-	rawKey, err := generateBase62(43)
-	if err != nil {
-		return "", fmt.Errorf("generate service key: %w", err)
-	}
-	fullKey := "dp_" + rawKey
+	fullKey := deriveServiceKey(sessionSigningKey)
 	prefix := fullKey[:11]
 	sum := sha256.Sum256([]byte(fullKey))
 	hash := hex.EncodeToString(sum[:])
 
-	_, err = pool.Exec(ctx, `
+	if _, err := pool.Exec(ctx, `
+		UPDATE service_keys
+		SET revoked_at = now() + interval '10 minutes'
+		WHERE name = '_service' AND key_hash <> $1 AND revoked_at IS NULL
+	`, hash); err != nil {
+		return "", fmt.Errorf("supersede old service keys: %w", err)
+	}
+
+	if _, err := pool.Exec(ctx, `
 		INSERT INTO service_keys (name, prefix, key_hash)
 		VALUES ('_service', $1, $2)
-	`, prefix, hash)
-	if err != nil {
-		return "", fmt.Errorf("insert service key: %w", err)
+		ON CONFLICT (key_hash) DO UPDATE SET revoked_at = NULL
+	`, prefix, hash); err != nil {
+		return "", fmt.Errorf("upsert service key: %w", err)
 	}
 
 	slog.InfoContext(ctx, "service api key bootstrapped", "prefix", prefix)
 	return fullKey, nil
-}
-
-func generateBase62(length int) (string, error) {
-	result := make([]byte, length)
-	base := big.NewInt(int64(len(base62Chars)))
-	for i := range result {
-		n, err := rand.Int(rand.Reader, base)
-		if err != nil {
-			return "", err
-		}
-		result[i] = base62Chars[n.Int64()]
-	}
-	return string(result), nil
 }

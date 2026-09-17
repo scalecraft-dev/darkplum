@@ -48,6 +48,7 @@ nothing branches yet; the key exists so the seam is ready when `vertex` lands.
 | `rds_endpoint` | Database host:port |
 | `inference_backend` | `bedrock` \| `vertex` — the gateway Provider to use |
 | `inference_region` | Region the hosted-model backend is called in |
+| `bedrock_model_filter` | Catalog globs for the gateway, derived from the hosted-model IAM allowlist (AWS: `bedrock_model_patterns`) |
 | `model_name` / `served_model_name` | Self-hosted vLLM model |
 
 When you add a new cloud root, copy this contract verbatim and resolve every

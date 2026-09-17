@@ -131,15 +131,17 @@ func run() error {
 		return fmt.Errorf("ensure partitions: %w", err)
 	}
 
-	serviceKey, err := db.BootstrapServiceKey(ctx, pool)
-	if err != nil {
-		return fmt.Errorf("bootstrap service key: %w", err)
-	}
-
-	// Auth configuration.
+	// Auth configuration must load before BootstrapServiceKey — the service
+	// key is now derived from SESSION_SIGNING_KEY rather than randomly
+	// generated, so the secret must be in hand first.
 	authCfg, err := auth.LoadConfig()
 	if err != nil {
 		return fmt.Errorf("load auth config: %w", err)
+	}
+
+	serviceKey, err := db.BootstrapServiceKey(ctx, pool, authCfg.Secret)
+	if err != nil {
+		return fmt.Errorf("bootstrap service key: %w", err)
 	}
 
 	activityRecorder := activity.NewRecorder(pool)
@@ -222,6 +224,7 @@ func run() error {
 	keys := handler.NewAPIKeyHandler(pool, activityRecorder)
 	chat := handler.NewChatHandler(gatewayURL, serviceKey)
 	activityH := handler.NewActivityHandler(pool)
+	routing := handler.NewRoutingHandler(pool, activityRecorder)
 
 	r.GET("/health", func(c *gin.Context) { c.Status(http.StatusOK) })
 
@@ -281,6 +284,13 @@ func run() error {
 
 			adminOnly.GET("/models", modelHandler.ListAdminModels)
 			adminOnly.PATCH("/models/:id", modelHandler.ToggleModel)
+
+			adminOnly.GET("/model-aliases", routing.ListAliases)
+			adminOnly.PUT("/model-aliases/:alias", routing.PutAlias)
+			adminOnly.DELETE("/model-aliases/:alias", routing.DeleteAlias)
+
+			adminOnly.GET("/routing-policy", routing.GetRoutingPolicy)
+			adminOnly.PUT("/routing-policy", routing.PutRoutingPolicy)
 
 			adminOnly.GET("/activity", activityH.ListActivity)
 			adminOnly.GET("/activity/export", activityH.ExportActivity)
@@ -396,7 +406,7 @@ func corsMiddleware() gin.HandlerFunc {
 	}
 	cfg := cors.Config{
 		AllowOrigins:     origins,
-		AllowMethods:     []string{"GET", "POST", "PATCH", "DELETE", "OPTIONS"},
+		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization", "X-Request-Id", "X-Requested-With"},
 		ExposeHeaders:    []string{"Content-Type", "X-Request-Id"},
 		AllowCredentials: true,

@@ -1,0 +1,258 @@
+.card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  margin-bottom: var(--space-5);
+  overflow: hidden;
+}
+
+.head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-4) var(--space-5);
+  border-bottom: 1px solid var(--border-default);
+}
+
+.title {
+  font-size: var(--fs-md);
+  font-weight: var(--fw-semibold);
+  color: var(--fg-default);
+  letter-spacing: -0.01em;
+}
+
+.subtitle {
+  margin-top: 2px;
+  max-width: 62ch;
+  font-size: var(--fs-sm);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-muted);
+}
+
+.tableWrap {
+  overflow-x: auto;
+}
+
+/* --- Rows --- */
+
+.idCell {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.alias {
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  color: var(--fg-default);
+  word-break: break-all;
+}
+
+.targetId {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+  word-break: break-all;
+}
+
+/* A flagged alias gets a stripe as well as the badge, so the warning survives
+   greyscale and colour-blind viewing. */
+.rowFlagged td:first-child {
+  box-shadow: inset 2px 0 0 var(--warning-fg);
+}
+
+.statusHint {
+  margin-top: var(--space-1);
+  max-width: 44ch;
+  font-size: var(--fs-xs);
+  line-height: var(--lh-normal);
+  color: var(--fg-muted);
+}
+
+.actionsCol {
+  width: 160px;
+  text-align: right;
+}
+
+.rowActions {
+  display: inline-flex;
+  gap: var(--space-1);
+}
+
+.rowBtn {
+  padding: 3px var(--space-2);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--fg-muted);
+  background: transparent;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color var(--transition-fast), background var(--transition-fast),
+    border-color var(--transition-fast);
+}
+
+.rowBtn:hover:not(:disabled) {
+  color: var(--fg-default);
+  background: var(--bg-surface-raised);
+  border-color: var(--fg-subtle);
+}
+
+.rowBtn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.rowBtnConfirm {
+  color: var(--danger-fg);
+  background: var(--danger-bg);
+  border-color: var(--danger-border);
+}
+
+/* --- Empty --- */
+
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-8) var(--space-4);
+  color: var(--fg-subtle);
+}
+
+.emptyTitle {
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  color: var(--fg-muted);
+}
+
+.emptyHint {
+  max-width: 52ch;
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  text-align: center;
+}
+
+.emptyCode {
+  font-family: var(--font-mono);
+  color: var(--fg-muted);
+}
+
+/* --- Load failure --- */
+
+.error {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-2);
+  margin: var(--space-4) var(--space-5);
+  padding: var(--space-4);
+  background: var(--danger-bg);
+  border: 1px solid var(--danger-border);
+  border-radius: var(--radius-md);
+}
+
+.errorTitle {
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  color: var(--fg-default);
+}
+
+.errorDetail {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--fg-muted);
+  word-break: break-word;
+}
+
+/* --- Dialog form --- */
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  margin-top: var(--space-5);
+}
+
+.monoInput {
+  font-family: var(--font-mono);
+}
+
+.fieldHint {
+  font-size: var(--fs-xs);
+  line-height: var(--lh-normal);
+  color: var(--fg-subtle);
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.fieldLabel {
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  color: var(--fg-muted);
+}
+
+.select {
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  color: var(--fg-default);
+  background: var(--bg-base);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  outline: none;
+  transition: border-color var(--transition-fast);
+}
+
+.select:focus {
+  border-color: var(--border-focus);
+}
+
+.fieldError {
+  font-size: var(--fs-xs);
+  color: var(--danger-fg);
+}
+
+.formWarning {
+  display: flex;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-default);
+  background: var(--warning-bg);
+  border-left: 2px solid var(--warning-fg);
+  border-radius: var(--radius-sm);
+}
+
+.formFooter {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+@media (max-width: 767px) {
+  .head {
+    flex-direction: column;
+    padding: var(--space-4);
+  }
+
+  .actionsCol {
+    width: auto;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rowBtn,
+  .select {
+    transition-duration: 0.01ms !important;
+  }
+}

@@ -1,7 +1,10 @@
-// Package bedrock implements the provider.Provider interface for AWS Bedrock,
-// scoped to Anthropic Claude models only. Credentials are sourced from the
-// default AWS credential chain — in production, IRSA via the gateway pod's
-// service account token; in local dev, environment variables.
+// Package bedrock implements the provider.Provider interface for AWS Bedrock
+// using the model-agnostic Converse / ConverseStream API, so any Bedrock model
+// that supports Converse (Anthropic, Meta Llama, Mistral, Amazon Nova,
+// DeepSeek, ...) works through this provider — not just Anthropic Claude.
+// Credentials are sourced from the default AWS credential chain — in
+// production, IRSA via the gateway pod's service account token; in local dev,
+// environment variables.
 //
 // There are no static credentials anywhere in this package. The IRSA binding is
 // the IAM Layer 1 enforcement boundary; OPA in the gateway is Layer 2.
@@ -20,19 +23,16 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/bedrock"
 	bedrocktypes "github.com/aws/aws-sdk-go-v2/service/bedrock/types"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
-	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
 	"github.com/aws/smithy-go"
 
 	"github.com/scalecraft/darkplum/gateway/internal/provider"
 )
 
-const contentTypeJSON = "application/json"
-
-// BedrockProvider implements provider.Provider using the Bedrock Anthropic
-// Messages API. It is safe for concurrent use; the underlying SDK client
-// manages its own connection pool.
+// BedrockProvider implements provider.Provider using the Bedrock Converse API.
+// It is safe for concurrent use; the underlying SDK client manages its own
+// connection pool.
 type BedrockProvider struct {
-	client        *bedrockruntime.Client
+	client        converseAPI
 	controlClient *bedrock.Client
 	region        string
 }
@@ -55,7 +55,7 @@ func New(region string) (*BedrockProvider, error) {
 	}
 
 	return &BedrockProvider{
-		client:        bedrockruntime.NewFromConfig(cfg),
+		client:        newRuntimeClient(bedrockruntime.NewFromConfig(cfg)),
 		controlClient: bedrock.NewFromConfig(cfg),
 		region:        region,
 	}, nil
@@ -72,8 +72,10 @@ func (p *BedrockProvider) Region() string { return p.region }
 // DiscoverModels queries the Bedrock API for all foundation models available
 // in this region and returns a set of model IDs. The gateway uses this at
 // startup to build a routing table: if a requested model is in this set, route
-// to Bedrock; otherwise route to vLLM. This replaces static prefix-based
-// routing so customers can use whatever Bedrock models their IAM policy allows.
+// to Bedrock; otherwise route elsewhere. This replaces static prefix-based
+// routing so customers can use whatever Bedrock models their IAM policy
+// allows — Converse's model-agnostic wire format means this is no longer
+// restricted to Anthropic Claude.
 func (p *BedrockProvider) DiscoverModels(ctx context.Context) (map[string]bool, error) {
 	models := make(map[string]bool)
 
@@ -98,30 +100,29 @@ func (p *BedrockProvider) DiscoverModels(ctx context.Context) (map[string]bool, 
 	return models, nil
 }
 
-// Complete calls InvokeModel (non-streaming) and returns the full response.
-// req.Model must be a valid Bedrock model ID for an Anthropic Claude model,
-// e.g. "anthropic.claude-3-5-sonnet-20241022-v2:0".
+// Complete calls Converse (non-streaming) and returns the full response.
+// req.Model must be a valid Bedrock model ID or inference profile ID.
 func (p *BedrockProvider) Complete(ctx context.Context, req provider.ChatRequest) (*provider.ChatResponse, error) {
-	body, err := translateRequest(req)
+	system, messages, inferenceConfig, err := translateRequest(req)
 	if err != nil {
-		return nil, fmt.Errorf("bedrock: translate request: %w", err)
+		return nil, err
 	}
 
-	out, err := p.client.InvokeModel(ctx, &bedrockruntime.InvokeModelInput{
-		ModelId:     aws.String(req.Model),
-		Body:        body,
-		ContentType: aws.String(contentTypeJSON),
-		Accept:      aws.String(contentTypeJSON),
+	out, err := p.client.Converse(ctx, &bedrockruntime.ConverseInput{
+		ModelId:         aws.String(req.Model),
+		Messages:        messages,
+		System:          system,
+		InferenceConfig: inferenceConfig,
 	})
 	if err != nil {
 		return nil, wrapBedrockError(err)
 	}
 
-	return translateResponse(out.Body, req.Model)
+	return translateResponse(out, req.Model)
 }
 
-// Stream calls InvokeModelWithResponseStream and writes OpenAI-compatible SSE
-// chunks to w as tokens arrive. The caller must set appropriate response headers
+// Stream calls ConverseStream and writes OpenAI-compatible SSE chunks to w as
+// tokens arrive. The caller must set appropriate response headers
 // (Content-Type: text/event-stream, Cache-Control: no-cache, X-Accel-Buffering:
 // no) before calling Stream, because w is written to as soon as the first chunk
 // arrives.
@@ -129,24 +130,27 @@ func (p *BedrockProvider) Complete(ctx context.Context, req provider.ChatRequest
 // If w implements http.Flusher, it is flushed after each SSE chunk — matching
 // the pattern established by the vLLM provider — so streaming clients see tokens
 // as they arrive rather than when the response buffer fills.
+//
+// Token usage (PromptTokens/CompletionTokens) is populated from the trailing
+// Metadata event Converse emits after MessageStop; this is new relative to the
+// old InvokeModelWithResponseStream integration, which never populated
+// streaming usage at all.
 func (p *BedrockProvider) Stream(ctx context.Context, req provider.ChatRequest, w io.Writer) (*provider.StreamStats, error) {
-	body, err := translateRequest(req)
+	system, messages, inferenceConfig, err := translateRequest(req)
 	if err != nil {
-		return nil, fmt.Errorf("bedrock: translate request: %w", err)
+		return nil, err
 	}
 
-	out, err := p.client.InvokeModelWithResponseStream(ctx, &bedrockruntime.InvokeModelWithResponseStreamInput{
-		ModelId:     aws.String(req.Model),
-		Body:        body,
-		ContentType: aws.String(contentTypeJSON),
-		Accept:      aws.String(contentTypeJSON),
+	out, err := p.client.ConverseStream(ctx, &bedrockruntime.ConverseStreamInput{
+		ModelId:         aws.String(req.Model),
+		Messages:        messages,
+		System:          system,
+		InferenceConfig: inferenceConfig,
 	})
 	if err != nil {
 		return nil, wrapBedrockError(err)
 	}
-
-	stream := out.GetStream()
-	defer stream.Close()
+	defer out.Close()
 
 	flusher, canFlush := w.(http.Flusher)
 
@@ -160,32 +164,39 @@ func (p *BedrockProvider) Stream(ctx context.Context, req provider.ChatRequest, 
 	completionID := fmt.Sprintf("bedrock-%p", stats)
 
 	var streamErr error
-	for event := range stream.Events() {
-		chunk, ok := event.(*types.ResponseStreamMemberChunk)
-		if !ok {
-			slog.Warn("bedrock: skipping unknown stream event type",
-				"type", fmt.Sprintf("%T", event))
-			continue
-		}
+loop:
+	for {
+		select {
+		case <-ctx.Done():
+			return stats, ctx.Err()
+		case event, ok := <-out.Events():
+			if !ok {
+				break loop
+			}
 
-		done, err := translateStreamEvent(chunk.Value.Bytes, completionID, req.Model, stats, w)
-		if err != nil {
-			slog.Error("bedrock: error translating stream event", "err", err)
-			streamErr = err
-			break
-		}
+			// translateStreamEvent reports done=true on MessageStop, but the
+			// loop deliberately keeps reading past it rather than breaking:
+			// Converse sends the trailing Metadata event (token usage) *after*
+			// MessageStop, and breaking early would silently drop streaming
+			// usage. The loop instead exits when the events channel closes.
+			_, err := translateStreamEvent(event, completionID, req.Model, stats, w)
+			if err != nil {
+				slog.Error("bedrock: error translating stream event", "err", err)
+				streamErr = err
+				break loop
+			}
 
-		if canFlush {
-			flusher.Flush()
-		}
-
-		if done {
-			break
+			if canFlush {
+				flusher.Flush()
+			}
 		}
 	}
 
-	if err := stream.Err(); err != nil {
-		return stats, fmt.Errorf("bedrock: stream error: %w", err)
+	// A mid-stream error (e.g. ModelStreamErrorException, ThrottlingException)
+	// surfaces via Err() after the events channel closes, not as an event —
+	// must not be swallowed.
+	if err := out.Err(); err != nil {
+		return stats, wrapBedrockError(err)
 	}
 	if streamErr != nil {
 		return stats, fmt.Errorf("bedrock: translate error: %w", streamErr)
@@ -223,8 +234,9 @@ func wrapBedrockError(err error) error {
 }
 
 // BedrockAPIError is returned by Complete and Stream when Bedrock returns a
-// typed API error. Gateway HTTP handlers should type-assert to this to write
-// the correct status and body without a second translation step.
+// typed API error, or when request translation fails validation (e.g. no user
+// messages). Gateway HTTP handlers should type-assert to this to write the
+// correct status and body without a second translation step.
 type BedrockAPIError struct {
 	StatusCode int
 	Body       []byte

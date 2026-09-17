@@ -1,6 +1,41 @@
-import type { User, ApiKey, ChatMessage, ActivityEvent, InferenceEvent, UsageBucket, UsageSummary, UserUsageSummary, KeyUsageSummary, Model, AdminModel } from '../types'
+import type { User, ApiKey, ChatMessage, ActivityEvent, InferenceEvent, UsageBucket, UsageSummary, UserUsageSummary, KeyUsageSummary, Model, AdminModel, ModelAlias, Residency, RoutingPolicy } from '../types'
 
 const BASE = '/api/v1'
+
+/**
+ * An error carrying the HTTP status so callers can branch on 400 / 404 / 409
+ * without string-matching the message.
+ */
+export class ApiError extends Error {
+  readonly status: number
+
+  constructor(message: string, status: number) {
+    super(message)
+    this.name = 'ApiError'
+    this.status = status
+  }
+}
+
+/**
+ * Pull a human-readable message out of an error body. Two shapes exist:
+ *   {"error":"..."}                          — the api service
+ *   {"error":{"message":"...","code":"..."}} — the gateway (OpenAI envelope)
+ * Anything else (HTML from a proxy, empty body) yields undefined so the caller
+ * can fall back to a status-based message instead of dumping markup on screen.
+ */
+function extractErrorMessage(raw: string): string | undefined {
+  const trimmed = raw.trim()
+  if (!trimmed || !(trimmed.startsWith('{') || trimmed.startsWith('['))) return undefined
+  try {
+    const body = JSON.parse(trimmed) as { error?: { message?: string } | string; message?: string }
+    if (body.error && typeof body.error === 'object' && body.error.message) return body.error.message
+    if (typeof body.error === 'string' && body.error) return body.error
+    if (typeof body.message === 'string' && body.message) return body.message
+  } catch {
+    // Not JSON after all.
+  }
+  return undefined
+}
 
 async function fetchJSON<T>(
   path: string,
@@ -17,8 +52,14 @@ async function fetchJSON<T>(
     return undefined as T
   }
   if (!res.ok) {
-    const body = await res.text().catch(() => res.statusText)
-    throw new Error(body || `HTTP ${res.status}`)
+    const body = await res.text().catch(() => '')
+    const plain = body.trim()
+    // Plain-text bodies stay useful; HTML from a proxy never reaches the UI.
+    const fallback = plain && !plain.startsWith('<') && plain.length <= 200 ? plain : ''
+    throw new ApiError(
+      extractErrorMessage(body) || fallback || res.statusText || `HTTP ${res.status}`,
+      res.status,
+    )
   }
   if (res.status === 204) return undefined as T
   const contentType = res.headers.get('Content-Type') ?? ''
@@ -174,7 +215,58 @@ export function toggleModel(id: string, enabled: boolean): Promise<AdminModel> {
   })
 }
 
+// Model aliases (admin)
+
+export function listModelAliases(): Promise<ModelAlias[]> {
+  return fetchJSON<ModelAlias[]>('/model-aliases')
+}
+
+/** Creates the alias, or points an existing one at a new target. */
+export function putModelAlias(alias: string, targetModelId: string): Promise<ModelAlias> {
+  return fetchJSON<ModelAlias>(`/model-aliases/${encodeURIComponent(alias)}`, {
+    method: 'PUT',
+    body: JSON.stringify({ target_model_id: targetModelId }),
+  })
+}
+
+export function deleteModelAlias(alias: string): Promise<void> {
+  return fetchJSON<void>(`/model-aliases/${encodeURIComponent(alias)}`, { method: 'DELETE' })
+}
+
+// Routing policy (admin)
+
+export function getRoutingPolicy(): Promise<RoutingPolicy> {
+  return fetchJSON<RoutingPolicy>('/routing-policy')
+}
+
+export function updateRoutingPolicy(residency: Residency): Promise<RoutingPolicy> {
+  return fetchJSON<RoutingPolicy>('/routing-policy', {
+    method: 'PUT',
+    body: JSON.stringify({ residency }),
+  })
+}
+
 // Chat streaming
+
+/**
+ * A chat failure carrying the gateway's OpenAI-style error code, so the
+ * conversation UI can explain routing refusals (model_not_found,
+ * model_not_enabled, model_residency_violation, policy_unavailable) instead of
+ * showing a generic failure.
+ */
+export class ChatError extends Error {
+  readonly code?: string
+  readonly type?: string
+  readonly status?: number
+
+  constructor(message: string, opts: { code?: string; type?: string; status?: number } = {}) {
+    super(message)
+    this.name = 'ChatError'
+    this.code = opts.code
+    this.type = opts.type
+    this.status = opts.status
+  }
+}
 
 export async function streamChat(
   messages: ChatMessage[],
@@ -205,29 +297,41 @@ export async function streamChat(
   }
 
   if (!res.ok) {
-    // Surface a clean, human-readable message. The gateway returns structured
-    // JSON errors in two shapes:
-    //   {"error":{"message":"...","type":"..."}}  (OpenAI-compat shape)
-    //   {"error":"..."}                           (gateway unavailable / proxy shape)
+    // Routing refusals (403/404/503) arrive as a JSON body even when the
+    // request asked for stream=true — they are not delivered as SSE events.
+    // Two shapes exist:
+    //   {"error":{"message":"...","type":"...","code":"..."}}  (gateway)
+    //   {"error":"..."}                                        (api / proxy)
     // For non-JSON responses (e.g. nginx HTML 502) we fall back to a generic
-    // message — we never dump raw HTML into the toast.
-    const contentType = res.headers.get('Content-Type') ?? ''
-    if (contentType.includes('application/json')) {
+    // message — we never dump raw markup into the UI.
+    const raw = await res.text().catch(() => '')
+    let message: string | undefined
+    let code: string | undefined
+    let type: string | undefined
+    const trimmed = raw.trim()
+    if (trimmed.startsWith('{')) {
       try {
-        const body = await res.json() as { error?: { message?: string } | string }
-        let message: string | undefined
-        if (body.error && typeof body.error === 'object' && body.error.message) {
+        const body = JSON.parse(trimmed) as {
+          error?: { message?: string; code?: string; type?: string } | string
+        }
+        if (body.error && typeof body.error === 'object') {
           message = body.error.message
+          code = body.error.code
+          type = body.error.type
         } else if (typeof body.error === 'string' && body.error) {
           message = body.error
         }
-        onError(new Error(message || `Request failed (HTTP ${res.status})`))
       } catch {
-        onError(new Error(`Request failed (HTTP ${res.status})`))
+        // Not JSON after all — fall through to the status message.
       }
-    } else {
-      onError(new Error(`Request failed (HTTP ${res.status})`))
     }
+    onError(
+      new ChatError(message || `Request failed (HTTP ${res.status})`, {
+        code,
+        type,
+        status: res.status,
+      }),
+    )
     return
   }
 
@@ -260,10 +364,10 @@ export async function streamChat(
         try {
           const parsed = JSON.parse(data) as {
             choices?: Array<{ delta: { content?: string } }>
-            error?: { message: string }
+            error?: { message: string; code?: string; type?: string }
           }
           if (parsed.error) {
-            onError(new Error(parsed.error.message))
+            onError(new ChatError(parsed.error.message, { code: parsed.error.code, type: parsed.error.type }))
             return
           }
           const token = parsed.choices?.[0]?.delta?.content

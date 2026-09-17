@@ -101,6 +101,11 @@ func Recording(rec *recorder.Recorder) gin.HandlerFunc {
 			model = resolved
 		}
 
+		// requested_model is only set by the handler when an alias was used
+		// (ChatHandler.HandleChatCompletions sets it to "" otherwise), so an
+		// empty string here correctly becomes NULL via recorder.nullableStr.
+		requestedModel := c.GetString("requested_model")
+
 		// Token counts are available when the backend returns them in a
 		// non-streaming response (Bedrock always does; vLLM streaming does not).
 		// Leave nil when not set so the DB column stays NULL rather than zero.
@@ -117,6 +122,7 @@ func Recording(rec *recorder.Recorder) gin.HandlerFunc {
 			APIKeyID:         keyID,
 			UserID:           userID,
 			Model:            model,
+			RequestedModel:   requestedModel,
 			StatusCode:       statusCode,
 			LatencyMS:        latencyMS,
 			Stream:           fields.Stream,

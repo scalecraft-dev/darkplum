@@ -1,4 +1,5 @@
 import { memo, useEffect, useRef, useState } from 'react'
+import { Link } from 'react-router-dom'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
@@ -7,10 +8,118 @@ import { CodeBlock } from '../components/ui/CodeBlock'
 import { CopyButton } from '../components/ui/CopyButton'
 import styles from './MessageList.module.css'
 
+/** A failed send, kept outside the message history so it is never replayed
+ *  back to the model or written to local storage. */
+export interface ChatFailure {
+  /** The gateway's own error.message — shown verbatim. */
+  message: string
+  /** OpenAI-style error code, e.g. model_residency_violation. */
+  code?: string
+  /** The model id the request was sent with. */
+  model?: string
+}
+
 interface Props {
   messages: ChatMessage[]
   streaming: boolean
   onRegenerate?: () => void
+  failure?: ChatFailure | null
+  isAdmin?: boolean
+  onRetry?: () => void
+}
+
+/** Headline and next step for each routing refusal the gateway can return. */
+function failureCopy(code: string | undefined, isAdmin: boolean): { title: string; hint: string } {
+  switch (code) {
+    case 'model_not_found':
+      return {
+        title: 'That model is not available',
+        hint: isAdmin
+          ? 'Pick another model, or check that the gateway still discovers this one on the Models page.'
+          : 'Pick another model from the list at the top of the page.',
+      }
+    case 'model_not_enabled':
+      return {
+        title: 'That model is turned off',
+        hint: isAdmin
+          ? 'Enable it on the Models page, or pick another model.'
+          : 'Pick another model, or ask an administrator to enable this one.',
+      }
+    case 'model_residency_violation':
+      return {
+        title: 'Blocked by the routing policy',
+        hint: isAdmin
+          ? 'The policy allows self-hosted models only. Pick a self-hosted model, or change the routing policy on the Models page.'
+          : 'Your organization allows self-hosted models only. Pick a self-hosted model from the list.',
+      }
+    case 'policy_unavailable':
+      return {
+        title: 'Routing policy unavailable',
+        hint: 'The gateway cannot read the routing policy, so it refuses every request until it can. Try again in a moment.',
+      }
+    default:
+      return {
+        title: 'The message was not sent',
+        hint: 'Nothing was delivered to the model. Try again.',
+      }
+  }
+}
+
+const FailureNotice = ({
+  failure,
+  isAdmin,
+  onRetry,
+}: {
+  failure: ChatFailure
+  isAdmin: boolean
+  onRetry?: () => void
+}) => {
+  const { title, hint } = failureCopy(failure.code, isAdmin)
+  const policyRelated =
+    failure.code === 'model_not_found' ||
+    failure.code === 'model_not_enabled' ||
+    failure.code === 'model_residency_violation'
+
+  return (
+    <div className={styles.failure} role="alert">
+      <div className={styles.failureHead}>
+        <svg
+          className={styles.failureIcon}
+          width="16"
+          height="16"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="2"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          aria-hidden="true"
+        >
+          <circle cx="12" cy="12" r="10" />
+          <line x1="12" y1="8" x2="12" y2="13" />
+          <line x1="12" y1="16" x2="12.01" y2="16" />
+        </svg>
+        <span className={styles.failureTitle}>{title}</span>
+      </div>
+      <p className={styles.failureMessage}>{failure.message}</p>
+      <p className={styles.failureHint}>{hint}</p>
+      <div className={styles.failureActions}>
+        {onRetry && (
+          <button type="button" className={styles.failureBtn} onClick={onRetry}>
+            Try again
+          </button>
+        )}
+        {isAdmin && policyRelated && (
+          <Link to="/admin/models" className={styles.failureLink}>
+            Open Models
+          </Link>
+        )}
+        {failure.model && (
+          <code className={styles.failureModel} title="Model requested">{failure.model}</code>
+        )}
+      </div>
+    </div>
+  )
 }
 
 const remarkPlugins = [remarkGfm]
@@ -101,7 +210,7 @@ const AssistantBubble = memo(({
 ))
 AssistantBubble.displayName = 'AssistantBubble'
 
-export function MessageList({ messages, streaming, onRegenerate }: Props) {
+export function MessageList({ messages, streaming, onRegenerate, failure, isAdmin, onRetry }: Props) {
   const bottomRef = useRef<HTMLDivElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const [userScrolled, setUserScrolled] = useState(false)
@@ -111,6 +220,12 @@ export function MessageList({ messages, streaming, onRegenerate }: Props) {
       bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
     }
   }, [messages, userScrolled])
+
+  // A failure always scrolls into view — it is the answer to what the person
+  // just did, even if they had scrolled up.
+  useEffect(() => {
+    if (failure) bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [failure])
 
   const handleScroll = () => {
     const el = containerRef.current
@@ -141,6 +256,9 @@ export function MessageList({ messages, streaming, onRegenerate }: Props) {
             />
           )
         })}
+        {failure && (
+          <FailureNotice failure={failure} isAdmin={isAdmin ?? false} onRetry={onRetry} />
+        )}
         <div ref={bottomRef} />
       </div>
     </div>

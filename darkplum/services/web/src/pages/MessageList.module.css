@@ -195,6 +195,90 @@
   background: var(--bg-surface-raised);
 }
 
+/* --- Failure notice ---
+   Sits where the assistant reply would have been, with a danger stripe so it
+   never reads as model output. */
+
+.failure {
+  align-self: flex-start;
+  max-width: 85%;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-3) var(--space-4);
+  padding-left: calc(var(--space-4) - 2px);
+  background: var(--danger-bg);
+  border: 1px solid var(--danger-border);
+  border-left: 2px solid var(--danger-fg);
+  border-radius: var(--radius-lg);
+  border-bottom-left-radius: var(--radius-sm);
+}
+
+.failureHead {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.failureIcon {
+  color: var(--danger-fg);
+  flex-shrink: 0;
+}
+
+.failureTitle {
+  font-size: var(--fs-base);
+  font-weight: var(--fw-semibold);
+  color: var(--fg-default);
+}
+
+.failureMessage {
+  font-size: var(--fs-sm);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-default);
+}
+
+.failureHint {
+  font-size: var(--fs-sm);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-muted);
+}
+
+.failureActions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.failureBtn,
+.failureLink {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px var(--space-3);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--fg-default);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  text-decoration: none;
+  transition: background var(--transition-fast), border-color var(--transition-fast);
+}
+
+.failureBtn:hover,
+.failureLink:hover {
+  background: var(--bg-surface-hover);
+  border-color: var(--fg-subtle);
+}
+
+.failureModel {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+  word-break: break-all;
+}
+
 /* --- Streaming cursor --- */
 
 .cursor {

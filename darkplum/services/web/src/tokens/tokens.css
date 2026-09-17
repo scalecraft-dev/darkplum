@@ -156,7 +156,11 @@
   --danger-bg: rgba(168, 60, 60, 0.08);
   --danger-border: rgba(168, 60, 60, 0.20);
 
-  --warning-fg: #a67c28;
+  /* #a67c28 was ~2.7:1 on bone — it was the one light-mode semantic color that
+     had not been pulled down to match its siblings. This sits at the same
+     luminance as light danger (#a83c3c), so warning badges now pass AA on
+     every surface up to the row-hover background. */
+  --warning-fg: #7d5a0e;
   --warning-bg: rgba(166, 124, 40, 0.08);
   --warning-border: rgba(166, 124, 40, 0.20);
 

@@ -9,6 +9,8 @@ interface UseModelsResult {
   models: Model[]
   isLoading: boolean
   error: string | null
+  /** Re-runs the fetch immediately — used by the "Try again" action. */
+  refetch: () => Promise<void>
 }
 
 export function useModels(): UseModelsResult {
@@ -66,5 +68,10 @@ export function useModels(): UseModelsResult {
     }
   }, [fetchModels])
 
-  return { models, isLoading, error }
+  const refetch = useCallback(async () => {
+    setIsLoading(true)
+    await fetchModels()
+  }, [fetchModels])
+
+  return { models, isLoading, error, refetch }
 }

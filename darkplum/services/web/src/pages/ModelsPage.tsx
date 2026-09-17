@@ -1,11 +1,22 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { listAdminModels, toggleModel } from '../lib/api'
+import {
+  deleteModelAlias,
+  getRoutingPolicy,
+  listAdminModels,
+  listModelAliases,
+  putModelAlias,
+  toggleModel,
+  updateRoutingPolicy,
+} from '../lib/api'
 import { formatModelName } from '../lib/formatModelName'
-import type { AdminModel } from '../types'
+import { backendClassLabel, backendClassOf } from '../lib/modelRouting'
+import type { AdminModel, ModelAlias, Residency, RoutingPolicy } from '../types'
 import { useToast } from '../components/Toast'
 import { Badge, Table, TableEmpty } from '../components/ui'
 import { CopyButton } from '../components/ui/CopyButton'
 import { Skeleton } from '../components/ui/Skeleton'
+import { AliasesSection } from './AliasesSection'
+import { RoutingPolicyCard } from './RoutingPolicyCard'
 import pageStyles from './PageLayout.module.css'
 import styles from './ModelsPage.module.css'
 
@@ -92,10 +103,11 @@ interface ProviderSectionProps {
   provider: string
   models: AdminModel[]
   togglingIds: Set<string>
+  residency: Residency
   onToggle: (model: AdminModel) => void
 }
 
-function ProviderSection({ provider, models, togglingIds, onToggle }: ProviderSectionProps) {
+function ProviderSection({ provider, models, togglingIds, residency, onToggle }: ProviderSectionProps) {
   const [collapsed, setCollapsed] = useState(false)
 
   const enabledCount = models.filter((m) => m.enabled).length
@@ -117,8 +129,11 @@ function ProviderSection({ provider, models, togglingIds, onToggle }: ProviderSe
 
   const renderModelRow = (m: AdminModel) => {
     const displayName = m.display_name ?? formatModelName(m.model_id)
+    const cls = backendClassOf(m)
+    // Enabled but unreachable: the routing policy refuses cloud-managed models.
+    const blocked = residency === 'self_hosted_only' && cls === 'cloud_managed'
     return (
-      <tr key={m.id}>
+      <tr key={m.id} className={blocked ? styles.rowBlocked : ''}>
         <td>
           <div className={styles.modelCell}>
             <span className={styles.modelName}>{displayName}</span>
@@ -131,9 +146,27 @@ function ProviderSection({ provider, models, togglingIds, onToggle }: ProviderSe
           </div>
         </td>
         <td>
-          <Badge variant={m.enabled ? 'success' : 'neutral'}>
-            {m.enabled ? 'Enabled' : 'Disabled'}
+          <Badge variant={cls === 'cloud_managed' ? 'info' : 'neutral'} bordered>
+            {backendClassLabel(cls)}
           </Badge>
+        </td>
+        <td>
+          {blocked && m.enabled ? (
+            <div className={styles.blockedCell}>
+              <Badge variant="warning" bordered>
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className={styles.blockedIcon}>
+                  <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
+                  <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+                </svg>
+                Blocked by policy
+              </Badge>
+              <span className={styles.blockedHint}>Enabled, but refused while routing is self-hosted only.</span>
+            </div>
+          ) : (
+            <Badge variant={m.enabled ? 'success' : 'neutral'}>
+              {m.enabled ? 'Enabled' : 'Disabled'}
+            </Badge>
+          )}
         </td>
         <td className={styles.statusCol}>
           <ToggleSwitch
@@ -194,6 +227,7 @@ function ProviderSection({ provider, models, togglingIds, onToggle }: ProviderSe
                     <tr>
                       <th>Model</th>
                       <th>Model ID</th>
+                      <th>Hosting</th>
                       <th>Status</th>
                       <th className={styles.statusCol}></th>
                     </tr>
@@ -211,6 +245,7 @@ function ProviderSection({ provider, models, togglingIds, onToggle }: ProviderSe
                 <tr>
                   <th>Model</th>
                   <th>Model ID</th>
+                  <th>Hosting</th>
                   <th>Status</th>
                   <th className={styles.statusCol}></th>
                 </tr>
@@ -244,7 +279,8 @@ function LoadingSkeleton() {
           {[1, 2, 3].map((i) => (
             <div key={i} className={styles.skeletonRow}>
               <Skeleton width="160px" height="14px" />
-              <Skeleton width="240px" height="14px" />
+              <Skeleton width="220px" height="14px" />
+              <Skeleton width="80px" height="18px" borderRadius="var(--radius-full)" />
               <Skeleton width="60px" height="18px" borderRadius="var(--radius-full)" />
               <Skeleton width="36px" height="20px" borderRadius="var(--radius-full)" />
             </div>
@@ -267,6 +303,17 @@ export function ModelsPage() {
   const [filter, setFilter] = useState<Filter>('all')
   const [togglingIds, setTogglingIds] = useState<Set<string>>(new Set())
 
+  const [policy, setPolicy] = useState<RoutingPolicy | null>(null)
+  const [policyLoading, setPolicyLoading] = useState(true)
+  const [policyError, setPolicyError] = useState<string | null>(null)
+  const [policySaving, setPolicySaving] = useState(false)
+
+  const [aliases, setAliases] = useState<ModelAlias[]>([])
+  const [aliasesLoading, setAliasesLoading] = useState(true)
+  const [aliasesError, setAliasesError] = useState<string | null>(null)
+
+  const residency: Residency = policy?.residency ?? 'any'
+
   const loadModels = useCallback(async () => {
     try {
       const data = await listAdminModels()
@@ -278,9 +325,71 @@ export function ModelsPage() {
     }
   }, [toast])
 
+  // Policy and aliases report their own failures inside their card rather than
+  // as a toast: the reason belongs next to the control it disables.
+  const loadPolicy = useCallback(async () => {
+    setPolicyLoading(true)
+    try {
+      setPolicy(await getRoutingPolicy())
+      setPolicyError(null)
+    } catch (err) {
+      setPolicyError((err as Error).message)
+    } finally {
+      setPolicyLoading(false)
+    }
+  }, [])
+
+  const loadAliases = useCallback(async () => {
+    setAliasesLoading(true)
+    try {
+      setAliases(await listModelAliases())
+      setAliasesError(null)
+    } catch (err) {
+      setAliasesError((err as Error).message)
+    } finally {
+      setAliasesLoading(false)
+    }
+  }, [])
+
   useEffect(() => {
     void loadModels()
-  }, [loadModels])
+    void loadPolicy()
+    void loadAliases()
+  }, [loadModels, loadPolicy, loadAliases])
+
+  const handlePolicyChange = async (next: Residency) => {
+    setPolicySaving(true)
+    try {
+      const updated = await updateRoutingPolicy(next)
+      setPolicy(updated)
+      toast(
+        next === 'self_hosted_only'
+          ? 'Switched to self-hosted only. Cloud-managed models are refused.'
+          : 'Any model allowed. Cloud-managed models can answer again.',
+        'success',
+      )
+    } catch (err) {
+      toast((err as Error).message, 'error')
+    } finally {
+      setPolicySaving(false)
+    }
+  }
+
+  // Throws on failure so the dialog can attach the server's message to a field.
+  const handleSaveAlias = async (alias: string, targetModelId: string) => {
+    const existing = aliases.some((a) => a.alias === alias)
+    const saved = await putModelAlias(alias, targetModelId)
+    setAliases((prev) => {
+      const next = prev.filter((a) => a.alias !== saved.alias)
+      return [...next, saved].sort((a, b) => a.alias.localeCompare(b.alias))
+    })
+    toast(existing ? `Alias ${alias} now points at ${targetModelId}` : `Alias ${alias} created`, 'success')
+  }
+
+  const handleDeleteAlias = async (alias: string) => {
+    await deleteModelAlias(alias)
+    setAliases((prev) => prev.filter((a) => a.alias !== alias))
+  }
 
   const handleToggle = async (model: AdminModel) => {
     const newEnabled = !model.enabled
@@ -351,8 +460,31 @@ export function ModelsPage() {
     <div className={pageStyles.page}>
       <div className={pageStyles.header}>
         <h1 className={pageStyles.title}>Models</h1>
-        <p className={pageStyles.subtitle}>Enable models for your organization</p>
+        <p className={pageStyles.subtitle}>Choose what your organization can send requests to</p>
       </div>
+
+      <RoutingPolicyCard
+        policy={policy}
+        loading={policyLoading}
+        error={policyError}
+        saving={policySaving}
+        models={models}
+        onRetry={() => void loadPolicy()}
+        onChange={handlePolicyChange}
+      />
+
+      <AliasesSection
+        aliases={aliases}
+        models={models}
+        loading={aliasesLoading || loading}
+        error={aliasesError}
+        residency={residency}
+        onRetry={() => void loadAliases()}
+        onSave={handleSaveAlias}
+        onDelete={handleDeleteAlias}
+      />
+
+      <h2 className={styles.sectionHeading}>Available models</h2>
 
       {/* Search + filters */}
       <div className={styles.toolbar}>
@@ -420,12 +552,13 @@ export function ModelsPage() {
                 <tr>
                   <th>Model</th>
                   <th>Model ID</th>
+                  <th>Hosting</th>
                   <th>Status</th>
                   <th className={styles.statusCol}></th>
                 </tr>
               </thead>
               <tbody>
-                <TableEmpty colSpan={4}>
+                <TableEmpty colSpan={5}>
                   <div className={styles.empty}>
                     <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                       <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
@@ -448,12 +581,13 @@ export function ModelsPage() {
                 <tr>
                   <th>Model</th>
                   <th>Model ID</th>
+                  <th>Hosting</th>
                   <th>Status</th>
                   <th className={styles.statusCol}></th>
                 </tr>
               </thead>
               <tbody>
-                <TableEmpty colSpan={4}>
+                <TableEmpty colSpan={5}>
                   <div className={styles.empty}>
                     <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                       <circle cx="11" cy="11" r="8" />
@@ -474,6 +608,7 @@ export function ModelsPage() {
             provider={provider}
             models={providerModels}
             togglingIds={togglingIds}
+            residency={residency}
             onToggle={handleToggle}
           />
         ))

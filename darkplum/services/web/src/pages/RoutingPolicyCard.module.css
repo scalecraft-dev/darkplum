@@ -1,0 +1,206 @@
+.card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-left: 2px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  padding: var(--space-5);
+  margin-bottom: var(--space-5);
+}
+
+/* The one loud moment on this page: when the policy is tightened, the card
+   itself carries the restriction and the model rows below re-read as blocked. */
+.cardRestricted {
+  border-left-color: var(--warning-fg);
+}
+
+.head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-4);
+  margin-bottom: var(--space-4);
+}
+
+.title {
+  font-size: var(--fs-md);
+  font-weight: var(--fw-semibold);
+  color: var(--fg-default);
+  letter-spacing: -0.01em;
+}
+
+.subtitle {
+  margin-top: 2px;
+  font-size: var(--fs-sm);
+  color: var(--fg-muted);
+}
+
+.updated {
+  flex-shrink: 0;
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+  white-space: nowrap;
+}
+
+.options {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-3);
+}
+
+.option {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  background: var(--bg-base);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: border-color var(--transition-fast), background var(--transition-fast);
+}
+
+.option:hover {
+  border-color: var(--fg-subtle);
+}
+
+.option:focus-within {
+  border-color: var(--border-focus);
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
+.optionChecked {
+  background: var(--brand-subtle);
+  border-color: var(--brand-default);
+}
+
+.optionTop {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.radio {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--brand-default);
+  flex-shrink: 0;
+}
+
+.optionLabel {
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  color: var(--fg-default);
+}
+
+.optionConsequence {
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-muted);
+}
+
+.effect {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  font-size: var(--fs-xs);
+  /* Sentence stays in body colour; the amber carries the icon and the frame.
+     Long copy in a semantic colour is the first thing to fail contrast. */
+  color: var(--fg-default);
+  background: var(--warning-bg);
+  border: 1px solid var(--warning-border);
+  border-radius: var(--radius-sm);
+}
+
+.effect svg {
+  flex-shrink: 0;
+  color: var(--warning-fg);
+}
+
+/* --- Load failure --- */
+
+.error {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-4);
+  background: var(--danger-bg);
+  border: 1px solid var(--danger-border);
+  border-radius: var(--radius-md);
+}
+
+.errorTitle {
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  color: var(--fg-default);
+}
+
+.errorDetail {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--fg-muted);
+  word-break: break-word;
+}
+
+/* --- Confirmation --- */
+
+.confirmBody {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin-top: var(--space-4);
+}
+
+.confirmText {
+  font-size: var(--fs-sm);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-muted);
+}
+
+.confirmList {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding-left: var(--space-4);
+  list-style: disc;
+}
+
+.confirmModel {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--fg-default);
+  word-break: break-all;
+}
+
+.confirmMore {
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+}
+
+.confirmFooter {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+@media (max-width: 767px) {
+  .options {
+    grid-template-columns: 1fr;
+  }
+
+  .head {
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .option {
+    transition-duration: 0.01ms !important;
+  }
+}

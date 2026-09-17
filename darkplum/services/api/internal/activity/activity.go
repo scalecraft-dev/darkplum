@@ -23,6 +23,11 @@ const (
 	UserPasswordChanged EventType = "user.password_changed"
 	APIKeyCreated       EventType = "apikey.created"
 	APIKeyRevoked       EventType = "apikey.revoked"
+
+	ModelAliasCreated    EventType = "model_alias.created"
+	ModelAliasUpdated    EventType = "model_alias.updated"
+	ModelAliasDeleted    EventType = "model_alias.deleted"
+	RoutingPolicyChanged EventType = "routing_policy.changed"
 )
 
 // Event is the input to Recorder.Record.

@@ -23,11 +23,18 @@ export interface ChatMessage {
   content: string
 }
 
+/** Where a model actually runs. Mirrors models.backend_class in the API. */
+export type BackendClass = 'self_hosted' | 'cloud_managed'
+
 export interface Model {
   id: string
   object: string
   created: number
   owned_by: string
+  /** Absent on older gateways/APIs — treat a missing value as 'self_hosted'. */
+  backend_class?: BackendClass
+  /** Present only on alias entries: the model id this alias resolves to. */
+  alias_of?: string
 }
 
 export interface AdminModel {
@@ -37,6 +44,26 @@ export interface AdminModel {
   display_name: string | null
   enabled: boolean
   discovered_at: string
+  updated_at: string
+  /** Absent on older APIs — treat a missing value as 'self_hosted'. */
+  backend_class?: BackendClass
+}
+
+export interface ModelAlias {
+  alias: string
+  target_model_id: string
+  target_exists: boolean
+  target_enabled: boolean
+  target_backend_class: BackendClass | null
+  created_at: string
+  updated_at: string
+}
+
+/** Routing policy residency. 'self_hosted_only' refuses cloud-managed models. */
+export type Residency = 'any' | 'self_hosted_only'
+
+export interface RoutingPolicy {
+  residency: Residency
   updated_at: string
 }
 

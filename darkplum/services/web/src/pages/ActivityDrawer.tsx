@@ -13,26 +13,10 @@ import {
 import { getUsageStats, listActivity, listUsage } from '../lib/api'
 import { useTheme } from '../context/ThemeContext'
 import type { KeyUsageSummary, TimeRange, UsageBucket, UserUsageSummary } from '../types'
+import { eventLabel, eventVariant, formatEventDetail, type EventVariant } from '../lib/activityEvents'
 import { useToast } from '../components/Toast'
 import { Avatar, Badge, Skeleton } from '../components/ui'
 import styles from './ActivityDrawer.module.css'
-
-// ---------------------------------------------------------------------------
-// Constants (mirror ActivityTab so the two are consistent)
-// ---------------------------------------------------------------------------
-
-const EVENT_LABELS: Record<string, { label: string; variant: 'neutral' | 'info' | 'warning' | 'danger' | 'success' }> = {
-  'user.login':            { label: 'Login',            variant: 'neutral'  },
-  'user.login_failed':     { label: 'Login Failed',     variant: 'danger'   },
-  'user.logout':           { label: 'Logout',           variant: 'neutral'  },
-  'user.created':          { label: 'User Created',     variant: 'info'     },
-  'user.deleted':          { label: 'User Deleted',     variant: 'info'     },
-  'user.role_changed':     { label: 'Role Changed',     variant: 'info'     },
-  'user.password_reset':   { label: 'Password Reset',   variant: 'info'     },
-  'user.password_changed': { label: 'Password Changed', variant: 'info'     },
-  'apikey.created':        { label: 'Key Created',      variant: 'warning'  },
-  'apikey.revoked':        { label: 'Key Revoked',      variant: 'warning'  },
-}
 
 const CHART_COLORS = {
   dark:  { stroke: '#5C7048', grid: '#1A1E2A', axis: '#6e6460' },
@@ -162,24 +146,19 @@ export function ActivityDrawer({ open, onClose, user, apiKey, timeRange }: Drawe
           listUsage({ user_id: user.user_id, since, until, limit: 10, offset: 0 }),
         ])
 
-        const adminMapped = activityRes.events.map((e) => {
-          const lbl = EVENT_LABELS[e.event_type]
-          return {
-            id: e.id,
-            created_at: e.created_at,
-            label: lbl?.label ?? e.event_type,
-            variant: (lbl?.variant ?? 'neutral') as 'neutral' | 'info' | 'warning' | 'danger' | 'success',
-            detail: e.detail
-              ? Object.entries(e.detail).map(([k, v]) => `${k}: ${v}`).join(', ')
-              : '',
-          }
-        })
+        const adminMapped = activityRes.events.map((e) => ({
+          id: e.id,
+          created_at: e.created_at,
+          label: eventLabel(e.event_type),
+          variant: eventVariant(e.event_type),
+          detail: e.detail ? formatEventDetail(e.detail) : '',
+        }))
 
         const inferenceMapped = usageRes.events.map((e) => ({
           id: e.id,
           created_at: e.created_at,
           label: e.status_code < 400 ? 'Request' : 'Error',
-          variant: (e.status_code < 400 ? 'success' : 'danger') as 'neutral' | 'info' | 'warning' | 'danger' | 'success',
+          variant: (e.status_code < 400 ? 'success' : 'danger') as EventVariant,
           detail: `model: ${e.model}, ${e.latency_ms}ms, status: ${e.status_code}`,
         }))
 
@@ -193,7 +172,7 @@ export function ActivityDrawer({ open, onClose, user, apiKey, timeRange }: Drawe
           id: e.id,
           created_at: e.created_at,
           label: e.status_code < 400 ? 'Request' : 'Error',
-          variant: (e.status_code < 400 ? 'success' : 'danger') as 'neutral' | 'info' | 'warning' | 'danger' | 'success',
+          variant: (e.status_code < 400 ? 'success' : 'danger') as EventVariant,
           detail: `model: ${e.model}, ${e.latency_ms}ms, status: ${e.status_code}`,
         }))
         setRecentEvents(mapped)

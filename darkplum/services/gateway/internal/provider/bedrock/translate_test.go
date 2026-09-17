@@ -3,9 +3,13 @@ package bedrock
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
+	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
 
 	"github.com/scalecraft/darkplum/gateway/internal/provider"
 )
@@ -13,6 +17,15 @@ import (
 // ---------------------------------------------------------------------------
 // translateRequest tests
 // ---------------------------------------------------------------------------
+
+func textOf(t *testing.T, block types.ContentBlock) string {
+	t.Helper()
+	tb, ok := block.(*types.ContentBlockMemberText)
+	if !ok {
+		t.Fatalf("expected a text content block, got %T", block)
+	}
+	return tb.Value
+}
 
 func TestTranslateRequest_SystemMessageExtracted(t *testing.T) {
 	req := provider.ChatRequest{
@@ -23,25 +36,27 @@ func TestTranslateRequest_SystemMessageExtracted(t *testing.T) {
 		},
 	}
 
-	raw, err := translateRequest(req)
+	system, messages, _, err := translateRequest(req)
 	if err != nil {
 		t.Fatalf("translateRequest returned error: %v", err)
 	}
 
-	var br bedrockRequest
-	if err := json.Unmarshal(raw, &br); err != nil {
-		t.Fatalf("unmarshal bedrockRequest: %v", err)
+	if len(system) != 1 {
+		t.Fatalf("expected 1 system block, got %d", len(system))
+	}
+	sb, ok := system[0].(*types.SystemContentBlockMemberText)
+	if !ok {
+		t.Fatalf("expected text system block, got %T", system[0])
+	}
+	if sb.Value != "You are a helpful assistant." {
+		t.Errorf("expected system=%q, got %q", "You are a helpful assistant.", sb.Value)
 	}
 
-	if br.System != "You are a helpful assistant." {
-		t.Errorf("expected system=%q, got %q", "You are a helpful assistant.", br.System)
+	if len(messages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(messages))
 	}
-
-	if len(br.Messages) != 1 {
-		t.Fatalf("expected 1 message, got %d", len(br.Messages))
-	}
-	if br.Messages[0].Role != "user" || br.Messages[0].Content != "Hello" {
-		t.Errorf("unexpected message: %+v", br.Messages[0])
+	if messages[0].Role != types.ConversationRoleUser || textOf(t, messages[0].Content[0]) != "Hello" {
+		t.Errorf("unexpected message: %+v", messages[0])
 	}
 }
 
@@ -54,19 +69,15 @@ func TestTranslateRequest_MultipleSystemMessagesConcatenated(t *testing.T) {
 		},
 	}
 
-	raw, err := translateRequest(req)
+	system, _, _, err := translateRequest(req)
 	if err != nil {
 		t.Fatalf("translateRequest returned error: %v", err)
 	}
 
-	var br bedrockRequest
-	if err := json.Unmarshal(raw, &br); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-
 	want := "First system instruction.\nSecond system instruction."
-	if br.System != want {
-		t.Errorf("expected system=%q, got %q", want, br.System)
+	sb := system[0].(*types.SystemContentBlockMemberText)
+	if sb.Value != want {
+		t.Errorf("expected system=%q, got %q", want, sb.Value)
 	}
 }
 
@@ -78,21 +89,16 @@ func TestTranslateRequest_NoSystemMessage(t *testing.T) {
 		},
 	}
 
-	raw, err := translateRequest(req)
+	system, messages, _, err := translateRequest(req)
 	if err != nil {
 		t.Fatalf("translateRequest returned error: %v", err)
 	}
 
-	var br bedrockRequest
-	if err := json.Unmarshal(raw, &br); err != nil {
-		t.Fatalf("unmarshal: %v", err)
+	if len(system) != 0 {
+		t.Errorf("expected no system blocks, got %d", len(system))
 	}
-
-	if br.System != "" {
-		t.Errorf("expected empty system field, got %q", br.System)
-	}
-	if len(br.Messages) != 2 {
-		t.Errorf("expected 2 messages, got %d", len(br.Messages))
+	if len(messages) != 2 {
+		t.Errorf("expected 2 messages, got %d", len(messages))
 	}
 }
 
@@ -104,46 +110,152 @@ func TestTranslateRequest_UnknownRolesDropped(t *testing.T) {
 		},
 	}
 
-	raw, err := translateRequest(req)
+	_, messages, _, err := translateRequest(req)
 	if err != nil {
 		t.Fatalf("translateRequest returned error: %v", err)
 	}
 
-	var br bedrockRequest
-	if err := json.Unmarshal(raw, &br); err != nil {
-		t.Fatalf("unmarshal: %v", err)
+	if len(messages) != 1 {
+		t.Fatalf("expected 1 message (tool role dropped), got %d", len(messages))
+	}
+	if messages[0].Role != types.ConversationRoleUser {
+		t.Errorf("expected user role, got %q", messages[0].Role)
+	}
+}
+
+func TestTranslateRequest_ConsecutiveSameRoleMerged(t *testing.T) {
+	req := provider.ChatRequest{
+		Messages: []provider.Message{
+			{Role: "user", Content: "Part one."},
+			{Role: "user", Content: "Part two."},
+			{Role: "assistant", Content: "Ack one."},
+			{Role: "assistant", Content: "Ack two."},
+		},
 	}
 
-	if len(br.Messages) != 1 {
-		t.Fatalf("expected 1 message (tool role dropped), got %d", len(br.Messages))
+	_, messages, _, err := translateRequest(req)
+	if err != nil {
+		t.Fatalf("translateRequest returned error: %v", err)
 	}
-	if br.Messages[0].Role != "user" {
-		t.Errorf("expected user role, got %q", br.Messages[0].Role)
+
+	if len(messages) != 2 {
+		t.Fatalf("expected 2 merged messages, got %d", len(messages))
+	}
+	if messages[0].Role != types.ConversationRoleUser || textOf(t, messages[0].Content[0]) != "Part one.\nPart two." {
+		t.Errorf("unexpected merged user message: role=%q content=%+v", messages[0].Role, messages[0].Content)
+	}
+	if messages[1].Role != types.ConversationRoleAssistant || textOf(t, messages[1].Content[0]) != "Ack one.\nAck two." {
+		t.Errorf("unexpected merged assistant message: role=%q content=%+v", messages[1].Role, messages[1].Content)
+	}
+}
+
+func TestTranslateRequest_LeadingAssistantDropped(t *testing.T) {
+	req := provider.ChatRequest{
+		Messages: []provider.Message{
+			{Role: "assistant", Content: "Hi, how can I help?"},
+			{Role: "user", Content: "What's the weather?"},
+		},
+	}
+
+	_, messages, _, err := translateRequest(req)
+	if err != nil {
+		t.Fatalf("translateRequest returned error: %v", err)
+	}
+
+	if len(messages) != 1 {
+		t.Fatalf("expected leading assistant message dropped, got %d messages", len(messages))
+	}
+	if messages[0].Role != types.ConversationRoleUser {
+		t.Errorf("expected first message to be user after dropping leading assistant, got %q", messages[0].Role)
+	}
+}
+
+func TestTranslateRequest_NoUserMessagesReturnsBedrockAPIError(t *testing.T) {
+	req := provider.ChatRequest{
+		Messages: []provider.Message{
+			{Role: "assistant", Content: "Only an assistant turn."},
+		},
+	}
+
+	_, _, _, err := translateRequest(req)
+	if err == nil {
+		t.Fatal("expected an error when no user messages remain")
+	}
+	var apiErr *BedrockAPIError
+	if !errors.As(err, &apiErr) {
+		t.Fatalf("expected *BedrockAPIError, got %T: %v", err, err)
+	}
+	if apiErr.StatusCode != http.StatusBadRequest {
+		t.Errorf("expected 400, got %d", apiErr.StatusCode)
+	}
+}
+
+func TestTranslateRequest_OnlySystemMessagesReturnsBedrockAPIError(t *testing.T) {
+	req := provider.ChatRequest{
+		Messages: []provider.Message{
+			{Role: "system", Content: "You are a helpful assistant."},
+		},
+	}
+
+	_, _, _, err := translateRequest(req)
+	if err == nil {
+		t.Fatal("expected an error when the request has no user messages")
+	}
+}
+
+func TestTranslateRequest_EmptyContentMessagesDropped(t *testing.T) {
+	req := provider.ChatRequest{
+		Messages: []provider.Message{
+			{Role: "user", Content: "   "},
+			{Role: "user", Content: "Real content"},
+		},
+	}
+
+	_, messages, _, err := translateRequest(req)
+	if err != nil {
+		t.Fatalf("translateRequest returned error: %v", err)
+	}
+	if len(messages) != 1 {
+		t.Fatalf("expected empty-content message to be dropped, got %d messages", len(messages))
+	}
+	if textOf(t, messages[0].Content[0]) != "Real content" {
+		t.Errorf("unexpected surviving message content: %+v", messages[0])
+	}
+}
+
+func TestTranslateRequest_EmptySystemMessageDropped(t *testing.T) {
+	req := provider.ChatRequest{
+		Messages: []provider.Message{
+			{Role: "system", Content: ""},
+			{Role: "user", Content: "hi"},
+		},
+	}
+
+	system, _, _, err := translateRequest(req)
+	if err != nil {
+		t.Fatalf("translateRequest returned error: %v", err)
+	}
+	if len(system) != 0 {
+		t.Errorf("expected no system blocks for empty system message, got %d", len(system))
 	}
 }
 
 // ---------------------------------------------------------------------------
-// MaxTokens defaulting
+// MaxTokens / Temperature (InferenceConfiguration)
 // ---------------------------------------------------------------------------
 
-func TestTranslateRequest_MaxTokensDefaultsTo4096(t *testing.T) {
+func TestTranslateRequest_MaxTokensDefaultsWhenUnset(t *testing.T) {
 	req := provider.ChatRequest{
 		MaxTokens: 0,
 		Messages:  []provider.Message{{Role: "user", Content: "hi"}},
 	}
 
-	raw, err := translateRequest(req)
+	_, _, cfg, err := translateRequest(req)
 	if err != nil {
 		t.Fatalf("translateRequest returned error: %v", err)
 	}
-
-	var br bedrockRequest
-	if err := json.Unmarshal(raw, &br); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-
-	if br.MaxTokens != 4096 {
-		t.Errorf("expected MaxTokens=4096, got %d", br.MaxTokens)
+	if cfg.MaxTokens == nil || *cfg.MaxTokens != defaultMaxTokens {
+		t.Errorf("expected MaxTokens=%d, got %v", defaultMaxTokens, cfg.MaxTokens)
 	}
 }
 
@@ -153,24 +265,14 @@ func TestTranslateRequest_MaxTokensExplicitValuePreserved(t *testing.T) {
 		Messages:  []provider.Message{{Role: "user", Content: "hi"}},
 	}
 
-	raw, err := translateRequest(req)
+	_, _, cfg, err := translateRequest(req)
 	if err != nil {
 		t.Fatalf("translateRequest returned error: %v", err)
 	}
-
-	var br bedrockRequest
-	if err := json.Unmarshal(raw, &br); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-
-	if br.MaxTokens != 512 {
-		t.Errorf("expected MaxTokens=512, got %d", br.MaxTokens)
+	if cfg.MaxTokens == nil || *cfg.MaxTokens != 512 {
+		t.Errorf("expected MaxTokens=512, got %v", cfg.MaxTokens)
 	}
 }
-
-// ---------------------------------------------------------------------------
-// Temperature forwarding
-// ---------------------------------------------------------------------------
 
 func TestTranslateRequest_TemperatureNilOmitted(t *testing.T) {
 	req := provider.ChatRequest{
@@ -178,19 +280,12 @@ func TestTranslateRequest_TemperatureNilOmitted(t *testing.T) {
 		Messages:    []provider.Message{{Role: "user", Content: "hi"}},
 	}
 
-	raw, err := translateRequest(req)
+	_, _, cfg, err := translateRequest(req)
 	if err != nil {
 		t.Fatalf("translateRequest returned error: %v", err)
 	}
-
-	// json.Unmarshal into a map so we can check key presence.
-	var m map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &m); err != nil {
-		t.Fatalf("unmarshal to map: %v", err)
-	}
-
-	if _, ok := m["temperature"]; ok {
-		t.Error("temperature key should be absent when nil, but it is present")
+	if cfg.Temperature != nil {
+		t.Errorf("expected nil temperature, got %v", *cfg.Temperature)
 	}
 }
 
@@ -201,45 +296,15 @@ func TestTranslateRequest_TemperatureNonNilForwarded(t *testing.T) {
 		Messages:    []provider.Message{{Role: "user", Content: "hi"}},
 	}
 
-	raw, err := translateRequest(req)
+	_, _, cfg, err := translateRequest(req)
 	if err != nil {
 		t.Fatalf("translateRequest returned error: %v", err)
 	}
-
-	var br bedrockRequest
-	if err := json.Unmarshal(raw, &br); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-
-	if br.Temperature == nil {
+	if cfg.Temperature == nil {
 		t.Fatal("expected temperature to be set, got nil")
 	}
-	if *br.Temperature != 0.7 {
-		t.Errorf("expected temperature=0.7, got %f", *br.Temperature)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// AnthropicVersion
-// ---------------------------------------------------------------------------
-
-func TestTranslateRequest_AnthropicVersionSet(t *testing.T) {
-	req := provider.ChatRequest{
-		Messages: []provider.Message{{Role: "user", Content: "hi"}},
-	}
-
-	raw, err := translateRequest(req)
-	if err != nil {
-		t.Fatalf("translateRequest returned error: %v", err)
-	}
-
-	var br bedrockRequest
-	if err := json.Unmarshal(raw, &br); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-
-	if br.AnthropicVersion != "bedrock-2023-05-31" {
-		t.Errorf("expected anthropic_version=bedrock-2023-05-31, got %q", br.AnthropicVersion)
+	if *cfg.Temperature != 0.7 {
+		t.Errorf("expected temperature=0.7, got %f", *cfg.Temperature)
 	}
 }
 
@@ -247,14 +312,26 @@ func TestTranslateRequest_AnthropicVersionSet(t *testing.T) {
 // translateResponse tests
 // ---------------------------------------------------------------------------
 
-func TestTranslateResponse_BasicMapping(t *testing.T) {
-	responseJSON := `{
-		"content": [{"type": "text", "text": "Hello, world!"}],
-		"stop_reason": "end_turn",
-		"usage": {"input_tokens": 10, "output_tokens": 5}
-	}`
+func converseOutput(text string, stopReason types.StopReason, inputTokens, outputTokens int32) *bedrockruntime.ConverseOutput {
+	return &bedrockruntime.ConverseOutput{
+		Output: &types.ConverseOutputMemberMessage{
+			Value: types.Message{
+				Role:    types.ConversationRoleAssistant,
+				Content: []types.ContentBlock{&types.ContentBlockMemberText{Value: text}},
+			},
+		},
+		StopReason: stopReason,
+		Usage: &types.TokenUsage{
+			InputTokens:  &inputTokens,
+			OutputTokens: &outputTokens,
+		},
+	}
+}
 
-	resp, err := translateResponse([]byte(responseJSON), "anthropic.claude-3-haiku-20240307-v1:0")
+func TestTranslateResponse_BasicMapping(t *testing.T) {
+	out := converseOutput("Hello, world!", types.StopReasonEndTurn, 10, 5)
+
+	resp, err := translateResponse(out, "anthropic.claude-3-haiku-20240307-v1:0")
 	if err != nil {
 		t.Fatalf("translateResponse returned error: %v", err)
 	}
@@ -277,16 +354,21 @@ func TestTranslateResponse_BasicMapping(t *testing.T) {
 }
 
 func TestTranslateResponse_MultipleTextBlocksConcatenated(t *testing.T) {
-	responseJSON := `{
-		"content": [
-			{"type": "text", "text": "Part one. "},
-			{"type": "text", "text": "Part two."}
-		],
-		"stop_reason": "end_turn",
-		"usage": {"input_tokens": 5, "output_tokens": 10}
-	}`
+	out := &bedrockruntime.ConverseOutput{
+		Output: &types.ConverseOutputMemberMessage{
+			Value: types.Message{
+				Role: types.ConversationRoleAssistant,
+				Content: []types.ContentBlock{
+					&types.ContentBlockMemberText{Value: "Part one. "},
+					&types.ContentBlockMemberText{Value: "Part two."},
+				},
+			},
+		},
+		StopReason: types.StopReasonEndTurn,
+		Usage:      &types.TokenUsage{},
+	}
 
-	resp, err := translateResponse([]byte(responseJSON), "model")
+	resp, err := translateResponse(out, "model")
 	if err != nil {
 		t.Fatalf("translateResponse returned error: %v", err)
 	}
@@ -297,16 +379,21 @@ func TestTranslateResponse_MultipleTextBlocksConcatenated(t *testing.T) {
 }
 
 func TestTranslateResponse_NonTextBlocksIgnored(t *testing.T) {
-	responseJSON := `{
-		"content": [
-			{"type": "tool_use", "id": "123"},
-			{"type": "text", "text": "Only this."}
-		],
-		"stop_reason": "tool_use",
-		"usage": {"input_tokens": 5, "output_tokens": 3}
-	}`
+	out := &bedrockruntime.ConverseOutput{
+		Output: &types.ConverseOutputMemberMessage{
+			Value: types.Message{
+				Role: types.ConversationRoleAssistant,
+				Content: []types.ContentBlock{
+					&types.ContentBlockMemberToolUse{Value: types.ToolUseBlock{ToolUseId: strPtr("123")}},
+					&types.ContentBlockMemberText{Value: "Only this."},
+				},
+			},
+		},
+		StopReason: types.StopReasonToolUse,
+		Usage:      &types.TokenUsage{},
+	}
 
-	resp, err := translateResponse([]byte(responseJSON), "model")
+	resp, err := translateResponse(out, "model")
 	if err != nil {
 		t.Fatalf("translateResponse returned error: %v", err)
 	}
@@ -314,31 +401,52 @@ func TestTranslateResponse_NonTextBlocksIgnored(t *testing.T) {
 	if resp.Content != "Only this." {
 		t.Errorf("expected only text block content, got %q", resp.Content)
 	}
+	if resp.FinishReason != "tool_calls" {
+		t.Errorf("expected finish_reason=tool_calls, got %q", resp.FinishReason)
+	}
 }
 
-func TestTranslateResponse_InvalidJSONReturnsError(t *testing.T) {
-	_, err := translateResponse([]byte("{bad json"), "model")
-	if err == nil {
-		t.Fatal("expected error for invalid JSON, got nil")
+func TestTranslateResponse_NilOutputReturnsError(t *testing.T) {
+	if _, err := translateResponse(nil, "model"); err == nil {
+		t.Fatal("expected error for nil Converse output")
+	}
+}
+
+func TestTranslateResponse_UsageNilDefaultsToZero(t *testing.T) {
+	out := &bedrockruntime.ConverseOutput{
+		Output: &types.ConverseOutputMemberMessage{
+			Value: types.Message{
+				Role:    types.ConversationRoleAssistant,
+				Content: []types.ContentBlock{&types.ContentBlockMemberText{Value: "hi"}},
+			},
+		},
+		StopReason: types.StopReasonEndTurn,
+	}
+
+	resp, err := translateResponse(out, "model")
+	if err != nil {
+		t.Fatalf("translateResponse returned error: %v", err)
+	}
+	if resp.PromptTokens != 0 || resp.CompletionTokens != 0 {
+		t.Errorf("expected zero token counts when Usage is nil, got prompt=%d completion=%d", resp.PromptTokens, resp.CompletionTokens)
 	}
 }
 
 // ---------------------------------------------------------------------------
-// translateStreamEvent / SSE chunk format tests
+// translateStreamEvent tests
 // ---------------------------------------------------------------------------
 
-// TestTranslateStreamEvent_ContentBlockDelta verifies that a content_block_delta
-// event produces an OpenAI SSE chunk with the correct format.
 func TestTranslateStreamEvent_ContentBlockDelta(t *testing.T) {
-	raw := []byte(`{
-		"type": "content_block_delta",
-		"delta": {"type": "text_delta", "text": "Hello"}
-	}`)
+	event := &types.ConverseStreamOutputMemberContentBlockDelta{
+		Value: types.ContentBlockDeltaEvent{
+			Delta: &types.ContentBlockDeltaMemberText{Value: "Hello"},
+		},
+	}
 
 	stats := &provider.StreamStats{}
 	var buf bytes.Buffer
 
-	done, err := translateStreamEvent(raw, "test-id", "model-x", stats, &buf)
+	done, err := translateStreamEvent(event, "test-id", "model-x", stats, &buf)
 	if err != nil {
 		t.Fatalf("translateStreamEvent returned error: %v", err)
 	}
@@ -354,79 +462,91 @@ func TestTranslateStreamEvent_ContentBlockDelta(t *testing.T) {
 		t.Errorf("SSE chunk must end with '\\n\\n', got: %q", output)
 	}
 
-	// Verify the JSON payload is valid and contains the token.
-	payload := strings.TrimPrefix(output, "data: ")
-	payload = strings.TrimSuffix(payload, "\n\n")
+	payload := strings.TrimSuffix(strings.TrimPrefix(output, "data: "), "\n\n")
 
-	var parsed map[string]json.RawMessage
+	var parsed struct {
+		Choices []struct {
+			Delta struct {
+				Role    string `json:"role"`
+				Content string `json:"content"`
+			} `json:"delta"`
+		} `json:"choices"`
+	}
 	if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
 		t.Fatalf("SSE chunk JSON is not valid: %v", err)
 	}
-
-	// Drill into choices[0].delta.content.
-	var choices []struct {
-		Delta struct {
-			Content string `json:"content"`
-		} `json:"delta"`
-	}
-	if err := json.Unmarshal(parsed["choices"], &choices); err != nil {
-		t.Fatalf("parse choices: %v", err)
-	}
-	if len(choices) == 0 {
+	if len(parsed.Choices) == 0 {
 		t.Fatal("expected at least one choice in SSE chunk")
 	}
-	if choices[0].Delta.Content != "Hello" {
-		t.Errorf("expected delta content=%q, got %q", "Hello", choices[0].Delta.Content)
+	if parsed.Choices[0].Delta.Content != "Hello" {
+		t.Errorf("expected delta content=%q, got %q", "Hello", parsed.Choices[0].Delta.Content)
+	}
+	// Every content chunk already carries role="assistant" (via
+	// provider.BuildStreamingChunkSSE) — this matches the pre-Converse
+	// behaviour exactly, so no separate initial role-only chunk is emitted.
+	if parsed.Choices[0].Delta.Role != "assistant" {
+		t.Errorf("expected delta role=assistant, got %q", parsed.Choices[0].Delta.Role)
 	}
 }
 
-// TestTranslateStreamEvent_MessageStart verifies input token accumulation.
-func TestTranslateStreamEvent_MessageStart(t *testing.T) {
-	raw := []byte(`{"type":"message_start","message":{"usage":{"input_tokens":42,"output_tokens":0}}}`)
+func TestTranslateStreamEvent_ContentBlockDeltaEmptyTextIsNoOp(t *testing.T) {
+	event := &types.ConverseStreamOutputMemberContentBlockDelta{
+		Value: types.ContentBlockDeltaEvent{
+			Delta: &types.ContentBlockDeltaMemberText{Value: ""},
+		},
+	}
 	stats := &provider.StreamStats{}
 	var buf bytes.Buffer
 
-	_, err := translateStreamEvent(raw, "id", "model", stats, &buf)
+	done, err := translateStreamEvent(event, "id", "model", stats, &buf)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if done {
+		t.Fatal("expected done=false")
+	}
+	if buf.Len() != 0 {
+		t.Errorf("expected no SSE output for an empty text delta, got: %q", buf.String())
+	}
+}
+
+func TestTranslateStreamEvent_MessageStart(t *testing.T) {
+	event := &types.ConverseStreamOutputMemberMessageStart{
+		Value: types.MessageStartEvent{Role: types.ConversationRoleAssistant},
+	}
+	stats := &provider.StreamStats{}
+	var buf bytes.Buffer
+
+	_, err := translateStreamEvent(event, "id", "model", stats, &buf)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if buf.Len() != 0 {
 		t.Errorf("expected no SSE output for message_start, got: %q", buf.String())
 	}
-	if stats.PromptTokens != 42 {
-		t.Errorf("expected prompt_tokens=42, got %d", stats.PromptTokens)
-	}
 }
 
-// TestTranslateStreamEvent_MessageDelta verifies finish_reason and output token
-// accumulation, and that a final SSE chunk is emitted.
-func TestTranslateStreamEvent_MessageDelta(t *testing.T) {
-	raw := []byte(`{
-		"type": "message_delta",
-		"delta": {"stop_reason": "end_turn"},
-		"usage": {"output_tokens": 17}
-	}`)
+func TestTranslateStreamEvent_MessageStop(t *testing.T) {
+	event := &types.ConverseStreamOutputMemberMessageStop{
+		Value: types.MessageStopEvent{StopReason: types.StopReasonEndTurn},
+	}
 	stats := &provider.StreamStats{}
 	var buf bytes.Buffer
 
-	done, err := translateStreamEvent(raw, "id", "model", stats, &buf)
+	done, err := translateStreamEvent(event, "id", "model", stats, &buf)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if done {
-		t.Fatal("message_delta should not set done=true; message_stop does")
+	if !done {
+		t.Fatal("expected done=true for message_stop")
 	}
 	if stats.FinishReason != "stop" {
 		t.Errorf("expected finish_reason=stop (mapped from end_turn), got %q", stats.FinishReason)
 	}
-	if stats.CompletionTokens != 17 {
-		t.Errorf("expected completion_tokens=17, got %d", stats.CompletionTokens)
-	}
 	if buf.Len() == 0 {
-		t.Error("expected final SSE chunk to be written on message_delta, got empty buffer")
+		t.Error("expected a final SSE chunk to be written on message_stop, got empty buffer")
 	}
 
-	// The final chunk must carry a non-nil finish_reason.
 	output := buf.String()
 	payload := strings.TrimPrefix(strings.TrimSuffix(output, "\n\n"), "data: ")
 	var parsed struct {
@@ -442,48 +562,58 @@ func TestTranslateStreamEvent_MessageDelta(t *testing.T) {
 	}
 }
 
-// TestTranslateStreamEvent_MessageStop verifies done=true is returned and
-// nothing is written to the buffer.
-func TestTranslateStreamEvent_MessageStop(t *testing.T) {
-	raw := []byte(`{"type":"message_stop"}`)
+func TestTranslateStreamEvent_MetadataCapturesUsage(t *testing.T) {
+	input := int32(42)
+	output := int32(17)
+	event := &types.ConverseStreamOutputMemberMetadata{
+		Value: types.ConverseStreamMetadataEvent{
+			Usage: &types.TokenUsage{InputTokens: &input, OutputTokens: &output},
+		},
+	}
 	stats := &provider.StreamStats{}
 	var buf bytes.Buffer
 
-	done, err := translateStreamEvent(raw, "id", "model", stats, &buf)
+	done, err := translateStreamEvent(event, "id", "model", stats, &buf)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !done {
-		t.Fatal("expected done=true for message_stop")
-	}
-	if buf.Len() != 0 {
-		t.Errorf("expected no SSE output for message_stop, got: %q", buf.String())
-	}
-}
-
-// TestTranslateStreamEvent_UnknownTypeIsNoOp ensures future unknown event types
-// don't produce output or errors.
-func TestTranslateStreamEvent_UnknownTypeIsNoOp(t *testing.T) {
-	raw := []byte(`{"type":"ping"}`)
-	stats := &provider.StreamStats{}
-	var buf bytes.Buffer
-
-	done, err := translateStreamEvent(raw, "id", "model", stats, &buf)
-	if err != nil {
-		t.Fatalf("unexpected error for unknown event type: %v", err)
-	}
 	if done {
-		t.Fatal("unknown event type should not signal done")
+		t.Fatal("metadata event should not signal done")
 	}
 	if buf.Len() != 0 {
-		t.Errorf("expected no SSE output for unknown event type")
+		t.Errorf("expected no SSE output for metadata event, got: %q", buf.String())
+	}
+	if stats.PromptTokens != 42 {
+		t.Errorf("expected prompt_tokens=42, got %d", stats.PromptTokens)
+	}
+	if stats.CompletionTokens != 17 {
+		t.Errorf("expected completion_tokens=17, got %d", stats.CompletionTokens)
 	}
 }
 
-func TestTranslateStreamEvent_InvalidJSONReturnsError(t *testing.T) {
-	_, err := translateStreamEvent([]byte("{bad"), "id", "model", &provider.StreamStats{}, &bytes.Buffer{})
-	if err == nil {
-		t.Fatal("expected error for invalid JSON stream event")
+func TestTranslateStreamEvent_ContentBlockStartStopAreNoOps(t *testing.T) {
+	stats := &provider.StreamStats{}
+
+	startEvent := &types.ConverseStreamOutputMemberContentBlockStart{
+		Value: types.ContentBlockStartEvent{},
+	}
+	var buf1 bytes.Buffer
+	if _, err := translateStreamEvent(startEvent, "id", "model", stats, &buf1); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if buf1.Len() != 0 {
+		t.Errorf("expected no SSE output for content_block_start, got: %q", buf1.String())
+	}
+
+	stopEvent := &types.ConverseStreamOutputMemberContentBlockStop{
+		Value: types.ContentBlockStopEvent{},
+	}
+	var buf2 bytes.Buffer
+	if _, err := translateStreamEvent(stopEvent, "id", "model", stats, &buf2); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if buf2.Len() != 0 {
+		t.Errorf("expected no SSE output for content_block_stop, got: %q", buf2.String())
 	}
 }
 
@@ -499,8 +629,8 @@ func TestTranslateBedrockError_Throttling(t *testing.T) {
 func TestTranslateBedrockError_AccessDenied(t *testing.T) {
 	code, body := TranslateBedrockError("AccessDeniedException", "")
 	assertErrorResponse(t, code, body, http.StatusForbidden, "permission_error")
-	if !strings.Contains(string(body), "IAM permissions") {
-		t.Errorf("access denied error should mention IAM permissions; got: %s", body)
+	if !strings.Contains(string(body), "bedrock:InvokeModel") {
+		t.Errorf("access denied error should hint at the bedrock:InvokeModel IAM allowlist; got: %s", body)
 	}
 }
 
@@ -515,7 +645,6 @@ func TestTranslateBedrockError_Validation(t *testing.T) {
 func TestTranslateBedrockError_ValidationEmptyMessageDefaulted(t *testing.T) {
 	code, body := TranslateBedrockError("ValidationException", "")
 	assertErrorResponse(t, code, body, http.StatusBadRequest, "invalid_request_error")
-	// Should not produce empty message field.
 	if strings.Contains(string(body), `"message":""`) {
 		t.Errorf("empty rawMessage should be replaced with default; got: %s", body)
 	}
@@ -526,9 +655,24 @@ func TestTranslateBedrockError_ModelNotReady(t *testing.T) {
 	assertErrorResponse(t, code, body, http.StatusServiceUnavailable, "server_error")
 }
 
-func TestTranslateBedrockError_UnknownDefaultsTo500(t *testing.T) {
+func TestTranslateBedrockError_ServiceUnavailable(t *testing.T) {
+	code, body := TranslateBedrockError("ServiceUnavailableException", "")
+	assertErrorResponse(t, code, body, http.StatusServiceUnavailable, "server_error")
+}
+
+func TestTranslateBedrockError_ResourceNotFound(t *testing.T) {
+	code, body := TranslateBedrockError("ResourceNotFoundException", "")
+	assertErrorResponse(t, code, body, http.StatusNotFound, "invalid_request_error")
+}
+
+func TestTranslateBedrockError_ModelTimeout(t *testing.T) {
+	code, body := TranslateBedrockError("ModelTimeoutException", "")
+	assertErrorResponse(t, code, body, http.StatusGatewayTimeout, "server_error")
+}
+
+func TestTranslateBedrockError_UnknownDefaultsTo502(t *testing.T) {
 	code, body := TranslateBedrockError("SomeOtherException", "weird error")
-	assertErrorResponse(t, code, body, http.StatusInternalServerError, "server_error")
+	assertErrorResponse(t, code, body, http.StatusBadGateway, "server_error")
 }
 
 // ---------------------------------------------------------------------------
@@ -545,11 +689,16 @@ func TestConvertFinishReason(t *testing.T) {
 		{"max_tokens", "length"},
 		{"tool_use", "tool_calls"},
 		{"content_filtered", "content_filter"},
+		{"guardrail_intervened", "content_filter"},
 		{"finished", "stop"},
 		{"complete", "stop"},
 		{"END_TURN", "stop"},
 		{"", ""},
-		{"unknown_reason", "unknown_reason"},
+		// Unknown reasons (including other real Converse StopReason values we
+		// don't special-case, like model_context_window_exceeded) must not leak
+		// a Bedrock-specific string to an OpenAI-compatible client.
+		{"model_context_window_exceeded", "stop"},
+		{"unknown_reason", "stop"},
 	}
 	for _, tc := range cases {
 		got := convertFinishReason(tc.input)
@@ -584,3 +733,5 @@ func assertErrorResponse(t *testing.T, code int, body []byte, wantCode int, want
 		t.Error("error.message must not be empty")
 	}
 }
+
+func strPtr(s string) *string { return &s }

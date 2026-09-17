@@ -12,8 +12,8 @@ import (
 )
 
 const (
-	ContextKeyID     = "key_id"
-	ContextUserID    = "user_id"
+	ContextKeyID  = "key_id"
+	ContextUserID = "user_id"
 )
 
 // apiKeyRow holds the columns we care about from the api_keys / service_keys lookup.
@@ -71,15 +71,20 @@ func hashKey(key string) string {
 }
 
 // lookupKey queries api_keys and service_keys for a non-revoked row matching
-// keyHash. For service keys, UserID is empty. Returns an error (including
+// keyHash. A row is valid when revoked_at IS NULL OR revoked_at is in the
+// future — the latter supports the service-key rotation grace window
+// (BootstrapServiceKey supersedes the previous "_service" row with
+// revoked_at = now() + 10 minutes rather than revoking it immediately, so
+// overlapping pod rollouts on the old key don't get 401s mid-rotation).
+// For service keys, UserID is empty. Returns an error (including
 // pgx.ErrNoRows) if no matching row is found.
 func lookupKey(ctx context.Context, db *pgxpool.Pool, keyHash string) (*apiKeyRow, error) {
 	const q = `
 		SELECT id::text, user_id::text, 'user' AS key_type
-		  FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL
+		  FROM api_keys WHERE key_hash = $1 AND (revoked_at IS NULL OR revoked_at > now())
 		UNION ALL
 		SELECT id::text, ''::text, 'service' AS key_type
-		  FROM service_keys WHERE key_hash = $1 AND revoked_at IS NULL
+		  FROM service_keys WHERE key_hash = $1 AND (revoked_at IS NULL OR revoked_at > now())
 		LIMIT 1`
 
 	row := &apiKeyRow{}
