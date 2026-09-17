@@ -20,10 +20,14 @@
 # Self-hosted model served by vLLM.
 # model_name        = "mistralai/Mistral-7B-Instruct-v0.3"
 # served_model_name = "mistral-7b"
+# model_revision    = "main"   # pin a commit SHA from the model's Hugging Face repo
 
 # Bedrock (Layer 1 IAM allowlist — the gateway can ONLY invoke models matching
 # these patterns; they also become the gateway's catalog filter). Open-weight
 # families (Llama, Mistral) are included by default alongside Claude. Model
 # access must still be granted per model in the Bedrock console.
+# Inference stays inside one geography (us | eu | apac); "global" profiles are
+# never granted.
 # bedrock_region         = "us-east-1"
+# bedrock_inference_geo  = "us"
 # bedrock_model_patterns = ["anthropic.claude-*", "meta.llama*", "mistral.*"]

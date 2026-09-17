@@ -14,24 +14,25 @@ locals {
   # the right gateway Provider (bedrock vs. vertex) without branching on cloud.
   inference_backend = "bedrock"
 
-  # Layer 1 allowlist for cloud-managed models. The gateway invokes system
-  # inference-profile IDs ("us.anthropic.claude-..."), which IAM authorises
-  # against BOTH the profile ARN in this account and the underlying
-  # foundation-model ARN in every region the profile can route to — hence the
-  # region wildcard on the foundation-model side only.
-  bedrock_invoke_arns = concat(
-    [for p in var.bedrock_model_patterns : "arn:aws:bedrock:*::foundation-model/${p}"],
-    [for p in var.bedrock_model_patterns : "arn:aws:bedrock:${var.bedrock_region}:${data.aws_caller_identity.current.account_id}:inference-profile/*.${p}"],
-  )
-
-  # Same patterns as gateway catalog globs (geo prefix + model ID), so the
-  # catalog never lists a Bedrock model this role cannot invoke.
-  bedrock_model_filter = join(",", [for p in var.bedrock_model_patterns : "*.${p}"])
+  # Layer 1 allowlist for cloud-managed models — computed (and unit-tested) in
+  # modules/bedrock-allowlist.
+  bedrock_invoke_arns  = module.bedrock_allowlist.invoke_arns
+  bedrock_model_filter = module.bedrock_allowlist.model_filter
 
   tags = {
     Project   = "darkplum"
     ManagedBy = "terraform"
   }
+}
+
+module "bedrock_allowlist" {
+  source = "./modules/bedrock-allowlist"
+
+  account_id          = data.aws_caller_identity.current.account_id
+  region              = var.bedrock_region
+  geo                 = var.bedrock_inference_geo
+  destination_regions = var.bedrock_destination_regions
+  model_patterns      = var.bedrock_model_patterns
 }
 
 module "vpc" {

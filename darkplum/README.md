@@ -100,7 +100,9 @@ cp terraform.tfvars.example terraform.tfvars   # edit, then `terraform apply` or
 | `model_name` | mistralai/Mistral-7B-Instruct-v0.3 | Hugging Face model ID (default self-hosted model) |
 | `served_model_name` | mistral-7b | API model name |
 | `bedrock_region` | us-east-1 | Region the gateway calls Bedrock in |
+| `bedrock_inference_geo` | us | Geography inference stays in (`us`, `eu`, `apac`); `global` profiles are never granted |
 | `bedrock_model_patterns` | Claude, Llama, Mistral | Bedrock model-ID globs the gateway may invoke (IAM allowlist + catalog filter) |
+| `model_revision` | main | Hugging Face revision of the default model — pin a commit SHA |
 
 See `terraform/aws/variables.tf` for the full list.
 
@@ -124,6 +126,7 @@ See `terraform/aws/variables.tf` for the full list.
 | `make deploy-model NAME= MODEL=` | Add another self-hosted open-source model (one GPU each) |
 | `make remove-model NAME=` | Remove a model added with `deploy-model` |
 | `make list-models` | List self-hosted model deployments and gateway upstreams |
+| `make verify-bedrock-iam` | Prove the gateway's IAM role allows only the configured Bedrock models |
 | `make test` | Send a test chat completion request |
 | `make status` | Show cluster, node, pod, and GPU status |
 | `make destroy` | Tear down all resources |
@@ -160,13 +163,21 @@ deployment and takes one GPU, so grow the GPU node group first
 (`gpu_desired_size = 2`, then `make deploy-infra`), then:
 
 ```bash
-make deploy-model NAME=qwen MODEL=Qwen/Qwen2.5-7B-Instruct SERVED=qwen-2.5-7b
+make deploy-model NAME=qwen MODEL=Qwen/Qwen2.5-7B-Instruct SERVED=qwen-2.5-7b REVISION=<commit-sha>
 make list-models
 make remove-model NAME=qwen
 ```
 
 The gateway re-discovers models every minute; a new model shows up under
-**Admin > Models**, disabled until an administrator enables it.
+**Admin > Models**, disabled until an administrator enables it. A model whose
+backend goes away (cold start, crash) keeps its settings and is shown as
+unreachable until it returns.
+
+Model backends run third-party weights, so they are locked down: safetensors only
+(pickled weights are refused), no Kubernetes API token, ingress from the gateway
+only, and egress limited to public HTTPS for the weight download — never the
+instance metadata service or anything inside the cluster. Pin `REVISION` to a
+commit SHA so a re-download cannot change the weights.
 
 **Choosing which Bedrock models are reachable.** `bedrock_model_patterns` is the
 IAM allowlist for the gateway's role and also filters the catalog, so the admin
@@ -174,8 +185,14 @@ UI only lists models the role can actually invoke. Model access must still be
 granted per model in the Bedrock console.
 
 ```hcl
+bedrock_inference_geo  = "us"                                     # us | eu | apac
 bedrock_model_patterns = ["anthropic.claude-*", "meta.llama*"]   # [] = no Bedrock
 ```
+
+The role is granted the geo inference profiles (`us.anthropic.claude-*`) and the
+underlying models in that geography's regions only — no all-region wildcard and no
+`global.` profiles. `make verify-bedrock-iam` simulates the deployed role and fails
+if anything outside the allowlist would be permitted.
 
 **Routing policy and aliases** (Admin > Models):
 

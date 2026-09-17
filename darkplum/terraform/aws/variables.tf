@@ -63,6 +63,12 @@ variable "model_name" {
   default     = "mistralai/Mistral-7B-Instruct-v0.3"
 }
 
+variable "model_revision" {
+  description = "Hugging Face revision (branch, tag, or preferably a full commit SHA) of model_name. Pin a SHA so a re-download cannot silently change the weights."
+  type        = string
+  default     = "main"
+}
+
 variable "served_model_name" {
   description = "Short model name exposed on the OpenAI-compatible API."
   type        = string
@@ -75,17 +81,45 @@ variable "bedrock_region" {
   default     = "us-east-1"
 }
 
+variable "bedrock_inference_geo" {
+  description = <<-EOT
+    Geography prefix of the Bedrock system inference profiles the gateway may use:
+    "us", "eu" or "apac". A geo profile (e.g. "us.anthropic.claude-...") keeps
+    inference inside that geography. "global" profiles, which can route a request
+    to any commercial region worldwide, are deliberately not selectable — they are
+    never granted and never listed.
+  EOT
+  type        = string
+  default     = "us"
+
+  validation {
+    condition     = contains(["us", "eu", "apac"], var.bedrock_inference_geo)
+    error_message = "bedrock_inference_geo must be one of: us, eu, apac."
+  }
+}
+
+variable "bedrock_destination_regions" {
+  description = <<-EOT
+    Regions a geo inference profile may route to. IAM must allow the underlying
+    foundation model in each of them. Leave empty to use the built-in list for
+    bedrock_inference_geo; override when AWS adds a destination region or to
+    narrow the boundary further. bedrock_region is always included.
+  EOT
+  type        = list(string)
+  default     = []
+}
+
 variable "bedrock_model_patterns" {
   description = <<-EOT
     Bedrock model-ID patterns the gateway may invoke, e.g. "anthropic.claude-*" or
     "meta.llama*". This IAM allowlist is the Layer 1 (cloud IAM) enforcement
-    boundary for cloud-managed model access: each pattern expands to the
-    foundation-model ARNs (any region, because cross-region inference profiles
-    fan out) AND the system inference-profile ARNs in this account, which is what
-    the gateway actually invokes (e.g. "us.anthropic.claude-..."). The same
-    patterns are emitted as the bedrock_model_filter output so the gateway's
-    catalog only lists models this role can call. Model access must still be
-    granted per model in the Bedrock console. Set to [] to allow no Bedrock models.
+    boundary for cloud-managed model access. Each pattern expands to the geo
+    inference-profile ARN in this account (what the gateway actually invokes,
+    e.g. "us.anthropic.claude-...") AND the foundation-model ARN in each
+    destination region of that geo — nothing outside the geo, nothing "global".
+    The same patterns are emitted as the bedrock_model_filter output so the
+    gateway's catalog only lists models this role can call. Model access must
+    still be granted per model in the Bedrock console. [] allows no Bedrock models.
   EOT
   type        = list(string)
   default = [

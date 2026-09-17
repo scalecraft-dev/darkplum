@@ -1,0 +1,47 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: inference-backend-egress
+  namespace: darkplum-inference
+  labels:
+    app.kubernetes.io/part-of: darkplum
+spec:
+  # Self-hosted model backends run third-party model code and weights. They
+  # need outbound HTTPS once, in the init container, to download weights (the
+  # policy cannot tell init from main container, so it stays open on :443), and
+  # nothing else. Everything link-local is denied: a compromised model pod must
+  # not reach IMDS (node role credentials) or the Pod Identity agent. No
+  # in-cluster destinations are allowed — a model backend never calls the
+  # gateway, the api, or Postgres.
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/component: inference-backend
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+
+    # Hugging Face Hub + PyPI. Public IPv4 only: link-local and the RFC 1918
+    # ranges (VPC, pod and service networks) are excluded.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.0.0/16
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443

@@ -64,6 +64,15 @@ spec:
                 secretKeyRef:
                   name: darkplum-auth
                   key: SESSION_SIGNING_KEY
+            # Secret the api<->gateway service key is derived from. Separate from
+            # SESSION_SIGNING_KEY so the gateway credential can be rotated without
+            # logging every user out. Optional: falls back to SESSION_SIGNING_KEY.
+            - name: SERVICE_KEY_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: darkplum-auth
+                  key: SERVICE_KEY_SECRET
+                  optional: true
             - name: SECURE_COOKIES
               valueFrom:
                 secretKeyRef:

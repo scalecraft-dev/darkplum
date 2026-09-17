@@ -4,3 +4,4 @@ kind: Kustomization
 resources:
   - vllm-ingress.yaml
   - gateway-egress.yaml
+  - inference-egress.yaml

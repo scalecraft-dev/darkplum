@@ -62,6 +62,21 @@ output "model_name" {
   value       = var.model_name
 }
 
+output "model_revision" {
+  description = "Hugging Face revision of the default self-hosted model."
+  value       = var.model_revision
+}
+
+output "bedrock_invoke_arns" {
+  description = "The exact ARNs the gateway role may invoke (Layer 1 allowlist). Used by `make verify-bedrock-iam`."
+  value       = local.bedrock_invoke_arns
+}
+
+output "gateway_role_arn" {
+  description = "IAM role the gateway assumes via EKS Pod Identity."
+  value       = module.pod_identity_gateway.role_arn
+}
+
 output "served_model_name" {
   description = "Short model name exposed on the OpenAI-compatible API."
   value       = var.served_model_name

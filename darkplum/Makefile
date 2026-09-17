@@ -18,7 +18,7 @@ DEV_AWS ?=
 DEV_AWS_PROFILE ?= default
 DEV_OVERLAY := $(if $(DEV_AWS),dev-aws,dev)
 
-PROD_TARGETS := deploy deploy-infra deploy-k8s deploy-platform build-images push-images configure-sso test status destroy deploy-model remove-model list-models
+PROD_TARGETS := verify-bedrock-iam deploy deploy-infra deploy-k8s deploy-platform build-images push-images configure-sso test status destroy deploy-model remove-model list-models
 ifneq ($(filter $(PROD_TARGETS),$(MAKECMDGOALS)),)
 # Read from the normalized output contract — never reconstruct cloud-specific
 # values (e.g. the ECR host from `aws sts get-caller-identity`) in the Makefile.
@@ -35,7 +35,7 @@ export DOCKER_CLI_HINTS = false
 export DOCKER_CLI_HOOKS = 0
 
 .PHONY: help check-prereqs _require-outputs deploy deploy-infra deploy-k8s deploy-platform build-images push-images configure-sso test status destroy \
-       deploy-model remove-model list-models \
+       deploy-model remove-model list-models verify-bedrock-iam \
        dev-up dev-down dev-build-gateway dev-build-api dev-build-web dev-status dev-logs dev-test
 
 help: ## Show this help
@@ -94,11 +94,14 @@ deploy-k8s: ## Deploy Kubernetes workloads (vLLM inference)
 	@echo "Configuring model in deployment..."
 	@MODEL_NAME=$$(cd $(TF_DIR) && terraform output -raw model_name) && \
 		SERVED_NAME=$$(cd $(TF_DIR) && terraform output -raw served_model_name) && \
+		MODEL_REV=$$(cd $(TF_DIR) && terraform output -json | jq -r '.model_revision.value // "main"') && \
 		sed -e "s|PLACEHOLDER_MODEL_NAME|$$MODEL_NAME|g" \
+			-e "s|PLACEHOLDER_MODEL_REVISION|$$MODEL_REV|g" \
 			-e "s|PLACEHOLDER_SERVED_MODEL_NAME|$$SERVED_NAME|g" \
 			$(K8S_DIR)/overlays/prod/resources/vllm-deployment.yaml | kubectl apply -f -
 	@kubectl apply -f $(K8S_DIR)/overlays/prod/resources/vllm-service.yaml
 	@kubectl apply -f $(K8S_DIR)/base/network-policies/vllm-ingress.yaml
+	@kubectl apply -f $(K8S_DIR)/base/network-policies/inference-egress.yaml
 	@echo "vLLM deployment created. Model download + loading takes 15-25 minutes."
 	@echo "Monitor progress: kubectl logs -f -n $(NAMESPACE) deploy/vllm-inference -c model-download"
 
@@ -165,6 +168,9 @@ deploy-platform: build-images push-images ## Build, push, and deploy gateway + w
 	@EXISTING_SESSION_SIGNING_KEY=$$(kubectl get secret darkplum-auth -n darkplum-system \
 		-o jsonpath='{.data.SESSION_SIGNING_KEY}' 2>/dev/null | base64 -d 2>/dev/null); \
 		SESSION_SIGNING_KEY=$${SESSION_SIGNING_KEY:-$${EXISTING_SESSION_SIGNING_KEY:-$$(openssl rand -base64 48)}}; \
+		EXISTING_SERVICE_KEY_SECRET=$$(kubectl get secret darkplum-auth -n darkplum-system \
+			-o jsonpath='{.data.SERVICE_KEY_SECRET}' 2>/dev/null | base64 -d 2>/dev/null); \
+		SERVICE_KEY_SECRET=$${SERVICE_KEY_SECRET:-$${EXISTING_SERVICE_KEY_SECRET:-$$(openssl rand -base64 48)}}; \
 		OIDC_ISSUER=$${OIDC_ISSUER:-unconfigured}; \
 		OIDC_CLIENT_ID=$${OIDC_CLIENT_ID:-unconfigured}; \
 		OIDC_CLIENT_SECRET=$${OIDC_CLIENT_SECRET:-unconfigured}; \
@@ -180,7 +186,16 @@ deploy-platform: build-images push-images ## Build, push, and deploy gateway + w
 			--from-literal=OIDC_CLIENT_SECRET="$$OIDC_CLIENT_SECRET" \
 			--from-literal=OIDC_REDIRECT_URL="$$OIDC_REDIRECT_URL" \
 			--from-literal=SESSION_SIGNING_KEY="$$SESSION_SIGNING_KEY" \
+			--from-literal=SERVICE_KEY_SECRET="$$SERVICE_KEY_SECRET" \
 			--dry-run=client -o yaml | kubectl apply -f -
+	@# The api owns the schema: it must migrate before the gateway rolls, because
+	@# the gateway fails closed (503 policy_unavailable) until it can load routing
+	@# policy from tables the api creates.
+	@echo "Deploying api (runs database migrations)..."
+	@sed "s|darkplum-api:latest|$(CONTAINER_REGISTRY)/darkplum-api:latest|" \
+		$(K8S_DIR)/base/api/deployment.yaml | kubectl apply -f -
+	@kubectl apply -f $(K8S_DIR)/base/api/service.yaml
+	@kubectl rollout status deployment/darkplum-api -n darkplum-system --timeout=300s
 	@echo "Deploying gateway..."
 	@# Bedrock region + catalog filter come from Terraform so the catalog matches
 	@# the IAM allowlist. VLLM_UPSTREAMS is owned by deploy-model/remove-model:
@@ -196,10 +211,7 @@ deploy-platform: build-images push-images ## Build, push, and deploy gateway + w
 		/- name: VLLM_UPSTREAMS$$/       { print; getline; sub(/value: .*/, "value: \"" ENVIRON["VLLM_UPSTREAMS"] "\""); print; next } \
 		{ print }' | kubectl apply -f -
 	@kubectl apply -f $(K8S_DIR)/base/gateway/service.yaml
-	@echo "Deploying api..."
-	@sed "s|darkplum-api:latest|$(CONTAINER_REGISTRY)/darkplum-api:latest|" \
-		$(K8S_DIR)/base/api/deployment.yaml | kubectl apply -f -
-	@kubectl apply -f $(K8S_DIR)/base/api/service.yaml
+	@kubectl rollout status deployment/darkplum-gateway -n darkplum-system --timeout=300s
 	@echo "Deploying web..."
 	@sed "s|darkplum-web:latest|$(CONTAINER_REGISTRY)/darkplum-web:latest|" \
 		$(K8S_DIR)/base/web/deployment.yaml | kubectl apply -f -
@@ -235,6 +247,9 @@ configure-sso: ## Configure OIDC/SSO authentication (interactive)
 	EXISTING_SESSION_SIGNING_KEY=$$(kubectl get secret darkplum-auth -n darkplum-system \
 		-o jsonpath='{.data.SESSION_SIGNING_KEY}' 2>/dev/null | base64 -d 2>/dev/null); \
 	SESSION_SIGNING_KEY=$${EXISTING_SESSION_SIGNING_KEY:-$$(openssl rand -base64 48)}; \
+	EXISTING_SERVICE_KEY_SECRET=$$(kubectl get secret darkplum-auth -n darkplum-system \
+		-o jsonpath='{.data.SERVICE_KEY_SECRET}' 2>/dev/null | base64 -d 2>/dev/null); \
+	SERVICE_KEY_SECRET=$${EXISTING_SERVICE_KEY_SECRET:-$$(openssl rand -base64 48)}; \
 	echo ""; \
 	echo "Updating darkplum-auth secret..."; \
 	kubectl create secret generic darkplum-auth \
@@ -244,6 +259,7 @@ configure-sso: ## Configure OIDC/SSO authentication (interactive)
 		--from-literal=OIDC_CLIENT_SECRET="$$OIDC_CLIENT_SECRET" \
 		--from-literal=OIDC_REDIRECT_URL="$$OIDC_REDIRECT_URL" \
 		--from-literal=SESSION_SIGNING_KEY="$$SESSION_SIGNING_KEY" \
+		--from-literal=SERVICE_KEY_SECRET="$$SERVICE_KEY_SECRET" \
 		--dry-run=client -o yaml | kubectl apply -f -; \
 	echo "Restarting darkplum-api to pick up new config..."; \
 	kubectl rollout restart deployment/darkplum-api -n darkplum-system; \
@@ -316,6 +332,7 @@ destroy: ## Tear down all resources
 	@kubectl delete -f $(K8S_DIR)/base/web/deployment.yaml --ignore-not-found 2>/dev/null || true
 	@kubectl delete -f $(K8S_DIR)/base/network-policies/vllm-ingress.yaml --ignore-not-found 2>/dev/null || true
 	@kubectl delete -f $(K8S_DIR)/base/network-policies/gateway-egress.yaml --ignore-not-found 2>/dev/null || true
+	@kubectl delete -f $(K8S_DIR)/base/network-policies/inference-egress.yaml --ignore-not-found 2>/dev/null || true
 	@kubectl delete deploy,svc -n $(NAMESPACE) -l darkplum.ai/model-instance --ignore-not-found 2>/dev/null || true
 	@kubectl delete -f $(K8S_DIR)/overlays/prod/resources/vllm-service.yaml --ignore-not-found 2>/dev/null || true
 	@kubectl delete -f $(K8S_DIR)/overlays/prod/resources/vllm-deployment.yaml --ignore-not-found 2>/dev/null || true
@@ -329,15 +346,34 @@ destroy: ## Tear down all resources
 	@cd $(TF_DIR) && terraform destroy -auto-approve -input=false
 	@echo "All resources destroyed."
 
+verify-bedrock-iam: ## Prove the gateway's IAM role allows only the configured Bedrock models (Layer 1 check)
+	@ROLE=$$(cd $(TF_DIR) && terraform output -json | jq -r '.gateway_role_arn.value // empty'); \
+	REGION=$$(cd $(TF_DIR) && terraform output -json | jq -r '.inference_region.value // empty'); \
+	ALLOWED=$$(cd $(TF_DIR) && terraform output -json | jq -r '.bedrock_invoke_arns.value[]? | select(test("inference-profile/"))' | head -1); \
+	[ -n "$$ROLE" ] || { echo "ERROR: no gateway_role_arn output. Run 'make deploy-infra' first."; exit 1; }; \
+	ACCOUNT=$$(echo "$$ROLE" | cut -d: -f5); \
+	sim() { aws iam simulate-principal-policy --policy-source-arn "$$ROLE" --action-names bedrock:InvokeModel \
+		--resource-arns "$$1" --query 'EvaluationResults[0].EvalDecision' --output text; }; \
+	FAIL=0; \
+	check() { GOT=$$(sim "$$2"); if [ "$$GOT" = "$$1" ]; then echo "  ok    $$1  $$2"; else echo "  FAIL  expected $$1, got $$GOT  $$2"; FAIL=1; fi; }; \
+	echo "Simulating bedrock:InvokeModel as $$ROLE"; \
+	if [ -n "$$ALLOWED" ]; then check allowed "$$(echo "$$ALLOWED" | sed 's/\*$$/example-v1:0/')"; else echo "  (no Bedrock models are allowed; checking denials only)"; fi; \
+	check implicitDeny "arn:aws:bedrock:$$REGION:$$ACCOUNT:inference-profile/global.anthropic.claude-example-v1:0"; \
+	check implicitDeny "arn:aws:bedrock:$$REGION::foundation-model/darkplum.not-an-allowed-model-v1:0"; \
+	check implicitDeny "arn:aws:bedrock:ap-southeast-7::foundation-model/anthropic.claude-example-v1:0"; \
+	[ $$FAIL -eq 0 ] && echo "Layer 1 allowlist behaves as configured." || { echo "Layer 1 allowlist does NOT behave as configured."; exit 1; }
+
 # =============================================================================
 # Additional self-hosted open-source models (one vLLM deployment + GPU each)
 # =============================================================================
 
 MAX_LEN ?= 8192
+# Hugging Face revision for deploy-model. Pin a commit SHA for anything that matters.
+REVISION ?= main
 _GW_UPSTREAMS = kubectl get deploy darkplum-gateway -n darkplum-system \
 	-o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="VLLM_UPSTREAMS")].value}' 2>/dev/null
 
-deploy-model: ## Add a self-hosted model: make deploy-model NAME=qwen MODEL=Qwen/Qwen2.5-7B-Instruct [SERVED=qwen-2.5-7b] [MAX_LEN=8192]
+deploy-model: ## Add a self-hosted model: make deploy-model NAME=qwen MODEL=Qwen/Qwen2.5-7B-Instruct [REVISION=<commit-sha>] [SERVED=qwen-2.5-7b] [MAX_LEN=8192]
 	@[[ "$(NAME)" =~ ^[a-z0-9][a-z0-9-]{0,30}$$ ]] || { echo "ERROR: NAME is required: lowercase letters, digits and dashes (max 31 chars). Got '$(NAME)'."; exit 1; }
 	@[ "$(NAME)" != "default" ] && [ "$(NAME)" != "inference" ] || { echo "ERROR: NAME '$(NAME)' is reserved for the default vLLM deployment."; exit 1; }
 	@[ -n "$(MODEL)" ] || { echo "ERROR: MODEL is required (Hugging Face model ID, e.g. Qwen/Qwen2.5-7B-Instruct)."; exit 1; }
@@ -350,9 +386,11 @@ deploy-model: ## Add a self-hosted model: make deploy-model NAME=qwen MODEL=Qwen
 		echo "WARNING: no free GPU ($$USED of $$TOTAL allocated). vllm-$(NAME) will stay Pending until the GPU"; \
 		echo "         node group grows: raise gpu_desired_size in $(TF_DIR)/terraform.tfvars and run 'make deploy-infra'."; \
 	fi; \
-	echo "Deploying vllm-$(NAME): $(MODEL) served as '$$SERVED'..."; \
+	[ "$(REVISION)" != "main" ] || echo "NOTE: REVISION=main is a moving target. Pin a commit SHA (REVISION=<sha>) so weights cannot change under you."; \
+	echo "Deploying vllm-$(NAME): $(MODEL)@$(REVISION) served as '$$SERVED'..."; \
 	sed -e "s|MODEL_INSTANCE|$(NAME)|g" \
 		-e "s|PLACEHOLDER_MODEL_NAME|$(MODEL)|g" \
+		-e "s|PLACEHOLDER_MODEL_REVISION|$(REVISION)|g" \
 		-e "s|PLACEHOLDER_SERVED_MODEL_NAME|$$SERVED|g" \
 		-e "s|PLACEHOLDER_MAX_MODEL_LEN|$(MAX_LEN)|g" \
 		$(K8S_DIR)/templates/vllm-model.yaml | kubectl apply -f -

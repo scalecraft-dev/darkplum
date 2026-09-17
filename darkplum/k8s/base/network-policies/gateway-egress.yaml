@@ -42,6 +42,20 @@ spec:
         - protocol: TCP
           port: 443
 
+    # EKS Pod Identity agent. The gateway's AWS credentials (for Bedrock) are
+    # served from this fixed link-local address on the node — NOT from IMDS.
+    # The :443 rule above excludes all of 169.254.0.0/16, and the VPC CNI
+    # enforces NetworkPolicy on this cluster, so without this rule the AWS SDK
+    # can never obtain credentials and every Bedrock model stays unavailable.
+    # Only this one address and port is opened; IMDS (169.254.169.254) stays
+    # blocked.
+    - to:
+        - ipBlock:
+            cidr: 169.254.170.23/32
+      ports:
+        - protocol: TCP
+          port: 80
+
     - to:
         - namespaceSelector:
             matchLabels:
