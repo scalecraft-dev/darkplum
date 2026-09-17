@@ -3,6 +3,7 @@ package bedrock
 import (
 	"context"
 
+	"github.com/aws/aws-sdk-go-v2/service/bedrock"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
 )
@@ -33,6 +34,13 @@ type converseStream interface {
 type converseAPI interface {
 	Converse(ctx context.Context, params *bedrockruntime.ConverseInput, optFns ...func(*bedrockruntime.Options)) (*bedrockruntime.ConverseOutput, error)
 	ConverseStream(ctx context.Context, params *bedrockruntime.ConverseStreamInput, optFns ...func(*bedrockruntime.Options)) (converseStream, error)
+}
+
+// controlAPI abstracts the Bedrock control-plane operation DiscoverModels
+// calls, so pagination can be unit-tested against a fake without any AWS SDK
+// or network involvement. *bedrock.Client satisfies this structurally.
+type controlAPI interface {
+	ListInferenceProfiles(ctx context.Context, params *bedrock.ListInferenceProfilesInput, optFns ...func(*bedrock.Options)) (*bedrock.ListInferenceProfilesOutput, error)
 }
 
 // runtimeClient adapts *bedrockruntime.Client to the converseAPI interface.

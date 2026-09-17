@@ -175,7 +175,7 @@ func TestManager_BedrockVsVLLMCollision(t *testing.T) {
 	brk := newBedrockSourceFromState(state)
 	vllm := staticSource("vllm-default", "vllm", ClassSelfHosted, "vllm-default", []string{"shared-model"})
 
-	m := NewManager([]Source{brk, vllm})
+	m := NewManager([]Source{brk, vllm}, 0)
 	m.Refresh(context.Background())
 
 	route, ok := m.Snapshot().Lookup("shared-model")

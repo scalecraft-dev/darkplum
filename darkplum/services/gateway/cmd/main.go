@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"net/http/httputil"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -23,7 +22,6 @@ import (
 	"github.com/scalecraft/darkplum/gateway/internal/provider"
 	"github.com/scalecraft/darkplum/gateway/internal/provider/mock"
 	"github.com/scalecraft/darkplum/gateway/internal/provider/openaicompat"
-	"github.com/scalecraft/darkplum/gateway/internal/proxy"
 	"github.com/scalecraft/darkplum/gateway/internal/recorder"
 	"github.com/scalecraft/darkplum/gateway/internal/routing"
 )
@@ -61,7 +59,6 @@ func main() {
 	// regardless of position).
 	var sources []routing.Source
 
-	var rp *httputil.ReverseProxy
 	mockMode := cfg.VLLMUpstream == "mock"
 
 	if mockMode {
@@ -73,11 +70,6 @@ func main() {
 		// Validate the vLLM upstream URL before attempting to connect.
 		if err := config.ValidateUpstreamURL(cfg.VLLMUpstream, cfg.DevMode); err != nil {
 			log.Fatalf("vllm: upstream validation failed: %v", err)
-		}
-
-		rp, err = proxy.New(cfg.VLLMUpstream)
-		if err != nil {
-			log.Fatalf("proxy: failed to parse upstream URL %q: %v", cfg.VLLMUpstream, err)
 		}
 
 		vllmProv, err := openaicompat.New("vllm-default", "vllm", cfg.VLLMUpstream)
@@ -136,17 +128,17 @@ func main() {
 	}
 	log.Printf("gateway: routing sources configured: %s", strings.Join(sourceDescriptions, ", "))
 
-	routeMgr := routing.NewManager(sources)
+	routeMgr := routing.NewManager(sources, time.Duration(cfg.RouteLastGoodTTLSeconds)*time.Second)
 	routeMgr.Run(ctx, time.Duration(cfg.DiscoveryIntervalSeconds)*time.Second)
-	log.Printf("gateway: initial discovery complete, %d models routable (refreshing every %ds)",
-		len(routeMgr.Snapshot().IDs()), cfg.DiscoveryIntervalSeconds)
+	log.Printf("gateway: initial discovery complete, %d models routable (refreshing every %ds, last-good TTL %ds)",
+		len(routeMgr.Snapshot().IDs()), cfg.DiscoveryIntervalSeconds, cfg.RouteLastGoodTTLSeconds)
 
 	// Policy store: models.enabled, model_aliases, routing_policy. Fails
 	// closed (503 policy_unavailable) until the first successful load — which
 	// may not happen until the api runs migration 010 against a freshly
 	// onboarded database — then keeps serving the last-good snapshot on later
-	// refresh failures.
-	polStore := policy.NewPgStore(dbPool)
+	// refresh failures, up to POLICY_MAX_STALENESS_SECONDS.
+	polStore := policy.NewPgStore(dbPool, time.Duration(cfg.PolicyMaxStalenessSeconds)*time.Second)
 	polStore.Run(ctx, time.Duration(cfg.PolicyRefreshSeconds)*time.Second)
 	if _, loaded := polStore.Current(); loaded {
 		log.Printf("policy: initial load succeeded (refreshing every %ds)", cfg.PolicyRefreshSeconds)
@@ -186,73 +178,8 @@ func main() {
 	rec := recorder.New(dbPool)
 
 	gin.SetMode(gin.ReleaseMode)
-	router := gin.New()
-	router.Use(gin.Logger())
-	router.Use(gin.Recovery())
-
-	// /health is the liveness AND readiness probe endpoint.
-	//
-	// It always returns 200 as long as the process is healthy — upstream
-	// reachability is OBSERVABILITY, not a kill switch. A down lmstudio or vllm
-	// upstream must never flip the pod to unready and take out Bedrock traffic.
-	//
-	// The response body carries a per-upstream status map so operators and
-	// dashboards can see which upstreams are reachable without tailing pod logs.
-	// Probe results are cached (10s TTL) so frequent readiness checks don't
-	// hammer the upstream /v1/models endpoints.
-	//
-	// TODO(follow-up): increment an upstream_error_total counter here once a
-	// metrics infrastructure (e.g. prometheus/expvar) is wired in. Currently no
-	// metrics infra exists in the gateway, so we don't invent one now.
-	router.GET("/health", func(c *gin.Context) {
-		upstreams := upstreamChecker.Check(c.Request.Context())
-
-		// Convert to map[string]string for JSON serialisation.
-		upstreamBody := make(map[string]string, len(upstreams))
-		for name, status := range upstreams {
-			upstreamBody[name] = string(status)
-		}
-
-		c.JSON(http.StatusOK, gin.H{
-			"status":    "ok",
-			"upstreams": upstreamBody,
-		})
-	})
-
-	v1 := router.Group("/v1")
-	v1.Use(middleware.APIKey(dbPool))
-	v1.Use(middleware.Recording(rec))
-
-	// Chat completions are handled by ChatHandler, which enforces model
-	// routing (alias resolve -> route lookup -> enabled -> residency ->
-	// dispatch) using the live routing.Table and policy.Snapshot. GET
-	// /v1/models is served by HandleListModels, which lists every discovered
-	// model with its backend_class. All other /v1/* GET paths are forwarded
-	// to the vLLM upstream via the reverse proxy.
-	//
-	// NOTE: gin/httprouter does not allow registering both a static segment
-	// (/models) and a catch-all (/*path) under the same parent. The wildcard
-	// handler below checks c.Param("path") and dispatches to HandleListModels
-	// for the /models path so that both routing requirements are satisfied
-	// without a route conflict panic.
-	v1.POST("/chat/completions", chatHandler.HandleChatCompletions)
-	proxyHandler := func(c *gin.Context) {
-		if rp == nil {
-			c.JSON(http.StatusNotFound, gin.H{"error": "no upstream configured"})
-			return
-		}
-		rp.ServeHTTP(c.Writer, c.Request)
-	}
-	v1.GET("/*path", func(c *gin.Context) {
-		if c.Param("path") == "/models" {
-			chatHandler.HandleListModels(c)
-			return
-		}
-		proxyHandler(c)
-	})
-	v1.DELETE("/*path", proxyHandler)
-	v1.PUT("/*path", proxyHandler)
-	v1.PATCH("/*path", proxyHandler)
+	healthHandler := newHealthHandler(upstreamChecker, routeMgr, polStore)
+	router := buildRouter(chatHandler, middleware.APIKey(dbPool), middleware.Recording(rec), healthHandler)
 
 	addr := ":" + cfg.Port
 	srv := &http.Server{
@@ -288,4 +215,114 @@ func main() {
 
 	rec.Drain()
 	log.Println("gateway: recorder drained, exiting")
+}
+
+// buildRouter assembles the full gin.Engine: /health plus the /v1 surface.
+// Extracted from main so tests can exercise the real route table — including
+// the unknown-endpoint 404 contract — via httptest without a live database or
+// upstream. apiKeyMW/recordingMW are gin.HandlerFunc rather than concrete
+// dependencies so tests can substitute no-op fakes for the auth/audit
+// machinery, which already has its own package-level tests.
+func buildRouter(chatHandler *handler.ChatHandler, apiKeyMW, recordingMW, healthHandler gin.HandlerFunc) *gin.Engine {
+	router := gin.New()
+	router.Use(gin.Logger())
+	router.Use(gin.Recovery())
+
+	router.GET("/health", healthHandler)
+
+	v1 := router.Group("/v1")
+	v1.Use(apiKeyMW)
+	v1.Use(recordingMW)
+
+	// Only two endpoints are served under /v1. There is no reverse-proxy
+	// passthrough: the previous behaviour forwarded every other
+	// GET/DELETE/PUT/PATCH /v1/* request straight to the default vLLM
+	// upstream with no policy check — an open allowlist onto a third party's
+	// route table that also leaked GET /v1/models/{id} metadata for arbitrary
+	// ids. Every other /v1/* path, and every other method on these two paths,
+	// falls through to the NoRoute handler below.
+	v1.GET("/models", chatHandler.HandleListModels)
+	v1.POST("/chat/completions", chatHandler.HandleChatCompletions)
+
+	router.NoRoute(func(c *gin.Context) {
+		if strings.HasPrefix(c.Request.URL.Path, "/v1/") {
+			respondUnknownEndpoint(c)
+			return
+		}
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+	})
+
+	return router
+}
+
+// respondUnknownEndpoint writes the OpenAI-compatible 404 for any /v1/* path
+// or method combination other than GET /v1/models and POST
+// /v1/chat/completions. This also fixes POST /v1/embeddings and
+// /v1/completions, which previously fell through to gin's bare (non-JSON) 404
+// since no route matched them at all.
+func respondUnknownEndpoint(c *gin.Context) {
+	c.JSON(http.StatusNotFound, gin.H{
+		"error": gin.H{
+			"message": fmt.Sprintf("unknown endpoint: %s %s", c.Request.Method, c.Request.URL.Path),
+			"type":    "invalid_request_error",
+			"code":    "unknown_endpoint",
+		},
+	})
+}
+
+// newHealthHandler builds the /health handler. /health is the liveness AND
+// readiness probe endpoint: it always returns 200 as long as the process is
+// healthy — upstream reachability, routing source state, and policy
+// staleness are OBSERVABILITY, never a kill switch. A down lmstudio/vllm
+// upstream, an expired routing source, or a stale policy snapshot must never
+// flip the pod to unready and take out unrelated traffic (e.g. a
+// Bedrock-only deployment).
+//
+// The response is unauthenticated, so routing source status reports model
+// COUNTS only (never model ids or secrets); upstream hostnames are
+// acceptable since they already appear in gateway config, but error strings
+// otherwise stay generic.
+func newHealthHandler(upstreamChecker *health.Checker, routeMgr *routing.Manager, polStore *policy.PgStore) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		upstreams := upstreamChecker.Check(c.Request.Context())
+		upstreamBody := make(map[string]string, len(upstreams))
+		for name, status := range upstreams {
+			upstreamBody[name] = string(status)
+		}
+
+		routingStatus := routeMgr.Status()
+		sourcesBody := make(map[string]gin.H, len(routingStatus.Sources))
+		for name, s := range routingStatus.Sources {
+			sourcesBody[name] = gin.H{
+				"models":                   s.Models,
+				"last_success_seconds_ago": s.LastSuccessSecondsAgo,
+				"last_error":               nullableString(s.LastError),
+			}
+		}
+
+		policyStatus := polStore.Status()
+
+		c.JSON(http.StatusOK, gin.H{
+			"status":    "ok",
+			"upstreams": upstreamBody,
+			"routing": gin.H{
+				"models":  routingStatus.Models,
+				"sources": sourcesBody,
+			},
+			"policy": gin.H{
+				"loaded":      policyStatus.Loaded,
+				"age_seconds": policyStatus.AgeSeconds,
+				"stale":       policyStatus.Stale,
+			},
+		})
+	}
+}
+
+// nullableString returns nil for an empty string so it serialises as JSON
+// null rather than "" (used for /health's last_error field).
+func nullableString(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }

@@ -1,19 +1,29 @@
 import { useEffect, useId, useRef } from 'react'
 import styles from './ChatComposer.module.css'
 
+/** Why the composer is off, and what the reader can do about it. */
+export interface ComposerNotice {
+  /** Plain sentence. Used wherever only text fits, e.g. the send tooltip. */
+  text: string
+  /** The same sentence with an inline link, when there is somewhere to go. */
+  content?: React.ReactNode
+  /** An action on the same line, e.g. retrying a failed model load. */
+  action?: { label: string; onClick: () => void }
+}
+
 interface Props {
   onSend: (text: string) => void
   onStop: () => void
   streaming: boolean
   disabled?: boolean
   /** Shown in place of the disclaimer while the composer is unusable. */
-  disabledReason?: string
+  notice?: ComposerNotice
 }
 
-export function ChatComposer({ onSend, onStop, streaming, disabled, disabledReason }: Props) {
+export function ChatComposer({ onSend, onStop, streaming, disabled, notice }: Props) {
   const textareaRef = useRef<HTMLTextAreaElement>(null)
-  const reasonId = useId()
-  const showReason = Boolean(disabled && disabledReason)
+  const noticeId = useId()
+  const showNotice = Boolean(disabled && notice)
 
   // Auto-resize textarea
   const resize = () => {
@@ -50,9 +60,11 @@ export function ChatComposer({ onSend, onStop, streaming, disabled, disabledReas
         <textarea
           ref={textareaRef}
           className={styles.textarea}
-          placeholder={disabled && disabledReason ? disabledReason : 'Message darkplum...'}
+          /* No placeholder while off: the line below already says why, and the
+             same sentence twice reads as a rendering bug. */
+          placeholder={disabled ? undefined : 'Message darkplum...'}
           aria-label="Message"
-          aria-describedby={showReason ? reasonId : undefined}
+          aria-describedby={showNotice ? noticeId : undefined}
           rows={1}
           onInput={resize}
           onKeyDown={handleKeyDown}
@@ -70,7 +82,7 @@ export function ChatComposer({ onSend, onStop, streaming, disabled, disabledReas
             className={styles.sendBtn}
             onClick={submit}
             disabled={disabled}
-            title={disabled && disabledReason ? disabledReason : 'Send message'}
+            title={showNotice && notice ? notice.text : 'Send message'}
             aria-label="Send message"
           >
             <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -80,13 +92,19 @@ export function ChatComposer({ onSend, onStop, streaming, disabled, disabledReas
           </button>
         )}
       </div>
-      {showReason ? (
-        <p id={reasonId} className={styles.reason}>
+      {showNotice && notice ? (
+        <p id={noticeId} className={styles.reason}>
           <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-            <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
-            <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+            <circle cx="12" cy="12" r="10" />
+            <line x1="12" y1="16" x2="12" y2="11" />
+            <line x1="12" y1="8" x2="12.01" y2="8" />
           </svg>
-          {disabledReason}
+          <span>{notice.content ?? notice.text}</span>
+          {notice.action && (
+            <button type="button" className={styles.reasonAction} onClick={notice.action.onClick}>
+              {notice.action.label}
+            </button>
+          )}
         </p>
       ) : (
         <p className={styles.disclaimer}>AI responses may be inaccurate. Always verify important information.</p>

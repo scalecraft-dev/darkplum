@@ -378,13 +378,29 @@ func TestHandleChatCompletions_AliasToUnknownTargetRefused404(t *testing.T) {
 		true,
 	)
 
-	w, _ := doChat(t, h, "broken-alias")
+	w, c := doChat(t, h, "broken-alias")
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 for an alias pointing at an unknown model, got %d; body=%s", w.Code, w.Body.String())
 	}
 	e := decodeError(t, w.Body.Bytes())
 	if e.Error.Code != "model_not_found" {
 		t.Errorf("expected code model_not_found, got %q", e.Error.Code)
+	}
+
+	// Regression guard: the audit trail must not lose the resolved model on
+	// an alias denial — model=<alias>/requested_model=NULL would otherwise
+	// hide which model was actually refused.
+	resolved, _ := c.Get("resolved_model")
+	requested, _ := c.Get("requested_model")
+	denialCode, _ := c.Get("denial_code")
+	if resolved != "ghost-model" {
+		t.Errorf("resolved_model = %v, want ghost-model (must be set even on a 404 denial)", resolved)
+	}
+	if requested != "broken-alias" {
+		t.Errorf("requested_model = %v, want broken-alias (must be set even on a 404 denial)", requested)
+	}
+	if denialCode != "model_not_found" {
+		t.Errorf("denial_code = %v, want model_not_found", denialCode)
 	}
 }
 
@@ -401,7 +417,7 @@ func TestHandleChatCompletions_AliasToDisabledTargetRefused403(t *testing.T) {
 		true,
 	)
 
-	w, _ := doChat(t, h, "disabled-alias")
+	w, c := doChat(t, h, "disabled-alias")
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("expected 403 for an alias pointing at a disabled model, got %d; body=%s", w.Code, w.Body.String())
 	}
@@ -411,6 +427,62 @@ func TestHandleChatCompletions_AliasToDisabledTargetRefused403(t *testing.T) {
 	}
 	if prov.completeCalls != 0 {
 		t.Errorf("provider must not be called for a disabled alias target, got %d calls", prov.completeCalls)
+	}
+
+	resolved, _ := c.Get("resolved_model")
+	requested, _ := c.Get("requested_model")
+	denialCode, _ := c.Get("denial_code")
+	if resolved != "model-x" {
+		t.Errorf("resolved_model = %v, want model-x (must be set even on a 403 denial)", resolved)
+	}
+	if requested != "disabled-alias" {
+		t.Errorf("requested_model = %v, want disabled-alias (must be set even on a 403 denial)", requested)
+	}
+	if denialCode != "model_not_enabled" {
+		t.Errorf("denial_code = %v, want model_not_enabled", denialCode)
+	}
+}
+
+// TestHandleChatCompletions_AliasToResidencyBlockedTargetRefused403 asserts
+// that a residency denial reached through an alias still records the
+// resolved/requested model pair and the denial code — the same audit
+// requirement as the 404 and 403(not-enabled) alias-denial cases above.
+func TestHandleChatCompletions_AliasToResidencyBlockedTargetRefused403(t *testing.T) {
+	brk := &fakeNameOnlyProvider{name: "bedrock"}
+	h := newTestHandler(
+		fakeProviders{"bedrock": brk},
+		map[string]routing.Route{"us.anthropic.claude-3-5-sonnet": {ProviderKey: "bedrock", Kind: "bedrock", Class: routing.ClassCloudManaged}},
+		policy.Snapshot{
+			Enabled:   map[string]bool{"us.anthropic.claude-3-5-sonnet": true},
+			Aliases:   map[string]string{"prod-claude": "us.anthropic.claude-3-5-sonnet"},
+			Residency: policy.ResidencySelfHostedOnly,
+		},
+		true,
+	)
+
+	w, c := doChat(t, h, "prod-claude")
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d; body=%s", w.Code, w.Body.String())
+	}
+	e := decodeError(t, w.Body.Bytes())
+	if e.Error.Code != "model_residency_violation" {
+		t.Errorf("expected code model_residency_violation, got %q", e.Error.Code)
+	}
+	if brk.completeCalls != 0 {
+		t.Errorf("bedrock must not be called when residency policy blocks it, got %d calls", brk.completeCalls)
+	}
+
+	resolved, _ := c.Get("resolved_model")
+	requested, _ := c.Get("requested_model")
+	denialCode, _ := c.Get("denial_code")
+	if resolved != "us.anthropic.claude-3-5-sonnet" {
+		t.Errorf("resolved_model = %v, want us.anthropic.claude-3-5-sonnet (must be set even on a 403 denial)", resolved)
+	}
+	if requested != "prod-claude" {
+		t.Errorf("requested_model = %v, want prod-claude (must be set even on a 403 denial)", requested)
+	}
+	if denialCode != "model_residency_violation" {
+		t.Errorf("denial_code = %v, want model_residency_violation", denialCode)
 	}
 }
 
@@ -427,7 +499,7 @@ func TestHandleChatCompletions_PolicyNeverLoaded_503(t *testing.T) {
 		false, // never loaded
 	)
 
-	w, _ := doChat(t, h, "llama-3-8b")
+	w, c := doChat(t, h, "llama-3-8b")
 
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503, got %d; body=%s", w.Code, w.Body.String())
@@ -438,6 +510,9 @@ func TestHandleChatCompletions_PolicyNeverLoaded_503(t *testing.T) {
 	}
 	if prov.completeCalls != 0 {
 		t.Errorf("provider must not be called when policy has never loaded, got %d calls", prov.completeCalls)
+	}
+	if denialCode, _ := c.Get("denial_code"); denialCode != "policy_unavailable" {
+		t.Errorf("denial_code = %v, want policy_unavailable", denialCode)
 	}
 }
 

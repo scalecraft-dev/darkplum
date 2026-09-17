@@ -10,11 +10,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/scalecraft/darkplum/gateway/internal/middleware"
 	"github.com/scalecraft/darkplum/gateway/internal/policy"
 	"github.com/scalecraft/darkplum/gateway/internal/provider"
 	"github.com/scalecraft/darkplum/gateway/internal/provider/bedrock"
@@ -86,7 +88,13 @@ func NewChatHandler(providers providerLookup, routes routeSnapshotter, pol polic
 // Provider metadata (provider_name, provider_region), resolved_model,
 // requested_model, and token counts are written to the Gin context so the
 // Recording middleware can include them in the InferenceEvent without
-// re-parsing the body.
+// re-parsing the body. resolved_model/requested_model are set immediately
+// after alias resolution (step 3) rather than after dispatch, so a request
+// refused via an alias (404/403 below) is still attributed to the model the
+// alias pointed at instead of recording model=<alias>/requested_model=NULL.
+// Every refusal below also sets "denial_code" on the context and logs a
+// structured line — inference_events has no column for the denial reason
+// today, so this is the only audit trail until one is added.
 //
 // provider_name is set to the backend KIND ("vllm", "lmstudio", "bedrock"),
 // not the instance name, so that audit/billing aggregation is not fragmented
@@ -116,6 +124,8 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 
 	snap, loaded := h.policy.Current()
 	if !loaded {
+		c.Set("denial_code", "policy_unavailable")
+		logDenial(c, "policy_unavailable", req.Model, "", "")
 		respondPolicyUnavailable(c)
 		return
 	}
@@ -124,25 +134,40 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 	// same-named discovered model. No chains: the target is looked up as-is
 	// below, never re-resolved through Aliases again (model_aliases
 	// guarantees a target is never itself an alias).
+	//
+	// resolved_model/requested_model are written to the Gin context
+	// immediately — before any of the checks below can refuse the request —
+	// so that a denial reached through an alias (unknown target, disabled
+	// target, residency violation) is still recorded against the model the
+	// alias actually pointed at, not left with model=<alias> and
+	// requested_model NULL.
 	requestedModel := ""
 	resolvedModel := req.Model
 	if target, isAlias := snap.Aliases[req.Model]; isAlias {
 		requestedModel = req.Model
 		resolvedModel = target
 	}
+	c.Set("resolved_model", resolvedModel)
+	c.Set("requested_model", requestedModel)
 
 	route, ok := h.routes.Snapshot().Lookup(resolvedModel)
 	if !ok {
+		c.Set("denial_code", "model_not_found")
+		logDenial(c, "model_not_found", req.Model, resolvedModel, "")
 		respondModelNotFound(c, resolvedModel)
 		return
 	}
 
 	if !snap.Enabled[resolvedModel] {
+		c.Set("denial_code", "model_not_enabled")
+		logDenial(c, "model_not_enabled", req.Model, resolvedModel, route.Class)
 		respondModelNotEnabled(c, resolvedModel)
 		return
 	}
 
 	if snap.Residency == policy.ResidencySelfHostedOnly && route.Class == routing.ClassCloudManaged {
+		c.Set("denial_code", "model_residency_violation")
+		logDenial(c, "model_residency_violation", req.Model, resolvedModel, route.Class)
 		respondResidencyViolation(c, resolvedModel)
 		return
 	}
@@ -172,9 +197,6 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 	} else {
 		c.Set("provider_name", prov.Name())
 	}
-
-	c.Set("resolved_model", resolvedModel)
-	c.Set("requested_model", requestedModel)
 
 	providerRegion := ""
 	if bp, ok := prov.(*bedrock.BedrockProvider); ok {
@@ -357,6 +379,28 @@ func respondResidencyViolation(c *gin.Context, model string) {
 			Code:    "model_residency_violation",
 		},
 	})
+}
+
+// logDenial emits one structured log line for a refused chat completion so an
+// auditor can see WHY a request was denied without cross-referencing
+// inference_events, which today has no column to carry the denial reason
+// (model=<alias> with requested_model NULL would otherwise be the only trace
+// of an alias-routed 404/403). code is one of model_not_found,
+// model_not_enabled, model_residency_violation, policy_unavailable.
+// requestedModel is always the raw value the caller sent in the request body
+// (regardless of whether it was an alias); resolvedModel and class are empty
+// when not yet known (e.g. policy_unavailable, or model_not_found which by
+// definition has no route to read a class from).
+func logDenial(c *gin.Context, code, requestedModel, resolvedModel, class string) {
+	slog.Warn("chat completion denied",
+		"request_id", c.GetHeader("X-Request-Id"),
+		"key_id", c.GetString(middleware.ContextKeyID),
+		"user_id", c.GetString(middleware.ContextUserID),
+		"requested_model", requestedModel,
+		"resolved_model", resolvedModel,
+		"backend_class", class,
+		"code", code,
+	)
 }
 
 // respondPolicyUnavailable writes the 503 for the fail-closed case: no policy

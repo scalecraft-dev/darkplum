@@ -106,6 +106,7 @@
 
 .reason {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: center;
   gap: var(--space-2);
@@ -121,10 +122,50 @@
   color: var(--fg-subtle);
 }
 
+/* The way out of the state, inline in the sentence that describes it. */
+.reason a {
+  color: var(--brand-fg);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+.reason a:hover {
+  color: var(--fg-default);
+}
+
+.reason a:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
+.reasonAction {
+  padding: 2px var(--space-2);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--fg-default);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background var(--transition-fast), border-color var(--transition-fast);
+}
+
+.reasonAction:hover {
+  background: var(--bg-surface-hover);
+  border-color: var(--fg-subtle);
+}
+
+.reasonAction:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .composer,
   .sendBtn,
-  .stopBtn {
+  .stopBtn,
+  .reasonAction {
     transition-duration: 0.01ms !important;
   }
 }

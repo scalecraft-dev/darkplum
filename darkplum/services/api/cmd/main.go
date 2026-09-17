@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -132,23 +133,38 @@ func run() error {
 	}
 
 	// Auth configuration must load before BootstrapServiceKey — the service
-	// key is now derived from SESSION_SIGNING_KEY rather than randomly
-	// generated, so the secret must be in hand first.
+	// key is derived from a secret (SERVICE_KEY_SECRET if set, else
+	// SESSION_SIGNING_KEY) rather than randomly generated, so the secret must
+	// be in hand first.
 	authCfg, err := auth.LoadConfig()
 	if err != nil {
 		return fmt.Errorf("load auth config: %w", err)
 	}
 
-	serviceKey, err := db.BootstrapServiceKey(ctx, pool, authCfg.Secret)
+	serviceKeySecret, serviceKeySecretSource, err := db.SelectServiceKeySecret(
+		os.Getenv("SERVICE_KEY_SECRET"), authCfg.Secret,
+	)
+	if err != nil {
+		return fmt.Errorf("select service key secret: %w", err)
+	}
+	if serviceKeySecretSource == db.ServiceKeySecretSourceFallback {
+		slog.Info("service key secret: SERVICE_KEY_SECRET not set, falling back to SESSION_SIGNING_KEY " +
+			"(set SERVICE_KEY_SECRET to rotate the gateway credential independently of user sessions)")
+	} else {
+		slog.Info("service key secret: using SERVICE_KEY_SECRET")
+	}
+
+	serviceKey, err := db.BootstrapServiceKey(ctx, pool, serviceKeySecret)
 	if err != nil {
 		return fmt.Errorf("bootstrap service key: %w", err)
 	}
 
 	activityRecorder := activity.NewRecorder(pool)
 
-	// Model sync — run once at startup, then every 5 minutes. This is
+	// Model sync — run once at startup, then on a periodic ticker. This is
 	// constructed early so SyncModels can run before the HTTP server accepts
 	// traffic. The handler is also registered on the router below.
+	modelSyncInterval := modelSyncIntervalFromEnv()
 	modelHandler := handler.NewModelHandler(gatewayURL, serviceKey, pool)
 	go func() {
 		delay := 2 * time.Second
@@ -171,7 +187,7 @@ func run() error {
 			}
 		}
 
-		ticker := time.NewTicker(5 * time.Minute)
+		ticker := time.NewTicker(modelSyncInterval)
 		defer ticker.Stop()
 		for {
 			select {
@@ -361,6 +377,48 @@ func envOr(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// modelSyncMinInterval is the floor for MODEL_SYNC_INTERVAL_SECONDS: below
+// this, polling the gateway's /v1/models on every tick stops being a
+// meaningful cost/freshness trade-off and starts being a self-inflicted load
+// problem.
+const modelSyncMinInterval = 10 * time.Second
+
+// modelSyncDefaultInterval matches the gateway's default discovery interval
+// (DISCOVERY_INTERVAL_SECONDS=60) so the admin UI doesn't lag behind what the
+// gateway itself already knows.
+const modelSyncDefaultInterval = 60 * time.Second
+
+// modelSyncIntervalFromEnv reads MODEL_SYNC_INTERVAL_SECONDS from the
+// environment and applies parseModelSyncInterval.
+func modelSyncIntervalFromEnv() time.Duration {
+	return parseModelSyncInterval(os.Getenv("MODEL_SYNC_INTERVAL_SECONDS"))
+}
+
+// parseModelSyncInterval defaults to modelSyncDefaultInterval and enforces
+// modelSyncMinInterval as a floor. An empty or unparseable value falls back
+// to the default rather than failing startup — this is a polling cadence,
+// not a required secret. Pulled out as a pure function (raw string in,
+// time.Duration out) so the default/min/parse-failure paths are unit-
+// testable without touching the environment.
+func parseModelSyncInterval(raw string) time.Duration {
+	if raw == "" {
+		return modelSyncDefaultInterval
+	}
+	secs, err := strconv.Atoi(raw)
+	if err != nil {
+		slog.Warn("MODEL_SYNC_INTERVAL_SECONDS is not a valid integer, using default",
+			"value", raw, "default_seconds", int(modelSyncDefaultInterval.Seconds()))
+		return modelSyncDefaultInterval
+	}
+	interval := time.Duration(secs) * time.Second
+	if interval < modelSyncMinInterval {
+		slog.Warn("MODEL_SYNC_INTERVAL_SECONDS is below the minimum, clamping",
+			"requested_seconds", secs, "min_seconds", int(modelSyncMinInterval.Seconds()))
+		return modelSyncMinInterval
+	}
+	return interval
 }
 
 // requestID attaches a unique request ID to the context and response header.

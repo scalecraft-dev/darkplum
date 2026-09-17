@@ -9,7 +9,7 @@ import {
   updateRoutingPolicy,
 } from '../lib/api'
 import { formatModelName } from '../lib/formatModelName'
-import { backendClassLabel, backendClassOf } from '../lib/modelRouting'
+import { UNREACHABLE_HINT, backendClassLabel, backendClassOf, isReachable } from '../lib/modelRouting'
 import type { AdminModel, ModelAlias, Residency, RoutingPolicy } from '../types'
 import { useToast } from '../components/Toast'
 import { Badge, Table, TableEmpty } from '../components/ui'
@@ -49,6 +49,28 @@ function extractVendor(modelId: string): string {
 function vendorLabel(vendor: string): string {
   if (!vendor) return 'Other'
   return vendor.charAt(0).toUpperCase() + vendor.slice(1)
+}
+
+// ---------------------------------------------------------------------------
+// Badge glyphs — the state is never carried by colour alone.
+// ---------------------------------------------------------------------------
+
+function LockGlyph() {
+  return (
+    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className={styles.badgeIcon}>
+      <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
+      <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+    </svg>
+  )
+}
+
+function UnreachableGlyph() {
+  return (
+    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className={styles.badgeIcon}>
+      <circle cx="12" cy="12" r="10" />
+      <line x1="4.93" y1="4.93" x2="19.07" y2="19.07" />
+    </svg>
+  )
 }
 
 // ---------------------------------------------------------------------------
@@ -111,6 +133,7 @@ function ProviderSection({ provider, models, togglingIds, residency, onToggle }:
   const [collapsed, setCollapsed] = useState(false)
 
   const enabledCount = models.filter((m) => m.enabled).length
+  const unreachableCount = models.filter((m) => !isReachable(m)).length
 
   // For Bedrock, sub-group by vendor
   const isBedrock = provider === 'bedrock'
@@ -130,10 +153,19 @@ function ProviderSection({ provider, models, togglingIds, residency, onToggle }:
   const renderModelRow = (m: AdminModel) => {
     const displayName = m.display_name ?? formatModelName(m.model_id)
     const cls = backendClassOf(m)
-    // Enabled but unreachable: the routing policy refuses cloud-managed models.
-    const blocked = residency === 'self_hosted_only' && cls === 'cloud_managed'
+    // Enabled, but the routing policy refuses cloud-managed models.
+    const blocked = m.enabled && residency === 'self_hosted_only' && cls === 'cloud_managed'
+    // Configured, but the gateway has not seen its backend for a few minutes.
+    const unreachable = !isReachable(m)
+    // One hint per row. A policy refusal outranks an unreachable backend: it
+    // still refuses the request once the backend comes back.
+    const hint = blocked
+      ? 'Enabled, but refused while routing is self-hosted only.'
+      : unreachable
+        ? UNREACHABLE_HINT
+        : null
     return (
-      <tr key={m.id} className={blocked ? styles.rowBlocked : ''}>
+      <tr key={m.id} className={blocked || unreachable ? styles.rowFlagged : ''}>
         <td>
           <div className={styles.modelCell}>
             <span className={styles.modelName}>{displayName}</span>
@@ -151,22 +183,27 @@ function ProviderSection({ provider, models, togglingIds, residency, onToggle }:
           </Badge>
         </td>
         <td>
-          {blocked && m.enabled ? (
-            <div className={styles.blockedCell}>
-              <Badge variant="warning" bordered>
-                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className={styles.blockedIcon}>
-                  <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
-                  <path d="M7 11V7a5 5 0 0 1 10 0v4" />
-                </svg>
-                Blocked by policy
+          <div className={styles.statusCell}>
+            <div className={styles.statusBadges}>
+              {/* Configuration first: it is what the toggle beside it controls. */}
+              <Badge variant={m.enabled ? 'success' : 'neutral'}>
+                {m.enabled ? 'Enabled' : 'Disabled'}
               </Badge>
-              <span className={styles.blockedHint}>Enabled, but refused while routing is self-hosted only.</span>
+              {blocked && (
+                <Badge variant="warning" bordered>
+                  <LockGlyph />
+                  Blocked by policy
+                </Badge>
+              )}
+              {unreachable && (
+                <Badge variant="warning" bordered>
+                  <UnreachableGlyph />
+                  Not reachable
+                </Badge>
+              )}
             </div>
-          ) : (
-            <Badge variant={m.enabled ? 'success' : 'neutral'}>
-              {m.enabled ? 'Enabled' : 'Disabled'}
-            </Badge>
-          )}
+            {hint && <span className={styles.statusHint}>{hint}</span>}
+          </div>
         </td>
         <td className={styles.statusCol}>
           <ToggleSwitch
@@ -201,6 +238,12 @@ function ProviderSection({ provider, models, togglingIds, residency, onToggle }:
             <span className={styles.providerCount}>
               {enabledCount} of {models.length} enabled
             </span>
+            {/* Counted apart from "enabled": an unreachable model can be either. */}
+            {unreachableCount > 0 && (
+              <span className={styles.providerUnreachable}>
+                {unreachableCount} not reachable
+              </span>
+            )}
           </div>
           <svg
             className={`${styles.collapseChevron} ${!collapsed ? styles.collapseChevronOpen : ''}`}
@@ -455,6 +498,7 @@ export function ModelsPage() {
   }, [filtered])
 
   const totalEnabled = models.filter((m) => m.enabled).length
+  const totalUnreachable = models.filter((m) => !isReachable(m)).length
 
   return (
     <div className={pageStyles.page}>
@@ -530,6 +574,12 @@ export function ModelsPage() {
           <span className={styles.summaryText}>
             {totalEnabled} of {models.length} models enabled
           </span>
+          {totalUnreachable > 0 && (
+            <span className={styles.summaryFlag}>
+              <UnreachableGlyph />
+              {totalUnreachable} not reachable right now
+            </span>
+          )}
           {search && (
             <span className={styles.summaryText}>
               — {filtered.length} matching "{search}"

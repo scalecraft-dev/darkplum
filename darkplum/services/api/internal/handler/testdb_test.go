@@ -1,10 +1,12 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"log/slog"
 	"os"
 	"regexp"
 	"strings"
@@ -15,6 +17,22 @@ import (
 
 	"github.com/scalecraft/darkplum/api/internal/db"
 )
+
+// captureLogs swaps the global slog default logger for one that writes to a
+// buffer, restoring the previous default via t.Cleanup, so tests can assert
+// on a specific WARNING/ERROR being logged (e.g. SyncModels' alias-shadow
+// warning) without a dedicated logger being threaded through the handler.
+// Not safe to use from tests that run in parallel with each other (none in
+// this package do — see testdb_test.go's setupTestDB doc comment, which only
+// claims parallel-safety with respect to the database).
+func captureLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
+}
 
 var nonSchemaChar = regexp.MustCompile(`[^a-z0-9_]+`)
 

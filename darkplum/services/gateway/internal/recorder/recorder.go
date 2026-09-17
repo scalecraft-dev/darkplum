@@ -24,7 +24,11 @@ type InferenceEvent struct {
 	// RequestedModel is what the caller sent when it differs from Model
 	// (i.e. an alias was resolved). Empty when no alias was used, which
 	// nullableStr turns into a NULL requested_model column.
-	RequestedModel   string
+	RequestedModel string
+	// DenialCode is the policy reason a request was refused before reaching a
+	// provider (model_not_found, model_not_enabled, model_residency_violation,
+	// policy_unavailable). Empty for requests that were dispatched.
+	DenialCode       string
 	StatusCode       int
 	LatencyMS        int
 	PromptTokens     *int
@@ -113,7 +117,8 @@ func (r *Recorder) flush() {
 // column when it's believed to exist and falling back to the legacy column
 // set (without requested_model) otherwise.
 //
-// requested_model is added by the api's migration 010, but the gateway and
+// requested_model and denial_code are added by the api's migrations 010 and
+// 011 (the "routing columns"), but the gateway and
 // api are deployed independently — a gateway pod can start before the api has
 // run that migration against a freshly onboarded customer database. Without
 // this fallback, every INSERT in the batch would fail with an
@@ -161,8 +166,8 @@ func (r *Recorder) execBatch(events []InferenceEvent, includeRequestedModel bool
 				INSERT INTO inference_events
 					(request_id, api_key_id, user_id, model, requested_model, status_code, latency_ms,
 					 prompt_tokens, completion_tokens, stream, ip_address,
-					 provider, region)
-				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::inet, $12, $13)
+					 provider, region, denial_code)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::inet, $12, $13, $14)
 			`,
 				evt.RequestID,
 				nullableStr(evt.APIKeyID),
@@ -177,6 +182,7 @@ func (r *Recorder) execBatch(events []InferenceEvent, includeRequestedModel bool
 				nullableStr(evt.IP),
 				evt.Provider,
 				nullableStr(evt.Region),
+				nullableStr(evt.DenialCode),
 			)
 		} else {
 			b.Queue(`

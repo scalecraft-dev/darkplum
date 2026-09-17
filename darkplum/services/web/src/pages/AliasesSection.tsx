@@ -1,7 +1,14 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import type { AdminModel, ModelAlias, Residency } from '../types'
 import { ApiError } from '../lib/api'
-import { ALIAS_HINT, backendClassOf, validateAlias } from '../lib/modelRouting'
+import {
+  ALIAS_HINT,
+  UNREACHABLE_HINT,
+  backendClassOf,
+  isReachable,
+  isTargetReachable,
+  validateAlias,
+} from '../lib/modelRouting'
 import { useToast } from '../components/Toast'
 import { Badge, Button, Input, Modal, Table, TableEmpty } from '../components/ui'
 import { CopyButton } from '../components/ui/CopyButton'
@@ -24,13 +31,17 @@ type AliasHealth =
   | { kind: 'missing' }
   | { kind: 'disabled' }
   | { kind: 'blocked' }
+  | { kind: 'unreachable' }
 
+/** Most permanent problem first: a missing target outranks a disabled one,
+ *  a policy refusal outranks a backend that is merely away for a few minutes. */
 function healthOf(a: ModelAlias, residency: Residency): AliasHealth {
   if (!a.target_exists) return { kind: 'missing' }
   if (!a.target_enabled) return { kind: 'disabled' }
   if (residency === 'self_hosted_only' && a.target_backend_class === 'cloud_managed') {
     return { kind: 'blocked' }
   }
+  if (!isTargetReachable(a)) return { kind: 'unreachable' }
   return { kind: 'ok' }
 }
 
@@ -54,6 +65,11 @@ const HEALTH_COPY: Record<AliasHealth['kind'], { label: string; variant: 'succes
     label: 'Blocked by policy',
     variant: 'warning',
     hint: 'The routing policy allows self-hosted models only, and this target is cloud-managed.',
+  },
+  unreachable: {
+    label: 'Target unreachable',
+    variant: 'warning',
+    hint: 'The target model is not reachable right now. The alias stays pointed at it and works again when its backend is back.',
   },
 }
 
@@ -100,6 +116,15 @@ function DeleteAliasButton({ alias, onDelete }: { alias: string; onDelete: (alia
 // ---------------------------------------------------------------------------
 // Create / retarget dialog
 // ---------------------------------------------------------------------------
+
+/** A <option> cannot hold a badge, so the caveats ride in the text. */
+function targetOptionLabel(m: AdminModel): string {
+  const notes = [
+    m.enabled ? '' : 'disabled',
+    isReachable(m) ? '' : 'not reachable',
+  ].filter(Boolean)
+  return notes.length > 0 ? `${m.model_id} (${notes.join(', ')})` : m.model_id
+}
 
 interface DialogProps {
   open: boolean
@@ -214,18 +239,14 @@ function AliasDialog({ open, editing, models, residency, existing, onClose, onSa
             {grouped.selfHosted.length > 0 && (
               <optgroup label="Self-hosted">
                 {grouped.selfHosted.map((m) => (
-                  <option key={m.id} value={m.model_id}>
-                    {m.model_id}{m.enabled ? '' : ' (disabled)'}
-                  </option>
+                  <option key={m.id} value={m.model_id}>{targetOptionLabel(m)}</option>
                 ))}
               </optgroup>
             )}
             {grouped.cloud.length > 0 && (
               <optgroup label="Cloud-managed">
                 {grouped.cloud.map((m) => (
-                  <option key={m.id} value={m.model_id}>
-                    {m.model_id}{m.enabled ? '' : ' (disabled)'}
-                  </option>
+                  <option key={m.id} value={m.model_id}>{targetOptionLabel(m)}</option>
                 ))}
               </optgroup>
             )}
@@ -243,6 +264,9 @@ function AliasDialog({ open, editing, models, residency, existing, onClose, onSa
             The routing policy allows self-hosted models only, so this alias is refused until the
             policy changes.
           </p>
+        )}
+        {selected && selected.enabled && !isReachable(selected) && (
+          <p className={styles.formWarning}>{UNREACHABLE_HINT}</p>
         )}
 
         <div className={styles.formFooter}>

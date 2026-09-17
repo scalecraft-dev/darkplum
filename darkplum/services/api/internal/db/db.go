@@ -146,6 +146,36 @@ func EnsurePartitions(ctx context.Context, pool *pgxpool.Pool) error {
 	return nil
 }
 
+// Service-key secret source labels, for logging only — the caller must never
+// log the secret bytes or the derived key alongside these.
+const (
+	ServiceKeySecretSourceDedicated = "SERVICE_KEY_SECRET"
+	ServiceKeySecretSourceFallback  = "SESSION_SIGNING_KEY (fallback)"
+)
+
+// SelectServiceKeySecret decides which secret drives deriveServiceKey.
+//
+// Rotating the gateway's service credential should not force logging out
+// every user, and the blast radius of the session-signing secret (which
+// authenticates every human session) should not extend to a standing
+// gateway credential used by an entirely different trust boundary. Setting
+// SERVICE_KEY_SECRET decouples the two so each can be rotated independently.
+// When it's unset, we fall back to sessionSigningKey — today's behavior —
+// so existing deployments keep working without a newly-required variable.
+//
+// It is a pure function so the selection logic, including the length-
+// validation error path, is unit-testable without touching the environment
+// or a database.
+func SelectServiceKeySecret(serviceKeySecretEnv string, sessionSigningKey []byte) (secret []byte, source string, err error) {
+	if serviceKeySecretEnv == "" {
+		return sessionSigningKey, ServiceKeySecretSourceFallback, nil
+	}
+	if len(serviceKeySecretEnv) < 32 {
+		return nil, "", fmt.Errorf("SERVICE_KEY_SECRET must be at least 32 characters when set")
+	}
+	return []byte(serviceKeySecretEnv), ServiceKeySecretSourceDedicated, nil
+}
+
 const base62Chars = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 
 // serviceKeyHMACLabel is the fixed, non-secret context string that domain-

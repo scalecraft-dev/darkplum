@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router-dom'
 import { ChatError, streamChat } from '../lib/api'
 import {
   createConversation,
@@ -17,7 +17,7 @@ import { Button } from '../components/ui'
 import { Skeleton } from '../components/ui/Skeleton'
 import { ConversationList } from './ConversationList'
 import { MessageList, type ChatFailure } from './MessageList'
-import { ChatComposer } from './ChatComposer'
+import { ChatComposer, type ComposerNotice } from './ChatComposer'
 import { ModelSelector } from './ModelSelector'
 import styles from './ChatPage.module.css'
 
@@ -316,20 +316,48 @@ export function ChatPage() {
           onStop={handleStop}
           streaming={streaming}
           disabled={!modelsReady}
-          disabledReason={COMPOSER_REASONS[modelsState](isAdmin)}
+          /* The empty-state card has its own Try again; offer one here only
+             when that card is not on screen. */
+          notice={composerNotice(
+            modelsState,
+            isAdmin,
+            messages.length > 0 ? () => void refetchModels() : undefined,
+          )}
         />
       </div>
     </div>
   )
 }
 
-/** Why the composer is off, in the words that matter to the person reading. */
-const COMPOSER_REASONS: Record<ModelsState, (isAdmin: boolean) => string | undefined> = {
-  ready: () => undefined,
-  loading: () => 'Loading the list of available models…',
-  error: () => 'Chat is paused until the model gateway responds.',
-  empty: (isAdmin) =>
-    isAdmin
-      ? 'No models are enabled. Turn one on in Models to start chatting.'
-      : 'No models are available. Ask an administrator to enable one.',
+/** Why the composer is off, in the words that matter to the person reading.
+ *  With a conversation already open there is no empty-state card, so this line
+ *  is the only explanation on screen — it carries the way out with it. */
+function composerNotice(
+  state: ModelsState,
+  isAdmin: boolean,
+  onRetryModels?: () => void,
+): ComposerNotice | undefined {
+  switch (state) {
+    case 'ready':
+      return undefined
+    case 'loading':
+      return { text: 'Loading the list of available models…' }
+    case 'error':
+      return {
+        text: 'Chat is paused until the model gateway responds.',
+        action: onRetryModels ? { label: 'Try again', onClick: onRetryModels } : undefined,
+      }
+    case 'empty':
+      return isAdmin
+        ? {
+            text: 'No models are enabled. Turn one on in Models to start chatting.',
+            content: (
+              <>
+                No models are enabled. Turn one on in <Link to="/admin/models">Models</Link> to
+                start chatting.
+              </>
+            ),
+          }
+        : { text: 'No models are available. Ask an administrator to enable one.' }
+  }
 }

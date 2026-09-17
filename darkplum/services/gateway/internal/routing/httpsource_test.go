@@ -78,7 +78,7 @@ func TestHTTPModelSource_ThroughManagerKeepsLastGoodOnOutage(t *testing.T) {
 	defer srv.Close()
 
 	src := NewHTTPModelSource("vllm-default", "vllm", ClassSelfHosted, "vllm-default", srv.URL)
-	m := NewManager([]Source{src})
+	m := NewManager([]Source{src}, 0)
 	m.Refresh(context.Background())
 	if _, ok := m.Snapshot().Lookup("llama-3-8b"); !ok {
 		t.Fatal("expected llama-3-8b to be discovered while upstream is up")

@@ -43,12 +43,16 @@ func NewRoutingHandler(db *pgxpool.Pool, rec *activity.Recorder) *RoutingHandler
 }
 
 // aliasResponse is the wire shape for one row in the model-aliases endpoints.
+// TargetAvailable is false whenever TargetExists is false (a missing target
+// is never available) or the target row exists but hasn't been re-discovered
+// within modelAvailabilityWindow (see models_logic.go).
 type aliasResponse struct {
 	Alias              string    `json:"alias"`
 	TargetModelID      string    `json:"target_model_id"`
 	TargetExists       bool      `json:"target_exists"`
 	TargetEnabled      bool      `json:"target_enabled"`
 	TargetBackendClass *string   `json:"target_backend_class"`
+	TargetAvailable    bool      `json:"target_available"`
 	CreatedAt          time.Time `json:"created_at"`
 	UpdatedAt          time.Time `json:"updated_at"`
 }
@@ -62,6 +66,7 @@ func (h *RoutingHandler) ListAliases(c *gin.Context) {
 			(m.model_id IS NOT NULL) AS target_exists,
 			COALESCE(m.enabled, false) AS target_enabled,
 			m.backend_class,
+			m.discovered_at,
 			a.created_at,
 			a.updated_at
 		FROM model_aliases a
@@ -74,16 +79,19 @@ func (h *RoutingHandler) ListAliases(c *gin.Context) {
 	}
 	defer rows.Close()
 
+	now := time.Now()
 	aliases := make([]aliasResponse, 0)
 	for rows.Next() {
 		var a aliasResponse
+		var targetDiscoveredAt *time.Time
 		if err := rows.Scan(
 			&a.Alias, &a.TargetModelID, &a.TargetExists, &a.TargetEnabled,
-			&a.TargetBackendClass, &a.CreatedAt, &a.UpdatedAt,
+			&a.TargetBackendClass, &targetDiscoveredAt, &a.CreatedAt, &a.UpdatedAt,
 		); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "scan alias failed"})
 			return
 		}
+		a.TargetAvailable = targetDiscoveredAt != nil && modelIsAvailable(*targetDiscoveredAt, now)
 		aliases = append(aliases, a)
 	}
 	if err := rows.Err(); err != nil {
@@ -102,6 +110,16 @@ type putAliasRequest struct {
 // alias. Validation order: alias format -> missing target -> alias/model-id
 // conflict (409) -> target-is-itself-an-alias (400, no chains) -> target must
 // exist in models (404).
+//
+// The whole handler runs in one transaction that opens by taking
+// modelRoutingAdvisoryLockKey (see models_logic.go), the same lock
+// ModelHandler.SyncModels takes around its upsert transaction. Without this,
+// the model-id conflict check (below) and the alias upsert are separate
+// statements a concurrent SyncModels run can interleave with: SyncModels
+// could insert a model row for this exact id in the gap between the conflict
+// check and the upsert, leaving both a model row and an alias row for the
+// same id. The lock serialises the two transactions so one of them always
+// completes (and the other observes its result) before proceeding.
 func (h *RoutingHandler) PutAlias(c *gin.Context) {
 	alias := c.Param("alias")
 	if !validAliasFormat(alias) {
@@ -121,12 +139,24 @@ func (h *RoutingHandler) PutAlias(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
+	tx, err := h.db.Begin(ctx)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "begin transaction failed"})
+		return
+	}
+	defer tx.Rollback(ctx) // no-op once committed
+
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, modelRoutingAdvisoryLockKey); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "acquire routing lock failed"})
+		return
+	}
+
 	// 409: the alias name would shadow a real model id. The gateway resolves
 	// alias-vs-model collisions by letting the alias win (admin intent is
 	// authoritative), but allowing that ambiguity to be created here would
 	// just be confusing, so it's rejected outright.
 	var modelIDConflict bool
-	if err := h.db.QueryRow(ctx,
+	if err := tx.QueryRow(ctx,
 		`SELECT EXISTS(SELECT 1 FROM models WHERE model_id = $1)`, alias,
 	).Scan(&modelIDConflict); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "check alias conflict failed"})
@@ -139,7 +169,7 @@ func (h *RoutingHandler) PutAlias(c *gin.Context) {
 
 	// 400: no alias chains — the target must not itself be an alias.
 	var targetIsAlias bool
-	if err := h.db.QueryRow(ctx,
+	if err := tx.QueryRow(ctx,
 		`SELECT EXISTS(SELECT 1 FROM model_aliases WHERE alias = $1)`, req.TargetModelID,
 	).Scan(&targetIsAlias); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "check alias target failed"})
@@ -153,9 +183,10 @@ func (h *RoutingHandler) PutAlias(c *gin.Context) {
 	// 404: the target must be a currently known model.
 	var targetEnabled bool
 	var targetBackendClass string
-	err := h.db.QueryRow(ctx,
-		`SELECT enabled, backend_class FROM models WHERE model_id = $1`, req.TargetModelID,
-	).Scan(&targetEnabled, &targetBackendClass)
+	var targetDiscoveredAt time.Time
+	err = tx.QueryRow(ctx,
+		`SELECT enabled, backend_class, discovered_at FROM models WHERE model_id = $1`, req.TargetModelID,
+	).Scan(&targetEnabled, &targetBackendClass, &targetDiscoveredAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "target model not found"})
@@ -167,7 +198,7 @@ func (h *RoutingHandler) PutAlias(c *gin.Context) {
 
 	var row aliasResponse
 	var created bool
-	err = h.db.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		INSERT INTO model_aliases (alias, target_model_id, created_at, updated_at)
 		VALUES ($1, $2, now(), now())
 		ON CONFLICT (alias) DO UPDATE
@@ -181,6 +212,12 @@ func (h *RoutingHandler) PutAlias(c *gin.Context) {
 	row.TargetExists = true
 	row.TargetEnabled = targetEnabled
 	row.TargetBackendClass = &targetBackendClass
+	row.TargetAvailable = modelIsAvailable(targetDiscoveredAt, time.Now())
+
+	if err := tx.Commit(ctx); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "commit alias failed"})
+		return
+	}
 
 	evtType := activity.ModelAliasUpdated
 	if created {

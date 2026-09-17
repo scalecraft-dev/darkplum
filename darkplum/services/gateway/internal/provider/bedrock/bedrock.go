@@ -33,7 +33,7 @@ import (
 // connection pool.
 type BedrockProvider struct {
 	client        converseAPI
-	controlClient *bedrock.Client
+	controlClient controlAPI
 	region        string
 }
 
@@ -76,6 +76,11 @@ func (p *BedrockProvider) Region() string { return p.region }
 // routing so customers can use whatever Bedrock models their IAM policy
 // allows — Converse's model-agnostic wire format means this is no longer
 // restricted to Anthropic Claude.
+//
+// ListInferenceProfiles is paginated: a customer with many system-defined
+// profiles (e.g. one per model per supported region-pair) can exceed the
+// 1000-item MaxResults in a single page, so every page is followed via
+// NextToken until the API stops returning one.
 func (p *BedrockProvider) DiscoverModels(ctx context.Context) (map[string]bool, error) {
 	models := make(map[string]bool)
 
@@ -83,18 +88,27 @@ func (p *BedrockProvider) DiscoverModels(ctx context.Context) (map[string]bool, 
 	// Raw foundation model IDs (e.g. "anthropic.claude-...") cannot be used with
 	// on-demand throughput and must be invoked via a profile. We only return
 	// profile IDs so users see models they can actually call.
-	profileResp, err := p.controlClient.ListInferenceProfiles(ctx, &bedrock.ListInferenceProfilesInput{
-		MaxResults: aws.Int32(1000),
-		TypeEquals: bedrocktypes.InferenceProfileTypeSystemDefined,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("bedrock: list inference profiles: %w", err)
-	}
-
-	for _, profile := range profileResp.InferenceProfileSummaries {
-		if profile.InferenceProfileId != nil && profile.Status == bedrocktypes.InferenceProfileStatusActive {
-			models[*profile.InferenceProfileId] = true
+	var nextToken *string
+	for {
+		profileResp, err := p.controlClient.ListInferenceProfiles(ctx, &bedrock.ListInferenceProfilesInput{
+			MaxResults: aws.Int32(1000),
+			NextToken:  nextToken,
+			TypeEquals: bedrocktypes.InferenceProfileTypeSystemDefined,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("bedrock: list inference profiles: %w", err)
 		}
+
+		for _, profile := range profileResp.InferenceProfileSummaries {
+			if profile.InferenceProfileId != nil && profile.Status == bedrocktypes.InferenceProfileStatusActive {
+				models[*profile.InferenceProfileId] = true
+			}
+		}
+
+		if profileResp.NextToken == nil || *profileResp.NextToken == "" {
+			break
+		}
+		nextToken = profileResp.NextToken
 	}
 
 	return models, nil

@@ -32,9 +32,22 @@ type Config struct {
 	// DiscoveryIntervalSeconds controls how often routing.Manager re-runs
 	// discovery across all sources. DISCOVERY_INTERVAL_SECONDS, default 60.
 	DiscoveryIntervalSeconds int
+	// RouteLastGoodTTLSeconds caps how long a source's last-good model list
+	// stays routable after its discovery starts failing. Once exceeded, the
+	// source's models leave the route table (so requests get a clean 404
+	// model_not_found instead of silently dialling a backend that has been
+	// down for many discovery cycles). ROUTE_LAST_GOOD_TTL_SECONDS, default
+	// 180; must be >= DiscoveryIntervalSeconds.
+	RouteLastGoodTTLSeconds int
 	// PolicyRefreshSeconds controls how often policy.PgStore reloads its
 	// snapshot from Postgres. POLICY_REFRESH_SECONDS, default 5.
 	PolicyRefreshSeconds int
+	// PolicyMaxStalenessSeconds caps how old the last successful policy load
+	// may be before the store fails closed (503 policy_unavailable) even
+	// though a last-good snapshot is still cached in memory.
+	// POLICY_MAX_STALENESS_SECONDS, default 900. 0/disabled is not allowed —
+	// minimum 30.
+	PolicyMaxStalenessSeconds int
 
 	// DevMode relaxes startup validation that blocks loopback/link-local upstream
 	// URLs. Set DEV_MODE=true when running locally against LM Studio or a local
@@ -128,19 +141,51 @@ func Load() (*Config, error) {
 		policyRefresh = n
 	}
 
+	// 0/disabled is deliberately not allowed: an unbounded staleness cap
+	// means a policy snapshot loaded once, years ago, keeps being enforced
+	// forever even through an extended Postgres outage. Minimum 30s keeps the
+	// cap meaningfully larger than POLICY_REFRESH_SECONDS' default (5s) while
+	// still bounding worst-case staleness to something an operator would
+	// actually choose.
+	policyMaxStaleness := 900
+	if v := os.Getenv("POLICY_MAX_STALENESS_SECONDS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 30 {
+			return nil, fmt.Errorf("POLICY_MAX_STALENESS_SECONDS must be an integer >= 30 (0/disabled is not allowed), got %q", v)
+		}
+		policyMaxStaleness = n
+	}
+
+	// Minimum is the discovery interval: a TTL shorter than the interval that
+	// refreshes it would expire a healthy, merely-not-yet-re-polled source on
+	// every single tick.
+	routeLastGoodTTL := 180
+	if v := os.Getenv("ROUTE_LAST_GOOD_TTL_SECONDS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return nil, fmt.Errorf("ROUTE_LAST_GOOD_TTL_SECONDS must be a positive integer, got %q", v)
+		}
+		routeLastGoodTTL = n
+	}
+	if routeLastGoodTTL < discoveryInterval {
+		return nil, fmt.Errorf("ROUTE_LAST_GOOD_TTL_SECONDS (%d) must be >= DISCOVERY_INTERVAL_SECONDS (%d)", routeLastGoodTTL, discoveryInterval)
+	}
+
 	return &Config{
-		Port:                     port,
-		VLLMUpstream:             upstream,
-		VLLMUpstreams:            vllmUpstreams,
-		DatabaseURL:              dbURL,
-		BedrockEnabled:           bedrockEnabled,
-		BedrockRegion:            bedrockRegion,
-		BedrockModelFilter:       bedrockModelFilter,
-		LMStudioEnabled:          lmStudioEnabled,
-		LMStudioUpstream:         lmStudioUpstream,
-		DiscoveryIntervalSeconds: discoveryInterval,
-		PolicyRefreshSeconds:     policyRefresh,
-		DevMode:                  devMode,
+		Port:                      port,
+		VLLMUpstream:              upstream,
+		VLLMUpstreams:             vllmUpstreams,
+		DatabaseURL:               dbURL,
+		BedrockEnabled:            bedrockEnabled,
+		BedrockRegion:             bedrockRegion,
+		BedrockModelFilter:        bedrockModelFilter,
+		LMStudioEnabled:           lmStudioEnabled,
+		LMStudioUpstream:          lmStudioUpstream,
+		DiscoveryIntervalSeconds:  discoveryInterval,
+		PolicyRefreshSeconds:      policyRefresh,
+		PolicyMaxStalenessSeconds: policyMaxStaleness,
+		RouteLastGoodTTLSeconds:   routeLastGoodTTL,
+		DevMode:                   devMode,
 	}, nil
 }
 

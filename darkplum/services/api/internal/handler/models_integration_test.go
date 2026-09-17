@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -151,5 +153,271 @@ func TestSyncModels_PreservesEnabledAndDisplayNameUpdatesBackendClass(t *testing
 	}
 	if newBackendClass != backendClassSelfHosted {
 		t.Errorf("new-model backend_class = %q, want self_hosted (default when gateway omits the field)", newBackendClass)
+	}
+}
+
+// emptySyncServer returns a gateway stub whose /v1/models reports zero
+// models, simulating a gateway that is up but hasn't (re-)discovered
+// anything this tick — e.g. because a vLLM backend is still cold-starting.
+func emptySyncServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(gatewayModelsResponse{Object: "list", Data: nil})
+	}))
+}
+
+// TestSyncModels_NotRediscoveredSurvivesAndBecomesUnavailable is the
+// regression test for the cold-start bug: a model that isn't re-discovered
+// within the old 1-minute window must NOT be deleted (which used to drop the
+// admin's enabled flag and dangle any alias pointing at it), but it must
+// still stop showing up in the chat-facing list once it's stale, via
+// available=false rather than deletion.
+func TestSyncModels_NotRediscoveredSurvivesAndBecomesUnavailable(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+
+	insertModel(t, ctx, pool, "llama3", backendClassSelfHosted, true)
+
+	gw := emptySyncServer(t)
+	defer gw.Close()
+	h := NewModelHandler(gw.URL, "unused", pool)
+
+	// A sync that rediscovers nothing must not touch the row at all.
+	h.SyncModels(ctx)
+
+	var enabled bool
+	var discoveredAt time.Time
+	if err := pool.QueryRow(ctx,
+		`SELECT enabled, discovered_at FROM models WHERE model_id = 'llama3'`,
+	).Scan(&enabled, &discoveredAt); err != nil {
+		t.Fatalf("expected llama3 row to survive an empty sync, got: %v", err)
+	}
+	if !enabled {
+		t.Fatalf("expected enabled to remain true after an empty sync, got false")
+	}
+
+	// Push discovered_at back past the 3-minute availability cutoff (but well
+	// under the 7-day purge window) to simulate time passing without a
+	// rediscovery, without waiting in the test.
+	if _, err := pool.Exec(ctx,
+		`UPDATE models SET discovered_at = now() - interval '10 minutes' WHERE model_id = 'llama3'`,
+	); err != nil {
+		t.Fatalf("backdate discovered_at: %v", err)
+	}
+
+	// The row must still exist and still be enabled...
+	if err := pool.QueryRow(ctx,
+		`SELECT enabled FROM models WHERE model_id = 'llama3'`,
+	).Scan(&enabled); err != nil {
+		t.Fatalf("expected llama3 row to still exist after backdating, got: %v", err)
+	}
+	if !enabled {
+		t.Fatalf("expected enabled to still be true after backdating discovered_at")
+	}
+
+	// ...but must be hidden from the chat-facing list (available = false).
+	r := newModelsTestRouter(h)
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	r.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+	var listResp openAIModelsResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &listResp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	for _, e := range listResp.Data {
+		if e.ID == "llama3" {
+			t.Fatalf("expected stale-but-enabled llama3 to be hidden from /v1/models, got it in the list")
+		}
+	}
+
+	// Admin view must still show it, with available = false and enabled true.
+	adminRouter := gin.New()
+	gin.SetMode(gin.TestMode)
+	adminRouter.GET("/api/v1/models", h.ListAdminModels)
+	resp = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/api/v1/models", nil)
+	adminRouter.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("admin list status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+	var admin []modelRow
+	if err := json.Unmarshal(resp.Body.Bytes(), &admin); err != nil {
+		t.Fatalf("decode admin list: %v", err)
+	}
+	found := false
+	for _, m := range admin {
+		if m.ModelID == "llama3" {
+			found = true
+			if !m.Enabled {
+				t.Fatalf("expected admin row to still show enabled=true, got %+v", m)
+			}
+			if m.Available {
+				t.Fatalf("expected admin row to show available=false after the cutoff, got %+v", m)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected llama3 row to still be present in the admin list")
+	}
+
+	// Re-discovery (backend finished cold-starting) must flip available back
+	// to true without touching enabled.
+	gw2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(gatewayModelsResponse{
+			Object: "list",
+			Data:   []openAIModelEntry{{ID: "llama3", Object: "model", Created: 1, OwnedBy: "vllm", BackendClass: backendClassSelfHosted}},
+		})
+	}))
+	defer gw2.Close()
+	h2 := NewModelHandler(gw2.URL, "unused", pool)
+	h2.SyncModels(ctx)
+
+	resp = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	r.ServeHTTP(resp, req)
+	if err := json.Unmarshal(resp.Body.Bytes(), &listResp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	reappeared := false
+	for _, e := range listResp.Data {
+		if e.ID == "llama3" {
+			reappeared = true
+		}
+	}
+	if !reappeared {
+		t.Fatalf("expected llama3 to reappear in /v1/models after re-discovery")
+	}
+	if err := pool.QueryRow(ctx, `SELECT enabled FROM models WHERE model_id = 'llama3'`).Scan(&enabled); err != nil {
+		t.Fatalf("fetch llama3 after re-discovery: %v", err)
+	}
+	if !enabled {
+		t.Fatalf("expected enabled to still be true after re-discovery")
+	}
+}
+
+// TestSyncModels_PurgesOnlyAfterSevenDays verifies the purge window: a row
+// unseen for just over the old 1-minute cutoff must survive, and only a row
+// unseen for more than 7 days is actually deleted.
+func TestSyncModels_PurgesOnlyAfterSevenDays(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+
+	insertModel(t, ctx, pool, "recently-stale", backendClassSelfHosted, true)
+	insertModel(t, ctx, pool, "long-gone", backendClassSelfHosted, true)
+
+	if _, err := pool.Exec(ctx,
+		`UPDATE models SET discovered_at = now() - interval '10 minutes' WHERE model_id = 'recently-stale'`,
+	); err != nil {
+		t.Fatalf("backdate recently-stale: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`UPDATE models SET discovered_at = now() - interval '8 days' WHERE model_id = 'long-gone'`,
+	); err != nil {
+		t.Fatalf("backdate long-gone: %v", err)
+	}
+
+	gw := emptySyncServer(t)
+	defer gw.Close()
+	h := NewModelHandler(gw.URL, "unused", pool)
+	h.SyncModels(ctx)
+
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM models WHERE model_id = 'recently-stale'`).Scan(&count); err != nil {
+		t.Fatalf("count recently-stale: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected recently-stale (10 min unseen) to survive, got count=%d", count)
+	}
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM models WHERE model_id = 'long-gone'`).Scan(&count); err != nil {
+		t.Fatalf("count long-gone: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("expected long-gone (8 days unseen) to be purged, got count=%d", count)
+	}
+}
+
+// TestSyncModels_WarnsWhenDiscoveredModelShadowsAlias covers item 4: a
+// discovered model id that equals an existing alias name is not a sync
+// failure (the gateway lets the alias win by design), but it must be logged
+// as a WARNING naming the shadowed alias so the admin notices.
+func TestSyncModels_WarnsWhenDiscoveredModelShadowsAlias(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+
+	insertModel(t, ctx, pool, "llama3", backendClassSelfHosted, true)
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO model_aliases (alias, target_model_id) VALUES ('smart', 'llama3')`,
+	); err != nil {
+		t.Fatalf("insert alias: %v", err)
+	}
+
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(gatewayModelsResponse{
+			Object: "list",
+			// "smart" collides with the existing alias name.
+			Data: []openAIModelEntry{{ID: "smart", Object: "model", Created: 1, OwnedBy: "vllm", BackendClass: backendClassSelfHosted}},
+		})
+	}))
+	defer gw.Close()
+
+	logs := captureLogs(t)
+	h := NewModelHandler(gw.URL, "unused", pool)
+	h.SyncModels(ctx)
+
+	// The sync must not fail: the shadowing model row is still inserted.
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM models WHERE model_id = 'smart'`).Scan(&count); err != nil {
+		t.Fatalf("count smart model: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("expected the shadowing model row to be inserted despite the alias collision, got count=%d", count)
+	}
+
+	logOutput := logs.String()
+	if !strings.Contains(logOutput, "level=WARN") {
+		t.Fatalf("expected a WARNING to be logged, got logs: %s", logOutput)
+	}
+	if !strings.Contains(logOutput, "smart") {
+		t.Fatalf("expected the warning to name the shadowed alias %q, got logs: %s", "smart", logOutput)
+	}
+}
+
+// One row the database rejects must not abort the whole sync transaction: the
+// other discovered models still land. A NUL byte is valid JSON but Postgres
+// refuses it in a TEXT column, which makes that one upsert fail.
+func TestSyncModels_OneBadRowDoesNotAbortTheSync(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(gatewayModelsResponse{
+			Object: "list",
+			Data: []openAIModelEntry{
+				{ID: "good-before", Object: "model", Created: 1, OwnedBy: "vllm", BackendClass: backendClassSelfHosted},
+				{ID: "bad\x00model", Object: "model", Created: 1, OwnedBy: "vllm", BackendClass: backendClassSelfHosted},
+				{ID: "good-after", Object: "model", Created: 1, OwnedBy: "vllm", BackendClass: backendClassSelfHosted},
+			},
+		})
+	}))
+	defer gw.Close()
+
+	h := NewModelHandler(gw.URL, "unused", pool)
+	h.SyncModels(ctx)
+
+	var count int
+	if err := pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM models WHERE model_id IN ('good-before', 'good-after')`,
+	).Scan(&count); err != nil {
+		t.Fatalf("count models: %v", err)
+	}
+	if count != 2 {
+		t.Fatalf("expected both valid models to be synced despite the rejected row, got %d", count)
 	}
 }

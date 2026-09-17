@@ -275,6 +275,56 @@ func TestDeleteAlias(t *testing.T) {
 	}
 }
 
+// TestPutAlias_TargetAvailableReflectsDiscoveredAt covers the new
+// target_available field: it must be true for a freshly-discovered enabled
+// target, and false once that target's discovered_at falls outside
+// modelAvailabilityWindow, even though target_exists and target_enabled stay
+// true (the row survives a cold start; only availability changes).
+func TestPutAlias_TargetAvailableReflectsDiscoveredAt(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	userID := newTestUser(t, ctx, pool)
+	insertModel(t, ctx, pool, "llama3", backendClassSelfHosted, true)
+	h := NewRoutingHandler(pool, activity.NewRecorder(pool))
+	r := newRoutingTestRouter(h, userID)
+
+	resp := doJSON(t, r, http.MethodPut, "/api/v1/model-aliases/default", map[string]string{"target_model_id": "llama3"})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("create alias: status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+	var row aliasResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &row); err != nil {
+		t.Fatalf("decode alias response: %v", err)
+	}
+	if !row.TargetAvailable {
+		t.Fatalf("expected target_available = true for a freshly discovered target, got %+v", row)
+	}
+
+	if _, err := pool.Exec(ctx,
+		`UPDATE models SET discovered_at = now() - interval '10 minutes' WHERE model_id = 'llama3'`,
+	); err != nil {
+		t.Fatalf("backdate discovered_at: %v", err)
+	}
+
+	resp = doJSON(t, r, http.MethodGet, "/api/v1/model-aliases", nil)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("list aliases: status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+	var aliases []aliasResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &aliases); err != nil {
+		t.Fatalf("decode aliases: %v", err)
+	}
+	if len(aliases) != 1 {
+		t.Fatalf("expected 1 alias, got %d: %+v", len(aliases), aliases)
+	}
+	if !aliases[0].TargetExists || !aliases[0].TargetEnabled {
+		t.Fatalf("expected target_exists and target_enabled to remain true after the cutoff, got %+v", aliases[0])
+	}
+	if aliases[0].TargetAvailable {
+		t.Fatalf("expected target_available = false once discovered_at is stale, got %+v", aliases[0])
+	}
+}
+
 func TestListAliases_ReflectsTargetState(t *testing.T) {
 	pool := setupTestDB(t)
 	ctx := context.Background()
@@ -312,6 +362,9 @@ func TestListAliases_ReflectsTargetState(t *testing.T) {
 	}
 	if aliases[0].TargetBackendClass != nil {
 		t.Fatalf("expected target_backend_class = nil when target is gone, got %v", aliases[0].TargetBackendClass)
+	}
+	if aliases[0].TargetAvailable {
+		t.Fatalf("expected target_available = false when target is gone, got %+v", aliases[0])
 	}
 }
 

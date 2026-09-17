@@ -105,6 +105,15 @@
   color: var(--fg-muted);
 }
 
+/* Reachability is a separate fact from the enabled count, so it is counted
+   separately rather than folded into it. */
+.summaryFlag {
+  display: inline-flex;
+  align-items: center;
+  font-size: var(--fs-sm);
+  color: var(--warning-fg);
+}
+
 /* --- Provider section --- */
 
 .providerSection {
@@ -156,6 +165,17 @@
   color: var(--fg-subtle);
   background: var(--bg-surface-raised);
   padding: 1px 7px;
+  border-radius: var(--radius-full);
+  font-variant-numeric: tabular-nums;
+}
+
+.providerUnreachable {
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--warning-fg);
+  background: var(--warning-bg);
+  border: 1px solid var(--warning-border);
+  padding: 0 6px;
   border-radius: var(--radius-full);
   font-variant-numeric: tabular-nums;
 }
@@ -219,26 +239,34 @@
   gap: var(--space-1);
 }
 
-/* --- Blocked by the routing policy ---
-   Stripe + lock icon + wording, so the state survives greyscale printing and
+/* --- Flagged row: blocked by policy, or backend not reachable ---
+   Stripe + glyph + wording, so the state survives greyscale printing and
    colour-blind viewing; the badge colour is never the only signal. */
 
-.rowBlocked td:first-child {
+.rowFlagged td:first-child {
   box-shadow: inset 2px 0 0 var(--warning-fg);
 }
 
-.blockedCell {
+.statusCell {
   display: flex;
   flex-direction: column;
   align-items: flex-start;
   gap: var(--space-1);
 }
 
-.blockedIcon {
+/* Enabled/Disabled always shows; policy and reachability stack beside it. */
+.statusBadges {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.badgeIcon {
   margin-right: 4px;
 }
 
-.blockedHint {
+.statusHint {
   max-width: 34ch;
   font-size: var(--fs-xs);
   line-height: var(--lh-normal);

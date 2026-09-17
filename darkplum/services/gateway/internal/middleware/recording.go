@@ -41,11 +41,17 @@ type chatBodyFields struct {
 // Recording returns a Gin middleware that captures inference metrics and sends
 // them to rec after the downstream handler (the proxy) returns.
 //
-// X-Darkplum-User-Id is trusted unconditionally here because the NetworkPolicy
-// ensures only the web service can reach the gateway on its cluster-internal
-// address. The APIKey middleware has already resolved the key-level user_id;
-// X-Darkplum-User-Id overrides it when present so the web service's session
-// user ID is attributed rather than the system service-key user ID.
+// X-Darkplum-User-Id is honoured ONLY when the authenticated caller used a
+// service key (KeyTypeService) — the api service proxying a session
+// user's request, which cannot authenticate any other way since it holds
+// one shared service credential for all its users. A caller authenticated
+// with a *user* API key always has its own key-level user_id attributed,
+// regardless of what the header says: trusting the header unconditionally
+// would let any holder of a user API key attribute their own traffic to a
+// different user simply by setting the header on their request, which a
+// NetworkPolicy restricting the header's *origin* does nothing to prevent
+// once the caller is inside the cluster boundary the policy protects.
+// See resolveAttributedUserID.
 func Recording(rec *recorder.Recorder) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if c.Request.Method != http.MethodPost {
@@ -79,12 +85,13 @@ func Recording(rec *recorder.Recorder) gin.HandlerFunc {
 			statusCode = c.Writer.Status()
 		}
 
-		// Resolve user ID: prefer X-Darkplum-User-Id (set by web service for
-		// session-authenticated requests), fall back to context user_id from key lookup.
-		userID := c.GetHeader("X-Darkplum-User-Id")
-		if userID == "" {
-			userID = c.GetString(ContextUserID)
-		}
+		// Resolve user ID via the pure decision in resolveAttributedUserID:
+		// X-Darkplum-User-Id is only trusted for service-key callers.
+		userID := resolveAttributedUserID(
+			c.GetString(ContextKeyType),
+			c.GetString(ContextUserID),
+			c.GetHeader("X-Darkplum-User-Id"),
+		)
 
 		requestID := c.GetHeader("X-Request-Id")
 		keyID := c.GetString(ContextKeyID)
@@ -123,6 +130,7 @@ func Recording(rec *recorder.Recorder) gin.HandlerFunc {
 			UserID:           userID,
 			Model:            model,
 			RequestedModel:   requestedModel,
+			DenialCode:       c.GetString("denial_code"),
 			StatusCode:       statusCode,
 			LatencyMS:        latencyMS,
 			Stream:           fields.Stream,
@@ -133,4 +141,17 @@ func Recording(rec *recorder.Recorder) gin.HandlerFunc {
 			CompletionTokens: completionTokens,
 		})
 	}
+}
+
+// resolveAttributedUserID decides which user_id an inference event is
+// attributed to. Pulled out as a pure function (no gin.Context, no DB) so the
+// audit-spoofing rule can be unit-tested directly: headerUserID
+// (X-Darkplum-User-Id) is honoured only when keyType is KeyTypeService; a
+// user-key caller (keyType == KeyTypeUser, or any other/unknown value) always
+// gets its own key-level keyUserID attributed, even if headerUserID is set.
+func resolveAttributedUserID(keyType, keyUserID, headerUserID string) string {
+	if keyType == KeyTypeService && headerUserID != "" {
+		return headerUserID
+	}
+	return keyUserID
 }

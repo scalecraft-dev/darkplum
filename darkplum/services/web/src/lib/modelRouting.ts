@@ -25,6 +25,20 @@ export function backendClassOf(m: { backend_class?: BackendClass | null }): Back
   return m.backend_class === 'cloud_managed' ? 'cloud_managed' : 'self_hosted'
 }
 
+/** Older APIs omit `available`; only an explicit false means unreachable. */
+export function isReachable(m: { available?: boolean | null }): boolean {
+  return m.available !== false
+}
+
+/** Same rule for the target of an alias. */
+export function isTargetReachable(a: { target_available?: boolean | null }): boolean {
+  return a.target_available !== false
+}
+
+/** One sentence, used wherever an unreachable model needs explaining. */
+export const UNREACHABLE_HINT =
+  'Not reachable right now — it stays configured and returns when its backend is back.'
+
 /** Admin vocabulary — matches the wording on the routing policy control. */
 export function backendClassLabel(c: BackendClass): string {
   return c === 'cloud_managed' ? 'Cloud-managed' : 'Self-hosted'

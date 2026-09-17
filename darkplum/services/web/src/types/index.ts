@@ -47,6 +47,9 @@ export interface AdminModel {
   updated_at: string
   /** Absent on older APIs — treat a missing value as 'self_hosted'. */
   backend_class?: BackendClass
+  /** False when the gateway has not seen this model for 3+ minutes. The row
+   *  stays configured either way. Absent on older APIs — treat as reachable. */
+  available?: boolean
 }
 
 export interface ModelAlias {
@@ -55,6 +58,9 @@ export interface ModelAlias {
   target_exists: boolean
   target_enabled: boolean
   target_backend_class: BackendClass | null
+  /** False when the target model is configured but currently unreachable.
+   *  Absent on older APIs — treat as reachable. */
+  target_available?: boolean
   created_at: string
   updated_at: string
 }

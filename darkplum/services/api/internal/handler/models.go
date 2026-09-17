@@ -37,6 +37,9 @@ func NewModelHandler(gatewayURL, serviceKey string, pool *pgxpool.Pool) *ModelHa
 }
 
 // modelRow is the full DB representation returned by admin endpoints.
+// Available is not a column — it's derived from DiscoveredAt at response
+// time via modelIsAvailable (see models_logic.go), so admin UI and toggle
+// responses always reflect the current cutoff rather than a stale snapshot.
 type modelRow struct {
 	ID           string    `json:"id"`
 	ModelID      string    `json:"model_id"`
@@ -44,6 +47,7 @@ type modelRow struct {
 	DisplayName  *string   `json:"display_name,omitempty"`
 	Enabled      bool      `json:"enabled"`
 	BackendClass string    `json:"backend_class"`
+	Available    bool      `json:"available"`
 	DiscoveredAt time.Time `json:"discovered_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
 }
@@ -83,7 +87,7 @@ func (h *ModelHandler) ListModels(c *gin.Context) {
 	}
 
 	modelRows, err := h.pool.Query(ctx, `
-		SELECT model_id, provider, backend_class
+		SELECT model_id, provider, backend_class, discovered_at
 		FROM models
 		WHERE enabled = true
 		ORDER BY provider, model_id
@@ -98,7 +102,7 @@ func (h *ModelHandler) ListModels(c *gin.Context) {
 	var models []modelDBRow
 	for modelRows.Next() {
 		var m modelDBRow
-		if err := modelRows.Scan(&m.ModelID, &m.Provider, &m.BackendClass); err != nil {
+		if err := modelRows.Scan(&m.ModelID, &m.Provider, &m.BackendClass, &m.DiscoveredAt); err != nil {
 			slog.ErrorContext(ctx, "scan model row failed", "err", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "scan models failed"})
 			return
@@ -112,7 +116,7 @@ func (h *ModelHandler) ListModels(c *gin.Context) {
 	}
 
 	aliasRows, err := h.pool.Query(ctx, `
-		SELECT a.alias, a.target_model_id, m.provider, m.backend_class
+		SELECT a.alias, a.target_model_id, m.provider, m.backend_class, m.discovered_at
 		FROM model_aliases a
 		JOIN models m ON m.model_id = a.target_model_id
 		WHERE m.enabled = true
@@ -128,7 +132,7 @@ func (h *ModelHandler) ListModels(c *gin.Context) {
 	var aliases []aliasDBRow
 	for aliasRows.Next() {
 		var a aliasDBRow
-		if err := aliasRows.Scan(&a.Alias, &a.TargetModelID, &a.OwnedBy, &a.BackendClass); err != nil {
+		if err := aliasRows.Scan(&a.Alias, &a.TargetModelID, &a.OwnedBy, &a.BackendClass, &a.TargetDiscoveredAt); err != nil {
 			slog.ErrorContext(ctx, "scan model alias row failed", "err", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "scan models failed"})
 			return
@@ -141,7 +145,7 @@ func (h *ModelHandler) ListModels(c *gin.Context) {
 		return
 	}
 
-	data := buildModelsList(models, aliases, residency, time.Now().Unix())
+	data := buildModelsList(models, aliases, residency, time.Now())
 	c.JSON(http.StatusOK, openAIModelsResponse{Object: "list", Data: data})
 }
 
@@ -167,6 +171,7 @@ func (h *ModelHandler) ListAdminModels(c *gin.Context) {
 	}
 	defer rows.Close()
 
+	now := time.Now()
 	models := make([]modelRow, 0)
 	for rows.Next() {
 		var m modelRow
@@ -175,6 +180,7 @@ func (h *ModelHandler) ListAdminModels(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "scan models failed"})
 			return
 		}
+		m.Available = modelIsAvailable(m.DiscoveredAt, now)
 		models = append(models, m)
 	}
 	if err := rows.Err(); err != nil {
@@ -231,6 +237,7 @@ func (h *ModelHandler) ToggleModel(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "fetch updated model failed"})
 		return
 	}
+	m.Available = modelIsAvailable(m.DiscoveredAt, time.Now())
 
 	c.JSON(http.StatusOK, m)
 }
@@ -240,6 +247,18 @@ type gatewayModelsResponse struct {
 	Object string             `json:"object"`
 	Data   []openAIModelEntry `json:"data"`
 }
+
+// modelPurgeAfter documents the purge cutoff used in the DELETE below (kept
+// as a literal `interval '7 days'` in the SQL itself, since pgx has no clean
+// way to bind a Go time.Duration as a Postgres interval — keep the two in
+// sync by hand if this changes). It is intentionally much longer than
+// modelAvailabilityWindow: "available" flips off quickly (see
+// models_logic.go) to hide a model that isn't currently routable, but the row
+// itself — and with it the admin's enabled flag and any aliases pointing at
+// it — must survive a slow backend restart (a vLLM cold start can take 15-25
+// minutes) or a longer maintenance window without the admin having to
+// re-toggle it or recreate aliases once it comes back.
+const modelPurgeAfter = 7 * 24 * time.Hour
 
 // SyncModels fetches the model list from the gateway and upserts each model
 // into the models table. Re-discovered models do not have their enabled flag
@@ -277,7 +296,26 @@ func (h *ModelHandler) SyncModels(ctx context.Context) {
 		return
 	}
 
+	// The whole sync runs in one transaction, serialised against PutAlias
+	// (routing.go) via the same fixed advisory lock, so a concurrent alias PUT
+	// can't interleave with a discovery upsert of a model sharing that id and
+	// leave both a model row and an alias row for it (see PutAlias's comment
+	// for the other half of this). Advisory locks are per-transaction here
+	// (pg_advisory_xact_lock), so it releases automatically on commit/rollback.
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		slog.ErrorContext(ctx, "sync models: begin transaction failed", "err", err)
+		return
+	}
+	defer tx.Rollback(ctx) // no-op once committed
+
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, modelRoutingAdvisoryLockKey); err != nil {
+		slog.ErrorContext(ctx, "sync models: acquire routing lock failed", "err", err)
+		return
+	}
+
 	var inserted, updated int
+	discoveredIDs := make([]string, 0, len(gwResp.Data))
 	for _, m := range gwResp.Data {
 		if m.ID == "" {
 			continue
@@ -299,8 +337,17 @@ func (h *ModelHandler) SyncModels(ctx context.Context) {
 		// INSERT-from-conflict-update because both report "INSERT 0 1" under
 		// ON CONFLICT DO UPDATE ... RETURNING, so RETURNING (xmax = 0) is the
 		// reliable way to tell which branch actually ran.
+		//
+		// Each row runs in its own savepoint: a failed statement aborts a
+		// Postgres transaction, and one bad row must not take the rest of the
+		// sync (and the purge) down with it.
 		var wasInsert bool
-		err := h.pool.QueryRow(ctx, `
+		sp, err := tx.Begin(ctx)
+		if err != nil {
+			slog.ErrorContext(ctx, "sync models: savepoint failed", "model_id", m.ID, "err", err)
+			return
+		}
+		err = sp.QueryRow(ctx, `
 			INSERT INTO models (model_id, provider, backend_class, discovered_at, updated_at)
 			VALUES ($1, $2, $3, now(), now())
 			ON CONFLICT (model_id) DO UPDATE
@@ -311,8 +358,15 @@ func (h *ModelHandler) SyncModels(ctx context.Context) {
 		`, m.ID, providerName, backendClass).Scan(&wasInsert)
 		if err != nil {
 			slog.ErrorContext(ctx, "sync models: upsert failed", "model_id", m.ID, "err", err)
+			_ = sp.Rollback(ctx)
 			continue
 		}
+		if err := sp.Commit(ctx); err != nil {
+			slog.ErrorContext(ctx, "sync models: release savepoint failed", "model_id", m.ID, "err", err)
+			return
+		}
+		// Only ids the database accepted take part in the alias-shadow check below.
+		discoveredIDs = append(discoveredIDs, m.ID)
 
 		if wasInsert {
 			inserted++
@@ -321,23 +375,60 @@ func (h *ModelHandler) SyncModels(ctx context.Context) {
 		}
 	}
 
-	// Remove models that were not re-discovered. Their discovered_at will be
-	// older than the current sync run (which set discovered_at = now() on
-	// every model it found). A 1-minute buffer avoids clock-skew races.
-	res, err := h.pool.Exec(ctx, `
-		DELETE FROM models WHERE discovered_at < now() - interval '1 minute'
+	// A discovered model id that equals an existing alias is not an error —
+	// the gateway's route table lets the alias win by design — but the admin
+	// needs to know, since it means that alias no longer reaches the model it
+	// looks like it targets. Log one WARNING per sync naming every alias
+	// shadowed this run, rather than failing the sync or silently proceeding.
+	if len(discoveredIDs) > 0 {
+		rows, err := tx.Query(ctx, `SELECT alias FROM model_aliases WHERE alias = ANY($1)`, discoveredIDs)
+		if err != nil {
+			slog.ErrorContext(ctx, "sync models: check alias shadowing failed", "err", err)
+		} else {
+			var shadowed []string
+			for rows.Next() {
+				var alias string
+				if err := rows.Scan(&alias); err != nil {
+					slog.ErrorContext(ctx, "sync models: scan shadowed alias failed", "err", err)
+					continue
+				}
+				shadowed = append(shadowed, alias)
+			}
+			rows.Close()
+			if err := rows.Err(); err != nil {
+				slog.ErrorContext(ctx, "sync models: shadowed alias rows error", "err", err)
+			}
+			if len(shadowed) > 0 {
+				slog.Warn("sync models: discovered model id(s) shadow existing alias(es) of the same name — the alias wins at the gateway by design",
+					"aliases", shadowed)
+			}
+		}
+	}
+
+	// Purge rows unseen for a long time — not "not re-discovered this tick",
+	// which would delete a model whose backend is mid-restart (see
+	// modelPurgeAfter). Aliases pointing at a purged model are left alone;
+	// they already tolerate a missing target (target_exists/target_available
+	// go false, but the alias row survives so it doesn't need recreating).
+	res, err := tx.Exec(ctx, `
+		DELETE FROM models WHERE discovered_at < now() - interval '7 days'
 	`)
-	var removed int64
+	var purged int64
 	if err != nil {
-		slog.ErrorContext(ctx, "sync models: stale cleanup failed", "err", err)
+		slog.ErrorContext(ctx, "sync models: purge stale rows failed", "err", err)
 	} else {
-		removed = res.RowsAffected()
+		purged = res.RowsAffected()
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		slog.ErrorContext(ctx, "sync models: commit failed", "err", err)
+		return
 	}
 
 	slog.Info("sync models: complete",
 		"fetched", len(gwResp.Data),
 		"inserted", inserted,
 		"updated", updated,
-		"removed", removed,
+		"purged", purged,
 	)
 }

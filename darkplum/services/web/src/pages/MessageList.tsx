@@ -54,8 +54,10 @@ function failureCopy(code: string | undefined, isAdmin: boolean): { title: strin
       }
     case 'policy_unavailable':
       return {
-        title: 'Routing policy unavailable',
-        hint: 'The gateway cannot read the routing policy, so it refuses every request until it can. Try again in a moment.',
+        title: 'Chat is paused for safety',
+        hint: isAdmin
+          ? 'The gateway has no routing policy it can trust, so it is temporarily refusing every request rather than guessing. Try again shortly, and check the gateway’s database connectivity if it persists.'
+          : 'The service is temporarily refusing requests for safety. Try again shortly.',
       }
     default:
       return {
