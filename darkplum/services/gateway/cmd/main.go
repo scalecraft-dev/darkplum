@@ -307,9 +307,13 @@ type classifierBreakerStatus interface {
 }
 
 // semanticRouterHealthStatus is the subset of *router.SemanticRouterClassifier
-// that newHealthHandler needs, for the same reason as classifierBreakerStatus.
+// that newHealthHandler needs, for the same reason as classifierBreakerStatus:
+// its own circuit-breaker state (Status) alongside its reachability probe
+// (HealthStatus) — the semantic router classifier has a breaker independent
+// of the model classifier's, and /health must surface both.
 type semanticRouterHealthStatus interface {
 	HealthStatus(ctx context.Context) string
+	Status() (breakerOpen bool, consecutiveFailures int)
 }
 
 // newHealthHandler builds the /health handler. /health is the liveness AND
@@ -350,7 +354,9 @@ func newHealthHandler(upstreamChecker *health.Checker, routeMgr *routing.Manager
 
 		policyStatus := polStore.Status()
 
-		breakerOpen, consecutiveFailures := modelClassifier.Status()
+		modelBreakerOpen, modelConsecutiveFailures := modelClassifier.Status()
+		srBreakerOpen, srConsecutiveFailures := semanticClassifier.Status()
+		srHealthStatus := semanticClassifier.HealthStatus(c.Request.Context())
 
 		c.JSON(http.StatusOK, gin.H{
 			"status":    "ok",
@@ -359,9 +365,15 @@ func newHealthHandler(upstreamChecker *health.Checker, routeMgr *routing.Manager
 				"models":  routingStatus.Models,
 				"sources": sourcesBody,
 				"classifier": gin.H{
-					"breaker_open":         breakerOpen,
-					"consecutive_failures": consecutiveFailures,
-					"semantic_router":      semanticClassifier.HealthStatus(c.Request.Context()),
+					"model": gin.H{
+						"breaker_open":         modelBreakerOpen,
+						"consecutive_failures": modelConsecutiveFailures,
+					},
+					"semantic_router": gin.H{
+						"status":               srHealthStatus,
+						"breaker_open":         srBreakerOpen,
+						"consecutive_failures": srConsecutiveFailures,
+					},
 				},
 			},
 			"policy": gin.H{

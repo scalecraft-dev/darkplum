@@ -251,15 +251,27 @@ func parseArchRouterOutput(raw string) (string, bool) {
 	return "", false
 }
 
-// matchRouteName finds the route in routes whose Name case-insensitively
-// equals name (e.g. the classifier model's "route" field, or the semantic
-// router's "category"), returning the route's canonical-case Name. "other"
-// (the Arch-Router protocol's explicit no-match sentinel) will not match any
-// real route name and falls through to the caller's unparseable/unknown
-// fallback, same as any other unmatched string.
+// matchRouteName finds the route in routes whose Name matches name (e.g. the
+// classifier model's "route" field, or the semantic router's "category"),
+// returning the route's canonical-case Name. It first tries an exact
+// case-insensitive match (strings.EqualFold, unchanged behaviour for callers
+// that only differ by case); if that fails, it falls back to comparing
+// normalizeRouteToken of both sides, so a decision like "computer science" or
+// "Computer_Science" still matches a route literally named
+// "computer-science". "other" (the Arch-Router protocol's explicit no-match
+// sentinel) will not match any real route name under either comparison and
+// falls through to the caller's unparseable/unknown fallback, same as any
+// other unmatched string.
 func matchRouteName(routes []policy.RouteDef, name string) (string, bool) {
 	for _, r := range routes {
 		if strings.EqualFold(r.Name, name) {
+			return r.Name, true
+		}
+	}
+
+	normalized := normalizeRouteToken(name)
+	for _, r := range routes {
+		if normalizeRouteToken(r.Name) == normalized {
 			return r.Name, true
 		}
 	}

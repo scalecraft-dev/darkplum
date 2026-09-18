@@ -285,21 +285,13 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 		routeName = decision.RouteName
 		routerReason = decision.Reason
 
-		rd, ok := alias.Route(routeName)
-		if !ok {
-			// Unreachable for any alias actually present in a loaded
-			// Snapshot (policy.buildAliases drops a routed alias whose
-			// default_route doesn't resolve, and every Classifier only ever
-			// names alias.DefaultRoute or one of alias.Routes) — but fail
-			// closed rather than dispatch to an unresolved target if this
-			// invariant is ever violated.
-			c.Set("denial_code", "model_not_found")
-			logDenial(c, "model_not_found", req.Model, "", "")
-			respondModelNotFound(c, req.Model, &routeContext{Alias: requestedModel, Route: routeName})
-			return
-		}
-		resolvedModel = rd.Target
-
+		// Set the routing audit event BEFORE the route-resolution check below:
+		// a model classifier that actually called an LLM (decision.ModelCall
+		// != nil) must always produce its purpose="routing" audit row, even
+		// on the defensive fail-closed path where the classifier named a
+		// route alias.Route can't resolve — the model still saw the prompt,
+		// so the audit trail must reflect that regardless of how the request
+		// is ultimately refused.
 		if decision.ModelCall != nil {
 			c.Set("routing_audit_event", recorder.InferenceEvent{
 				RequestID:        c.GetHeader("X-Request-Id"),
@@ -316,6 +308,21 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 				StatusCode:       decision.ModelCall.StatusCode,
 			})
 		}
+
+		rd, ok := alias.Route(routeName)
+		if !ok {
+			// Unreachable for any alias actually present in a loaded
+			// Snapshot (policy.buildAliases drops a routed alias whose
+			// default_route doesn't resolve, and every Classifier only ever
+			// names alias.DefaultRoute or one of alias.Routes) — but fail
+			// closed rather than dispatch to an unresolved target if this
+			// invariant is ever violated.
+			c.Set("denial_code", "model_not_found")
+			logDenial(c, "model_not_found", req.Model, "", "")
+			respondModelNotFound(c, req.Model, &routeContext{Alias: requestedModel, Route: routeName})
+			return
+		}
+		resolvedModel = rd.Target
 	case isAlias:
 		// Static alias: unchanged behaviour.
 		requestedModel = req.Model

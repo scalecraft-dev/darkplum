@@ -280,6 +280,67 @@ func TestHandleChatCompletions_RoutedAlias_PickedTargetNotFound(t *testing.T) {
 	}
 }
 
+// TestHandleChatCompletions_RoutedAlias_BogusRouteName_StillAudited covers
+// the defensive fail-closed path: a classifier (here standing in for
+// ModelClassifier) names a route that isn't in alias.Routes and isn't
+// alias.DefaultRoute — normally unreachable per policy.buildAliases's
+// invariants, but a real ModelClassifier could still hand back an
+// out-of-band string if that invariant were ever violated. The request must
+// still be refused with 404 model_not_found, but if the classifier actually
+// called an LLM (ModelCall != nil) that call's purpose="routing" audit event
+// must still be recorded — the model saw the prompt regardless of how the
+// route name it returned was handled afterwards.
+func TestHandleChatCompletions_RoutedAlias_BogusRouteName_StillAudited(t *testing.T) {
+	vllm := &fakeKindProvider{name: "vllm-default", kind: "vllm"}
+	pt, ctok := 9, 3
+	classifier := &fakeClassifier{decisions: []router.Decision{{
+		RouteName: "does-not-exist",
+		Reason:    "model:does-not-exist",
+		ModelCall: &router.ModelCallInfo{
+			Model: "router-model", Provider: "vllm", LatencyMS: 5, StatusCode: 200,
+			PromptTokens: &pt, CompletionTokens: &ctok,
+		},
+	}}}
+	h := newRoutedTestHandler(
+		fakeProviders{"vllm-default": vllm},
+		map[string]routing.Route{
+			"qwen-coder": {ProviderKey: "vllm-default", Kind: "vllm", Class: routing.ClassSelfHosted},
+			"llama-3-8b": {ProviderKey: "vllm-default", Kind: "vllm", Class: routing.ClassSelfHosted},
+		},
+		policy.Snapshot{
+			Enabled:   map[string]bool{"qwen-coder": true, "llama-3-8b": true},
+			Aliases:   map[string]policy.AliasDef{"smart-chat": routedAlias},
+			Residency: policy.ResidencyAny,
+		},
+		classifier,
+	)
+
+	w, c := doChat(t, h, "smart-chat")
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d; body=%s", w.Code, w.Body.String())
+	}
+	e := decodeError(t, w.Body.Bytes())
+	if e.Error.Code != "model_not_found" {
+		t.Errorf("expected code model_not_found, got %q", e.Error.Code)
+	}
+	if vllm.completeCalls != 0 {
+		t.Errorf("provider must never be dispatched to for an unresolved route, got %d calls", vllm.completeCalls)
+	}
+
+	v, ok := c.Get("routing_audit_event")
+	if !ok {
+		t.Fatal("expected a routing_audit_event to still be set even though the route name didn't resolve — the classifier model did see the prompt")
+	}
+	evt, ok := v.(recorder.InferenceEvent)
+	if !ok {
+		t.Fatalf("routing_audit_event has unexpected type %T", v)
+	}
+	if evt.Purpose != "routing" || evt.Model != "router-model" || evt.LatencyMS != 5 {
+		t.Errorf("got %+v", evt)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // Aborted classification: never dispatch
 // ---------------------------------------------------------------------------

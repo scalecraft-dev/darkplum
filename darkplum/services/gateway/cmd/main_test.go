@@ -260,9 +260,15 @@ func TestNewHealthHandler_IncludesRoutingAndPolicyStatus(t *testing.T) {
 				LastErrorKind         *string `json:"last_error_kind"`
 			} `json:"sources"`
 			Classifier struct {
-				BreakerOpen         bool   `json:"breaker_open"`
-				ConsecutiveFailures int    `json:"consecutive_failures"`
-				SemanticRouter      string `json:"semantic_router"`
+				Model struct {
+					BreakerOpen         bool `json:"breaker_open"`
+					ConsecutiveFailures int  `json:"consecutive_failures"`
+				} `json:"model"`
+				SemanticRouter struct {
+					Status              string `json:"status"`
+					BreakerOpen         bool   `json:"breaker_open"`
+					ConsecutiveFailures int    `json:"consecutive_failures"`
+				} `json:"semantic_router"`
 			} `json:"classifier"`
 		} `json:"routing"`
 		Policy struct {
@@ -300,14 +306,20 @@ func TestNewHealthHandler_IncludesRoutingAndPolicyStatus(t *testing.T) {
 		t.Errorf("routing.sources.lmstudio-dev.last_error_kind = %v, want \"unreachable\"", failingStatus.LastErrorKind)
 	}
 
-	if body.Routing.Classifier.BreakerOpen {
-		t.Error("expected routing.classifier.breaker_open=false for a fresh classifier")
+	if body.Routing.Classifier.Model.BreakerOpen {
+		t.Error("expected routing.classifier.model.breaker_open=false for a fresh classifier")
 	}
-	if body.Routing.Classifier.ConsecutiveFailures != 0 {
-		t.Errorf("routing.classifier.consecutive_failures = %d, want 0", body.Routing.Classifier.ConsecutiveFailures)
+	if body.Routing.Classifier.Model.ConsecutiveFailures != 0 {
+		t.Errorf("routing.classifier.model.consecutive_failures = %d, want 0", body.Routing.Classifier.Model.ConsecutiveFailures)
 	}
-	if body.Routing.Classifier.SemanticRouter != "unconfigured" {
-		t.Errorf("routing.classifier.semantic_router = %q, want unconfigured (SEMANTIC_ROUTER_URL unset)", body.Routing.Classifier.SemanticRouter)
+	if body.Routing.Classifier.SemanticRouter.Status != "unconfigured" {
+		t.Errorf("routing.classifier.semantic_router.status = %q, want unconfigured (SEMANTIC_ROUTER_URL unset)", body.Routing.Classifier.SemanticRouter.Status)
+	}
+	if body.Routing.Classifier.SemanticRouter.BreakerOpen {
+		t.Error("expected routing.classifier.semantic_router.breaker_open=false for a fresh classifier")
+	}
+	if body.Routing.Classifier.SemanticRouter.ConsecutiveFailures != 0 {
+		t.Errorf("routing.classifier.semantic_router.consecutive_failures = %d, want 0", body.Routing.Classifier.SemanticRouter.ConsecutiveFailures)
 	}
 
 	// The raw response must never contain the model ids themselves outside of

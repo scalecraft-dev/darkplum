@@ -18,6 +18,7 @@ package router
 import (
 	"context"
 	"errors"
+	"strings"
 
 	"github.com/scalecraft/darkplum/gateway/internal/policy"
 )
@@ -154,3 +155,29 @@ const (
 // builtinLongThreshold is the character count above which BuiltinLong
 // matches (Input.OriginalLen > builtinLongThreshold).
 const builtinLongThreshold = 8000
+
+// normalizeRouteToken normalises a route name or a classifier-provided
+// category/route field for loose matching (see matchRouteName): lowercased,
+// leading/trailing whitespace trimmed, and every run of spaces and
+// underscores collapsed to a single dash — so "Computer Science",
+// "computer_science", and "computer-science" all normalise to the same
+// token. Pure — no I/O — so it is directly table-testable.
+func normalizeRouteToken(s string) string {
+	s = strings.ToLower(strings.TrimSpace(s))
+
+	var b strings.Builder
+	b.Grow(len(s))
+	lastDash := false
+	for _, r := range s {
+		if r == ' ' || r == '_' || r == '-' {
+			if b.Len() > 0 && !lastDash {
+				b.WriteByte('-')
+				lastDash = true
+			}
+			continue
+		}
+		b.WriteRune(r)
+		lastDash = false
+	}
+	return strings.TrimRight(b.String(), "-")
+}
