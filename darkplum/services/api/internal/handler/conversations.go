@@ -110,11 +110,52 @@ func resolveAssistantProvenance(ctx context.Context, q rowQuerier, userID string
 	`, *requestID, userID).Scan(&m, &r)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, nil, nil
+			// The gateway's recorder writes inference_events in batches (about
+			// once a second), and the webchat appends the reply the moment the
+			// stream ends, so the audit row is often not there yet. Keep the
+			// request id as a correlation key — it is only ever matched against
+			// THIS user's audit rows — with model NULL; loadConversationFull
+			// resolves it on the next read (see backfillProvenance).
+			return nil, requestID, nil
 		}
 		return nil, nil, err
 	}
 	return &m, &r, nil
+}
+
+// backfillProvenance resolves assistant turns whose request_id was stored
+// before their audit row existed. Same rule as at append time: the model comes
+// only from an inference_events row with a matching request_id AND this
+// user's id; anything else stays NULL. Rows that resolve are updated in place
+// so the work is done once.
+func (h *ConversationHandler) backfillProvenance(ctx context.Context, userID, convID string, msgs []conversationMessage) {
+	for i := range msgs {
+		m := &msgs[i]
+		if m.Role != roleAssistant || m.Model != nil || m.RequestID == nil {
+			continue
+		}
+		var model string
+		err := h.db.QueryRow(ctx, `
+			SELECT model FROM inference_events
+			WHERE request_id = $1 AND user_id = $2
+			ORDER BY created_at DESC
+			LIMIT 1
+		`, *m.RequestID, userID).Scan(&model)
+		if err != nil {
+			if !errors.Is(err, pgx.ErrNoRows) {
+				slog.WarnContext(ctx, "conversation provenance backfill lookup failed", "conversation", convID, "seq", m.Seq, "err", err)
+			}
+			continue
+		}
+		if _, err := h.db.Exec(ctx, `
+			UPDATE conversation_messages SET model = $1
+			WHERE conversation_id = $2 AND seq = $3 AND model IS NULL
+		`, model, convID, m.Seq); err != nil {
+			slog.WarnContext(ctx, "conversation provenance backfill update failed", "conversation", convID, "seq", m.Seq, "err", err)
+			continue
+		}
+		m.Model = &model
+	}
 }
 
 // resolveMessageProvenance applies resolveAssistantProvenance to a role-typed
@@ -170,7 +211,9 @@ func (h *ConversationHandler) loadConversationFull(ctx context.Context, userID, 
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	rows.Close()
 	full.MessageCount = len(full.Messages)
+	h.backfillProvenance(ctx, userID, convID, full.Messages)
 
 	return &full, nil
 }

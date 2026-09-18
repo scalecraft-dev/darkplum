@@ -663,8 +663,19 @@ func TestAppendMessages_ModelProvenanceFromInferenceEvents(t *testing.T) {
 	if assistant1.Model != nil {
 		t.Errorf("foreign request_id: model = %v, want nil (not %q)", *assistant1.Model, "forged")
 	}
-	if assistant1.RequestID != nil {
-		t.Errorf("foreign request_id: stored request_id = %v, want nil", *assistant1.RequestID)
+	// The request id itself is kept as a correlation key (it may simply not
+	// have been recorded yet); it never yields a model unless it matches one
+	// of THIS user's audit rows — checked again on read below.
+	if assistant1.RequestID == nil || *assistant1.RequestID != "req-foreign" {
+		t.Errorf("foreign request_id: stored request_id = %v, want the correlation key kept", assistant1.RequestID)
+	}
+	reread := doJSON(t, rA, http.MethodGet, "/api/v1/conversations/"+full.ID, nil)
+	var rereadFull conversationFull
+	if err := json.Unmarshal(reread.Body.Bytes(), &rereadFull); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if rereadFull.Messages[1].Model != nil {
+		t.Errorf("foreign request_id must never resolve on read either, got %q", *rereadFull.Messages[1].Model)
 	}
 
 	// Case 2: request_id belongs to this user -> model resolves from
@@ -792,5 +803,66 @@ func TestTruncateMessages_OwnerScopedAndSeqContinues(t *testing.T) {
 	}
 	if len(after.Messages) != 4 || after.Messages[3].Seq != 4 || after.Messages[3].Content != "a2 (regenerated)" {
 		t.Fatalf("expected 4 messages ending with the regenerated turn at seq 4, got %+v", after.Messages)
+	}
+}
+
+// The gateway's audit recorder writes in batches, so the webchat's append can
+// run before the inference_events row exists. The request id is kept and the
+// model is resolved on the next read — still only from this user's audit rows.
+func TestGetConversation_BackfillsProvenanceRecordedAfterAppend(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	userA := newTestUserLabeled(t, ctx, pool, "a")
+	userB := newTestUserLabeled(t, ctx, pool, "b")
+	h := NewConversationHandler(pool, activity.NewRecorder(pool))
+	rA := newConversationsTestRouter(h, userA)
+
+	created := doJSON(t, rA, http.MethodPost, "/api/v1/conversations", map[string]any{
+		"messages": []map[string]any{{"role": "user", "content": "q"}},
+	})
+	var full conversationFull
+	if err := json.Unmarshal(created.Body.Bytes(), &full); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	// Append BEFORE the audit row exists: model must be NULL, request id kept.
+	appended := doJSON(t, rA, http.MethodPost, "/api/v1/conversations/"+full.ID+"/messages", map[string]any{
+		"messages": []map[string]any{{"role": "assistant", "content": "a", "request_id": "req-late"}},
+	})
+	var out struct{ Messages []conversationMessage }
+	if err := json.Unmarshal(appended.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if out.Messages[0].Model != nil || out.Messages[0].RequestID == nil {
+		t.Fatalf("before audit row: got model=%v request_id=%v", out.Messages[0].Model, out.Messages[0].RequestID)
+	}
+
+	// Another user's audit row with the same request id must not resolve it.
+	insertInferenceEvent(t, ctx, pool, "req-late", userB, "someone-elses-model")
+	got := doJSON(t, rA, http.MethodGet, "/api/v1/conversations/"+full.ID, nil)
+	var after conversationFull
+	if err := json.Unmarshal(got.Body.Bytes(), &after); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if after.Messages[1].Model != nil {
+		t.Fatalf("resolved from another user's audit row: %q", *after.Messages[1].Model)
+	}
+
+	// The owner's audit row lands (recorder flushed): the next read resolves
+	// and persists the model.
+	insertInferenceEvent(t, ctx, pool, "req-late", userA, "llama3")
+	got = doJSON(t, rA, http.MethodGet, "/api/v1/conversations/"+full.ID, nil)
+	if err := json.Unmarshal(got.Body.Bytes(), &after); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if after.Messages[1].Model == nil || *after.Messages[1].Model != "llama3" {
+		t.Fatalf("expected backfilled model llama3, got %v", after.Messages[1].Model)
+	}
+	var stored *string
+	if err := pool.QueryRow(ctx, `SELECT model FROM conversation_messages WHERE conversation_id = $1 AND seq = 2`, full.ID).Scan(&stored); err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	if stored == nil || *stored != "llama3" {
+		t.Fatalf("backfill must persist, stored = %v", stored)
 	}
 }
