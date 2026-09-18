@@ -316,16 +316,19 @@ fail(
 // 2. Call sites
 //
 // A ROUTES entry only proves a route is declared; this proves something on a
-// screen uses it. Each `ROUTES.<key>` must be reached either directly from a
-// file outside src/lib (AuthContext does this), or through an exported
-// function in src/lib (api.ts wrappers, conversations.ts helpers, plain
-// re-exports) that a screen references in a VALUE position. This walks the
-// TypeScript AST rather than matching text: every type position — `typeof
-// f`, `ReturnType<typeof import('./api').f>`, `(typeof ns)['f']`, import
-// declarations — is skipped structurally, so a name that only ever appears
-// in a type cannot keep a dead route green. Comments never reach the AST.
-// An import nobody uses is tsc's job (noUnusedLocals is on and `pnpm run
-// build` runs tsc), so the two together cover it.
+// screen uses it. This is a module graph, not a name search: every file's
+// imports are resolved, so a reference to an imported binding becomes a
+// reference to `<file>#<export>` — two modules exporting the same name, a
+// default export, a string literal that happens to spell a function's name,
+// none of these can be confused. Type positions are skipped structurally
+// (TypeScript AST), so a name that only appears in a type keeps nothing
+// alive; an import nobody uses is tsc's job (noUnusedLocals is on).
+//
+// Node kinds: an export is `<file>#<name>` ("default" for the default
+// export). Its edges are the exports it references, plus `ROUTES.<key>`
+// tokens. A screen's edges are the exports it references directly. A route
+// is reached if some screen, or some export reachable from a screen, has
+// its `ROUTES.<key>` edge.
 // ---------------------------------------------------------------------------
 
 function parse(file: string): ts.SourceFile {
@@ -333,13 +336,58 @@ function parse(file: string): ts.SourceFile {
     file.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS)
 }
 
+const parsed = new Map<string, ts.SourceFile>()
+function source(file: string): ts.SourceFile {
+  let sf = parsed.get(file)
+  if (!sf) { sf = parse(file); parsed.set(file, sf) }
+  return sf
+}
+
+/** Resolve a relative module specifier to a file, or null (a package). */
+function resolveModule(fromFile: string, spec: ts.Expression | undefined): string | null {
+  if (!spec || !ts.isStringLiteral(spec) || !spec.text.startsWith('.')) return null
+  const base = join(dirname(fromFile), spec.text)
+  for (const cand of [base, `${base}.ts`, `${base}.tsx`, join(base, 'index.ts'), join(base, 'index.tsx')]) {
+    try { if (statSync(cand).isFile()) return cand } catch { /* next */ }
+  }
+  return null
+}
+
+const exportKey = (file: string, name: string) => `${relative(WEB_ROOT, file).split('\\').join('/')}#${name}`
+
+/** What a local binding in one file stands for: a named export of another
+ *  file, that file's default export, or the whole namespace of it. */
+type Binding = { file: string; name: string } | { file: string; namespace: true }
+
+/** The import bindings of a file: local name -> what it refers to. */
+function importBindings(sf: ts.SourceFile): Map<string, Binding> {
+  const out = new Map<string, Binding>()
+  for (const stmt of sf.statements) {
+    if (!ts.isImportDeclaration(stmt) || !stmt.importClause || stmt.importClause.isTypeOnly) continue
+    const file = resolveModule(sf.fileName, stmt.moduleSpecifier)
+    if (!file) continue
+    const clause = stmt.importClause
+    if (clause.name) out.set(clause.name.text, { file, name: 'default' })
+    const nb = clause.namedBindings
+    if (nb && ts.isNamespaceImport(nb)) out.set(nb.name.text, { file, namespace: true })
+    if (nb && ts.isNamedImports(nb)) {
+      for (const el of nb.elements) {
+        if (el.isTypeOnly) continue
+        out.set(el.name.text, { file, name: (el.propertyName ?? el.name).text })
+      }
+    }
+  }
+  return out
+}
+
 /**
- * The value-position references inside `root`: identifiers, string literals
- * (so `ns['f']()` counts), and `ROUTES.<key>` property accesses spelled as
- * one token. Type nodes, import/export declarations and type-only constructs
- * contribute nothing.
+ * The edges out of one AST subtree, given the file's import bindings: export
+ * keys for every imported binding used by value (through a namespace's
+ * `.prop` / `['prop']` access as well), `ROUTES.<key>` tokens, and the bare
+ * names of local (non-imported) identifiers so a module-internal helper can
+ * be followed to its own body. Type positions contribute nothing.
  */
-function valueRefs(root: ts.Node, into: Set<string>): void {
+function edgesOf(root: ts.Node, imports: Map<string, Binding>, into: Set<string>, locals: Set<string>): void {
   const visit = (node: ts.Node): void => {
     if (
       ts.isTypeNode(node) ||
@@ -348,154 +396,202 @@ function valueRefs(root: ts.Node, into: Set<string>): void {
       ts.isExportDeclaration(node) ||
       ts.isTypeAliasDeclaration(node) ||
       ts.isInterfaceDeclaration(node)
-    ) {
-      return
+    ) return
+
+    // ROUTES.<key>, ns.<prop>, ns['<prop>'] — resolve through the object.
+    if ((ts.isPropertyAccessExpression(node) || ts.isElementAccessExpression(node)) && ts.isIdentifier(node.expression)) {
+      const obj = node.expression.text
+      const prop = ts.isPropertyAccessExpression(node)
+        ? node.name.text
+        : ts.isStringLiteral(node.argumentExpression) ? node.argumentExpression.text : null
+      if (obj === 'ROUTES' && prop) into.add(`ROUTES.${prop}`)
+      const b = imports.get(obj)
+      if (b && 'namespace' in b && prop) { into.add(exportKey(b.file, prop)); return }
+      // `ns.prop` where ns is a named import may be an `export * as ns`
+      // alias; recorded as "<file>#<ns>.<prop>" and expanded once every
+      // module's aliases are known (see expandNamespaceAliases).
+      if (b && 'name' in b && prop) into.add(`${exportKey(b.file, b.name)}.${prop}`)
     }
-    // `x satisfies T` / `x as T` keep x (a value) and drop T (handled above
-    // as a TypeNode child).
-    if (ts.isIdentifier(node)) into.add(node.text)
-    else if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) into.add(node.text)
-    else if (
-      ts.isPropertyAccessExpression(node) &&
-      ts.isIdentifier(node.expression) &&
-      node.expression.text === 'ROUTES'
-    ) {
-      into.add(`ROUTES.${node.name.text}`)
+    if (ts.isIdentifier(node)) {
+      // Skip the property side of `a.b` — only `a` is a binding.
+      const parent = node.parent
+      const isPropName = parent && ts.isPropertyAccessExpression(parent) && parent.name === node
+      const isDeclName = parent && (ts.isFunctionDeclaration(parent) || ts.isVariableDeclaration(parent) || ts.isParameter(parent)) && parent.name === node
+      if (!isPropName && !isDeclName) {
+        const b = imports.get(node.text)
+        if (b && 'name' in b) into.add(exportKey(b.file, b.name))
+        else if (!b) locals.add(node.text)
+      }
     }
     ts.forEachChild(node, visit)
   }
   visit(root)
 }
 
-/** Exported functions of a lib module: name -> the value references in its
- *  body. Handles every way a module can export: `export function f`,
- *  `export const f`, `export default f` / `export default function`, a
- *  later `export { f, g as h }` of local declarations (resolved to their
- *  bodies), `export { a as b } from './x'` (an export named b that
- *  references a) and `export * from './x'` (every export of x, resolved
- *  recursively within src/lib). */
-function exportedFunctions(sf: ts.SourceFile, seen = new Set<string>()): Map<string, Set<string>> {
+/**
+ * The export graph of one module: export name -> edges. Local helpers are
+ * folded in (an exported function that calls a local function that calls a
+ * wrapper reaches the wrapper). Handles `export function/const`, `export
+ * default`, later `export { f, g as h }`, `export { a as b } from`,
+ * `export { default as x } from`, `export * from` and `export * as ns from`.
+ */
+const moduleExportsMemo = new Map<string, Map<string, Set<string>>>()
+function moduleExports(file: string): Map<string, Set<string>> {
+  // Memoised, and the entry is registered before the body runs so a
+  // circular `export *` pair sees the (still-filling) map of the other side
+  // instead of recursing forever. Names the cycle has not yet produced when
+  // it is observed are simply not re-exported through that edge, which
+  // cannot hide a route: the module that declares it still exports it.
+  const memo = moduleExportsMemo.get(file)
+  if (memo) return memo
   const out = new Map<string, Set<string>>()
-  if (seen.has(sf.fileName)) return out
-  seen.add(sf.fileName)
+  moduleExportsMemo.set(file, out)
+  const sf = source(file)
+  const imports = importBindings(sf)
+  const hasMod = (n: ts.Node, k: ts.SyntaxKind) =>
+    ts.canHaveModifiers(n) && (ts.getModifiers(n) ?? []).some((m) => m.kind === k)
 
-  const hasExport = (n: ts.Node) =>
-    ts.canHaveModifiers(n) && (ts.getModifiers(n) ?? []).some((m) => m.kind === ts.SyntaxKind.ExportKeyword)
-  const hasDefault = (n: ts.Node) =>
-    ts.canHaveModifiers(n) && (ts.getModifiers(n) ?? []).some((m) => m.kind === ts.SyntaxKind.DefaultKeyword)
-  const refsOf = (n: ts.Node) => { const r = new Set<string>(); valueRefs(n, r); return r }
-
-  // Every top-level declaration, exported or not, so a later `export { f }`
-  // or `export default f` can be resolved to a real body.
-  const locals = new Map<string, Set<string>>()
+  // Every top-level declaration with its direct edges and the local names it uses.
+  const decls = new Map<string, { edges: Set<string>; uses: Set<string> }>()
+  const collect = (name: string, node: ts.Node) => {
+    const edges = new Set<string>(); const uses = new Set<string>()
+    edgesOf(node, imports, edges, uses)
+    decls.set(name, { edges, uses })
+  }
   for (const stmt of sf.statements) {
-    if (ts.isFunctionDeclaration(stmt) && stmt.name) locals.set(stmt.name.text, refsOf(stmt))
+    if (ts.isFunctionDeclaration(stmt) && stmt.name) collect(stmt.name.text, stmt)
     else if (ts.isVariableStatement(stmt)) {
-      for (const decl of stmt.declarationList.declarations) {
-        if (ts.isIdentifier(decl.name)) locals.set(decl.name.text, refsOf(decl))
-      }
+      for (const d of stmt.declarationList.declarations) if (ts.isIdentifier(d.name)) collect(d.name.text, d)
     }
   }
-
-  const resolveModule = (spec: ts.Expression | undefined): ts.SourceFile | null => {
-    if (!spec || !ts.isStringLiteral(spec) || !spec.text.startsWith('.')) return null
-    const base = join(dirname(sf.fileName), spec.text)
-    for (const cand of [base, `${base}.ts`, `${base}.tsx`, join(base, 'index.ts')]) {
-      try { if (statSync(cand).isFile()) return parse(cand) } catch { /* next */ }
-    }
-    return null
+  // Close each declaration over the local helpers it uses.
+  const closure = (name: string, seen = new Set<string>()): Set<string> => {
+    const out = new Set<string>()
+    const d = decls.get(name)
+    if (!d || seen.has(name)) return out
+    seen.add(name)
+    for (const e of d.edges) out.add(e)
+    for (const u of d.uses) if (decls.has(u)) for (const e of closure(u, seen)) out.add(e)
+    return out
   }
 
   for (const stmt of sf.statements) {
-    if (ts.isFunctionDeclaration(stmt) && hasExport(stmt)) {
-      out.set(hasDefault(stmt) ? 'default' : stmt.name!.text, refsOf(stmt))
-    } else if (ts.isVariableStatement(stmt) && hasExport(stmt)) {
-      for (const decl of stmt.declarationList.declarations) {
-        if (ts.isIdentifier(decl.name)) out.set(decl.name.text, refsOf(decl))
-      }
+    if (ts.isFunctionDeclaration(stmt) && stmt.name && hasMod(stmt, ts.SyntaxKind.ExportKeyword)) {
+      out.set(hasMod(stmt, ts.SyntaxKind.DefaultKeyword) ? 'default' : stmt.name.text, closure(stmt.name.text))
+    } else if (ts.isVariableStatement(stmt) && hasMod(stmt, ts.SyntaxKind.ExportKeyword)) {
+      for (const d of stmt.declarationList.declarations) if (ts.isIdentifier(d.name)) out.set(d.name.text, closure(d.name.text))
     } else if (ts.isExportAssignment(stmt) && !stmt.isExportEquals) {
-      // `export default f` resolves to f's body; `export default <expr>` is
-      // the expression's own references.
       const expr = stmt.expression
-      out.set('default', ts.isIdentifier(expr) ? (locals.get(expr.text) ?? new Set([expr.text])) : refsOf(expr))
+      if (ts.isIdentifier(expr) && decls.has(expr.text)) out.set('default', closure(expr.text))
+      else {
+        const edges = new Set<string>(); const uses = new Set<string>()
+        edgesOf(expr, imports, edges, uses)
+        for (const u of uses) for (const e of closure(u)) edges.add(e)
+        out.set('default', edges)
+      }
     } else if (ts.isExportDeclaration(stmt) && !stmt.isTypeOnly) {
+      const target = resolveModule(sf.fileName, stmt.moduleSpecifier)
       if (stmt.exportClause && ts.isNamedExports(stmt.exportClause)) {
         for (const el of stmt.exportClause.elements) {
           if (el.isTypeOnly) continue
           const local = (el.propertyName ?? el.name).text
-          if (stmt.moduleSpecifier) out.set(el.name.text, new Set([local]))
-          else out.set(el.name.text, locals.get(local) ?? new Set([local]))
+          if (target) out.set(el.name.text, new Set([exportKey(target, local)]))
+          else if (decls.has(local)) out.set(el.name.text, closure(local))
+          else {
+            const b = imports.get(local)
+            if (b && 'name' in b) out.set(el.name.text, new Set([exportKey(b.file, b.name)]))
+          }
         }
-      } else if (!stmt.exportClause && stmt.moduleSpecifier) {
-        const target = resolveModule(stmt.moduleSpecifier)
-        if (target) for (const [name, refs] of exportedFunctions(target, seen)) if (name !== 'default') out.set(name, refs)
+      } else if (stmt.exportClause && ts.isNamespaceExport(stmt.exportClause) && target) {
+        // `export * as ns from './x'`: ns.prop resolves to x#prop. Recorded
+        // as a namespace alias for screens that import { ns }.
+        namespaceAliases.set(exportKey(file, stmt.exportClause.name.text), target)
+      } else if (!stmt.exportClause && target) {
+        // `export * from './x'`: resolved after every module is loaded, so
+        // order and cycles do not matter (see the wildcard fixed point).
+        wildcards.set(file, [...(wildcards.get(file) ?? []), target])
       }
     }
   }
   return out
 }
 
+/** `<file>#<ns>` -> the file whose exports ns re-exports (`export * as ns`). */
+const namespaceAliases = new Map<string, string>()
+/** file -> the modules it `export * from`s. */
+const wildcards = new Map<string, string[]>()
+
+/** Rewrites "<file>#<ns>.<prop>" edges through `export * as ns` aliases to
+ *  "<target>#<prop>"; drops the ones that are not aliases (ordinary
+ *  property access on an imported object). */
+function expandNamespaceAliases(edges: Set<string>): void {
+  for (const e of [...edges]) {
+    const dot = e.indexOf('.', e.lastIndexOf('#'))
+    if (dot < 0 || e.startsWith('ROUTES.')) continue
+    const target = namespaceAliases.get(e.slice(0, dot))
+    if (target) edges.add(exportKey(target, e.slice(dot + 1)))
+    edges.delete(e)
+  }
+}
+
 const libFiles = walk(join(SRC_DIR, 'lib'))
 
-/** Everything a screen (any file outside src/lib) references by value. */
-const screenRefs = new Set<string>()
-for (const f of walk(SRC_DIR)) {
-  if (libFiles.includes(f)) continue
-  valueRefs(parse(f), screenRefs)
-}
-
-/** Every exported function in src/lib, keyed by file#name (two modules may
- *  export the same name — conversations.ts wraps api.ts's deleteConversation
- *  under the same name), with what its body references by value, so a route
- *  reached through a lib helper (api.ts -> conversations.ts -> ChatPage)
- *  counts. Import aliases inside a lib module (`import { a as b }`) are
- *  resolved so a body calling b is seen to reference a. */
-const libExports = new Map<string, { name: string; refs: Set<string> }>()
-for (const f of libFiles) {
-  const sf = parse(f)
-  const aliases = new Map<string, string>()
-  for (const stmt of sf.statements) {
-    if (ts.isImportDeclaration(stmt) && stmt.importClause?.namedBindings && ts.isNamedImports(stmt.importClause.namedBindings)) {
-      for (const el of stmt.importClause.namedBindings.elements) {
-        if (el.propertyName) aliases.set(el.name.text, el.propertyName.text)
-      }
-    }
-  }
-  for (const [name, refs] of exportedFunctions(sf)) {
-    const resolved = new Set<string>()
-    for (const r of refs) resolved.add(aliases.get(r) ?? r)
-    libExports.set(`${relative(WEB_ROOT, f)}#${name}`, { name, refs: resolved })
-  }
-}
-
-// Reachable lib exports: referenced by name from a screen, or from the body
-// of another reachable export in a different module. Fixed point over the
-// (small) export set. Same-named exports are conflated, which can only make
-// something look reachable, never hide a dead route behind a false alarm.
-const reachable = new Set<string>()
-for (const [k, e] of libExports) if (screenRefs.has(e.name)) reachable.add(k)
+/** Every export of every src/lib module, keyed <file>#<name>, with its edges. */
+const graph = new Map<string, Set<string>>()
+const perModule = new Map<string, Map<string, Set<string>>>()
+for (const f of libFiles) perModule.set(f, moduleExports(f))
+// Wildcard fixed point: a module re-exports every name its `export *`
+// targets have, under the same name, pointing at the target's export. Loops
+// until nothing new appears, so chains and cycles resolve regardless of
+// file order.
 for (let grew = true; grew; ) {
   grew = false
-  for (const [k, e] of libExports) {
-    if (reachable.has(k)) continue
-    for (const r of reachable) {
-      if (r.split('#')[0] !== k.split('#')[0] && libExports.get(r)!.refs.has(e.name)) {
-        reachable.add(k); grew = true; break
+  for (const [f, targets] of wildcards) {
+    const mine = perModule.get(f) ?? new Map<string, Set<string>>()
+    perModule.set(f, mine)
+    for (const t of targets) {
+      const theirs = perModule.get(t) ?? moduleExports(t)
+      perModule.set(t, theirs)
+      for (const name of theirs.keys()) {
+        if (name === 'default' || mine.has(name)) continue
+        mine.set(name, new Set([exportKey(t, name)])); grew = true
       }
     }
   }
+}
+for (const [f, exports] of perModule) for (const [name, edges] of exports) { expandNamespaceAliases(edges); graph.set(exportKey(f, name), edges) }
+
+/** The edges out of every screen (any file outside src/lib). */
+const screenEdges = new Set<string>()
+for (const f of walk(SRC_DIR)) {
+  if (libFiles.includes(f)) continue
+  const sf = source(f)
+  const imports = importBindings(sf)
+  edgesOf(sf, imports, screenEdges, new Set())
+}
+expandNamespaceAliases(screenEdges)
+
+// Reachable exports: a screen's edges, then everything they point at.
+const reachable = new Set<string>()
+const frontier = [...screenEdges].filter((e) => graph.has(e))
+while (frontier.length > 0) {
+  const k = frontier.pop()!
+  if (reachable.has(k)) continue
+  reachable.add(k)
+  for (const e of graph.get(k) ?? []) if (graph.has(e) && !reachable.has(e)) frontier.push(e)
 }
 
 const unreferenced: string[] = []
 for (const routeKey of Object.keys(ROUTES).sort()) {
-  if (screenRefs.has(`ROUTES.${routeKey}`)) continue
-  const via = [...libExports].filter(([, e]) => e.refs.has(`ROUTES.${routeKey}`)).map(([k]) => k)
+  const token = `ROUTES.${routeKey}`
+  if (screenEdges.has(token)) continue
+  const via = [...graph].filter(([, edges]) => edges.has(token)).map(([k]) => k)
   if (via.some((k) => reachable.has(k))) continue
-  const names = [...new Set(via.map((k) => k.split('#')[1]))]
+  const names = [...new Set(via.map((k) => k.slice(k.lastIndexOf('#') + 1)))]
   unreferenced.push(
     via.length === 0
-      ? `ROUTES.${routeKey} — no src/lib function uses it and nothing outside src/lib references it`
-      : `ROUTES.${routeKey} — used by ${names.join(', ')} but no screen reaches ${names.length === 1 ? 'it' : 'them'}`,
+      ? `${token} — no src/lib function uses it and nothing outside src/lib references it`
+      : `${token} — used by ${names.join(', ')} but no screen reaches ${names.length === 1 ? 'it' : 'them'}`,
   )
 }
 fail(
