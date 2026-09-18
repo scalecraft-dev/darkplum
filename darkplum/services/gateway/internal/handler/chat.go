@@ -973,10 +973,11 @@ func (h *ChatHandler) HandleEffectivePolicyImpact(c *gin.Context) {
 // principal that could be affected by an org-level override (see the
 // handler's doc comment for why that set is exactly "users with a row, owners
 // of keys with a row, and every key those users own"), reports the ones
-// whose effective allowlist comes out empty (LockedOut) and the ones whose
-// reachable set shrinks (Narrowed), and whether the org itself — hence every
-// inheriting principal — reaches less (OrgNarrowed). Split from the handler
-// so tests can drive it with a hand-built Snapshot and route table.
+// whose effective allowlist comes out empty (LockedOut), the ones with a row
+// of their own whose allowed set (allowedModels: allowed ∧ enabled ∧
+// residency-ok) shrinks (Narrowed), and whether the org's own allowed set —
+// hence every inheriting principal's — shrinks (OrgNarrowed). Split from the
+// handler so tests can drive it with a hand-built Snapshot and route table.
 func policyImpact(snap policy.Snapshot, table *routing.Table, override *policy.PolicyOverride) policyImpactResponse {
 	resp := policyImpactResponse{LockedOut: []policyImpactPrincipal{}, Narrowed: []policyImpactPrincipal{}}
 

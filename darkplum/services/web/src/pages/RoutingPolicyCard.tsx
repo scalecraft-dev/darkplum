@@ -351,7 +351,7 @@ export function RoutingPolicyCard({
           </fieldset>
 
           {/* affected counts only principals with a policy of their own whose
-              reachable set actually shrank — never "has a row". orgNarrowed is
+              allowed set actually shrank — never "has a row". orgNarrowed is
               the separate question of whether everyone who simply inherits now
               is allowed less too; the two can both be true, either alone, or
               neither. `!changed` is how the card knows the save landed: a

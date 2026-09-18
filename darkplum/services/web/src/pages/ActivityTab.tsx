@@ -227,10 +227,20 @@ function inferenceEventToUnified(e: InferenceEvent): UnifiedEvent {
   // answer anyone. A deliberate refusal (policy, unknown model, bad request)
   // is "Refused", not "Error" — an admin scanning the table must be able to
   // tell a rule firing from a backend falling over without reading detail.
+  // A caller pressing Stop (request_canceled) is neither; it gets its own
+  // neutral label rather than the red one.
+  const cancelled = e.denial_code === 'request_canceled'
   const label =
-    e.status_code < 400 ? PURPOSE_LABEL[purpose] : e.denial_code ? 'Refused' : 'Error'
-  // On a refusal `model` may be the resolved id or "(none)"; requested_model
-  // is what the caller actually asked for, and is the only record of it.
+    e.status_code < 400
+      ? PURPOSE_LABEL[purpose]
+      : cancelled
+        ? 'Cancelled'
+        : e.denial_code
+          ? 'Refused'
+          : 'Error'
+  // requested_model is set when the caller asked for something other than
+  // what `model` records (an alias that resolved, or a routed pick); it is
+  // shown whenever it differs. (A body with no model at all records neither.)
   const asked =
     e.requested_model && e.requested_model !== e.model ? `, asked for: ${e.requested_model}` : ''
   const base = `model: ${e.model}${asked}, latency: ${e.latency_ms}ms, status: ${e.status_code}`
@@ -247,7 +257,8 @@ function inferenceEventToUnified(e: InferenceEvent): UnifiedEvent {
     user_id:        e.user_id,
     user_display:   display,
     action_label:   label,
-    action_variant: e.status_code >= 400 ? 'danger' : purpose === 'inference' ? 'success' : 'info',
+    action_variant:
+      e.status_code >= 400 ? (cancelled ? 'neutral' : 'danger') : purpose === 'inference' ? 'success' : 'info',
     detail_text,
     ip_address:     e.ip_address,
     route:          e.route_name ?? null,
@@ -318,7 +329,8 @@ export function ActivityTab() {
   const [allUsers, setAllUsers]   = useState<User[]>([])
   const [allKeys, setAllKeys]     = useState<ApiKey[]>([])
   const [allModels, setAllModels] = useState<AdminModel[]>([])
-  const [exporting, setExporting] = useState(false)
+  /** Which export is in flight, so only that button reads "Preparing…". */
+  const [exporting, setExporting] = useState<'events' | 'requests' | null>(null)
 
   const [summary, setSummary]         = useState<UsageSummary | null>(null)
   const [buckets, setBuckets]         = useState<UsageBucket[]>([])
@@ -453,7 +465,7 @@ export function ActivityTab() {
    *  silently (a Denial reason filter only exists on requests). */
   async function handleExport(kind: 'events' | 'requests') {
     const { since, until } = getTimeRange(timeRange)
-    setExporting(true)
+    setExporting(kind)
     try {
       const { blob, filename } =
         kind === 'requests'
@@ -463,7 +475,7 @@ export function ActivityTab() {
     } catch (err) {
       toast((err as Error).message, 'error')
     } finally {
-      setExporting(false)
+      setExporting(null)
     }
   }
 
@@ -516,15 +528,15 @@ export function ActivityTab() {
       <div className={styles.toolbar}>
         <div className={styles.exportGroup}>
           {(logView === 'admin' || logView === 'all') && (
-            <Button variant="secondary" size="sm" onClick={() => void handleExport('events')} disabled={exporting}>
+            <Button variant="secondary" size="sm" onClick={() => void handleExport('events')} disabled={exporting !== null}>
               <ExportIcon />
-              {exporting ? 'Preparing…' : 'Export admin events CSV'}
+              {exporting === 'events' ? 'Preparing…' : 'Export admin events CSV'}
             </Button>
           )}
           {(logView === 'api' || logView === 'all') && (
-            <Button variant="secondary" size="sm" onClick={() => void handleExport('requests')} disabled={exporting}>
+            <Button variant="secondary" size="sm" onClick={() => void handleExport('requests')} disabled={exporting !== null}>
               <ExportIcon />
-              {exporting ? 'Preparing…' : 'Export requests CSV'}
+              {exporting === 'requests' ? 'Preparing…' : 'Export requests CSV'}
             </Button>
           )}
         </div>

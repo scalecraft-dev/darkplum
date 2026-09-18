@@ -310,9 +310,9 @@ as `denial_code` and shown in Admin > Activity (filter by reason, export with
 the same filter), so "did my rule fire, and on whom" has an answer in the
 product, not in `kubectl logs`. A save at any level — organisation included —
 that would leave a user or key with no allowed model is refused by the API
-(`409`, naming who), not just greyed out in the UI, and the editor shows what
-each of the user's keys is allowed before and after, before you save. Every
-user can open
+(`409`, naming who), not just greyed out in the UI, and the editor names which
+of the user's keys lose access, and what they lose, before you save. Every user
+can open
 "why is my access limited?" in chat to see their effective policy and which
 level set each part.
 

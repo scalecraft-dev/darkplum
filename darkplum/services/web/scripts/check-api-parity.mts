@@ -390,9 +390,9 @@ const mentions = (haystack: string, name: string) => new RegExp(`\\b${name}\\b`)
 // of another reachable export in a different module. Fixed point over the
 // (small) export set. Same-named exports are conflated, which can only make
 // something look reachable, never hide a dead route behind a false alarm.
-// An import counts as a reference here; an import nobody calls is tsc's job
-// (noUnusedLocals is on, and `pnpm run build` runs tsc), so the two together
-// cover it.
+// Imports and type positions are stripped first (valueUsesOnly), so only a
+// value use counts; an import nobody calls is tsc's job (noUnusedLocals is
+// on, and `pnpm run build` runs tsc), so the two together cover it.
 const reachable = new Set<string>()
 for (const [k, e] of libExports) if (mentions(nonLibSource, e.name)) reachable.add(k)
 for (let grew = true; grew; ) {

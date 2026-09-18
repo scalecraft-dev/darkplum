@@ -1004,6 +1004,47 @@ func TestPreviewUserPolicy_NoWritesAndReportsLockOut(t *testing.T) {
 	}
 }
 
+// An all-null body means "inherit everything", which is what no row means:
+// it must not leave a phantom row behind (one the UI shows as inheriting,
+// the impact count treats as an exception, and the drawer cannot remove).
+func TestUserPolicy_AllNullPutIsInherit(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	adminID := newPolicyTestUser(t, ctx, pool)
+	targetID := newPolicyTestUser(t, ctx, pool)
+	insertModel(t, ctx, pool, "m1", backendClassSelfHosted, true)
+
+	gw := newFakePolicyGateway(t, pool)
+	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	r := newPolicyTestRouter(ph, rh, adminID)
+
+	// Start with a real row, then "save" the drawer's inherit-everything form.
+	if resp := doJSON(t, r, http.MethodPut, "/api/v1/users/"+targetID+"/routing-policy", policyObject{AllowedModels: strs("m1")}); resp.Code != http.StatusOK {
+		t.Fatalf("put: %d %s", resp.Code, resp.Body.String())
+	}
+	resp := doJSON(t, r, http.MethodPut, "/api/v1/users/"+targetID+"/routing-policy", policyObject{})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("all-null put: %d %s", resp.Code, resp.Body.String())
+	}
+	got := decodeJSON[principalPolicyResponse](t, resp.Body.Bytes())
+	if got.UpdatedAt != nil || got.AllowedModels != nil || got.Residency != nil || got.DefaultModel != nil {
+		t.Fatalf("all-null put must answer with the no-row shape, got %+v", got)
+	}
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM principal_routing_policies WHERE user_id = $1`, targetID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("all-null put left %d row(s) behind", n)
+	}
+	// And it is not listed as a principal with a policy of its own.
+	list := doJSON(t, r, http.MethodGet, "/api/v1/routing-policy/principals", nil)
+	if strings.Contains(list.Body.String(), targetID) {
+		t.Fatalf("principals list still shows the user after an all-null put: %s", list.Body.String())
+	}
+}
+
 // --- Org policy: affected_principals on tighten -----------------------------
 
 func TestOrgPolicy_AffectedPrincipalsOnTighten(t *testing.T) {
@@ -1020,10 +1061,14 @@ func TestOrgPolicy_AffectedPrincipalsOnTighten(t *testing.T) {
 	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
 	r := newPolicyTestRouter(ph, rh, adminID)
 
-	if resp := doJSON(t, r, http.MethodPut, "/api/v1/users/"+targetID+"/routing-policy", policyObject{DefaultModel: nil}); resp.Code != http.StatusOK {
+	// Two principals with REAL rows of their own that the org narrowing will
+	// bite: both allow m1,m2 explicitly today. (An all-null body is not a
+	// row -- see TestUserPolicy_AllNullPutIsInherit -- so it could not be
+	// used to stand up a counted principal here even by accident.)
+	if resp := doJSON(t, r, http.MethodPut, "/api/v1/users/"+targetID+"/routing-policy", policyObject{AllowedModels: strs("m1", "m2")}); resp.Code != http.StatusOK {
 		t.Fatalf("put user policy: status = %d, body = %s", resp.Code, resp.Body.String())
 	}
-	if resp := doJSON(t, r, http.MethodPut, "/api/v1/api-keys/"+keyID+"/routing-policy", policyObject{DefaultModel: nil}); resp.Code != http.StatusOK {
+	if resp := doJSON(t, r, http.MethodPut, "/api/v1/api-keys/"+keyID+"/routing-policy", policyObject{AllowedModels: strs("m1", "m2")}); resp.Code != http.StatusOK {
 		t.Fatalf("put key policy: status = %d, body = %s", resp.Code, resp.Body.String())
 	}
 	// A second key with NO row of its own: it inherits its owner and must
@@ -1036,7 +1081,7 @@ func TestOrgPolicy_AffectedPrincipalsOnTighten(t *testing.T) {
 		t.Fatalf("put already-narrow user policy: status = %d, body = %s", resp.Code, resp.Body.String())
 	}
 
-	// Tightening: nil -> restricted. targetID and its key WITH a row inherit
+	// Tightening: nil -> restricted. targetID and its key WITH a row allow
 	// m1,m2 and drop to m1 (2 narrowed); the row-less key rides on its
 	// owner; alreadyID stays at m1; the org itself shrank.
 	resp := doJSON(t, r, http.MethodPut, "/api/v1/routing-policy", map[string]any{"residency": residencyAny, "allowed_models": []string{"m1"}})

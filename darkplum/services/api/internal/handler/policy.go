@@ -801,6 +801,20 @@ func (h *PolicyHandler) upsertPolicy(ctx context.Context, c *gin.Context, princi
 		col = "api_key_id"
 	}
 
+	// A body with every field null says "inherit everything" -- which is
+	// what having no row means. Storing it would create a phantom
+	// exception: a row the UI renders as "inherits", that the org card's
+	// impact count and the Access overview's "narrowed" tally still count,
+	// and that the drawer (which hides "Reset to inherit" for an all-null
+	// row) could never remove. So an all-null PUT is a DELETE, and the
+	// response is the no-row shape (updated_at absent).
+	if req.Residency == nil && req.AllowedModels == nil && req.DefaultModel == nil {
+		_, err := h.db.Exec(ctx, fmt.Sprintf(
+			`DELETE FROM principal_routing_policies WHERE principal_type = $1 AND %s = $2`, col,
+		), principalType, id)
+		return principalPolicyResponse{}, err
+	}
+
 	var resp principalPolicyResponse
 	err := h.db.QueryRow(ctx, fmt.Sprintf(`
 		INSERT INTO principal_routing_policies (principal_type, %s, residency, allowed_models, default_model, updated_at, updated_by)
