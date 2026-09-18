@@ -156,6 +156,7 @@ See `terraform/aws/variables.tf` for the full list.
 | `make verify-bedrock-iam` | Prove the gateway's IAM role allows only the configured Bedrock models |
 | `make set-hf-token` | Store a Hugging Face token for gated models (from `$HF_TOKEN`) |
 | `make deploy-semantic-router` | Install the open-source intent classifier for routed aliases |
+| `pnpm run check:parity` (in `services/web`) | Verify every API route has a UI and vice versa against `docs/api-routes.json` |
 | `make remove-semantic-router` | Remove it (routed aliases fall back to their default route) |
 | `make expose-web [SCHEME=internal] [CERT_ARN=]` | Publish the web UI on an AWS load balancer |
 | `make unexpose-web` | Back to cluster-internal (port-forward) |
@@ -166,6 +167,15 @@ See `terraform/aws/variables.tf` for the full list.
 | `make dev-up [DEV_PORT=8080] [DEV_AWS=1]` | Local kind stack with mocked inference (no cloud account needed) |
 | `make dev-test` | Smoke-test the local stack |
 | `make dev-down` | Delete the local kind cluster |
+
+## API reference
+
+`docs/API.md` lists every endpoint, generated from `docs/api-routes.json`. That
+file is also the parity contract: each route is marked `ui` (the web client
+calls it — checked by `pnpm run check:parity`) or `machine` with a reason (probes,
+the api↔gateway service calls, the OIDC redirect target). Go tests in both
+services fail if a route is registered that the file does not list, or listed
+but not registered.
 
 ## Reaching the web UI
 
@@ -273,11 +283,40 @@ underlying models in that geography's regions only — no all-region wildcard an
 `global.` profiles. `make verify-bedrock-iam` simulates the deployed role and fails
 if anything outside the allowlist would be permitted.
 
+**Who may use which models** — policy per organisation, per user and per API
+key (Admin > Models for the organisation; Admin > Users & Keys, "Routing
+policy" on each row). Each level carries the same three settings:
+
+- *Allowed models* — a list of models (inherit = whatever the level above
+  allows). Lists hold concrete models; an "add every target of alias …" helper
+  expands an alias when you click it, so adding a route later never widens
+  anyone's access.
+- *Residency* — inherit, or tighten to self-hosted only. It can never loosen.
+- *Default model* — preselected in the chat picker; used by an API key whose
+  request names no model.
+
+They merge most-restrictive-wins: **a key can never reach more than its owner,
+and a user never more than the organisation.** The gateway checks the model that
+actually serves the request — including the target a routed alias picks — and
+refuses with `model_not_allowed` (recorded in the usage log). A save that would
+leave a user or key with no reachable model is refused, and the editor previews
+"this will block N of this user's keys" before you save. Every user can open
+"why is my access limited?" in chat to see their effective policy and which
+level set each part.
+
+Two limits to know: policy changes take effect within a few seconds (the gateway
+refreshes its policy snapshot; revoking a key is immediate), and per-user policy
+for webchat traffic relies on the api telling the gateway who the user is —
+whoever holds the api's service credential can act as any user. Per-user and
+per-key allowlists are not yet backstopped by a separate cloud IAM role; every
+principal shares the gateway's role until workspaces ship. Groups and
+workspaces are the next principal types; the schema reserves room for them.
+
 **Routing policy and aliases** (Admin > Models):
 
 - *Residency* — `any`, or `self-hosted only`, which refuses every request that
-  would go to a cloud-managed model. This is one org-wide setting today, not
-  per-workspace policy.
+  would go to a cloud-managed model. Set for the organisation here; tightened
+  per user or per key from Users & Keys.
 - *Aliases* — stable names such as `default-chat` that point at a model, so
   swapping models is an admin change rather than a code change. The usage log
   records both the alias requested and the model that served it.
