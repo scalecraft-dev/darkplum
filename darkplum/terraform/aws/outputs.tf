@@ -49,7 +49,7 @@ output "inference_backend" {
 
 output "inference_region" {
   description = "Region the gateway calls the hosted-model backend in."
-  value       = var.bedrock_region
+  value       = local.bedrock_region
 }
 
 output "bedrock_model_filter" {
@@ -75,6 +75,11 @@ output "model_revision" {
 output "bedrock_invoke_arns" {
   description = "The exact ARNs the gateway role may invoke (Layer 1 allowlist). Used by `make verify-bedrock-iam`."
   value       = local.bedrock_invoke_arns
+}
+
+output "bedrock_transport" {
+  description = "How the gateway reaches Bedrock: privatelink (interface VPC endpoints, in-region) or nat (public endpoint via the NAT gateway)."
+  value       = local.bedrock_transport
 }
 
 output "gateway_role_arn" {

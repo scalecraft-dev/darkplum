@@ -46,7 +46,7 @@ const (
 
 // upstream holds configuration and cached state for one upstream.
 type upstream struct {
-	name    string
+	name     string
 	probeURL string // GET this URL to check reachability (e.g. http://host:port/v1/models)
 }
 
@@ -62,8 +62,8 @@ type Checker struct {
 	upstreams []upstream
 	client    *http.Client
 
-	mu      sync.Mutex
-	cache   map[string]cachedResult
+	mu       sync.Mutex
+	cache    map[string]cachedResult
 	cacheTTL time.Duration
 }
 

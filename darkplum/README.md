@@ -49,7 +49,14 @@ make cli && ./bin/darkplum doctor check --cloud aws --profile <your-profile>
 # Deploy everything (takes 35-50 minutes). CLOUD defaults to aws.
 make deploy             # equivalent to: make deploy CLOUD=aws
 
-# Check status while waiting for model to load
+# Prove the gateway's IAM role can only reach the Bedrock models you configured
+make verify-bedrock-iam
+
+# Publish the web UI (internal load balancer; add CERT_ARN=<ACM cert> for HTTPS)
+make expose-web
+# -> open the printed address, create the first admin, enable a model under Admin > Models
+
+# Check status while waiting for a self-hosted model to load (if gpu_desired_size > 0)
 make status
 
 # Test inference
@@ -127,6 +134,9 @@ See `terraform/aws/variables.tf` for the full list.
 | `make remove-model NAME=` | Remove a model added with `deploy-model` |
 | `make list-models` | List self-hosted model deployments and gateway upstreams |
 | `make verify-bedrock-iam` | Prove the gateway's IAM role allows only the configured Bedrock models |
+| `make set-hf-token` | Store a Hugging Face token for gated models (from `$HF_TOKEN`) |
+| `make expose-web [SCHEME=internal] [CERT_ARN=]` | Publish the web UI on an AWS load balancer |
+| `make unexpose-web` | Back to cluster-internal (port-forward) |
 | `make test` | Send a test chat completion request |
 | `make status` | Show cluster, node, pod, and GPU status |
 | `make destroy` | Tear down all resources |
@@ -134,6 +144,25 @@ See `terraform/aws/variables.tf` for the full list.
 | `make dev-up [DEV_PORT=8080] [DEV_AWS=1]` | Local kind stack with mocked inference (no cloud account needed) |
 | `make dev-test` | Smoke-test the local stack |
 | `make dev-down` | Delete the local kind cluster |
+
+## Reaching the web UI
+
+`make deploy` leaves the web UI cluster-internal. `make expose-web` publishes it
+on an AWS Network Load Balancer:
+
+- `make expose-web` — internal NLB, plain HTTP. Reachable from inside the VPC /
+  your VPN only. Session cookies lose the Secure flag; use this to evaluate, not
+  to run.
+- `make expose-web CERT_ARN=arn:aws:acm:...` — HTTPS terminated at the NLB with
+  your ACM certificate. Add `SCHEME=internet-facing` to publish publicly. Point a
+  DNS CNAME at the printed hostname; the certificate must match that name.
+- `make unexpose-web` — back to cluster-internal.
+
+Plain HTTP on an internet-facing load balancer is refused. Run `make configure-sso`
+after exposing; it uses the load balancer address for the OIDC redirect URL.
+
+The gateway itself is never exposed: its `/health` endpoint reports routing and
+policy state and is meant for in-cluster probes and operators only.
 
 ## Models and Routing
 
@@ -203,8 +232,15 @@ if anything outside the allowlist would be permitted.
   swapping models is an admin change rather than a code change. The usage log
   records both the alias requested and the model that served it.
 
-Gated models (Llama weights on Hugging Face, etc.) require HF token wiring that is
-not yet implemented for self-hosted deployments.
+**Gated models** (Llama, Gemma and other licence-gated weights on Hugging Face):
+accept the licence on huggingface.co with your account, then store a read token
+once — it is read from the environment, never passed on the command line:
+
+```bash
+read -s HF_TOKEN && export HF_TOKEN
+make set-hf-token
+make deploy-model NAME=llama MODEL=meta-llama/Llama-3.1-8B-Instruct REVISION=<commit-sha>
+```
 
 ## Troubleshooting
 
@@ -215,6 +251,8 @@ not yet implemented for self-hosted deployments.
 **Model download stalled**: HF Hub can be slow from NAT gateway IPs. Check init container logs: `kubectl logs -n darkplum-inference deploy/vllm-inference -c model-download`
 
 **Out of GPU memory**: The model doesn't fit in 24GB VRAM. Use a smaller model or a quantized variant (AWQ/GPTQ).
+
+**Bedrock models missing from the catalog**: check `kubectl logs -n darkplum-system deploy/darkplum-gateway | grep -i bedrock` and the gateway's `/health` (port-forward `svc/darkplum-gateway 8082:8080`): a `last_error_kind` of `auth` means the gateway role has no credentials or no access to the model families in `bedrock_model_patterns` — run `make verify-bedrock-iam`; `unreachable` means the VPC endpoints or NAT path are broken. Models also need access granted per model in the Bedrock console.
 
 **Cannot reach vLLM from another pod**: A NetworkPolicy restricts vLLM ingress to pods labeled `app.kubernetes.io/name: darkplum-gateway` only. `make test` uses `kubectl port-forward`, which bypasses NetworkPolicy. To call vLLM from a custom pod, add the gateway label to your pod or temporarily delete the NetworkPolicy: `kubectl delete -n darkplum-inference networkpolicy vllm-inference-ingress`
 

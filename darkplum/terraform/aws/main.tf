@@ -14,6 +14,12 @@ locals {
   # the right gateway Provider (bedrock vs. vertex) without branching on cloud.
   inference_backend = "bedrock"
 
+  bedrock_region = var.bedrock_region != "" ? var.bedrock_region : var.aws_region
+
+  # PrivateLink only works in-region; out-of-region Bedrock goes through NAT.
+  bedrock_private_endpoints = var.bedrock_private_endpoints && local.bedrock_region == var.aws_region
+  bedrock_transport         = local.bedrock_private_endpoints ? "privatelink" : "nat"
+
   # Layer 1 allowlist for cloud-managed models — computed (and unit-tested) in
   # modules/bedrock-allowlist.
   bedrock_invoke_arns  = module.bedrock_allowlist.invoke_arns
@@ -29,7 +35,7 @@ module "bedrock_allowlist" {
   source = "./modules/bedrock-allowlist"
 
   account_id          = data.aws_caller_identity.current.account_id
-  region              = var.bedrock_region
+  region              = local.bedrock_region
   geo                 = var.bedrock_inference_geo
   destination_regions = var.bedrock_destination_regions
   model_patterns      = var.bedrock_model_patterns
@@ -63,6 +69,19 @@ module "node_groups" {
   gpu_instance_types = var.gpu_instance_types
   gpu_desired_size   = var.gpu_desired_size
   tags               = local.tags
+}
+
+module "bedrock_endpoints" {
+  source = "./modules/bedrock-endpoints"
+
+  enabled    = local.bedrock_private_endpoints
+  name       = var.cluster_name
+  region     = var.aws_region
+  account_id = data.aws_caller_identity.current.account_id
+  vpc_id     = module.vpc.vpc_id
+  vpc_cidr   = var.vpc_cidr
+  subnet_ids = module.vpc.private_subnets
+  tags       = local.tags
 }
 
 module "pod_identity_gateway" {

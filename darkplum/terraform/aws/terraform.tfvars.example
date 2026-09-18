@@ -28,6 +28,7 @@
 # access must still be granted per model in the Bedrock console.
 # Inference stays inside one geography (us | eu | apac); "global" profiles are
 # never granted.
-# bedrock_region         = "us-east-1"
+# bedrock_region            = "us-east-2"   # defaults to aws_region; keep them equal for PrivateLink
+# bedrock_private_endpoints = true
 # bedrock_inference_geo  = "us"
 # bedrock_model_patterns = ["anthropic.claude-*", "meta.llama*", "mistral.*"]

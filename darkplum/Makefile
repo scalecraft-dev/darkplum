@@ -35,7 +35,7 @@ export DOCKER_CLI_HINTS = false
 export DOCKER_CLI_HOOKS = 0
 
 .PHONY: help check-prereqs _require-outputs _deploy-vllm deploy deploy-infra deploy-k8s deploy-platform build-images push-images configure-sso test status destroy \
-       deploy-model remove-model list-models verify-bedrock-iam \
+       deploy-model remove-model list-models verify-bedrock-iam expose-web unexpose-web set-hf-token \
        dev-up dev-down dev-build-gateway dev-build-api dev-build-web dev-status dev-logs dev-test
 
 help: ## Show this help
@@ -254,7 +254,8 @@ configure-sso: ## Configure OIDC/SSO authentication (interactive)
 	if [ -z "$$WEB_URL" ]; then \
 		read -p "OIDC Redirect URL (e.g. https://darkplum.company.com/auth/callback): " OIDC_REDIRECT_URL; \
 	else \
-		DEFAULT_REDIRECT="http://$$WEB_URL/auth/callback"; \
+		WEB_SCHEME=$$(kubectl get svc darkplum-web -n darkplum-system -o jsonpath='{.spec.ports[0].port}' 2>/dev/null | grep -q '^443$$' && echo https || echo http); \
+		DEFAULT_REDIRECT="$$WEB_SCHEME://$$WEB_URL/auth/callback"; \
 		read -p "OIDC Redirect URL [$$DEFAULT_REDIRECT]: " OIDC_REDIRECT_URL; \
 		OIDC_REDIRECT_URL=$${OIDC_REDIRECT_URL:-$$DEFAULT_REDIRECT}; \
 	fi; \
@@ -378,6 +379,57 @@ verify-bedrock-iam: ## Prove the gateway's IAM role allows only the configured B
 	[ $$FAIL -eq 0 ] && echo "Layer 1 allowlist behaves as configured." || { echo "Layer 1 allowlist does NOT behave as configured."; exit 1; }
 
 # =============================================================================
+# Exposing the web UI (production)
+# =============================================================================
+
+SCHEME ?= internal
+
+expose-web: ## Publish the web UI on an AWS NLB: make expose-web [SCHEME=internal|internet-facing] [CERT_ARN=<ACM cert arn> for HTTPS]
+	@[ "$(SCHEME)" = "internal" ] || [ "$(SCHEME)" = "internet-facing" ] || { echo "ERROR: SCHEME must be internal or internet-facing."; exit 1; }
+	@kubectl get svc darkplum-web -n darkplum-system >/dev/null 2>&1 || { echo "ERROR: darkplum-web is not deployed. Run 'make deploy' first."; exit 1; }
+	@if [ -n "$(CERT_ARN)" ]; then \
+		echo "Exposing web UI over HTTPS ($(SCHEME) NLB, TLS terminated with $(CERT_ARN))..."; \
+		PORTS='[{"name":"https","port":443,"targetPort":80,"protocol":"TCP"}]'; \
+		ANN='{"service.beta.kubernetes.io/aws-load-balancer-type":"nlb","service.beta.kubernetes.io/aws-load-balancer-scheme":"$(SCHEME)","service.beta.kubernetes.io/aws-load-balancer-internal":"$(if $(filter internal,$(SCHEME)),true,false)","service.beta.kubernetes.io/aws-load-balancer-ssl-cert":"$(CERT_ARN)","service.beta.kubernetes.io/aws-load-balancer-ssl-ports":"443","service.beta.kubernetes.io/aws-load-balancer-backend-protocol":"http"}'; \
+		SECURE=true; \
+	else \
+		echo "Exposing web UI over plain HTTP ($(SCHEME) NLB)."; \
+		echo "WARNING: without CERT_ARN sessions travel unencrypted and session cookies lose the Secure flag."; \
+		echo "         Use this only on a private network, and only until you have an ACM certificate."; \
+		[ "$(SCHEME)" = "internal" ] || { echo "ERROR: refusing to publish plain HTTP on an internet-facing load balancer. Pass CERT_ARN."; exit 1; }; \
+		PORTS='[{"name":"http","port":80,"targetPort":80,"protocol":"TCP"}]'; \
+		ANN='{"service.beta.kubernetes.io/aws-load-balancer-type":"nlb","service.beta.kubernetes.io/aws-load-balancer-scheme":"internal","service.beta.kubernetes.io/aws-load-balancer-internal":"true","service.beta.kubernetes.io/aws-load-balancer-ssl-cert":null,"service.beta.kubernetes.io/aws-load-balancer-ssl-ports":null,"service.beta.kubernetes.io/aws-load-balancer-backend-protocol":null}'; \
+		SECURE=false; \
+	fi; \
+	kubectl patch svc darkplum-web -n darkplum-system --type=merge \
+		-p "{\"metadata\":{\"annotations\":$$ANN},\"spec\":{\"type\":\"LoadBalancer\",\"ports\":$$PORTS}}" >/dev/null; \
+	CURRENT=$$(kubectl get secret darkplum-auth -n darkplum-system -o jsonpath='{.data.SECURE_COOKIES}' 2>/dev/null | base64 -d 2>/dev/null); \
+	if [ "$$CURRENT" != "$$SECURE" ]; then \
+		kubectl patch secret darkplum-auth -n darkplum-system --type=merge \
+			-p "{\"stringData\":{\"SECURE_COOKIES\":\"$$SECURE\"}}" >/dev/null; \
+		kubectl rollout restart deployment/darkplum-api -n darkplum-system >/dev/null; \
+		kubectl rollout status deployment/darkplum-api -n darkplum-system --timeout=120s; \
+	fi; \
+	echo "Waiting for the load balancer hostname..."; \
+	for i in $$(seq 1 30); do \
+		HOST=$$(kubectl get svc darkplum-web -n darkplum-system -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null); \
+		[ -n "$$HOST" ] && break; sleep 10; \
+	done; \
+	[ -n "$$HOST" ] || { echo "Load balancer not ready yet. Check: kubectl get svc darkplum-web -n darkplum-system"; exit 1; }; \
+	SCHEME_URL=$$([ "$$SECURE" = "true" ] && echo https || echo http); \
+	echo ""; \
+	echo "Web UI: $$SCHEME_URL://$$HOST"; \
+	[ "$$SECURE" != "true" ] || echo "Point your DNS name at this hostname (CNAME) — the certificate must match the name users type."; \
+	echo "Then: make configure-sso   (to enable SSO; uses this address for the redirect URL)"
+
+unexpose-web: ## Revert the web UI to cluster-internal (port-forward only)
+	@kubectl patch svc darkplum-web -n darkplum-system --type=merge \
+		-p '{"metadata":{"annotations":{"service.beta.kubernetes.io/aws-load-balancer-type":null,"service.beta.kubernetes.io/aws-load-balancer-scheme":null,"service.beta.kubernetes.io/aws-load-balancer-internal":null,"service.beta.kubernetes.io/aws-load-balancer-ssl-cert":null,"service.beta.kubernetes.io/aws-load-balancer-ssl-ports":null,"service.beta.kubernetes.io/aws-load-balancer-backend-protocol":null}},"spec":{"type":"ClusterIP","ports":[{"name":"http","port":80,"targetPort":80,"protocol":"TCP"}]}}' >/dev/null
+	@kubectl patch secret darkplum-auth -n darkplum-system --type=merge -p '{"stringData":{"SECURE_COOKIES":"true"}}' >/dev/null
+	@kubectl rollout restart deployment/darkplum-api -n darkplum-system >/dev/null
+	@echo "Web UI is cluster-internal again: kubectl port-forward -n darkplum-system svc/darkplum-web 8081:80"
+
+# =============================================================================
 # Additional self-hosted open-source models (one vLLM deployment + GPU each)
 # =============================================================================
 
@@ -420,6 +472,14 @@ deploy-model: ## Add a self-hosted model: make deploy-model NAME=qwen MODEL=Qwen
 	@echo "Model download + load takes 15-25 minutes. Monitor:"
 	@echo "  kubectl logs -f -n $(NAMESPACE) deploy/vllm-$(NAME) -c model-download"
 	@echo "Once ready, the gateway discovers it within a minute; then enable it under Admin > Models."
+
+set-hf-token: ## Store a Hugging Face token for gated models (reads HF_TOKEN from the environment, never argv)
+	@[ -n "$$HF_TOKEN" ] || { echo "ERROR: set HF_TOKEN in the environment first, e.g.  read -s HF_TOKEN && export HF_TOKEN"; exit 1; }
+	@kubectl get namespace $(NAMESPACE) >/dev/null 2>&1 || kubectl apply -f $(K8S_DIR)/base/namespaces/darkplum-inference.yaml >/dev/null
+	@kubectl create secret generic huggingface-token --namespace=$(NAMESPACE) \
+		--from-literal=token="$$HF_TOKEN" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
+	@echo "Hugging Face token stored in $(NAMESPACE)/huggingface-token. New model downloads use it; restart an existing"
+	@echo "deployment to pick it up: kubectl rollout restart -n $(NAMESPACE) deploy/<vllm-deployment>"
 
 remove-model: ## Remove a self-hosted model added with deploy-model: make remove-model NAME=qwen
 	@[[ "$(NAME)" =~ ^[a-z0-9][a-z0-9-]{0,30}$$ ]] || { echo "ERROR: NAME is required."; exit 1; }

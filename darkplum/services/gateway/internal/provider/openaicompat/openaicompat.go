@@ -121,12 +121,12 @@ type compatRequest struct {
 }
 
 type compatResponse struct {
-	ID      string          `json:"id"`
-	Object  string          `json:"object"`
-	Model   string          `json:"model"`
-	Choices []compatChoice  `json:"choices"`
-	Usage   *compatUsage    `json:"usage"`
-	Error   *compatError    `json:"error"`
+	ID      string         `json:"id"`
+	Object  string         `json:"object"`
+	Model   string         `json:"model"`
+	Choices []compatChoice `json:"choices"`
+	Usage   *compatUsage   `json:"usage"`
+	Error   *compatError   `json:"error"`
 }
 
 type compatChoice struct {

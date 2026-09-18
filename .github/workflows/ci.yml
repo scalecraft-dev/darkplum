@@ -1,0 +1,115 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Go (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        service: [gateway, api, cli]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: dptest
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    defaults:
+      run:
+        working-directory: darkplum/services/${{ matrix.service }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: darkplum/services/${{ matrix.service }}/go.mod
+          cache-dependency-path: darkplum/services/${{ matrix.service }}/go.sum
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l $(git ls-files '*.go'))
+          if [ -n "$unformatted" ]; then echo "gofmt needed:"; echo "$unformatted"; exit 1; fi
+      - run: go build ./...
+      - run: go vet ./...
+      # The api and gateway integration tests (migrations, model sync, aliases,
+      # service key, audit recorder) run against the Postgres service container;
+      # without TEST_DATABASE_URL they would skip silently.
+      - run: go test -race -count=1 ./...
+        env:
+          TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/dptest?sslmode=disable
+
+  web:
+    name: Web
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: darkplum/services/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: darkplum/services/web/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec tsc --noEmit
+      - run: pnpm run build
+
+  terraform:
+    name: Terraform
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: darkplum/terraform/aws
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.14.9"
+      - run: terraform fmt -check -recursive -diff
+      - run: terraform init -backend=false -input=false
+      - run: terraform validate
+      # Offline unit tests of the Bedrock IAM allowlist shape (no providers, no AWS).
+      - name: terraform test (bedrock-allowlist)
+        working-directory: darkplum/terraform/aws/modules/bedrock-allowlist
+        run: |
+          terraform init -backend=false -input=false
+          terraform test
+
+  manifests:
+    name: Kubernetes manifests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: darkplum
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-kubectl@v4
+      - name: kustomize builds
+        run: |
+          for overlay in dev dev-aws prod; do
+            kubectl kustomize k8s/overlays/$overlay > /dev/null || exit 1
+          done
+      - name: model template renders
+        run: |
+          sed -e "s|MODEL_INSTANCE|ci|g" -e "s|PLACEHOLDER_MODEL_NAME|org/model|g" \
+              -e "s|PLACEHOLDER_MODEL_REVISION|main|g" -e "s|PLACEHOLDER_SERVED_MODEL_NAME|ci|g" \
+              -e "s|PLACEHOLDER_MAX_MODEL_LEN|8192|g" k8s/templates/vllm-model.yaml \
+            | python3 -c 'import sys, yaml; docs = list(yaml.safe_load_all(sys.stdin)); assert {d["kind"] for d in docs} == {"Deployment", "Service"}, docs'
+      - name: Makefile parses
+        run: make -n help > /dev/null

@@ -64,6 +64,15 @@ spec:
             # Hugging Face repo, so a re-download cannot silently change weights.
             - name: MODEL_REVISION
               value: PLACEHOLDER_MODEL_REVISION
+            # Gated models (Llama, Gemma, ...) need a Hugging Face token that has
+            # accepted the model licence. Created with `make set-hf-token`; absent
+            # for ungated models.
+            - name: HF_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: huggingface-token
+                  key: token
+                  optional: true
           volumeMounts:
             - name: model-storage
               mountPath: /model

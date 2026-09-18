@@ -76,9 +76,24 @@ variable "served_model_name" {
 }
 
 variable "bedrock_region" {
-  description = "Region the gateway calls Bedrock in. May differ from aws_region; cross-region Bedrock calls are supported."
+  description = <<-EOT
+    Region the gateway calls Bedrock in. Defaults to aws_region, which keeps
+    Bedrock traffic on PrivateLink (see bedrock_private_endpoints). A different
+    region is supported but then calls leave the VPC via the NAT gateway.
+  EOT
   type        = string
-  default     = "us-east-1"
+  default     = ""
+}
+
+variable "bedrock_private_endpoints" {
+  description = <<-EOT
+    Create interface VPC endpoints (PrivateLink) for bedrock-runtime and bedrock
+    so cloud-managed model traffic never leaves the AWS network. Only possible
+    when bedrock_region equals aws_region; silently unused otherwise (see the
+    bedrock_transport output). Roughly USD 0.01/hour per endpoint per AZ.
+  EOT
+  type        = bool
+  default     = true
 }
 
 variable "bedrock_inference_geo" {
