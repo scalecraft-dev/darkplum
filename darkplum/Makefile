@@ -17,6 +17,9 @@ DEV_PORT ?= 8080
 DEV_AWS ?=
 DEV_AWS_PROFILE ?= default
 DEV_OVERLAY := $(if $(DEV_AWS),dev-aws,dev)
+# Every dev target talks to the kind cluster explicitly, never to whatever
+# kubectl's current context happens to be (which may be a production cluster).
+KUBECTL_DEV := kubectl --context kind-$(DEV_CLUSTER)
 
 PROD_TARGETS := verify-bedrock-iam deploy deploy-infra deploy-k8s deploy-platform build-images push-images configure-sso test status destroy deploy-model remove-model list-models
 ifneq ($(filter $(PROD_TARGETS),$(MAKECMDGOALS)),)
@@ -549,7 +552,7 @@ list-models: ## List self-hosted model deployments and the gateway's registered 
 
 dev-up: ## Create local kind cluster and deploy all services [DEV_PORT=8080] [DEV_AWS=1 DEV_AWS_PROFILE=default]
 	@command -v kind >/dev/null 2>&1 || { echo "ERROR: kind not found. Install: https://kind.sigs.k8s.io/docs/user/quick-start/#installation"; exit 1; }
-	@command -v kubectl >/dev/null 2>&1 || { echo "ERROR: kubectl not found."; exit 1; }
+	@command -v kubectl >/dev/null 2>&1 || { echo "ERROR: $(KUBECTL_DEV) not found."; exit 1; }
 	@command -v docker >/dev/null 2>&1 || { echo "ERROR: docker not found."; exit 1; }
 	@if kind get clusters 2>/dev/null | grep -q "^$(DEV_CLUSTER)$$"; then \
 		echo "Cluster $(DEV_CLUSTER) already exists. Run 'make dev-down' first to recreate."; \
@@ -585,16 +588,16 @@ dev-up: ## Create local kind cluster and deploy all services [DEV_PORT=8080] [DE
 	@echo "Loading images into kind..."
 	@kind load docker-image --name $(DEV_CLUSTER) darkplum-gateway:latest darkplum-api:latest darkplum-web:latest
 	@echo "Deploying all services ($(DEV_OVERLAY) overlay)..."
-	@kubectl kustomize $(K8S_DIR)/overlays/$(DEV_OVERLAY) | \
+	@$(KUBECTL_DEV) kustomize $(K8S_DIR)/overlays/$(DEV_OVERLAY) | \
 		sed -e "s|http://localhost:8080|http://localhost:$(DEV_PORT)|g" \
 		    -e "s|PLACEHOLDER_AWS_PROFILE|$(DEV_AWS_PROFILE)|g" | \
-		kubectl apply -f -
+		$(KUBECTL_DEV) apply -f -
 	@echo "Waiting for services to be ready..."
 	@sleep 5
-	@kubectl wait --namespace=darkplum-system --for=condition=ready pod -l app.kubernetes.io/name=postgres --timeout=60s
-	@kubectl wait --namespace=darkplum-system --for=condition=ready pod -l app.kubernetes.io/name=darkplum-gateway --timeout=90s
-	@kubectl wait --namespace=darkplum-system --for=condition=ready pod -l app.kubernetes.io/name=darkplum-api --timeout=90s
-	@kubectl wait --namespace=darkplum-system --for=condition=ready pod -l app.kubernetes.io/name=darkplum-web --timeout=60s
+	@$(KUBECTL_DEV) wait --namespace=darkplum-system --for=condition=ready pod -l app.kubernetes.io/name=postgres --timeout=60s
+	@$(KUBECTL_DEV) wait --namespace=darkplum-system --for=condition=ready pod -l app.kubernetes.io/name=darkplum-gateway --timeout=90s
+	@$(KUBECTL_DEV) wait --namespace=darkplum-system --for=condition=ready pod -l app.kubernetes.io/name=darkplum-api --timeout=90s
+	@$(KUBECTL_DEV) wait --namespace=darkplum-system --for=condition=ready pod -l app.kubernetes.io/name=darkplum-web --timeout=60s
 	@echo ""
 	@echo "========================================="
 	@echo "  Local dev cluster ready."
@@ -617,37 +620,37 @@ dev-down: ## Delete the local kind cluster
 dev-build-gateway: ## Rebuild and redeploy the gateway service
 	@docker build -t darkplum-gateway:latest services/gateway/
 	@kind load docker-image --name $(DEV_CLUSTER) darkplum-gateway:latest
-	@kubectl rollout restart deployment/darkplum-gateway -n darkplum-system
-	@kubectl rollout status deployment/darkplum-gateway -n darkplum-system --timeout=60s
+	@$(KUBECTL_DEV) rollout restart deployment/darkplum-gateway -n darkplum-system
+	@$(KUBECTL_DEV) rollout status deployment/darkplum-gateway -n darkplum-system --timeout=60s
 
 dev-build-api: ## Rebuild and redeploy the api service
 	@docker build -t darkplum-api:latest services/api/
 	@kind load docker-image --name $(DEV_CLUSTER) darkplum-api:latest
-	@kubectl rollout restart deployment/darkplum-api -n darkplum-system
-	@kubectl rollout status deployment/darkplum-api -n darkplum-system --timeout=60s
+	@$(KUBECTL_DEV) rollout restart deployment/darkplum-api -n darkplum-system
+	@$(KUBECTL_DEV) rollout status deployment/darkplum-api -n darkplum-system --timeout=60s
 
 dev-build-web: ## Rebuild and redeploy the web frontend
 	@docker build -t darkplum-web:latest services/web/
 	@kind load docker-image --name $(DEV_CLUSTER) darkplum-web:latest
-	@kubectl rollout restart deployment/darkplum-web -n darkplum-system
-	@kubectl rollout status deployment/darkplum-web -n darkplum-system --timeout=60s
+	@$(KUBECTL_DEV) rollout restart deployment/darkplum-web -n darkplum-system
+	@$(KUBECTL_DEV) rollout status deployment/darkplum-web -n darkplum-system --timeout=60s
 
 dev-status: ## Show local dev cluster status
 	@echo "=== Pods ==="
-	@kubectl get pods -n darkplum-system -o wide 2>/dev/null || echo "Cluster not running. Run: make dev-up"
+	@$(KUBECTL_DEV) get pods -n darkplum-system -o wide 2>/dev/null || echo "Cluster not running. Run: make dev-up"
 	@echo ""
 	@echo "=== Services ==="
-	@kubectl get svc -n darkplum-system 2>/dev/null || true
+	@$(KUBECTL_DEV) get svc -n darkplum-system 2>/dev/null || true
 
 dev-logs: ## Tail logs from all local dev services
 	@echo "=== Gateway (last 20) ==="
-	@kubectl logs -n darkplum-system deploy/darkplum-gateway --tail=20 2>/dev/null || true
+	@$(KUBECTL_DEV) logs -n darkplum-system deploy/darkplum-gateway --tail=20 2>/dev/null || true
 	@echo ""
 	@echo "=== API (last 20) ==="
-	@kubectl logs -n darkplum-system deploy/darkplum-api --tail=20 2>/dev/null || true
+	@$(KUBECTL_DEV) logs -n darkplum-system deploy/darkplum-api --tail=20 2>/dev/null || true
 	@echo ""
 	@echo "=== Web (last 20) ==="
-	@kubectl logs -n darkplum-system deploy/darkplum-web --tail=20 2>/dev/null || true
+	@$(KUBECTL_DEV) logs -n darkplum-system deploy/darkplum-web --tail=20 2>/dev/null || true
 
 dev-test: ## Smoke-test the local stack [DEV_PORT=8080] [DEV_EMAIL=.. DEV_PASSWORD=.. for the authenticated chat test] [MODEL=..]
 	@BASE=http://localhost:$(DEV_PORT); \
