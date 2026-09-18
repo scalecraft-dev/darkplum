@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"net/http"
 	"regexp"
+	"sort"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -833,6 +834,170 @@ func (h *ChatHandler) HandleEffectivePolicyOverride(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, resp)
+}
+
+// policyImpactRequest is the body of POST /v1/policy/impact. Only an org
+// level override is accepted: a user or api_key change only ever ripples to
+// that principal and the keys under it, which POST /v1/policy/effective
+// already answers; an org change ripples to every principal, which is what
+// this endpoint exists to enumerate in one call.
+type policyImpactRequest struct {
+	Override *effectivePolicyOverride `json:"override"`
+}
+
+// policyImpactPrincipal names one principal POST /v1/policy/impact found
+// locked out (empty effective allowlist) under the proposed org policy. A
+// user entry has no api_key_id; a key entry carries both.
+type policyImpactPrincipal struct {
+	UserID   string `json:"user_id"`
+	APIKeyID string `json:"api_key_id,omitempty"`
+}
+
+// policyImpactResponse is the body of a 200 from POST /v1/policy/impact.
+type policyImpactResponse struct {
+	// OrgLockedOut is true when the proposed org policy itself has an empty
+	// allowlist: every principal in the organisation, explicit row or not,
+	// would then be locked out, so LockedOut is not enumerated (it would be
+	// every user and key there is).
+	OrgLockedOut bool `json:"org_locked_out"`
+	// LockedOut lists every principal with an explicit policy row (or a key
+	// owned by a user with one) whose effective allowlist would be empty
+	// under the override. Never null.
+	LockedOut []policyImpactPrincipal `json:"locked_out"`
+	// Evaluated is how many user/key principals were re-merged.
+	Evaluated int `json:"evaluated"`
+}
+
+// HandleEffectivePolicyImpact handles POST /v1/policy/impact: the org-wide
+// counterpart of HandleEffectivePolicyOverride. The api's org PUT
+// /api/v1/routing-policy needs the same lock-out guard the user/key PUTs get
+// from POST /v1/policy/effective (refuse with 409 when the write would leave
+// a principal with no reachable model), but an org change can affect every
+// principal at once, and calling POST /v1/policy/effective once per principal
+// from inside a single admin request is exactly the per-principal-call-in-a-
+// loop anti-pattern the review checklist flags. So this endpoint does the
+// walk here, against the snapshot already in memory, using the SAME
+// Effective() merge — no second implementation on the api side.
+//
+// Which principals can a non-empty org allowlist lock out? Only ones with
+// their own allowlist somewhere in their chain: a principal that inherits is
+// the org, and the org is non-empty by hypothesis. So the walk covers every
+// user with a row, every key with a row (via its owner), and every key those
+// users own. An EMPTY org allowlist locks everyone out; that is reported as
+// org_locked_out rather than enumerated.
+//
+// Service-key only, identical rule to GET/POST /v1/policy/effective.
+func (h *ChatHandler) HandleEffectivePolicyImpact(c *gin.Context) {
+	if c.GetString(middleware.ContextKeyType) != middleware.KeyTypeService {
+		c.JSON(http.StatusForbidden, openAIError{
+			Error: openAIErrorBody{
+				Message: "POST /v1/policy/impact is only available to the service key",
+				Type:    "permission_error",
+				Code:    "service_key_required",
+			},
+		})
+		return
+	}
+
+	var req policyImpactRequest
+	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
+		c.JSON(http.StatusBadRequest, openAIError{
+			Error: openAIErrorBody{
+				Message: fmt.Sprintf("invalid request body: %s", err.Error()),
+				Type:    "invalid_request_error",
+				Code:    "invalid_request",
+			},
+		})
+		return
+	}
+	if req.Override == nil || req.Override.Level != policy.PrincipalTypeOrg {
+		c.JSON(http.StatusBadRequest, openAIError{
+			Error: openAIErrorBody{
+				Message: `override.level must be "org" (use POST /v1/policy/effective for a user or api_key preview)`,
+				Type:    "invalid_request_error",
+				Code:    "invalid_request",
+			},
+		})
+		return
+	}
+	var row *policy.PolicyRow
+	if req.Override.Policy != nil {
+		if req.Override.Policy.Residency != nil && *req.Override.Policy.Residency != policy.ResidencySelfHostedOnly {
+			c.JSON(http.StatusBadRequest, openAIError{
+				Error: openAIErrorBody{
+					Message: `override.policy.residency must be null or "self_hosted_only"`,
+					Type:    "invalid_request_error",
+					Code:    "invalid_request",
+				},
+			})
+			return
+		}
+		row = &policy.PolicyRow{
+			Residency:     req.Override.Policy.Residency,
+			AllowedModels: req.Override.Policy.AllowedModels,
+			DefaultModel:  req.Override.Policy.DefaultModel,
+		}
+	}
+	override := &policy.PolicyOverride{Level: policy.PrincipalTypeOrg, Policy: row}
+
+	snap, loaded := h.policy.Current()
+	if !loaded {
+		respondPolicyUnavailable(c)
+		return
+	}
+
+	c.JSON(http.StatusOK, policyImpact(snap, override))
+}
+
+// policyImpact is HandleEffectivePolicyImpact's pure core: it re-merges every
+// principal that could be locked out by an org-level override (see the
+// handler's doc comment for why that set is exactly "users with a row, owners
+// of keys with a row, and every key those users own") and reports the ones
+// whose effective allowlist comes out empty. Split from the handler so tests
+// can drive it with a hand-built Snapshot.
+func policyImpact(snap policy.Snapshot, override *policy.PolicyOverride) policyImpactResponse {
+	resp := policyImpactResponse{LockedOut: []policyImpactPrincipal{}}
+
+	org := policy.Effective(override.Apply([]policy.PolicyRow{{Level: policy.PrincipalTypeOrg}}))
+	if lockedOut(org) {
+		resp.OrgLockedOut = true
+		return resp
+	}
+
+	users := make(map[string]bool, len(snap.UserRows)+len(snap.KeyRows))
+	for userID := range snap.UserRows {
+		users[userID] = true
+	}
+	for keyID := range snap.KeyRows {
+		if owner, ok := snap.KeyOwner[keyID]; ok {
+			users[owner] = true
+		}
+	}
+	userIDs := make([]string, 0, len(users))
+	for userID := range users {
+		userIDs = append(userIDs, userID)
+	}
+	sort.Strings(userIDs)
+
+	for _, userID := range userIDs {
+		resp.Evaluated++
+		if lockedOut(policy.Effective(override.Apply(snap.ChainFor(userID, "")))) {
+			resp.LockedOut = append(resp.LockedOut, policyImpactPrincipal{UserID: userID})
+		}
+		for _, keyID := range snap.UserKeys[userID] {
+			resp.Evaluated++
+			if lockedOut(policy.Effective(override.Apply(snap.ChainFor(userID, keyID)))) {
+				resp.LockedOut = append(resp.LockedOut, policyImpactPrincipal{UserID: userID, APIKeyID: keyID})
+			}
+		}
+	}
+	return resp
+}
+
+// lockedOut reports whether eff permits no model at all — a non-nil, empty
+// allowlist. nil (unrestricted) is not locked out.
+func lockedOut(eff policy.EffectivePolicy) bool {
+	return eff.AllowedModels != nil && len(*eff.AllowedModels) == 0
 }
 
 // previewEffective builds userID/keyID's raw chain (Snapshot.ChainFor),

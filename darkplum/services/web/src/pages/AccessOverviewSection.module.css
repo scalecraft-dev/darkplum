@@ -175,8 +175,15 @@
   word-break: break-word;
 }
 
-.truncated {
+.more {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
   margin-top: var(--space-2);
+}
+
+.truncated {
   font-size: var(--fs-xs);
   color: var(--fg-subtle);
 }

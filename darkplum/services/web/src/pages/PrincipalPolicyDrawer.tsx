@@ -79,6 +79,43 @@ function errorText(err: unknown, fallback: string): string {
   return err instanceof Error && err.message ? err.message : fallback
 }
 
+/** "1 model" / "3 models" — said the same way everywhere a count of models is
+ *  shown, because "1 models" reads as a bug in the policy, not in the copy. */
+function modelCount(n: number): string {
+  return `${n} ${n === 1 ? 'model' : 'models'}`
+}
+
+/**
+ * What a key stops being able to reach: before minus after.
+ *
+ * A null list is "every model", the widest thing a policy can say. So a null
+ * `after` loses nothing whatever `before` was, and a null `before` is measured
+ * against every enabled model — the same set an explicit list is seeded from.
+ * The preview returns one entry per key the edited user owns, changed or not,
+ * so this difference is the only thing that says whether a key actually loses
+ * something.
+ */
+function lostModels(
+  before: string[] | null | undefined,
+  after: string[] | null | undefined,
+  everyModel: string[],
+): string[] {
+  if (after == null) return []
+  const from = before ?? everyModel
+  return from.filter((id) => !after.includes(id))
+}
+
+/** The other direction: what a key can reach that it could not before. */
+function gainedModels(
+  before: string[] | null | undefined,
+  after: string[] | null | undefined,
+  everyModel: string[],
+): string[] {
+  if (before == null) return []
+  const to = after ?? everyModel
+  return to.filter((id) => !before.includes(id))
+}
+
 // ---------------------------------------------------------------------------
 // Small parts
 // ---------------------------------------------------------------------------
@@ -263,6 +300,25 @@ export function PrincipalPolicyDrawer({ principal, models, aliases, onClose, onS
   const keysAffected = preview?.keys_affected ?? []
   const wouldLockOut = preview?.would_lock_out ?? []
   const lockedOut = wouldLockOut.length > 0
+
+  /** Every key the preview reported, with what it loses and gains. The preview
+   *  lists all of the user's keys, so "affected" here is a fact to compute, not
+   *  one to assume from the length of the list. */
+  const keyImpacts = useMemo(
+    () =>
+      keysAffected.map((k) => ({
+        ...k,
+        lost: lostModels(k.before, k.after, inheritedAllowed),
+        gained: gainedModels(k.before, k.after, inheritedAllowed),
+      })),
+    [keysAffected, inheritedAllowed],
+  )
+  /** The only keys the warning is about: the ones that end up reaching less. */
+  const keysLosing = useMemo(() => keyImpacts.filter((k) => k.lost.length > 0), [keyImpacts])
+  const keysGaining = useMemo(
+    () => keyImpacts.filter((k) => k.lost.length === 0 && k.gained.length > 0),
+    [keyImpacts],
+  )
 
   /** What the default-model control may offer. A default outside the allowlist
    *  is refused by the API, so it is never on the menu here. */
@@ -573,29 +629,41 @@ export function PrincipalPolicyDrawer({ principal, models, aliases, onClose, onS
                           : 'This would lock this key out of every model — save disabled.'}
                       </span>
                     </p>
-                  ) : keysAffected.length > 0 ? (
+                  ) : keysLosing.length > 0 ? (
                     <div className={styles.impactWarn}>
                       <p>
-                        {keysAffected.length === 1
-                          ? "This will block 1 of this user's keys from models it can reach today."
-                          : `This will block ${keysAffected.length} of this user's keys from models they can reach today.`}
+                        {!isUser
+                          ? `This will block this key from ${modelCount(keysLosing[0].lost.length)} it can reach today.`
+                          : keysLosing.length === 1
+                            ? "This will block 1 of this user's keys from models it can reach today."
+                            : `This will block ${keysLosing.length} of this user's keys from models they can reach today.`}
                       </p>
                       <ul className={styles.impactList}>
-                        {keysAffected.slice(0, 4).map((k) => (
+                        {keysLosing.slice(0, 4).map((k) => (
                           <li key={k.id}>
-                            <span className={styles.impactKey}>{k.name}</span>
-                            <span className={styles.impactCounts}>
-                              {(k.before ?? []).length} → {(k.after ?? []).length} models
+                            <span className={styles.impactKeyRow}>
+                              <span className={styles.impactKey}>{k.name}</span>
+                              <span className={styles.impactCounts}>
+                                loses {modelCount(k.lost.length)}
+                              </span>
+                            </span>
+                            <span className={styles.impactLost}>
+                              {k.lost.slice(0, 4).map((id) => modelLabel(id, models)).join(', ')}
+                              {k.lost.length > 4 && ` and ${k.lost.length - 4} more`}
                             </span>
                           </li>
                         ))}
                       </ul>
-                      {keysAffected.length > 4 && (
-                        <p className={styles.impactMore}>and {keysAffected.length - 4} more</p>
+                      {keysLosing.length > 4 && (
+                        <p className={styles.impactMore}>and {keysLosing.length - 4} more</p>
                       )}
                     </div>
                   ) : changed ? (
-                    <p className={styles.impactQuiet}>No key loses access because of this change.</p>
+                    <p className={styles.impactQuiet}>
+                      {isUser ? 'No key loses access.' : 'This key loses no model it can reach today.'}
+                      {keysGaining.length > 0 &&
+                        ` ${keysGaining.length === 1 ? '1 key reaches' : `${keysGaining.length} keys reach`} more than before.`}
+                    </p>
                   ) : (
                     <p className={styles.impactQuiet}>
                       {stored ? 'This principal has a policy of its own.' : `Inherits everything from ${inheritFrom}.`}

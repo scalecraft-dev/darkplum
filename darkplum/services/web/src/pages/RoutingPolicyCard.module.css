@@ -130,6 +130,17 @@
   border-radius: var(--radius-sm);
 }
 
+/* The API refused the save: same shape as .warnings, but the stripe is the
+   danger colour because nothing was written and the form is now ahead of
+   what is stored. */
+.blocked {
+  margin-top: var(--space-3);
+  padding: var(--space-3);
+  background: var(--danger-bg);
+  border-left: 2px solid var(--danger-fg);
+  border-radius: var(--radius-sm);
+}
+
 .warningsTitle {
   font-size: var(--fs-sm);
   font-weight: var(--fw-medium);
@@ -316,6 +327,16 @@
   font-size: var(--fs-xs);
   line-height: var(--lh-relaxed);
   color: var(--fg-default);
+  max-width: 68ch;
+}
+
+/* The same fact when it is good news: said plainly, without the amber a
+   warning earns. */
+.affectedQuiet {
+  margin-top: var(--space-3);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-subtle);
   max-width: 68ch;
 }
 

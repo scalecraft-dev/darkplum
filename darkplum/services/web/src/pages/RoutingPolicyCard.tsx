@@ -24,8 +24,11 @@ interface Props {
   /** Aliases, for the allowlist helper and the default-model menu. */
   aliases: ModelAlias[]
   onRetry: () => void
-  /** Resolves with what the API said the new policy does. */
-  onChange: (draft: OrgPolicyDraft) => Promise<{ warnings: string[]; affectedPrincipals: number }>
+  /** Resolves with what the API said the new policy does — or, when the API
+   *  refused it, who it would have left with no model (`lockedOut`). */
+  onChange: (
+    draft: OrgPolicyDraft,
+  ) => Promise<{ warnings: string[]; affectedPrincipals: number; lockedOut: string[] }>
 }
 
 const RESIDENCY_OPTIONS: { value: Residency; label: string; consequence: string }[] = [
@@ -80,6 +83,9 @@ export function RoutingPolicyCard({
   const [warnings, setWarnings] = useState<string[]>([])
   /** How many users and keys reach less than they did. Written by the API. */
   const [affected, setAffected] = useState<number | null>(null)
+  /** Who the API said the last attempt would have locked out of every model.
+   *  Non-empty means the save was refused and nothing changed. */
+  const [lockedOut, setLockedOut] = useState<string[]>([])
 
   // A reload or a save replaces what is stored; the form follows it rather than
   // keeping an edit the server has never heard of.
@@ -130,6 +136,13 @@ export function RoutingPolicyCard({
 
   const commit = async () => {
     const result = await onChange(draft)
+    setLockedOut(result.lockedOut)
+    if (result.lockedOut.length > 0) {
+      // Refused: the form stays ahead of what is stored, and the box below
+      // says who would have lost everything.
+      setConfirmOpen(false)
+      return
+    }
     setWarnings(result.warnings)
     setAffected(result.affectedPrincipals)
     if (result.warnings.length === 0) setConfirmOpen(false)
@@ -139,6 +152,7 @@ export function RoutingPolicyCard({
     if (!canSave) return
     setWarnings([])
     setAffected(null)
+    setLockedOut([])
     if (tightening) {
       setConfirmOpen(true)
       return
@@ -329,6 +343,41 @@ export function RoutingPolicyCard({
                 : `${affected} users and keys now reach fewer models than before.`}{' '}
               Their own policies are unchanged — the organisation moved under them.
             </p>
+          )}
+
+          {/* The API counts only principals that lost something, so nought is
+              worth saying rather than leaving the save silent. `!changed` is
+              how the card knows the save landed: a failed one leaves the form
+              ahead of the stored policy. */}
+          {affected === 0 && !changed && (
+            <p className={styles.affectedQuiet} role="status">
+              No user or key reaches fewer models than before.
+            </p>
+          )}
+
+          {lockedOut.length > 0 && (
+            <div className={styles.blocked} role="alert">
+              <p className={styles.warningsTitle}>
+                Not saved.{' '}
+                {lockedOut.length === 1 && lockedOut[0] === '(organisation)'
+                  ? 'This policy would leave the whole organisation with no model.'
+                  : lockedOut.length === 1
+                    ? 'This policy would leave one user or key with no model it may use:'
+                    : `This policy would leave ${lockedOut.length} users or keys with no model they may use:`}
+              </p>
+              {!(lockedOut.length === 1 && lockedOut[0] === '(organisation)') && (
+                <ul className={styles.warningsList}>
+                  {lockedOut.map((name) => (
+                    <li key={name}>{name}</li>
+                  ))}
+                </ul>
+              )}
+              <p className={styles.warningsHint}>
+                Their own allowed lists have nothing in common with this one. Widen the
+                organisation's list, or change their policies in Users &amp; Keys first — a key can
+                never reach more than its owner, and nobody more than the organisation.
+              </p>
+            </div>
           )}
 
           {warnings.length > 0 && (

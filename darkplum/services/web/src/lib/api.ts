@@ -7,11 +7,33 @@ import { ROUTES, buildPath, type QueryValue, type Route } from './routes'
  */
 export class ApiError extends Error {
   readonly status: number
+  /** The parsed JSON error body, when there was one. Some refusals carry more
+   *  than a sentence — a 409 from a routing-policy save lists `locked_out`
+   *  principals — and the page showing the refusal wants that, not a toast. */
+  readonly details?: unknown
 
-  constructor(message: string, status: number) {
+  constructor(message: string, status: number, details?: unknown) {
     super(message)
     this.name = 'ApiError'
     this.status = status
+    this.details = details
+  }
+
+  /** `locked_out` from a routing-policy 409, or [] when this isn't one. */
+  lockedOut(): string[] {
+    const d = this.details as { locked_out?: unknown } | undefined
+    return Array.isArray(d?.locked_out) ? d.locked_out.filter((x): x is string => typeof x === 'string') : []
+  }
+}
+
+/** The body as JSON if it is JSON, else undefined. */
+function parseJSONBody(raw: string): unknown {
+  const trimmed = raw.trim()
+  if (!trimmed || !(trimmed.startsWith('{') || trimmed.startsWith('['))) return undefined
+  try {
+    return JSON.parse(trimmed) as unknown
+  } catch {
+    return undefined
   }
 }
 
@@ -55,6 +77,7 @@ async function fetchJSON<T>(path: string, options?: RequestInit): Promise<T> {
     throw new ApiError(
       extractErrorMessage(body) || fallback || res.statusText || `HTTP ${res.status}`,
       res.status,
+      parseJSONBody(body),
     )
   }
   if (res.status === 204) return undefined as T

@@ -11,12 +11,24 @@
  *      surface "ui" is actually called by the UI. Both directions, so a route
  *      that is built and never used fails as loudly as one that is used and
  *      never built.
- *   2. No `fetch(` outside src/lib/api.ts and src/context/AuthContext.tsx.
+ *   2. No HTTP call outside src/lib/api.ts and src/context/AuthContext.tsx:
+ *      `fetch(` however it is reached (`window.fetch`, `globalThis.fetch`,
+ *      aliased through `const f = fetch`), `new XMLHttpRequest`, `sendBeacon(`,
+ *      `new EventSource`, `new WebSocket`, and an `axios`/`ky`/`got` import.
  *      Those two files are the only places allowed to speak HTTP; AuthContext
  *      keeps its session calls, and its paths are in ROUTES like everything
  *      else.
- *   3. No literal request path outside src/lib/routes.ts. A path that is
- *      written twice is a path that can drift.
+ *   3. No literal request path outside src/lib/routes.ts — a string that is,
+ *      or starts with, /api/v1, /v1 or /auth, with or without a trailing slash,
+ *      so a prefix kept in a constant and joined later is caught too. A path
+ *      that is written twice is a path that can drift.
+ *
+ * Checks 2 and 3 are tripwires against hygiene drift, not a proof: a path
+ * assembled from pieces none of which look like a path would slip past them.
+ * The guarantee that matters is check 1 together with the Go route-inventory
+ * tests: every route the server registers is in the golden, and every golden
+ * "ui" route is in ROUTES, so a hidden call could at most reach a route that
+ * is already declared and already reachable through ROUTES.
  *
  * Exits 1 with a readable list of what is wrong. No dependencies beyond Node.
  */
@@ -36,8 +48,30 @@ const FETCH_ALLOWED = ['src/lib/api.ts', 'src/context/AuthContext.tsx']
 /** The only file allowed to contain a literal request path. */
 const PATH_ALLOWED = ['src/lib/routes.ts']
 
-/** Prefixes that identify a request path written as a string literal. */
-const PATH_PREFIXES = ['/api/v1/', '/v1/', '/auth/']
+/**
+ * A string literal that is, or begins, a request path: one of the API roots
+ * followed by a slash, the closing quote, or a template-literal placeholder.
+ * `'/api/v1'` (no trailing slash, kept in a constant to concatenate later)
+ * matches as surely as `'/api/v1/users'`.
+ */
+const PATH_LITERAL = /(['"`])\/(api\/v1|v1|auth)(?=\/|\1|\$\{)/
+
+/**
+ * Anything that speaks HTTP from the browser. `\bfetch\s*\(` matches a bare
+ * call and a property access alike (`window.fetch(`); the bare-word `fetch`
+ * pattern catches it being aliased or passed along (`const f = fetch`,
+ * `call(fetch)`). The `X-Requested-With: XMLHttpRequest` header string in
+ * api.ts is a quoted word, not a constructor call, and does not match.
+ */
+const HTTP_PATTERNS: Array<{ re: RegExp; what: string }> = [
+  { re: /\bfetch\s*\(/, what: 'fetch()' },
+  { re: /\bfetch\b(?!\s*\()(?!\s*:)/, what: 'a reference to fetch' },
+  { re: /\bnew\s+XMLHttpRequest\b/, what: 'XMLHttpRequest' },
+  { re: /\bsendBeacon\s*\(/, what: 'navigator.sendBeacon()' },
+  { re: /\bnew\s+(EventSource|WebSocket)\b/, what: 'EventSource/WebSocket' },
+  { re: /\bfrom\s+['"](axios|ky|got|superagent|node-fetch|cross-fetch|isomorphic-fetch)['"]/, what: 'an HTTP client import' },
+  { re: /\brequire\(\s*['"](axios|ky|got|superagent|node-fetch|cross-fetch|isomorphic-fetch)['"]\s*\)/, what: 'an HTTP client require' },
+]
 
 interface GoldenRoute {
   service: 'api' | 'gateway'
@@ -148,30 +182,38 @@ function walk(dir: string, out: string[] = []): string[] {
 const strayFetch: string[] = []
 const strayPaths: string[] = []
 
+/**
+ * Blank out comments so prose ("the first fetch settles") is not read as
+ * code, keeping every newline so reported line numbers stay right. Block
+ * comments go first; a line comment is `//` at the start of a line or after
+ * whitespace, which leaves `https://` inside a string alone.
+ */
+function stripComments(source: string): string {
+  return source
+    .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '))
+    .replace(/(^|\s)\/\/.*$/gm, '$1')
+}
+
 for (const file of walk(SRC_DIR).sort()) {
   const rel = relative(WEB_ROOT, file).split('\\').join('/')
-  const lines = readFileSync(file, 'utf8').split('\n')
+  const lines = stripComments(readFileSync(file, 'utf8')).split('\n')
 
   lines.forEach((line, i) => {
     const where = `${rel}:${i + 1}`
 
-    if (!FETCH_ALLOWED.includes(rel) && /(^|[^.\w])fetch\s*\(/.test(line)) {
-      strayFetch.push(`${where}  ${line.trim()}`)
+    if (!FETCH_ALLOWED.includes(rel)) {
+      const hit = HTTP_PATTERNS.find((p) => p.re.test(line))
+      if (hit) strayFetch.push(`${where}  (${hit.what})  ${line.trim()}`)
     }
 
-    if (!PATH_ALLOWED.includes(rel)) {
-      for (const prefix of PATH_PREFIXES) {
-        if (line.includes(`'${prefix}`) || line.includes(`"${prefix}`) || line.includes(`\`${prefix}`)) {
-          strayPaths.push(`${where}  ${line.trim()}`)
-          break
-        }
-      }
+    if (!PATH_ALLOWED.includes(rel) && PATH_LITERAL.test(line)) {
+      strayPaths.push(`${where}  ${line.trim()}`)
     }
   })
 }
 
 fail(
-  `Calls to fetch() outside ${FETCH_ALLOWED.join(' and ')}:`,
+  `HTTP calls outside ${FETCH_ALLOWED.join(' and ')}:`,
   strayFetch,
 )
 fail(

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
+  ApiError,
   deleteModelAlias,
   getRoutingPolicy,
   listAdminModels,
@@ -22,6 +23,10 @@ import { AliasesSection } from './AliasesSection'
 import { RoutingPolicyCard, type OrgPolicyDraft } from './RoutingPolicyCard'
 import pageStyles from './PageLayout.module.css'
 import styles from './ModelsPage.module.css'
+
+/** Access overview page size. The API caps a page at 200; a smaller first
+ *  page keeps the section quick to paint, and "Show more" fetches the rest. */
+const PRINCIPALS_PAGE = 100
 
 type Filter = 'all' | 'enabled' | 'disabled'
 
@@ -439,6 +444,7 @@ export function ModelsPage() {
   const [principals, setPrincipals] = useState<PolicyPrincipal[]>([])
   const [principalsTotal, setPrincipalsTotal] = useState(0)
   const [principalsLoading, setPrincipalsLoading] = useState(true)
+  const [principalsLoadingMore, setPrincipalsLoadingMore] = useState(false)
   const [principalsError, setPrincipalsError] = useState<string | null>(null)
 
   const residency: Residency = policy?.residency ?? 'any'
@@ -468,10 +474,13 @@ export function ModelsPage() {
     }
   }, [])
 
+  /** Reloads the first page. Anything that can change a principal's reachable
+   *  set (the org policy, a per-principal edit) calls this, so the list is
+   *  never a mix of before and after. */
   const loadPrincipals = useCallback(async () => {
     setPrincipalsLoading(true)
     try {
-      const page = await listPolicyPrincipals({ limit: 200 })
+      const page = await listPolicyPrincipals({ limit: PRINCIPALS_PAGE, offset: 0 })
       setPrincipals(page.principals)
       setPrincipalsTotal(page.total)
       setPrincipalsError(null)
@@ -481,6 +490,24 @@ export function ModelsPage() {
       setPrincipalsLoading(false)
     }
   }, [])
+
+  /** Appends the next page. The API paginates by offset over a stable order,
+   *  so the offset is simply how many rows are already shown. */
+  const loadMorePrincipals = useCallback(async () => {
+    setPrincipalsLoadingMore(true)
+    try {
+      const page = await listPolicyPrincipals({ limit: PRINCIPALS_PAGE, offset: principals.length })
+      setPrincipals((prev) => {
+        const seen = new Set(prev.map((p) => `${p.principal_type}:${p.user_id ?? p.api_key_id}`))
+        return [...prev, ...page.principals.filter((p) => !seen.has(`${p.principal_type}:${p.user_id ?? p.api_key_id}`))]
+      })
+      setPrincipalsTotal(page.total)
+    } catch (err) {
+      toast((err as Error).message, 'error')
+    } finally {
+      setPrincipalsLoadingMore(false)
+    }
+  }, [principals.length, toast])
 
   const loadAliases = useCallback(async () => {
     setAliasesLoading(true)
@@ -503,10 +530,12 @@ export function ModelsPage() {
 
   /** Resolves with what the API said the change does: the routed-alias routes
    *  that will now be refused, and how many principals reach less than before.
-   *  Both are the API's own counts — nothing here is inferred. */
+   *  Both are the API's own counts — nothing here is inferred. A refusal
+   *  (409: the policy would leave someone with no model) comes back as
+   *  `lockedOut`, the API's list of who, so the card can show it in place. */
   const handlePolicyChange = async (
     draft: OrgPolicyDraft,
-  ): Promise<{ warnings: string[]; affectedPrincipals: number }> => {
+  ): Promise<{ warnings: string[]; affectedPrincipals: number; lockedOut: string[] }> => {
     setPolicySaving(true)
     try {
       const updated = await updateRoutingPolicy({
@@ -523,10 +552,15 @@ export function ModelsPage() {
       return {
         warnings: updated.warnings ?? [],
         affectedPrincipals: updated.affected_principals ?? 0,
+        lockedOut: [],
       }
     } catch (err) {
+      if (err instanceof ApiError && err.status === 409) {
+        const lockedOut = err.lockedOut()
+        return { warnings: [], affectedPrincipals: 0, lockedOut: lockedOut.length > 0 ? lockedOut : ['(organisation)'] }
+      }
       toast((err as Error).message, 'error')
-      return { warnings: [], affectedPrincipals: 0 }
+      return { warnings: [], affectedPrincipals: 0, lockedOut: [] }
     } finally {
       setPolicySaving(false)
     }
@@ -660,8 +694,10 @@ export function ModelsPage() {
         total={principalsTotal}
         models={models}
         loading={principalsLoading}
+        loadingMore={principalsLoadingMore}
         error={principalsError}
         onRetry={() => void loadPrincipals()}
+        onLoadMore={() => void loadMorePrincipals()}
       />
 
       <AliasesSection

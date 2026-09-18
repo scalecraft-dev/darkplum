@@ -909,3 +909,177 @@ func TestHandleEffectivePolicyOverride_KeysListForUserWithTwoKeys(t *testing.T) 
 		t.Errorf("expected no \"name\" field in the gateway's keys list, got body=%s", w.Body.String())
 	}
 }
+
+// --- POST /v1/policy/impact -------------------------------------------------
+
+func newPolicyImpactRequest(t *testing.T, ctxType string, body string) (*httptest.ResponseRecorder, *gin.Context) {
+	t.Helper()
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	req, err := http.NewRequest(http.MethodPost, "/v1/policy/impact", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	c.Request = req
+	c.Set(middleware.ContextKeyType, ctxType)
+	return w, c
+}
+
+type policyImpactBodyForTest struct {
+	OrgLockedOut bool `json:"org_locked_out"`
+	LockedOut    []struct {
+		UserID   string `json:"user_id"`
+		APIKeyID string `json:"api_key_id"`
+	} `json:"locked_out"`
+	Evaluated int `json:"evaluated"`
+}
+
+func decodePolicyImpact(t *testing.T, body []byte) policyImpactBodyForTest {
+	t.Helper()
+	var out policyImpactBodyForTest
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatalf("unmarshal impact response: %v; body=%s", err, body)
+	}
+	return out
+}
+
+// impactSnapshot: org allows m1,m2,m3. previewUserID has a user row allowing
+// only m1 and owns previewKeyID (no row) and previewKeyID2 (row allowing m2 —
+// already empty against its owner, which the api's 409 would normally have
+// prevented, kept here to prove the walk reports the key's own chain).
+// impactUser2 has no user row but owns impactKey3, which has a row allowing
+// m3 only. impactUser3 inherits everything and owns nothing with a row.
+const (
+	impactUser2 = "44444444-4444-4444-4444-444444444444"
+	impactUser3 = "55555555-5555-5555-5555-555555555555"
+	impactKey3  = "66666666-6666-6666-6666-666666666666"
+	impactKey4  = "77777777-7777-7777-7777-777777777777"
+)
+
+func impactSnapshot() policy.Snapshot {
+	snap := baseOverrideSnapshot()
+	snap.UserRows = map[string]policy.PolicyRow{
+		previewUserID: {Level: policy.PrincipalTypeUser, AllowedModels: &[]string{"m1"}},
+	}
+	snap.KeyRows = map[string]policy.PolicyRow{
+		previewKeyID2: {Level: policy.PrincipalTypeAPIKey, AllowedModels: &[]string{"m2"}},
+		impactKey3:    {Level: policy.PrincipalTypeAPIKey, AllowedModels: &[]string{"m3"}},
+	}
+	snap.KeyOwner = map[string]string{
+		previewKeyID:  previewUserID,
+		previewKeyID2: previewUserID,
+		impactKey3:    impactUser2,
+		impactKey4:    impactUser3,
+	}
+	snap.UserKeys = map[string][]string{
+		previewUserID: {previewKeyID, previewKeyID2},
+		impactUser2:   {impactKey3},
+		impactUser3:   {impactKey4},
+	}
+	return snap
+}
+
+func TestHandleEffectivePolicyImpact_403ForNonServiceKey(t *testing.T) {
+	h := newTestHandler(fakeProviders{}, baseOverrideRoutes(), impactSnapshot(), true)
+	w, c := newPolicyImpactRequest(t, middleware.KeyTypeUser, `{"override":{"level":"org","policy":{"allowed_models":[]}}}`)
+	h.HandleEffectivePolicyImpact(c)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for a non-service key, got %d; body=%s", w.Code, w.Body.String())
+	}
+	if e := decodeError(t, w.Body.Bytes()); e.Error.Code != "service_key_required" {
+		t.Errorf("expected code service_key_required, got %q", e.Error.Code)
+	}
+}
+
+func TestHandleEffectivePolicyImpact_400NonOrgLevel(t *testing.T) {
+	h := newTestHandler(fakeProviders{}, baseOverrideRoutes(), impactSnapshot(), true)
+	for _, body := range []string{`{}`, `{"override":{"level":"user","policy":null}}`, `not json`} {
+		w, c := newPolicyImpactRequest(t, middleware.KeyTypeService, body)
+		h.HandleEffectivePolicyImpact(c)
+		if w.Code != http.StatusBadRequest {
+			t.Errorf("body %s: expected 400, got %d; body=%s", body, w.Code, w.Body.String())
+		}
+	}
+}
+
+func TestHandleEffectivePolicyImpact_503WhenPolicyNotLoaded(t *testing.T) {
+	h := newTestHandler(fakeProviders{}, baseOverrideRoutes(), impactSnapshot(), false)
+	w, c := newPolicyImpactRequest(t, middleware.KeyTypeService, `{"override":{"level":"org","policy":{"allowed_models":["m1"]}}}`)
+	h.HandleEffectivePolicyImpact(c)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 with no policy snapshot, got %d; body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandleEffectivePolicyImpact_EmptyOrgAllowlistIsOrgLockedOut(t *testing.T) {
+	h := newTestHandler(fakeProviders{}, baseOverrideRoutes(), impactSnapshot(), true)
+	w, c := newPolicyImpactRequest(t, middleware.KeyTypeService, `{"override":{"level":"org","policy":{"allowed_models":[]}}}`)
+	h.HandleEffectivePolicyImpact(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body=%s", w.Code, w.Body.String())
+	}
+	got := decodePolicyImpact(t, w.Body.Bytes())
+	if !got.OrgLockedOut {
+		t.Errorf("expected org_locked_out=true for an empty org allowlist, got %+v", got)
+	}
+	if got.LockedOut == nil {
+		t.Errorf("locked_out must be [] not null when org_locked_out; body=%s", w.Body.String())
+	}
+}
+
+func TestHandleEffectivePolicyImpact_NarrowingReportsExactlyTheDisjointPrincipals(t *testing.T) {
+	h := newTestHandler(fakeProviders{}, baseOverrideRoutes(), impactSnapshot(), true)
+	// Narrow the org to m2,m3: previewUserID (m1 only) and its inheriting key
+	// previewKeyID lose everything; previewKeyID2 (m2 ∩ owner m1 = ∅) was
+	// already empty and stays so; impactKey3 (m3) keeps m3; impactUser3
+	// inherits and is never evaluated.
+	w, c := newPolicyImpactRequest(t, middleware.KeyTypeService, `{"override":{"level":"org","policy":{"allowed_models":["m2","m3"]}}}`)
+	h.HandleEffectivePolicyImpact(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body=%s", w.Code, w.Body.String())
+	}
+	got := decodePolicyImpact(t, w.Body.Bytes())
+	if got.OrgLockedOut {
+		t.Fatalf("org_locked_out must be false for a non-empty org allowlist; body=%s", w.Body.String())
+	}
+	want := map[string]bool{
+		previewUserID + "/":                 true,
+		previewUserID + "/" + previewKeyID:  true,
+		previewUserID + "/" + previewKeyID2: true,
+	}
+	gotSet := map[string]bool{}
+	for _, p := range got.LockedOut {
+		gotSet[p.UserID+"/"+p.APIKeyID] = true
+	}
+	for k := range want {
+		if !gotSet[k] {
+			t.Errorf("expected %s in locked_out, got %+v", k, got.LockedOut)
+		}
+	}
+	for k := range gotSet {
+		if !want[k] {
+			t.Errorf("unexpected %s in locked_out", k)
+		}
+	}
+	// previewUserID + 2 keys, impactUser2 + 1 key = 5. impactUser3 has no row
+	// and no key with a row, so it is not walked.
+	if got.Evaluated != 5 {
+		t.Errorf("evaluated = %d, want 5", got.Evaluated)
+	}
+}
+
+func TestHandleEffectivePolicyImpact_WideningLocksNobodyOut(t *testing.T) {
+	h := newTestHandler(fakeProviders{}, baseOverrideRoutes(), impactSnapshot(), true)
+	// null = inherit-all at org level; the only remaining empty set is
+	// previewKeyID2 (m2 ∩ owner m1), which is pre-existing, not caused here —
+	// the endpoint reports state under the override, so it is still listed.
+	w, c := newPolicyImpactRequest(t, middleware.KeyTypeService, `{"override":{"level":"org","policy":null}}`)
+	h.HandleEffectivePolicyImpact(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body=%s", w.Code, w.Body.String())
+	}
+	got := decodePolicyImpact(t, w.Body.Bytes())
+	if len(got.LockedOut) != 1 || got.LockedOut[0].APIKeyID != previewKeyID2 {
+		t.Errorf("expected only the pre-existing empty key %s, got %+v", previewKeyID2, got.LockedOut)
+	}
+}

@@ -354,6 +354,67 @@ func (g *gatewayEffectiveClient) effectiveWithOverride(ctx context.Context, user
 	return &out, nil
 }
 
+// gatewayPolicyImpactRequest is the body of POST /v1/policy/impact: an org
+// level override only (the gateway rejects any other level).
+type gatewayPolicyImpactRequest struct {
+	Override gatewayPolicyOverride `json:"override"`
+}
+
+// gatewayPolicyImpactPrincipal is one locked-out principal from POST
+// /v1/policy/impact -- a user (APIKeyID empty) or a key (both set).
+type gatewayPolicyImpactPrincipal struct {
+	UserID   string `json:"user_id"`
+	APIKeyID string `json:"api_key_id"`
+}
+
+// gatewayPolicyImpact is the wire shape of the gateway's POST
+// /v1/policy/impact response. OrgLockedOut is the "empty org allowlist" case
+// (everyone is locked out, so LockedOut is not enumerated).
+type gatewayPolicyImpact struct {
+	OrgLockedOut bool                           `json:"org_locked_out"`
+	LockedOut    []gatewayPolicyImpactPrincipal `json:"locked_out"`
+	Evaluated    int                            `json:"evaluated"`
+}
+
+// impact calls POST {gatewayURL}/v1/policy/impact with an org-level
+// override: which users and keys would have an EMPTY effective allowlist if
+// the org row became policy. This is PUT /api/v1/routing-policy's lock-out
+// guard -- the org-wide counterpart of effectiveWithOverride, so the org PUT
+// refuses lock-outs with the same 409 the user/key PUTs do, decided by the
+// same gateway merge, in one call rather than one per principal.
+func (g *gatewayEffectiveClient) impact(ctx context.Context, orgPolicy policyObject) (*gatewayPolicyImpact, error) {
+	ctx, cancel := context.WithTimeout(ctx, gatewayEffectiveTimeout)
+	defer cancel()
+
+	body, err := json.Marshal(gatewayPolicyImpactRequest{Override: gatewayPolicyOverride{Level: principalTypeOrg, Policy: &orgPolicy}})
+	if err != nil {
+		return nil, fmt.Errorf("encode policy impact request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, g.gatewayURL+"/v1/policy/impact", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("build policy impact request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+g.serviceKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := g.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("call gateway policy impact: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("gateway policy impact returned %d", resp.StatusCode)
+	}
+
+	var out gatewayPolicyImpact
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1024*1024)).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode gateway policy impact: %w", err)
+	}
+	return &out, nil
+}
+
 // PolicyHandler serves the per-principal routing-policy endpoints: GET/PUT/
 // DELETE on a user's or api key's own policy row, the admin/self "effective"
 // proxies, the principals overview list, and impact previews. Org-level GET/

@@ -454,10 +454,25 @@
   margin-top: var(--space-2);
 }
 
+/* A key and what it loses: the name and the count on one line, the models
+   themselves under them, so a long list wraps instead of pushing the name of
+   the key it belongs to out of the panel. */
 .impactList li {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding-bottom: var(--space-1);
+}
+
+.impactKeyRow {
   display: flex;
   justify-content: space-between;
   gap: var(--space-3);
+}
+
+.impactLost {
+  color: var(--fg-muted);
+  overflow-wrap: anywhere;
 }
 
 .impactKey {

@@ -194,15 +194,35 @@ func newFakePolicyGateway(t *testing.T, pool *pgxpool.Pool) *fakePolicyGateway {
 }
 
 func (fg *fakePolicyGateway) handle(w http.ResponseWriter, req *http.Request) {
-	if req.URL.Path != "/v1/policy/effective" {
-		w.WriteHeader(http.StatusNotFound)
-		return
-	}
 	if req.Header.Get("Authorization") != "Bearer testkey" {
 		w.WriteHeader(http.StatusForbidden)
 		return
 	}
 	ctx := req.Context()
+
+	if req.URL.Path == "/v1/policy/impact" && req.Method == http.MethodPost {
+		var body gatewayPolicyImpactRequest
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if body.Override.Level != principalTypeOrg {
+			http.Error(w, "override.level must be org", http.StatusBadRequest)
+			return
+		}
+		resp, err := fg.impact(ctx, &body.Override)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+		return
+	}
+	if req.URL.Path != "/v1/policy/effective" {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
 
 	var userID, apiKeyID string
 	var override *gatewayPolicyOverride
@@ -391,6 +411,59 @@ func (fg *fakePolicyGateway) effective(ctx context.Context, userID, apiKeyID str
 		}
 	}
 	return top, nil
+}
+
+// impact mirrors the real gateway's policyImpact (gateway/internal/handler):
+// under an org-level override, every user with a row, every owner of a key
+// with a row, and every non-revoked key those users own is re-merged, and
+// the ones whose allowlist comes out empty are listed. An empty org
+// allowlist short-circuits to org_locked_out.
+func (fg *fakePolicyGateway) impact(ctx context.Context, override *gatewayPolicyOverride) (gatewayPolicyImpact, error) {
+	out := gatewayPolicyImpact{LockedOut: []gatewayPolicyImpactPrincipal{}}
+	org := overriddenRow(override)
+	if org.AllowedModels != nil && len(*org.AllowedModels) == 0 {
+		out.OrgLockedOut = true
+		return out, nil
+	}
+	rows, err := fg.pool.Query(ctx, `
+		SELECT DISTINCT u FROM (
+			SELECT user_id::text AS u FROM principal_routing_policies WHERE principal_type = 'user'
+			UNION
+			SELECT k.user_id::text FROM principal_routing_policies p
+			JOIN api_keys k ON k.id = p.api_key_id
+			WHERE p.principal_type = 'api_key' AND k.revoked_at IS NULL
+		) s ORDER BY u`)
+	if err != nil {
+		return out, err
+	}
+	var users []string
+	for rows.Next() {
+		var u string
+		if err := rows.Scan(&u); err != nil {
+			rows.Close()
+			return out, err
+		}
+		users = append(users, u)
+	}
+	rows.Close()
+	empty := func(e gatewayEffectivePolicy) bool { return e.AllowedModels != nil && len(*e.AllowedModels) == 0 }
+	for _, u := range users {
+		eff, err := fg.effective(ctx, u, "", override)
+		if err != nil {
+			return out, err
+		}
+		out.Evaluated++
+		if empty(eff) {
+			out.LockedOut = append(out.LockedOut, gatewayPolicyImpactPrincipal{UserID: u})
+		}
+		for _, k := range eff.Keys {
+			out.Evaluated++
+			if empty(k.Effective) {
+				out.LockedOut = append(out.LockedOut, gatewayPolicyImpactPrincipal{UserID: u, APIKeyID: k.APIKeyID})
+			}
+		}
+	}
+	return out, nil
 }
 
 // overriddenRow converts a gatewayPolicyOverride into the row it substitutes
@@ -901,6 +974,96 @@ func TestOrgPolicy_AffectedPrincipalsOnTighten(t *testing.T) {
 	got = decodeJSON[routingPolicyResponse](t, resp.Body.Bytes())
 	if got.AffectedPrincipals != nil {
 		t.Fatalf("expected no affected_principals on a loosening change, got %v", *got.AffectedPrincipals)
+	}
+}
+
+// --- Org policy: lock-out guard (409), same rule as the user/key PUTs -------
+
+func TestOrgPolicy_PutRefusesLockOut(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	adminID := newPolicyTestUser(t, ctx, pool)
+	targetID := newPolicyTestUser(t, ctx, pool)
+	insertModel(t, ctx, pool, "m1", backendClassSelfHosted, true)
+	insertModel(t, ctx, pool, "m2", backendClassSelfHosted, true)
+	keyID := newTestAPIKey(t, ctx, pool, targetID, "ci-key")
+
+	gw := newFakePolicyGateway(t, pool)
+	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	r := newPolicyTestRouter(ph, rh, adminID)
+
+	// An empty org allowlist is refused outright, before any gateway call.
+	resp := doJSON(t, r, http.MethodPut, "/api/v1/routing-policy", map[string]any{"residency": residencyAny, "allowed_models": []string{}})
+	if resp.Code != http.StatusConflict {
+		t.Fatalf("empty org allowlist: status = %d, want 409; body = %s", resp.Code, resp.Body.String())
+	}
+
+	// The user may only use m1; its key inherits that.
+	if resp := doJSON(t, r, http.MethodPut, "/api/v1/users/"+targetID+"/routing-policy", policyObject{AllowedModels: strs("m1")}); resp.Code != http.StatusOK {
+		t.Fatalf("put user policy: status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+
+	// Narrowing the org to m2 alone would leave that user (and its key) with
+	// nothing: 409, naming both, and nothing written.
+	resp = doJSON(t, r, http.MethodPut, "/api/v1/routing-policy", map[string]any{"residency": residencyAny, "allowed_models": []string{"m2"}})
+	if resp.Code != http.StatusConflict {
+		t.Fatalf("disjoint org allowlist: status = %d, want 409; body = %s", resp.Code, resp.Body.String())
+	}
+	var conflict struct {
+		LockedOut []string `json:"locked_out"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &conflict); err != nil {
+		t.Fatalf("decode 409: %v", err)
+	}
+	var email string
+	if err := pool.QueryRow(ctx, `SELECT email FROM users WHERE id = $1`, targetID).Scan(&email); err != nil {
+		t.Fatal(err)
+	}
+	wantNames := map[string]bool{email: true, "ci-key (" + email + ")": true}
+	if len(conflict.LockedOut) != 2 {
+		t.Fatalf("locked_out = %v, want the user and its key", conflict.LockedOut)
+	}
+	for _, n := range conflict.LockedOut {
+		if !wantNames[n] {
+			t.Errorf("unexpected locked_out entry %q (want one of %v)", n, wantNames)
+		}
+	}
+	var stored *[]string
+	if err := pool.QueryRow(ctx, `SELECT allowed_models FROM principal_routing_policies WHERE principal_type = 'org'`).Scan(&stored); err != nil {
+		t.Fatal(err)
+	}
+	if stored != nil {
+		t.Fatalf("org row was written despite the 409: %v", *stored)
+	}
+	_ = keyID
+
+	// Narrowing to m1 keeps everyone reachable: 200.
+	resp = doJSON(t, r, http.MethodPut, "/api/v1/routing-policy", map[string]any{"residency": residencyAny, "allowed_models": []string{"m1"}})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("compatible narrowing: status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestOrgPolicy_PutNarrowingIs502WhenGatewayDown(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	adminID := newPolicyTestUser(t, ctx, pool)
+	insertModel(t, ctx, pool, "m1", backendClassSelfHosted, true)
+
+	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), "http://127.0.0.1:1", "testkey")
+	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://127.0.0.1:1", "testkey")
+	r := newPolicyTestRouter(ph, rh, adminID)
+
+	// A narrowing cannot be evaluated without the gateway: refuse, don't write.
+	resp := doJSON(t, r, http.MethodPut, "/api/v1/routing-policy", map[string]any{"residency": residencyAny, "allowed_models": []string{"m1"}})
+	if resp.Code != http.StatusBadGateway {
+		t.Fatalf("narrowing with gateway down: status = %d, want 502; body = %s", resp.Code, resp.Body.String())
+	}
+	// A residency-only change never needs the gateway.
+	resp = doJSON(t, r, http.MethodPut, "/api/v1/routing-policy", map[string]any{"residency": residencySelfHostedOnly})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("residency-only with gateway down: status = %d, want 200; body = %s", resp.Code, resp.Body.String())
 	}
 }
 

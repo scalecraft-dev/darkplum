@@ -7,11 +7,15 @@ import styles from './AccessOverviewSection.module.css'
 
 interface Props {
   principals: PolicyPrincipal[]
+  /** How many narrowed principals exist in all, as the API counted them. */
   total: number
   models: AdminModel[]
   loading: boolean
+  loadingMore: boolean
   error: string | null
   onRetry: () => void
+  /** Fetches the next page and appends it. Only offered while total > shown. */
+  onLoadMore: () => void
 }
 
 /** Where a principal's row is edited. The drawer lives on Users & Keys, so this
@@ -48,7 +52,16 @@ function ReachableCell({ ids, models }: { ids?: string[]; models: AdminModel[] }
  * Principals that inherit are not listed: they are the organisation, and the
  * card above already says what that is.
  */
-export function AccessOverviewSection({ principals, total, models, loading, error, onRetry }: Props) {
+export function AccessOverviewSection({
+  principals,
+  total,
+  models,
+  loading,
+  loadingMore,
+  error,
+  onRetry,
+  onLoadMore,
+}: Props) {
   return (
     <section className={styles.section} aria-labelledby="access-overview-heading">
       <div className={styles.head}>
@@ -140,10 +153,15 @@ export function AccessOverviewSection({ principals, total, models, loading, erro
         )}
       </div>
 
-      {total > principals.length && (
-        <p className={styles.truncated}>
-          Showing the first {principals.length} of {total}. Narrow the list from Users &amp; Keys.
-        </p>
+      {!loading && !error && total > principals.length && (
+        <div className={styles.more}>
+          <span className={styles.truncated}>
+            Showing {principals.length} of {total}.
+          </span>
+          <Button variant="secondary" size="sm" onClick={onLoadMore} disabled={loadingMore}>
+            {loadingMore ? 'Loading…' : `Show ${Math.min(total - principals.length, 100)} more`}
+          </Button>
+        </div>
       )}
     </section>
   )

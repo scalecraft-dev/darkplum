@@ -67,4 +67,5 @@ Generated from docs/api-routes.json by cmd/apidoc — do not hand-edit; regenera
 - `POST /v1/routing/dryrun` — auth: api_key, surface: machine (Called by the api on behalf of the admin Test-a-prompt panel (POST /api/v1/model-aliases/:alias/test) with the service key)
 - `GET /v1/policy/effective` — auth: service, surface: machine (Single effective-policy implementation, consulted by the api for every effective/preview/me view with the service key)
 - `POST /v1/policy/effective` — auth: service, surface: machine (Preview counterpart of GET /v1/policy/effective, consulted by the api's routing-policy impact-preview endpoints (POST .../users/:id/routing-policy/preview, .../api-keys/:id/routing-policy/preview) so preview and real save share the one gateway merge implementation)
+- `POST /v1/policy/impact` — auth: service, surface: machine (Org-wide lock-out check consulted by the api's PUT /api/v1/routing-policy before it writes: re-merges every principal with an explicit policy row under the proposed org policy in one call, so the org PUT refuses (409) a lock-out exactly like the user/key PUTs do, with the one gateway merge implementation)
 

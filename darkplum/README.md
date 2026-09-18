@@ -298,9 +298,11 @@ policy" on each row). Each level carries the same three settings:
 They merge most-restrictive-wins: **a key can never reach more than its owner,
 and a user never more than the organisation.** The gateway checks the model that
 actually serves the request — including the target a routed alias picks — and
-refuses with `model_not_allowed` (recorded in the usage log). A save that would
-leave a user or key with no reachable model is refused, and the editor previews
-"this will block N of this user's keys" before you save. Every user can open
+refuses with `model_not_allowed` (recorded in the usage log). A save at any
+level — organisation included — that would leave a user or key with no reachable
+model is refused by the API (`409`, naming who), not just greyed out in the UI,
+and the editor previews "this will block N of this user's keys" before you save.
+Every user can open
 "why is my access limited?" in chat to see their effective policy and which
 level set each part.
 

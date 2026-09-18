@@ -118,6 +118,10 @@ type RoutingHandler struct {
 	gatewayURL string
 	serviceKey string
 	httpClient *http.Client
+	// gateway is PutRoutingPolicy's lock-out guard: POST /v1/policy/impact,
+	// the org-wide counterpart of the POST /v1/policy/effective call the
+	// user/key PUTs in policy.go make before writing.
+	gateway *gatewayEffectiveClient
 
 	// srProbeMu guards the cached result of the last gateway /health probe
 	// (see semanticRouterNeedsWarning): srProbeWarn is valid until
@@ -142,6 +146,7 @@ func NewRoutingHandler(db *pgxpool.Pool, rec *activity.Recorder, gatewayURL, ser
 		httpClient: &http.Client{
 			Timeout: 10 * time.Second,
 		},
+		gateway: newGatewayEffectiveClient(gatewayURL, serviceKey),
 	}
 }
 
@@ -972,21 +977,84 @@ func orgPolicyTightened(oldResidency, newResidency string, oldAM, newAM *[]strin
 	if oldResidency != residencySelfHostedOnly && newResidency == residencySelfHostedOnly {
 		return true
 	}
-	if oldAM == nil && newAM != nil {
+	return allowlistNarrowed(oldAM, newAM)
+}
+
+// allowlistNarrowed reports whether newAM can take a model away from someone
+// oldAM allowed: unrestricted -> restricted, or a restricted list that drops
+// at least one id. A widening or unchanged list is never a narrowing, and
+// neither is a change that leaves the list unrestricted.
+func allowlistNarrowed(oldAM, newAM *[]string) bool {
+	if newAM == nil {
+		return false
+	}
+	if oldAM == nil {
 		return true
 	}
-	if oldAM != nil && newAM != nil {
-		allowed := make(map[string]bool, len(*newAM))
-		for _, id := range *newAM {
-			allowed[id] = true
-		}
-		for _, id := range *oldAM {
-			if !allowed[id] {
-				return true
-			}
+	allowed := make(map[string]bool, len(*newAM))
+	for _, id := range *newAM {
+		allowed[id] = true
+	}
+	for _, id := range *oldAM {
+		if !allowed[id] {
+			return true
 		}
 	}
 	return false
+}
+
+// orgLockOutNames turns POST /v1/policy/impact's id-only locked_out list into
+// the names PutRoutingPolicy's 409 reports: a user's email, or "<key name>
+// (<owner email>)" for a key. Ids the database no longer knows (a key
+// revoked between the gateway's snapshot and now) fall back to the id.
+func orgLockOutNames(ctx context.Context, db *pgxpool.Pool, locked []gatewayPolicyImpactPrincipal) ([]string, error) {
+	userIDs := make([]string, 0, len(locked))
+	keyIDs := make([]string, 0, len(locked))
+	for _, p := range locked {
+		userIDs = append(userIDs, p.UserID)
+		if p.APIKeyID != "" {
+			keyIDs = append(keyIDs, p.APIKeyID)
+		}
+	}
+	emails := make(map[string]string, len(userIDs))
+	rows, err := db.Query(ctx, `SELECT id::text, email FROM users WHERE id = ANY($1)`, userIDs)
+	if err != nil {
+		return nil, fmt.Errorf("lookup user emails: %w", err)
+	}
+	for rows.Next() {
+		var id, email string
+		if err := rows.Scan(&id, &email); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan user email: %w", err)
+		}
+		emails[id] = email
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	keyNames, err := keyNamesByID(ctx, db, keyIDs)
+	if err != nil {
+		return nil, err
+	}
+
+	names := make([]string, 0, len(locked))
+	for _, p := range locked {
+		owner := emails[p.UserID]
+		if owner == "" {
+			owner = p.UserID
+		}
+		if p.APIKeyID == "" {
+			names = append(names, owner)
+			continue
+		}
+		name := keyNames[p.APIKeyID]
+		if name == "" {
+			name = p.APIKeyID
+		}
+		names = append(names, fmt.Sprintf("%s (%s)", name, owner))
+	}
+	return names, nil
 }
 
 // PutRoutingPolicy handles PUT /api/v1/routing-policy (org level).
@@ -1029,6 +1097,47 @@ func (h *RoutingHandler) PutRoutingPolicy(c *gin.Context) {
 	var dbResidency *string
 	if req.Residency == residencySelfHostedOnly {
 		dbResidency = &req.Residency
+	}
+
+	// Lock-out guard, the same rule the user/key PUTs enforce (policy.go):
+	// never write a policy that leaves a principal with no reachable model.
+	// An empty org allowlist locks out everyone and needs no gateway call;
+	// any other narrowing is checked org-wide by the gateway's merge via
+	// POST /v1/policy/impact. Widening and residency-only changes can't
+	// empty anyone's allowlist, so they skip the call (and the gateway
+	// dependency) entirely.
+	if req.AllowedModels != nil && len(*req.AllowedModels) == 0 {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":      "an empty organisation allowlist would lock every user and key out of every model",
+			"locked_out": []string{"(organisation)"},
+		})
+		return
+	}
+	if allowlistNarrowed(oldAM, req.AllowedModels) {
+		impact, err := h.gateway.impact(ctx, policyObject{Residency: dbResidency, AllowedModels: req.AllowedModels, DefaultModel: req.DefaultModel})
+		if err != nil {
+			c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("%v: %v", errGatewayUnavailable, err)})
+			return
+		}
+		if impact.OrgLockedOut {
+			c.JSON(http.StatusConflict, gin.H{
+				"error":      "this policy would lock every user and key out of every model",
+				"locked_out": []string{"(organisation)"},
+			})
+			return
+		}
+		if len(impact.LockedOut) > 0 {
+			names, err := orgLockOutNames(ctx, h.db, impact.LockedOut)
+			if err != nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "resolve locked-out principals failed"})
+				return
+			}
+			c.JSON(http.StatusConflict, gin.H{
+				"error":      fmt.Sprintf("this policy would leave %d user(s) or key(s) with no reachable models; widen it, or change their own policies first", len(names)),
+				"locked_out": names,
+			})
+			return
+		}
 	}
 
 	var updatedBy *string
