@@ -398,7 +398,10 @@ function edgesOf(root: ts.Node, imported: Map<string, Binding>, into: Set<string
   // itself — `const mod = await import('./x')` (a namespace of x), and
   // `const { f } = ns` / `const { f } = await import('./x')` (f is x#f).
   // Collected in a first pass so use before declaration still resolves.
-  const imports = new Map(imported)
+  const imports = imported
+  /** Bindings this subtree declares itself, keyed by the declaring node
+   *  (two functions may each bind `mod` to different modules). */
+  const local: Array<{ name: string; decl: ts.Node; binding: Binding }> = []
   const dynamicTarget = (init: ts.Expression | undefined): string | null => {
     let e = init
     if (e && ts.isAwaitExpression(e)) e = e.expression
@@ -410,29 +413,88 @@ function edgesOf(root: ts.Node, imported: Map<string, Binding>, into: Set<string
   const bind = (node: ts.Node): void => {
     if (ts.isVariableDeclaration(node)) {
       const file = dynamicTarget(node.initializer)
-      const nsOf = node.initializer && ts.isIdentifier(node.initializer) ? imports.get(node.initializer.text) : undefined
+      const nsOf = node.initializer && ts.isIdentifier(node.initializer) ? resolve(node.initializer.text, node.initializer) : undefined
       const nsFile = file ?? (nsOf && 'namespace' in nsOf ? nsOf.file : null)
-      if (nsFile && ts.isIdentifier(node.name) && file) imports.set(node.name.text, { file, namespace: true })
+      if (nsFile && ts.isIdentifier(node.name) && file) local.push({ name: node.name.text, decl: node, binding: { file, namespace: true } })
       if (nsFile && ts.isObjectBindingPattern(node.name)) {
         for (const el of node.name.elements) {
           if (!ts.isIdentifier(el.name)) continue
           const prop = el.propertyName && ts.isIdentifier(el.propertyName) ? el.propertyName.text : el.name.text
-          imports.set(el.name.text, { file: nsFile, name: prop })
+          local.push({ name: el.name.text, decl: node, binding: { file: nsFile, name: prop } })
         }
       }
     }
     ts.forEachChild(node, bind)
   }
-  bind(root)
 
-  /** Whether an identifier named ROUTES is the real table from lib/routes. */
-  const routesFile = join(SRC_DIR, 'lib', 'routes.ts')
-  const isRoutesTable = (name: string): boolean => {
-    const b = imports.get(name)
-    if (b && 'name' in b) return b.file === routesFile && b.name === 'ROUTES'
-    // Inside lib/routes.ts itself, ROUTES is the local declaration.
-    return !b && name === 'ROUTES' && root.getSourceFile().fileName === routesFile
+  /** The names a scope-introducing node declares directly. */
+  const declaredNames = (scope: ts.Node): Set<string> => {
+    const names = new Set<string>()
+    const addPattern = (n: ts.BindingName): void => {
+      if (ts.isIdentifier(n)) names.add(n.text)
+      else for (const el of n.elements) if (!ts.isOmittedExpression(el)) addPattern(el.name)
+    }
+    if (ts.isFunctionLike(scope)) {
+      for (const p of scope.parameters) addPattern(p.name)
+      if (ts.isFunctionExpression(scope) && scope.name) names.add(scope.name.text)
+    }
+    if (ts.isCatchClause(scope) && scope.variableDeclaration) addPattern(scope.variableDeclaration.name)
+    const stmts = ts.isBlock(scope) || ts.isSourceFile(scope) || ts.isModuleBlock(scope) ? scope.statements
+      : ts.isCaseClause(scope) || ts.isDefaultClause(scope) ? scope.statements : []
+    for (const st of stmts) {
+      if (ts.isVariableStatement(st)) for (const d of st.declarationList.declarations) addPattern(d.name)
+      else if ((ts.isFunctionDeclaration(st) || ts.isClassDeclaration(st) || ts.isEnumDeclaration(st)) && st.name) names.add(st.name.text)
+    }
+    if (ts.isForStatement(scope) || ts.isForOfStatement(scope) || ts.isForInStatement(scope)) {
+      const init = scope.initializer
+      if (init && ts.isVariableDeclarationList(init)) for (const d of init.declarations) addPattern(d.name)
+    }
+    return names
   }
+
+  /**
+   * The binding an identifier at `at` refers to: a local declaration in an
+   * enclosing scope wins over the file's imports (so a `const ROUTES = …`
+   * inside a function is not the route table), unless that declaration is
+   * the very one that produced the binding (a dynamic import or a
+   * destructure bound above).
+   */
+  const resolve = (name: string, at: ts.Node): Binding | undefined => {
+    for (let n: ts.Node | undefined = at.parent; n; n = n.parent) {
+      if (ts.isSourceFile(n)) break
+      if (declaredNames(n).has(name)) {
+        // The nearest declaration: one of this subtree's own bindings
+        // (declared directly by this scope), or a shadow of everything.
+        return local.find((l) => l.name === name && isDirectDecl(l.decl, n))?.binding
+      }
+    }
+    // Top level: the file's imports, or a binding declared at top level here.
+    return imports.get(name) ?? local.find((l) => l.name === name && isDirectDecl(l.decl, at.getSourceFile()))?.binding
+  }
+  /** Whether decl (a VariableDeclaration) is declared directly by scope. */
+  const isDirectDecl = (decl: ts.Node, scope: ts.Node): boolean => {
+    let n: ts.Node | undefined = decl
+    while (n && !ts.isVariableStatement(n) && !ts.isVariableDeclarationList(n)) n = n.parent
+    if (n && ts.isVariableDeclarationList(n)) n = n.parent
+    return !!n && n.parent === scope
+  }
+
+  /** Whether an identifier named ROUTES, at this reference, is the real
+   *  table from lib/routes. */
+  const routesFile = join(SRC_DIR, 'lib', 'routes.ts')
+  const isRoutesTable = (name: string, at: ts.Node): boolean => {
+    const b = resolve(name, at)
+    if (b && 'name' in b) return b.file === routesFile && b.name === 'ROUTES'
+    // Inside lib/routes.ts itself, ROUTES is the top-level declaration.
+    if (b || name !== 'ROUTES' || root.getSourceFile().fileName !== routesFile) return false
+    for (let n: ts.Node | undefined = at.parent; n; n = n.parent) {
+      if (ts.isSourceFile(n)) return true
+      if (declaredNames(n).has(name)) return false
+    }
+    return true
+  }
+
+  bind(root)
 
   const visit = (node: ts.Node): void => {
     if (
@@ -450,8 +512,8 @@ function edgesOf(root: ts.Node, imported: Map<string, Binding>, into: Set<string
       const prop = ts.isPropertyAccessExpression(node)
         ? node.name.text
         : ts.isStringLiteral(node.argumentExpression) ? node.argumentExpression.text : null
-      if (prop && isRoutesTable(obj)) into.add(`ROUTES.${prop}`)
-      const b = imports.get(obj)
+      if (prop && isRoutesTable(obj, node)) into.add(`ROUTES.${prop}`)
+      const b = resolve(obj, node)
       if (b && 'namespace' in b && prop) { into.add(exportKey(b.file, prop)); return }
       // `ns.prop` where ns is a named import may be an `export * as ns`
       // alias; recorded as "<file>#<ns>.<prop>" and expanded once every
@@ -464,7 +526,7 @@ function edgesOf(root: ts.Node, imported: Map<string, Binding>, into: Set<string
       const isPropName = parent && ts.isPropertyAccessExpression(parent) && parent.name === node
       const isDeclName = parent && (ts.isFunctionDeclaration(parent) || ts.isVariableDeclaration(parent) || ts.isParameter(parent)) && parent.name === node
       if (!isPropName && !isDeclName) {
-        const b = imports.get(node.text)
+        const b = resolve(node.text, node)
         if (b && 'name' in b) into.add(exportKey(b.file, b.name))
         else if (!b) locals.add(node.text)
       }
