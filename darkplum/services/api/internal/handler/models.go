@@ -312,12 +312,14 @@ func (h *ModelHandler) SyncModels(ctx context.Context) {
 		return
 	}
 
-	// The whole sync runs in one transaction, serialised against PutAlias
-	// (routing.go) via the same fixed advisory lock, so a concurrent alias PUT
-	// can't interleave with a discovery upsert of a model sharing that id and
-	// leave both a model row and an alias row for it (see PutAlias's comment
-	// for the other half of this). Advisory locks are per-transaction here
-	// (pg_advisory_xact_lock), so it releases automatically on commit/rollback.
+	// The upsert runs in a transaction serialised against PutAlias (routing.go)
+	// via the same fixed advisory lock, so a concurrent alias PUT can't
+	// interleave with a discovery upsert of a model sharing that id and leave
+	// both a model row and an alias row for it (see PutAlias's comment for the
+	// other half of this). The lock is per-transaction (pg_advisory_xact_lock)
+	// and the transaction holds ONLY the upsert — the alias-shadow check and the
+	// purge below run after commit, outside the lock, so an admin's PutAlias
+	// waits for one statement, not for the whole sync.
 	tx, err := h.pool.Begin(ctx)
 	if err != nil {
 		slog.ErrorContext(ctx, "sync models: begin transaction failed", "err", err)
@@ -356,13 +358,18 @@ func (h *ModelHandler) SyncModels(ctx context.Context) {
 			"model_count", len(normalized), "inserted", inserted, "updated", updated)
 	}
 
+	if err := tx.Commit(ctx); err != nil {
+		slog.ErrorContext(ctx, "sync models: commit failed", "err", err)
+		return
+	}
+
 	// A discovered model id that equals an existing alias is not an error —
 	// the gateway's route table lets the alias win by design — but the admin
 	// needs to know, since it means that alias no longer reaches the model it
 	// looks like it targets. Log one WARNING per sync naming every alias
 	// shadowed this run, rather than failing the sync or silently proceeding.
 	if len(discoveredIDs) > 0 {
-		rows, err := tx.Query(ctx, `SELECT alias FROM model_aliases WHERE alias = ANY($1)`, discoveredIDs)
+		rows, err := h.pool.Query(ctx, `SELECT alias FROM model_aliases WHERE alias = ANY($1)`, discoveredIDs)
 		if err != nil {
 			slog.ErrorContext(ctx, "sync models: check alias shadowing failed", "err", err)
 		} else {
@@ -391,7 +398,7 @@ func (h *ModelHandler) SyncModels(ctx context.Context) {
 	// modelPurgeAfter). Aliases pointing at a purged model are left alone;
 	// they already tolerate a missing target (target_exists/target_available
 	// go false, but the alias row survives so it doesn't need recreating).
-	res, err := tx.Exec(ctx, `
+	res, err := h.pool.Exec(ctx, `
 		DELETE FROM models WHERE discovered_at < now() - interval '7 days'
 	`)
 	var purged int64
@@ -399,11 +406,6 @@ func (h *ModelHandler) SyncModels(ctx context.Context) {
 		slog.ErrorContext(ctx, "sync models: purge stale rows failed", "err", err)
 	} else {
 		purged = res.RowsAffected()
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		slog.ErrorContext(ctx, "sync models: commit failed", "err", err)
-		return
 	}
 
 	slog.Info("sync models: complete",

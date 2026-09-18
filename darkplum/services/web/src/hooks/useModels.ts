@@ -29,10 +29,17 @@ export function useModels(): UseModelsResult {
   const [error, setError] = useState<string | null>(null)
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const hasModelsRef = useRef(false)
+  // Monotonic request counter: a poll that started before a manual refetch may
+  // resolve after it and would otherwise overwrite the fresher list (bringing a
+  // just-removed model back into the picker until the next poll). Only the most
+  // recently started fetch may write state.
+  const fetchSeqRef = useRef(0)
 
   const fetchModels = useCallback(async (): Promise<Model[] | null> => {
+    const seq = ++fetchSeqRef.current
     try {
       const result = await listModels()
+      if (seq !== fetchSeqRef.current) return result.data // superseded; do not touch state
       setModels(result.data)
       setError(null)
       const hadModels = hasModelsRef.current
@@ -48,10 +55,11 @@ export function useModels(): UseModelsResult {
       }
       return result.data
     } catch (err) {
+      if (seq !== fetchSeqRef.current) return null
       setError(err instanceof Error ? err.message : 'Failed to load models')
       return null
     } finally {
-      setIsLoading(false)
+      if (seq === fetchSeqRef.current) setIsLoading(false)
     }
   }, [])
 

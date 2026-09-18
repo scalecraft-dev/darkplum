@@ -15,11 +15,11 @@ const (
 
 // modelAvailabilityWindow is the default value for how recently a model must
 // have been (re-)discovered to be considered available, used whenever a
-// caller doesn't have an operator-configured override in hand (see
-// MODEL_AVAILABILITY_WINDOW_SECONDS in cmd/main.go, which plumbs a
-// ModelHandler-scoped override into buildModelsList and the admin
-// available computation; RoutingHandler's alias endpoints are not
-// operator-tunable and always use this default). A vLLM backend can take
+// caller doesn't have an operator-configured override in hand.
+// MODEL_AVAILABILITY_WINDOW_SECONDS (cmd/main.go) overrides it on both
+// ModelHandler and RoutingHandler via SetAvailabilityWindow, so a model's
+// `available` and an alias's `target_available` always flip together.
+// A vLLM backend can take
 // 15-25 minutes to finish loading a model after a pod restart, and
 // SyncModels no longer deletes a row the instant it isn't re-discovered (see
 // models.go), so "available" is a separate, time-based signal layered on top

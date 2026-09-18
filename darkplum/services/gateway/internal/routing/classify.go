@@ -102,6 +102,12 @@ func classifyError(err error) string {
 	}
 
 	if status, ok := extractHTTPStatus(err.Error()); ok {
+		// A 401/403 from an upstream's /v1/models is an authorisation problem
+		// (e.g. a VPC endpoint policy or an upstream that wants a key), which
+		// an operator should read as "auth", not as a generic HTTP status.
+		if status == 401 || status == 403 {
+			return errKindAuth
+		}
 		return fmt.Sprintf("http_%d", status)
 	}
 

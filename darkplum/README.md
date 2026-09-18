@@ -106,7 +106,7 @@ cp terraform.tfvars.example terraform.tfvars   # edit, then `terraform apply` or
 | `gpu_desired_size` | 1 | Number of GPU nodes |
 | `model_name` | mistralai/Mistral-7B-Instruct-v0.3 | Hugging Face model ID (default self-hosted model) |
 | `served_model_name` | mistral-7b | API model name |
-| `bedrock_region` | us-east-1 | Region the gateway calls Bedrock in |
+| `bedrock_region` | = `aws_region` | Region the gateway calls Bedrock in; must belong to `bedrock_inference_geo` (validated). Set it explicitly when the cluster is outside that geography |
 | `bedrock_inference_geo` | us | Geography inference stays in (`us`, `eu`, `apac`); `global` profiles are never granted |
 | `bedrock_model_patterns` | Claude, Llama, Mistral | Bedrock model-ID globs the gateway may invoke (IAM allowlist + catalog filter) |
 | `model_revision` | main | Hugging Face revision of the default model — pin a commit SHA |
@@ -160,6 +160,13 @@ on an AWS Network Load Balancer:
 
 Plain HTTP on an internet-facing load balancer is refused. Run `make configure-sso`
 after exposing; it uses the load balancer address for the OIDC redirect URL.
+
+The NLB is created by the AWS cloud controller that runs inside the EKS control
+plane (the subnets carry the `kubernetes.io/role/elb` tags it needs); no extra
+controller is installed. If the load balancer does not appear within five
+minutes, `expose-web` reverts to cluster-internal on its own and prints where to
+look. The AWS Load Balancer Controller (ALB, WAF, per-path routing) is the
+upgrade path when you need more than a TLS-terminating NLB.
 
 The gateway itself is never exposed: its `/health` endpoint reports routing and
 policy state and is meant for in-cluster probes and operators only.

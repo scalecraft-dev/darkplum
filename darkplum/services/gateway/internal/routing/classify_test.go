@@ -75,6 +75,16 @@ func TestClassifyError(t *testing.T) {
 			want: "http_503",
 		},
 		{
+			name: "HTTP 403 from an upstream is an authorisation problem",
+			err:  fmt.Errorf("vllm-default: models request returned %d", 403),
+			want: errKindAuth,
+		},
+		{
+			name: "HTTP 401 from an upstream is an authorisation problem",
+			err:  fmt.Errorf("lmstudio-dev: models request returned %d", 401),
+			want: errKindAuth,
+		},
+		{
 			name: "JSON decode error",
 			err: func() error {
 				var v struct{}

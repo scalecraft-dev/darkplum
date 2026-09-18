@@ -105,3 +105,13 @@ run "rejects_global_geo" {
 
   expect_failures = [var.geo]
 }
+
+run "rejects_region_outside_geo" {
+  command = plan
+
+  variables {
+    region = "eu-west-1" # cluster in Europe, geo left at the default "us"
+  }
+
+  expect_failures = [output.invoke_arns]
+}

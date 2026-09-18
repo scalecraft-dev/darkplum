@@ -78,8 +78,12 @@ variable "served_model_name" {
 variable "bedrock_region" {
   description = <<-EOT
     Region the gateway calls Bedrock in. Defaults to aws_region, which keeps
-    Bedrock traffic on PrivateLink (see bedrock_private_endpoints). A different
-    region is supported but then calls leave the VPC via the NAT gateway.
+    Bedrock traffic on PrivateLink (see bedrock_private_endpoints). Must be a
+    region of bedrock_inference_geo (validated at plan time): a cluster outside
+    that geography must set this explicitly, and its calls then leave the VPC
+    via the NAT gateway. Upgrading from a version that hard-coded us-east-1:
+    set bedrock_region = "us-east-1" to keep the old behaviour, or accept the
+    move to the cluster region (the IAM allowlist is regenerated either way).
   EOT
   type        = string
   default     = ""

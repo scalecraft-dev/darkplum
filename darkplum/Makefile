@@ -387,6 +387,7 @@ SCHEME ?= internal
 expose-web: ## Publish the web UI on an AWS NLB: make expose-web [SCHEME=internal|internet-facing] [CERT_ARN=<ACM cert arn> for HTTPS]
 	@[ "$(SCHEME)" = "internal" ] || [ "$(SCHEME)" = "internet-facing" ] || { echo "ERROR: SCHEME must be internal or internet-facing."; exit 1; }
 	@kubectl get svc darkplum-web -n darkplum-system >/dev/null 2>&1 || { echo "ERROR: darkplum-web is not deployed. Run 'make deploy' first."; exit 1; }
+	@kubectl get nodes -o jsonpath='{.items[0].spec.providerID}' 2>/dev/null | grep -q '^aws://' || { echo "ERROR: this is not an EKS cluster (the local dev stack is reached on http://localhost:$(DEV_PORT)). expose-web provisions an AWS load balancer."; exit 1; }
 	@if [ -n "$(CERT_ARN)" ]; then \
 		echo "Exposing web UI over HTTPS ($(SCHEME) NLB, TLS terminated with $(CERT_ARN))..."; \
 		PORTS='[{"name":"https","port":443,"targetPort":80,"protocol":"TCP"}]'; \
@@ -403,6 +404,16 @@ expose-web: ## Publish the web UI on an AWS NLB: make expose-web [SCHEME=interna
 	fi; \
 	kubectl patch svc darkplum-web -n darkplum-system --type=merge \
 		-p "{\"metadata\":{\"annotations\":$$ANN},\"spec\":{\"type\":\"LoadBalancer\",\"ports\":$$PORTS}}" >/dev/null; \
+	echo "Waiting for the load balancer hostname (EKS provisions the NLB; usually 1-3 minutes)..."; \
+	for i in $$(seq 1 30); do \
+		HOST=$$(kubectl get svc darkplum-web -n darkplum-system -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null); \
+		[ -n "$$HOST" ] && break; sleep 10; \
+	done; \
+	if [ -z "$$HOST" ]; then \
+		echo "ERROR: no load balancer was provisioned. Reverting to cluster-internal so nothing is left half-configured."; \
+		echo "       Check: kubectl describe svc darkplum-web -n darkplum-system   (events show why EKS could not create the NLB)"; \
+		$(MAKE) --no-print-directory unexpose-web; exit 1; \
+	fi; \
 	CURRENT=$$(kubectl get secret darkplum-auth -n darkplum-system -o jsonpath='{.data.SECURE_COOKIES}' 2>/dev/null | base64 -d 2>/dev/null); \
 	if [ "$$CURRENT" != "$$SECURE" ]; then \
 		kubectl patch secret darkplum-auth -n darkplum-system --type=merge \
@@ -410,12 +421,6 @@ expose-web: ## Publish the web UI on an AWS NLB: make expose-web [SCHEME=interna
 		kubectl rollout restart deployment/darkplum-api -n darkplum-system >/dev/null; \
 		kubectl rollout status deployment/darkplum-api -n darkplum-system --timeout=120s; \
 	fi; \
-	echo "Waiting for the load balancer hostname..."; \
-	for i in $$(seq 1 30); do \
-		HOST=$$(kubectl get svc darkplum-web -n darkplum-system -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null); \
-		[ -n "$$HOST" ] && break; sleep 10; \
-	done; \
-	[ -n "$$HOST" ] || { echo "Load balancer not ready yet. Check: kubectl get svc darkplum-web -n darkplum-system"; exit 1; }; \
 	SCHEME_URL=$$([ "$$SECURE" = "true" ] && echo https || echo http); \
 	echo ""; \
 	echo "Web UI: $$SCHEME_URL://$$HOST"; \
@@ -425,8 +430,11 @@ expose-web: ## Publish the web UI on an AWS NLB: make expose-web [SCHEME=interna
 unexpose-web: ## Revert the web UI to cluster-internal (port-forward only)
 	@kubectl patch svc darkplum-web -n darkplum-system --type=merge \
 		-p '{"metadata":{"annotations":{"service.beta.kubernetes.io/aws-load-balancer-type":null,"service.beta.kubernetes.io/aws-load-balancer-scheme":null,"service.beta.kubernetes.io/aws-load-balancer-internal":null,"service.beta.kubernetes.io/aws-load-balancer-ssl-cert":null,"service.beta.kubernetes.io/aws-load-balancer-ssl-ports":null,"service.beta.kubernetes.io/aws-load-balancer-backend-protocol":null}},"spec":{"type":"ClusterIP","ports":[{"name":"http","port":80,"targetPort":80,"protocol":"TCP"}]}}' >/dev/null
-	@kubectl patch secret darkplum-auth -n darkplum-system --type=merge -p '{"stringData":{"SECURE_COOKIES":"true"}}' >/dev/null
-	@kubectl rollout restart deployment/darkplum-api -n darkplum-system >/dev/null
+	@CURRENT=$$(kubectl get secret darkplum-auth -n darkplum-system -o jsonpath='{.data.SECURE_COOKIES}' 2>/dev/null | base64 -d 2>/dev/null); \
+	if [ "$$CURRENT" != "true" ]; then \
+		kubectl patch secret darkplum-auth -n darkplum-system --type=merge -p '{"stringData":{"SECURE_COOKIES":"true"}}' >/dev/null; \
+		kubectl rollout restart deployment/darkplum-api -n darkplum-system >/dev/null; \
+	fi
 	@echo "Web UI is cluster-internal again: kubectl port-forward -n darkplum-system svc/darkplum-web 8081:80"
 
 # =============================================================================
