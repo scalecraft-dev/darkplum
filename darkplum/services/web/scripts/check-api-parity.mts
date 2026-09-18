@@ -326,9 +326,15 @@ fail(
 //
 // Node kinds: an export is `<file>#<name>` ("default" for the default
 // export). Its edges are the exports it references, plus `ROUTES.<key>`
-// tokens. A screen's edges are the exports it references directly. A route
-// is reached if some screen, or some export reachable from a screen, has
-// its `ROUTES.<key>` edge.
+// tokens (only for the ROUTES that really is lib/routes.ts's table — a
+// shadowing local named ROUTES is not it). A screen's edges are the exports
+// it references directly. A route is reached if some screen, or some export
+// reachable from a screen, has its `ROUTES.<key>` edge.
+//
+// Known limits, all in the false-positive direction (a used route reported
+// dead, which fails CI loudly rather than hiding anything): `export =`,
+// `import('./x').then(m => m.f())` without binding the module to a name,
+// and a wrapper passed around under a computed property name.
 // ---------------------------------------------------------------------------
 
 function parse(file: string): ts.SourceFile {
@@ -387,7 +393,47 @@ function importBindings(sf: ts.SourceFile): Map<string, Binding> {
  * names of local (non-imported) identifiers so a module-internal helper can
  * be followed to its own body. Type positions contribute nothing.
  */
-function edgesOf(root: ts.Node, imports: Map<string, Binding>, into: Set<string>, locals: Set<string>): void {
+function edgesOf(root: ts.Node, imported: Map<string, Binding>, into: Set<string>, locals: Set<string>): void {
+  // Bindings in scope: the file's imports, plus what this subtree binds
+  // itself — `const mod = await import('./x')` (a namespace of x), and
+  // `const { f } = ns` / `const { f } = await import('./x')` (f is x#f).
+  // Collected in a first pass so use before declaration still resolves.
+  const imports = new Map(imported)
+  const dynamicTarget = (init: ts.Expression | undefined): string | null => {
+    let e = init
+    if (e && ts.isAwaitExpression(e)) e = e.expression
+    if (e && ts.isCallExpression(e) && e.expression.kind === ts.SyntaxKind.ImportKeyword && e.arguments.length === 1) {
+      return resolveModule(root.getSourceFile().fileName, e.arguments[0])
+    }
+    return null
+  }
+  const bind = (node: ts.Node): void => {
+    if (ts.isVariableDeclaration(node)) {
+      const file = dynamicTarget(node.initializer)
+      const nsOf = node.initializer && ts.isIdentifier(node.initializer) ? imports.get(node.initializer.text) : undefined
+      const nsFile = file ?? (nsOf && 'namespace' in nsOf ? nsOf.file : null)
+      if (nsFile && ts.isIdentifier(node.name) && file) imports.set(node.name.text, { file, namespace: true })
+      if (nsFile && ts.isObjectBindingPattern(node.name)) {
+        for (const el of node.name.elements) {
+          if (!ts.isIdentifier(el.name)) continue
+          const prop = el.propertyName && ts.isIdentifier(el.propertyName) ? el.propertyName.text : el.name.text
+          imports.set(el.name.text, { file: nsFile, name: prop })
+        }
+      }
+    }
+    ts.forEachChild(node, bind)
+  }
+  bind(root)
+
+  /** Whether an identifier named ROUTES is the real table from lib/routes. */
+  const routesFile = join(SRC_DIR, 'lib', 'routes.ts')
+  const isRoutesTable = (name: string): boolean => {
+    const b = imports.get(name)
+    if (b && 'name' in b) return b.file === routesFile && b.name === 'ROUTES'
+    // Inside lib/routes.ts itself, ROUTES is the local declaration.
+    return !b && name === 'ROUTES' && root.getSourceFile().fileName === routesFile
+  }
+
   const visit = (node: ts.Node): void => {
     if (
       ts.isTypeNode(node) ||
@@ -404,7 +450,7 @@ function edgesOf(root: ts.Node, imports: Map<string, Binding>, into: Set<string>
       const prop = ts.isPropertyAccessExpression(node)
         ? node.name.text
         : ts.isStringLiteral(node.argumentExpression) ? node.argumentExpression.text : null
-      if (obj === 'ROUTES' && prop) into.add(`ROUTES.${prop}`)
+      if (prop && isRoutesTable(obj)) into.add(`ROUTES.${prop}`)
       const b = imports.get(obj)
       if (b && 'namespace' in b && prop) { into.add(exportKey(b.file, prop)); return }
       // `ns.prop` where ns is a named import may be an `export * as ns`
