@@ -18,10 +18,21 @@
 # minute or two); the pod needs outbound HTTPS for that and nothing else.
 resources:
   requests: { cpu: 500m, memory: 2Gi }
-  limits: { cpu: "2", memory: 6Gi }
+  limits: { cpu: "2", memory: 4Gi }
+# No PersistentVolumeClaim: the chart's default StorageClass ("standard") does
+# not exist on the EKS cluster this Terraform builds (no EBS CSI driver is
+# installed), so a PVC would stay Pending and the pod would never schedule.
+# Classifier weights (~1-2 GB) live in the pod's ephemeral storage and are
+# re-downloaded from Hugging Face on every pod start (one to three minutes).
+persistence:
+  enabled: false
 service:
   type: ClusterIP
   metrics: { enabled: false }
+# Sizing: the default CPU node group is 2 x m5.large (2 vCPU / 8 GiB each) and
+# already hosts web, api, gateway and Postgres. Before enabling the classifier
+# in production, add a node (cpu_desired_size) or move to m5.xlarge; otherwise
+# expect memory pressure.
 podLabels:
   app.kubernetes.io/part-of: darkplum
 config:

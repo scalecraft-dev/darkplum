@@ -428,8 +428,10 @@ deploy-semantic-router: ## Install the open-source intent classifier for routed 
 	@echo "Installing vLLM Semantic Router ($(SR_VERSION)) from $(SR_VALUES)..."
 	@helm upgrade --install semantic-router $(SR_CHART) --version $(SR_VERSION) -n darkplum-system -f $(SR_VALUES) >/dev/null
 	@kubectl apply -f $(K8S_DIR)/semantic-router/network-policies.yaml >/dev/null
-	@echo "Waiting for it to download its classifier models and become ready (usually 1-3 minutes)..."
-	@kubectl rollout status deploy/semantic-router -n darkplum-system --timeout=900s
+	@echo "Waiting for it to download its classifier models (~1-2 GB from Hugging Face) and become ready — usually 1-3 minutes, up to 30 on a slow link..."
+	@kubectl rollout status deploy/semantic-router -n darkplum-system --timeout=1800s || { \
+		echo "ERROR: the semantic router did not become ready. Check: kubectl describe pod -n darkplum-system -l app.kubernetes.io/name=semantic-router"; \
+		echo "       (a Pending pod = scheduling/resources; CrashLoop = see its logs; still downloading = re-run this target, it is idempotent)"; exit 1; }
 	@echo "Pointing the gateway at it..."
 	@kubectl set env deploy/darkplum-gateway -n darkplum-system \
 		SEMANTIC_ROUTER_URL=http://semantic-router.darkplum-system.svc.cluster.local:8080 >/dev/null

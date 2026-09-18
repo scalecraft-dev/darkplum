@@ -300,8 +300,13 @@ if anything outside the allowlist would be permitted.
     (Apache-2.0) running on CPU inside the cluster, installed with
     `make deploy-semantic-router`. About 100 ms per decision. Its decision names
     are configured in `k8s/semantic-router/values.yaml` (defaults: `legal`,
-    `code`, `general`) and must match your route names. The gateway only calls
-    its classification API; it never carries traffic.
+    `code`, `general`) and must match your route names (matching is
+    case-insensitive and treats spaces as dashes, so a decision named
+    `computer science` matches a route `computer-science`). The gateway only
+    calls its classification API; it never carries traffic. It keeps its
+    classifier weights in ephemeral storage and re-downloads them (~1-2 GB) on
+    every pod start; it needs about 2 GiB of memory, so add a CPU node before
+    enabling it on the default 2 x m5.large node group.
   - **Model** — any self-hosted instruct model from your catalog, asked with the
     Arch-Router prompt protocol (routes as JSON, answer `{"route": ...}`),
     temperature 0, 8 tokens, last user turn only. Note: Katanemo's own
