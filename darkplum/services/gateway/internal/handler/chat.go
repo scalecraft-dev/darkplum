@@ -47,6 +47,14 @@ type chatCompletionRequest struct {
 	Temperature *float64           `json:"temperature,omitempty"`
 }
 
+// noModelRecorded is written to the "resolved_model" context key (and used as
+// the requested_model value in the structured denial log) for the two 400
+// paths that never reach model resolution: an unparseable body has no model
+// field to read at all, and a missing `model` field is indistinguishable from
+// one that was never sent. Recording.go documents why this literal is used
+// instead of the empty string for the recorded inference_events.model column.
+const noModelRecorded = "(none)"
+
 // providerLookup is the subset of *provider.Registry the handler needs.
 // Defined as an interface so tests can substitute a fake registry.
 type providerLookup interface {
@@ -102,6 +110,9 @@ func NewChatHandler(providers providerLookup, routes routeSnapshotter, pol polic
 func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 	var req chatCompletionRequest
 	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
+		c.Set("denial_code", "invalid_request")
+		c.Set("resolved_model", noModelRecorded)
+		logDenial(c, "invalid_request", noModelRecorded, "", "")
 		c.JSON(http.StatusBadRequest, openAIError{
 			Error: openAIErrorBody{
 				Message: fmt.Sprintf("invalid request body: %s", err.Error()),
@@ -112,6 +123,9 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 	}
 
 	if req.Model == "" {
+		c.Set("denial_code", "invalid_request")
+		c.Set("resolved_model", noModelRecorded)
+		logDenial(c, "invalid_request", noModelRecorded, "", "")
 		c.JSON(http.StatusBadRequest, openAIError{
 			Error: openAIErrorBody{
 				Message: "model is required",
@@ -386,11 +400,13 @@ func respondResidencyViolation(c *gin.Context, model string) {
 // inference_events, which today has no column to carry the denial reason
 // (model=<alias> with requested_model NULL would otherwise be the only trace
 // of an alias-routed 404/403). code is one of model_not_found,
-// model_not_enabled, model_residency_violation, policy_unavailable.
-// requestedModel is always the raw value the caller sent in the request body
-// (regardless of whether it was an alias); resolvedModel and class are empty
-// when not yet known (e.g. policy_unavailable, or model_not_found which by
-// definition has no route to read a class from).
+// model_not_enabled, model_residency_violation, policy_unavailable,
+// invalid_request. requestedModel is always the raw value the caller sent in
+// the request body (regardless of whether it was an alias), except for
+// invalid_request where no reliable value exists — noModelRecorded ("(none)")
+// is passed instead so the log and the audit table agree; resolvedModel and
+// class are empty when not yet known (e.g. policy_unavailable, invalid_request,
+// or model_not_found which by definition has no route to read a class from).
 func logDenial(c *gin.Context, code, requestedModel, resolvedModel, class string) {
 	slog.Warn("chat completion denied",
 		"request_id", c.GetHeader("X-Request-Id"),

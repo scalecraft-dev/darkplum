@@ -57,8 +57,8 @@ func TestLoad_RouteLastGoodTTLSecondsDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if cfg.RouteLastGoodTTLSeconds != 180 {
-		t.Errorf("RouteLastGoodTTLSeconds = %d, want default 180", cfg.RouteLastGoodTTLSeconds)
+	if cfg.RouteLastGoodTTLSeconds != 120 {
+		t.Errorf("RouteLastGoodTTLSeconds = %d, want default 120", cfg.RouteLastGoodTTLSeconds)
 	}
 }
 

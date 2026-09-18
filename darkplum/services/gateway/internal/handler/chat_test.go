@@ -487,6 +487,72 @@ func TestHandleChatCompletions_AliasToResidencyBlockedTargetRefused403(t *testin
 }
 
 // ---------------------------------------------------------------------------
+// Item 1: invalid_request denials record a sane model and denial_code.
+// ---------------------------------------------------------------------------
+
+// TestHandleChatCompletions_UnparseableBody_RecordsInvalidRequest asserts that
+// a body that fails to decode as JSON sets denial_code=invalid_request and
+// resolved_model="(none)" so the recorded inference_events row does not fall
+// back to an empty model column.
+func TestHandleChatCompletions_UnparseableBody_RecordsInvalidRequest(t *testing.T) {
+	h := newTestHandler(
+		fakeProviders{},
+		map[string]routing.Route{},
+		policy.Snapshot{Enabled: map[string]bool{}, Residency: policy.ResidencyAny},
+		true,
+	)
+
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	req, err := http.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader([]byte("{not-json")))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	c.Request = req
+
+	h.HandleChatCompletions(c)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d; body=%s", w.Code, w.Body.String())
+	}
+	if denialCode, _ := c.Get("denial_code"); denialCode != "invalid_request" {
+		t.Errorf("denial_code = %v, want invalid_request", denialCode)
+	}
+	if resolved, _ := c.Get("resolved_model"); resolved != "(none)" {
+		t.Errorf("resolved_model = %v, want \"(none)\"", resolved)
+	}
+}
+
+// TestHandleChatCompletions_MissingModel_RecordsInvalidRequest asserts the
+// same denial_code/resolved_model contract for a well-formed body that omits
+// the required `model` field.
+func TestHandleChatCompletions_MissingModel_RecordsInvalidRequest(t *testing.T) {
+	h := newTestHandler(
+		fakeProviders{},
+		map[string]routing.Route{},
+		policy.Snapshot{Enabled: map[string]bool{}, Residency: policy.ResidencyAny},
+		true,
+	)
+
+	w, c := doChat(t, h, "")
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d; body=%s", w.Code, w.Body.String())
+	}
+	e := decodeError(t, w.Body.Bytes())
+	if e.Error.Code != "model_required" {
+		t.Errorf("expected code model_required, got %q", e.Error.Code)
+	}
+	if denialCode, _ := c.Get("denial_code"); denialCode != "invalid_request" {
+		t.Errorf("denial_code = %v, want invalid_request", denialCode)
+	}
+	if resolved, _ := c.Get("resolved_model"); resolved != "(none)" {
+		t.Errorf("resolved_model = %v, want \"(none)\"", resolved)
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Policy fail-closed
 // ---------------------------------------------------------------------------
 

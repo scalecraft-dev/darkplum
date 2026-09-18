@@ -166,6 +166,7 @@ func run() error {
 	// traffic. The handler is also registered on the router below.
 	modelSyncInterval := modelSyncIntervalFromEnv()
 	modelHandler := handler.NewModelHandler(gatewayURL, serviceKey, pool)
+	modelHandler.SetAvailabilityWindow(modelAvailabilityWindowFromEnv())
 	go func() {
 		delay := 2 * time.Second
 		for i := 0; i < 20; i++ {
@@ -241,6 +242,7 @@ func run() error {
 	chat := handler.NewChatHandler(gatewayURL, serviceKey)
 	activityH := handler.NewActivityHandler(pool)
 	routing := handler.NewRoutingHandler(pool, activityRecorder)
+	routing.SetAvailabilityWindow(modelAvailabilityWindowFromEnv())
 
 	r.GET("/health", func(c *gin.Context) { c.Status(http.StatusOK) })
 
@@ -419,6 +421,50 @@ func parseModelSyncInterval(raw string) time.Duration {
 		return modelSyncMinInterval
 	}
 	return interval
+}
+
+// modelAvailabilityWindowMinInterval is the floor for
+// MODEL_AVAILABILITY_WINDOW_SECONDS: below this, a single missed
+// MODEL_SYNC_INTERVAL_SECONDS tick would flap a model's availability off and
+// on for no operational reason.
+const modelAvailabilityWindowMinInterval = 30 * time.Second
+
+// modelAvailabilityWindowDefaultInterval mirrors handler.modelAvailabilityWindow
+// (kept in sync by hand — the handler package's constant is unexported and
+// this is the operator-facing default for the same setting, so there's
+// nothing to import). See handler.modelAvailabilityWindow's doc comment for
+// why 2 minutes.
+const modelAvailabilityWindowDefaultInterval = 2 * time.Minute
+
+// modelAvailabilityWindowFromEnv reads MODEL_AVAILABILITY_WINDOW_SECONDS from
+// the environment and applies parseModelAvailabilityWindow.
+func modelAvailabilityWindowFromEnv() time.Duration {
+	return parseModelAvailabilityWindow(os.Getenv("MODEL_AVAILABILITY_WINDOW_SECONDS"))
+}
+
+// parseModelAvailabilityWindow defaults to modelAvailabilityWindowDefaultInterval
+// and enforces modelAvailabilityWindowMinInterval as a floor. An empty or
+// unparseable value falls back to the default rather than failing startup,
+// matching parseModelSyncInterval's contract. Pulled out as a pure function
+// so the default/min/parse-failure paths are unit-testable without touching
+// the environment.
+func parseModelAvailabilityWindow(raw string) time.Duration {
+	if raw == "" {
+		return modelAvailabilityWindowDefaultInterval
+	}
+	secs, err := strconv.Atoi(raw)
+	if err != nil {
+		slog.Warn("MODEL_AVAILABILITY_WINDOW_SECONDS is not a valid integer, using default",
+			"value", raw, "default_seconds", int(modelAvailabilityWindowDefaultInterval.Seconds()))
+		return modelAvailabilityWindowDefaultInterval
+	}
+	window := time.Duration(secs) * time.Second
+	if window < modelAvailabilityWindowMinInterval {
+		slog.Warn("MODEL_AVAILABILITY_WINDOW_SECONDS is below the minimum, clamping",
+			"requested_seconds", secs, "min_seconds", int(modelAvailabilityWindowMinInterval.Seconds()))
+		return modelAvailabilityWindowMinInterval
+	}
+	return window
 }
 
 // requestID attaches a unique request ID to the context and response header.

@@ -57,9 +57,13 @@ type SourceStatus struct {
 	// LastSuccessSecondsAgo is how long ago this source's last successful
 	// discovery completed, or nil if it has never succeeded.
 	LastSuccessSecondsAgo *int64
-	// LastError is the error message from the most recent failed discovery,
-	// or "" if the last attempt succeeded (or none has run yet).
-	LastError string
+	// LastErrorKind classifies the most recent failed discovery into one of a
+	// small fixed set safe to expose on the unauthenticated /health endpoint
+	// (see classifyError), or "" if the last attempt succeeded (or none has
+	// run yet). The raw error — which may contain upstream hostnames or
+	// internal detail — is never exposed here; it is only ever logged, by
+	// Manager.Refresh.
+	LastErrorKind string
 }
 
 // Status is the aggregate routing health snapshot returned by
@@ -162,15 +166,10 @@ func (m *Manager) Status() Status {
 			lastSuccessAgo = &secs
 		}
 
-		lastErrMsg := ""
-		if err := m.lastErr[src.Name]; err != nil {
-			lastErrMsg = err.Error()
-		}
-
 		sources[src.Name] = SourceStatus{
 			Models:                models,
 			LastSuccessSecondsAgo: lastSuccessAgo,
-			LastError:             lastErrMsg,
+			LastErrorKind:         classifyError(m.lastErr[src.Name]),
 		}
 	}
 

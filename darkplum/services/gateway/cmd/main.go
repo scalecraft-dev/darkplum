@@ -279,9 +279,12 @@ func respondUnknownEndpoint(c *gin.Context) {
 // Bedrock-only deployment).
 //
 // The response is unauthenticated, so routing source status reports model
-// COUNTS only (never model ids or secrets); upstream hostnames are
-// acceptable since they already appear in gateway config, but error strings
-// otherwise stay generic.
+// COUNTS only (never model ids or secrets), and a discovery failure is
+// surfaced as last_error_kind — a small fixed classification (see
+// routing.classifyError) — never the raw error string. The raw error
+// (which, for an HTTP discovery failure, is an *url.Error whose message
+// embeds the full upstream URL) is only ever written to the gateway's own
+// log by routing.Manager.Refresh.
 func newHealthHandler(upstreamChecker *health.Checker, routeMgr *routing.Manager, polStore *policy.PgStore) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		upstreams := upstreamChecker.Check(c.Request.Context())
@@ -296,7 +299,7 @@ func newHealthHandler(upstreamChecker *health.Checker, routeMgr *routing.Manager
 			sourcesBody[name] = gin.H{
 				"models":                   s.Models,
 				"last_success_seconds_ago": s.LastSuccessSecondsAgo,
-				"last_error":               nullableString(s.LastError),
+				"last_error_kind":          nullableString(s.LastErrorKind),
 			}
 		}
 

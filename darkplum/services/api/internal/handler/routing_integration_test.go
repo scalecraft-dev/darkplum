@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -419,5 +420,45 @@ func TestRoutingPolicy_GetPutAndInvalidValue(t *testing.T) {
 	}
 	if eventCount != 1 {
 		t.Fatalf("expected 1 routing_policy.changed event, got %d", eventCount)
+	}
+}
+
+// The alias endpoints must apply the same operator-configured availability
+// window as the model endpoints, or target_available and available disagree.
+func TestListAliases_TargetAvailableHonoursConfiguredWindow(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+
+	insertModel(t, ctx, pool, "llama3", backendClassSelfHosted, true)
+	if _, err := pool.Exec(ctx, `UPDATE models SET discovered_at = now() - interval '4 minutes' WHERE model_id = 'llama3'`); err != nil {
+		t.Fatalf("backdate: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO model_aliases (alias, target_model_id) VALUES ('smart', 'llama3')`); err != nil {
+		t.Fatalf("insert alias: %v", err)
+	}
+
+	for _, tc := range []struct {
+		window time.Duration
+		want   bool
+	}{
+		{2 * time.Minute, false}, // default: unseen for 4 min -> unavailable
+		{10 * time.Minute, true}, // operator widened the window
+	} {
+		h := NewRoutingHandler(pool, activity.NewRecorder(pool))
+		h.SetAvailabilityWindow(tc.window)
+		r := gin.New()
+		r.GET("/api/v1/model-aliases", h.ListAliases)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/api/v1/model-aliases", nil))
+		if w.Code != http.StatusOK {
+			t.Fatalf("window %v: status %d body %s", tc.window, w.Code, w.Body.String())
+		}
+		var rows []aliasResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &rows); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if len(rows) != 1 || rows[0].TargetAvailable != tc.want {
+			t.Fatalf("window %v: expected target_available=%v, got %+v", tc.window, tc.want, rows)
+		}
 	}
 }

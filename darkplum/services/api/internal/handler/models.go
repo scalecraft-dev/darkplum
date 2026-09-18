@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -20,6 +21,12 @@ type ModelHandler struct {
 	serviceKey string
 	pool       *pgxpool.Pool
 	client     *http.Client
+
+	// availabilityWindow defaults to modelAvailabilityWindow and can be
+	// overridden via SetAvailabilityWindow, which cmd/main.go does from
+	// MODEL_AVAILABILITY_WINDOW_SECONDS so an operator can tune it without a
+	// rebuild.
+	availabilityWindow time.Duration
 }
 
 // NewModelHandler constructs a ModelHandler. gatewayURL and serviceKey are used
@@ -33,7 +40,16 @@ func NewModelHandler(gatewayURL, serviceKey string, pool *pgxpool.Pool) *ModelHa
 		client: &http.Client{
 			Timeout: 10 * time.Second,
 		},
+		availabilityWindow: modelAvailabilityWindow,
 	}
+}
+
+// SetAvailabilityWindow overrides the default modelAvailabilityWindow used by
+// ListModels/ListAdminModels/ToggleModel. Exported so cmd/main.go (a
+// different package) can apply an operator-configured
+// MODEL_AVAILABILITY_WINDOW_SECONDS value after construction.
+func (h *ModelHandler) SetAvailabilityWindow(w time.Duration) {
+	h.availabilityWindow = w
 }
 
 // modelRow is the full DB representation returned by admin endpoints.
@@ -145,7 +161,7 @@ func (h *ModelHandler) ListModels(c *gin.Context) {
 		return
 	}
 
-	data := buildModelsList(models, aliases, residency, time.Now())
+	data := buildModelsList(models, aliases, residency, time.Now(), h.availabilityWindow)
 	c.JSON(http.StatusOK, openAIModelsResponse{Object: "list", Data: data})
 }
 
@@ -180,7 +196,7 @@ func (h *ModelHandler) ListAdminModels(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "scan models failed"})
 			return
 		}
-		m.Available = modelIsAvailable(m.DiscoveredAt, now)
+		m.Available = modelIsAvailableWithin(m.DiscoveredAt, now, h.availabilityWindow)
 		models = append(models, m)
 	}
 	if err := rows.Err(); err != nil {
@@ -237,7 +253,7 @@ func (h *ModelHandler) ToggleModel(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "fetch updated model failed"})
 		return
 	}
-	m.Available = modelIsAvailable(m.DiscoveredAt, time.Now())
+	m.Available = modelIsAvailableWithin(m.DiscoveredAt, time.Now(), h.availabilityWindow)
 
 	c.JSON(http.StatusOK, m)
 }
@@ -314,65 +330,30 @@ func (h *ModelHandler) SyncModels(ctx context.Context) {
 		return
 	}
 
-	var inserted, updated int
-	discoveredIDs := make([]string, 0, len(gwResp.Data))
-	for _, m := range gwResp.Data {
-		if m.ID == "" {
-			continue
-		}
+	// Normalize+de-dup once, up front, so both the batch path and its
+	// per-row fallback see the same input (see normalizeGatewayModels).
+	normalized := normalizeGatewayModels(gwResp.Data)
 
-		providerName := m.OwnedBy
-		if providerName == "" {
-			providerName = "vllm"
-		}
-		backendClass := normalizeBackendClass(m.BackendClass)
-
-		// INSERT new rows with enabled = false (schema default). On conflict,
-		// refresh discovered_at, backend_class and provider — never enabled or
-		// display_name, so admin settings survive a resync.
-		//
-		// "xmax = 0" is true only for the row version created by this INSERT
-		// (xmax is unset on a freshly inserted tuple); the ON CONFLICT UPDATE
-		// path always sets a nonzero xmax. CommandTag can't distinguish
-		// INSERT-from-conflict-update because both report "INSERT 0 1" under
-		// ON CONFLICT DO UPDATE ... RETURNING, so RETURNING (xmax = 0) is the
-		// reliable way to tell which branch actually ran.
-		//
-		// Each row runs in its own savepoint: a failed statement aborts a
-		// Postgres transaction, and one bad row must not take the rest of the
-		// sync (and the purge) down with it.
-		var wasInsert bool
-		sp, err := tx.Begin(ctx)
-		if err != nil {
-			slog.ErrorContext(ctx, "sync models: savepoint failed", "model_id", m.ID, "err", err)
+	// The common case (a healthy sync) is one set-based upsert instead of
+	// three round trips per model inside a per-row savepoint — with a few
+	// hundred Bedrock profiles, the old per-row loop held
+	// modelRoutingAdvisoryLockKey long enough to stall admin PutAlias calls.
+	// A batch statement failure (e.g. one row's data Postgres rejects, which
+	// fails the whole INSERT) falls back to the old per-row savepoint path so
+	// one bad row still can't take the rest of the sync down.
+	inserted, updated, discoveredIDs, err := h.syncModelsBatch(ctx, tx, normalized)
+	if err != nil {
+		slog.WarnContext(ctx, "sync models: batch upsert failed, falling back to per-row upserts",
+			"model_count", len(normalized), "err", err)
+		var fatalErr error
+		inserted, updated, discoveredIDs, fatalErr = h.syncModelsPerRow(ctx, tx, normalized)
+		if fatalErr != nil {
+			slog.ErrorContext(ctx, "sync models: per-row fallback failed", "err", fatalErr)
 			return
 		}
-		err = sp.QueryRow(ctx, `
-			INSERT INTO models (model_id, provider, backend_class, discovered_at, updated_at)
-			VALUES ($1, $2, $3, now(), now())
-			ON CONFLICT (model_id) DO UPDATE
-				SET discovered_at = now(),
-					backend_class = EXCLUDED.backend_class,
-					provider = EXCLUDED.provider
-			RETURNING (xmax = 0)
-		`, m.ID, providerName, backendClass).Scan(&wasInsert)
-		if err != nil {
-			slog.ErrorContext(ctx, "sync models: upsert failed", "model_id", m.ID, "err", err)
-			_ = sp.Rollback(ctx)
-			continue
-		}
-		if err := sp.Commit(ctx); err != nil {
-			slog.ErrorContext(ctx, "sync models: release savepoint failed", "model_id", m.ID, "err", err)
-			return
-		}
-		// Only ids the database accepted take part in the alias-shadow check below.
-		discoveredIDs = append(discoveredIDs, m.ID)
-
-		if wasInsert {
-			inserted++
-		} else {
-			updated++
-		}
+	} else if len(normalized) > 0 {
+		slog.InfoContext(ctx, "sync models: batch upsert succeeded",
+			"model_count", len(normalized), "inserted", inserted, "updated", updated)
 	}
 
 	// A discovered model id that equals an existing alias is not an error —
@@ -431,4 +412,125 @@ func (h *ModelHandler) SyncModels(ctx context.Context) {
 		"updated", updated,
 		"purged", purged,
 	)
+}
+
+// syncModelsBatch upserts every discovered model in one set-based statement,
+// run inside its own savepoint of tx so a statement-level failure (e.g. one
+// row's data Postgres rejects) can be rolled back without aborting tx itself
+// — the caller falls back to syncModelsPerRow on any returned error.
+//
+// "xmax = 0" is true only for the row version created by the INSERT branch
+// (xmax is unset on a freshly inserted tuple); the ON CONFLICT UPDATE path
+// always sets a nonzero xmax. CommandTag can't distinguish
+// INSERT-from-conflict-update because both report the same tag under
+// ON CONFLICT DO UPDATE ... RETURNING, so RETURNING (xmax = 0) is the
+// reliable way to tell which branch ran for each row.
+func (h *ModelHandler) syncModelsBatch(ctx context.Context, tx pgx.Tx, models []normalizedModel) (inserted, updated int, discoveredIDs []string, err error) {
+	if len(models) == 0 {
+		return 0, 0, nil, nil
+	}
+
+	ids := make([]string, len(models))
+	providers := make([]string, len(models))
+	backendClasses := make([]string, len(models))
+	for i, m := range models {
+		ids[i] = m.ID
+		providers[i] = m.Provider
+		backendClasses[i] = m.BackendClass
+	}
+
+	sp, err := tx.Begin(ctx)
+	if err != nil {
+		return 0, 0, nil, fmt.Errorf("open batch savepoint: %w", err)
+	}
+	defer sp.Rollback(ctx) // no-op once committed
+
+	rows, err := sp.Query(ctx, `
+		INSERT INTO models (model_id, provider, backend_class, discovered_at, updated_at)
+		SELECT id, provider, backend_class, now(), now()
+		FROM unnest($1::text[], $2::text[], $3::text[]) AS t(id, provider, backend_class)
+		ON CONFLICT (model_id) DO UPDATE
+			SET discovered_at = now(),
+				backend_class = EXCLUDED.backend_class,
+				provider = EXCLUDED.provider
+		RETURNING model_id, (xmax = 0)
+	`, ids, providers, backendClasses)
+	if err != nil {
+		return 0, 0, nil, fmt.Errorf("batch upsert: %w", err)
+	}
+
+	discoveredIDs = make([]string, 0, len(models))
+	for rows.Next() {
+		var id string
+		var wasInsert bool
+		if scanErr := rows.Scan(&id, &wasInsert); scanErr != nil {
+			rows.Close()
+			return 0, 0, nil, fmt.Errorf("scan batch upsert row: %w", scanErr)
+		}
+		discoveredIDs = append(discoveredIDs, id)
+		if wasInsert {
+			inserted++
+		} else {
+			updated++
+		}
+	}
+	if rowsErr := rows.Err(); rowsErr != nil {
+		rows.Close()
+		return 0, 0, nil, fmt.Errorf("batch upsert rows: %w", rowsErr)
+	}
+	rows.Close()
+
+	if err := sp.Commit(ctx); err != nil {
+		return 0, 0, nil, fmt.Errorf("commit batch savepoint: %w", err)
+	}
+
+	return inserted, updated, discoveredIDs, nil
+}
+
+// syncModelsPerRow is the fallback for syncModelsBatch: each model is
+// upserted in its own savepoint, so one row Postgres rejects doesn't abort
+// the rest of the sync (and the purge that follows). This is the original
+// (pre-batch) upsert strategy, kept as-is for the case a discovered set
+// can't go through in one statement.
+//
+// A savepoint-open or savepoint-commit failure (as opposed to a rejected
+// upsert statement) means something is wrong with the connection/transaction
+// itself, not a single row's data — that is returned as a fatal error, which
+// the caller must treat as reason to abort the whole sync without
+// committing, exactly as this code did before being pulled out of SyncModels.
+func (h *ModelHandler) syncModelsPerRow(ctx context.Context, tx pgx.Tx, models []normalizedModel) (inserted, updated int, discoveredIDs []string, fatalErr error) {
+	discoveredIDs = make([]string, 0, len(models))
+	for _, m := range models {
+		var wasInsert bool
+		sp, err := tx.Begin(ctx)
+		if err != nil {
+			return inserted, updated, discoveredIDs, fmt.Errorf("savepoint failed for model_id %s: %w", m.ID, err)
+		}
+		err = sp.QueryRow(ctx, `
+			INSERT INTO models (model_id, provider, backend_class, discovered_at, updated_at)
+			VALUES ($1, $2, $3, now(), now())
+			ON CONFLICT (model_id) DO UPDATE
+				SET discovered_at = now(),
+					backend_class = EXCLUDED.backend_class,
+					provider = EXCLUDED.provider
+			RETURNING (xmax = 0)
+		`, m.ID, m.Provider, m.BackendClass).Scan(&wasInsert)
+		if err != nil {
+			slog.ErrorContext(ctx, "sync models: upsert failed", "model_id", m.ID, "err", err)
+			_ = sp.Rollback(ctx)
+			continue
+		}
+		if err := sp.Commit(ctx); err != nil {
+			return inserted, updated, discoveredIDs, fmt.Errorf("release savepoint failed for model_id %s: %w", m.ID, err)
+		}
+		// Only ids the database accepted take part in the alias-shadow check.
+		discoveredIDs = append(discoveredIDs, m.ID)
+
+		if wasInsert {
+			inserted++
+		} else {
+			updated++
+		}
+	}
+	return inserted, updated, discoveredIDs, nil
 }

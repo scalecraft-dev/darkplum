@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"testing"
 	"time"
 
@@ -188,7 +190,20 @@ func TestNewHealthHandler_IncludesRoutingAndPolicyStatus(t *testing.T) {
 			return []string{"llama-3-8b", "mistral-7b"}, nil
 		},
 	}
-	routeMgr := routing.NewManager([]routing.Source{src}, 0)
+	// A failing source whose error — like a real *url.Error from a dial
+	// failure — embeds a scheme and hostname, so this test can assert that
+	// text never reaches the unauthenticated /health response.
+	failingSrc := routing.Source{
+		Name: "lmstudio-dev", Kind: "lmstudio", Class: routing.ClassSelfHosted, ProviderKey: "lmstudio-dev",
+		Discover: func(_ context.Context) ([]string, error) {
+			return nil, &url.Error{
+				Op:  "Get",
+				URL: "http://lmstudio.internal.example.com:1234/v1/models",
+				Err: errors.New("dial tcp 10.0.0.5:1234: connect: connection refused"),
+			}
+		},
+	}
+	routeMgr := routing.NewManager([]routing.Source{src, failingSrc}, 0)
 	routeMgr.Refresh(context.Background())
 
 	// A PgStore that has never loaded (no DB call is ever made — Status()
@@ -215,7 +230,7 @@ func TestNewHealthHandler_IncludesRoutingAndPolicyStatus(t *testing.T) {
 			Sources map[string]struct {
 				Models                int     `json:"models"`
 				LastSuccessSecondsAgo *int64  `json:"last_success_seconds_ago"`
-				LastError             *string `json:"last_error"`
+				LastErrorKind         *string `json:"last_error_kind"`
 			} `json:"sources"`
 		} `json:"routing"`
 		Policy struct {
@@ -241,14 +256,32 @@ func TestNewHealthHandler_IncludesRoutingAndPolicyStatus(t *testing.T) {
 	if src1.LastSuccessSecondsAgo == nil {
 		t.Error("expected routing.sources.vllm-default.last_success_seconds_ago to be set after a successful refresh")
 	}
-	if src1.LastError != nil {
-		t.Errorf("routing.sources.vllm-default.last_error = %v, want null", src1.LastError)
+	if src1.LastErrorKind != nil {
+		t.Errorf("routing.sources.vllm-default.last_error_kind = %v, want null", src1.LastErrorKind)
+	}
+
+	failingStatus, ok := body.Routing.Sources["lmstudio-dev"]
+	if !ok {
+		t.Fatal("expected lmstudio-dev under routing.sources")
+	}
+	if failingStatus.LastErrorKind == nil || *failingStatus.LastErrorKind != "unreachable" {
+		t.Errorf("routing.sources.lmstudio-dev.last_error_kind = %v, want \"unreachable\"", failingStatus.LastErrorKind)
 	}
 
 	// The raw response must never contain the model ids themselves outside of
 	// what's already exposed on the authenticated /v1/models surface.
 	if bytes.Contains(w.Body.Bytes(), []byte("llama-3-8b")) || bytes.Contains(w.Body.Bytes(), []byte("mistral-7b")) {
 		t.Error("unauthenticated /health must not expose model ids, only counts")
+	}
+
+	// Item 2 regression guard: /health must never leak upstream hostnames or
+	// raw error text — only the classified last_error_kind. lmstudio-dev's
+	// underlying discovery error above embeds a scheme and a hostname; none
+	// of that may survive into the response body.
+	for _, needle := range []string{"http://", "https://", "lmstudio.internal.example.com", "10.0.0.5", "connection refused"} {
+		if bytes.Contains(w.Body.Bytes(), []byte(needle)) {
+			t.Errorf("unauthenticated /health body must not contain %q, got: %s", needle, w.Body.String())
+		}
 	}
 
 	if body.Policy.Loaded {

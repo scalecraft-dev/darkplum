@@ -13,22 +13,38 @@ const (
 	residencySelfHostedOnly = "self_hosted_only"
 )
 
-// modelAvailabilityWindow is how recently a model must have been (re-)discovered
-// to be considered available. A vLLM backend can take 15-25 minutes to finish
-// loading a model after a pod restart, and SyncModels no longer deletes a row
-// the instant it isn't re-discovered (see models.go), so "available" is a
-// separate, time-based signal layered on top of the durable "enabled" flag.
-// The gateway's own discovery interval defaults to 60s (DISCOVERY_INTERVAL_SECONDS),
-// so 3 minutes tolerates a couple of missed ticks without flapping a model in
-// and out of the chat-facing list while it's mid-restart.
-const modelAvailabilityWindow = 3 * time.Minute
+// modelAvailabilityWindow is the default value for how recently a model must
+// have been (re-)discovered to be considered available, used whenever a
+// caller doesn't have an operator-configured override in hand (see
+// MODEL_AVAILABILITY_WINDOW_SECONDS in cmd/main.go, which plumbs a
+// ModelHandler-scoped override into buildModelsList and the admin
+// available computation; RoutingHandler's alias endpoints are not
+// operator-tunable and always use this default). A vLLM backend can take
+// 15-25 minutes to finish loading a model after a pod restart, and
+// SyncModels no longer deletes a row the instant it isn't re-discovered (see
+// models.go), so "available" is a separate, time-based signal layered on top
+// of the durable "enabled" flag. The gateway's own discovery interval
+// defaults to 60s (DISCOVERY_INTERVAL_SECONDS), and its own last-good TTL is
+// 120s, so 2 minutes tolerates one missed tick without flapping a model in
+// and out of the chat-facing list while it's mid-restart, and keeps a
+// genuinely dead backend out of the picker within about 3 minutes total
+// (sync interval + this window) rather than 5.
+const modelAvailabilityWindow = 2 * time.Minute
 
 // modelIsAvailable reports whether discoveredAt is recent enough, relative to
-// now, for a model to be considered routable. It is a pure function, pulled
-// out of buildModelsList, so the cutoff boundary is unit-testable without a
+// now, for a model to be considered routable, using the default
+// modelAvailabilityWindow. It is a pure function, pulled out of
+// buildModelsList, so the cutoff boundary is unit-testable without a
 // database.
 func modelIsAvailable(discoveredAt, now time.Time) bool {
-	return discoveredAt.After(now.Add(-modelAvailabilityWindow))
+	return modelIsAvailableWithin(discoveredAt, now, modelAvailabilityWindow)
+}
+
+// modelIsAvailableWithin is modelIsAvailable with an explicit window,
+// letting ModelHandler apply an operator-configured
+// MODEL_AVAILABILITY_WINDOW_SECONDS override instead of the default.
+func modelIsAvailableWithin(discoveredAt, now time.Time, window time.Duration) bool {
+	return discoveredAt.After(now.Add(-window))
 }
 
 // modelRoutingAdvisoryLockKey is a fixed pg_advisory_xact_lock key shared by
@@ -85,7 +101,11 @@ type aliasDBRow struct {
 // model_residency_violation, or 404 once the route table drops it), since
 // this endpoint can be bypassed entirely by callers that already know a model
 // id.
-func buildModelsList(models []modelDBRow, aliases []aliasDBRow, residency string, now time.Time) []openAIModelEntry {
+//
+// availabilityWindow is caller-supplied (rather than the modelAvailabilityWindow
+// default baked in) so ModelHandler can apply an operator-configured
+// MODEL_AVAILABILITY_WINDOW_SECONDS override; see cmd/main.go.
+func buildModelsList(models []modelDBRow, aliases []aliasDBRow, residency string, now time.Time, availabilityWindow time.Duration) []openAIModelEntry {
 	created := now.Unix()
 	entries := make([]openAIModelEntry, 0, len(models)+len(aliases))
 
@@ -93,7 +113,7 @@ func buildModelsList(models []modelDBRow, aliases []aliasDBRow, residency string
 		if residency == residencySelfHostedOnly && m.BackendClass == backendClassCloudManaged {
 			continue
 		}
-		if !modelIsAvailable(m.DiscoveredAt, now) {
+		if !modelIsAvailableWithin(m.DiscoveredAt, now, availabilityWindow) {
 			continue
 		}
 		entries = append(entries, openAIModelEntry{
@@ -109,7 +129,7 @@ func buildModelsList(models []modelDBRow, aliases []aliasDBRow, residency string
 		if residency == residencySelfHostedOnly && a.BackendClass == backendClassCloudManaged {
 			continue
 		}
-		if !modelIsAvailable(a.TargetDiscoveredAt, now) {
+		if !modelIsAvailableWithin(a.TargetDiscoveredAt, now, availabilityWindow) {
 			continue
 		}
 		target := a.TargetModelID
@@ -124,4 +144,50 @@ func buildModelsList(models []modelDBRow, aliases []aliasDBRow, residency string
 	}
 
 	return entries
+}
+
+// normalizedModel is one gateway-reported model after applying the same
+// provider/backend_class defaulting SyncModels has always done, ready to be
+// fed into either the batch upsert or the per-row fallback.
+type normalizedModel struct {
+	ID           string
+	Provider     string
+	BackendClass string
+}
+
+// normalizeGatewayModels applies field defaulting (empty owned_by -> "vllm",
+// unrecognized/absent backend_class -> self_hosted) and de-duplicates by
+// model id, keeping the last occurrence. It is pure so the defaulting and
+// de-dup behaviour is unit-testable without a database or an HTTP stub.
+//
+// The gateway should never report the same model id twice in one response,
+// but SyncModels' batch upsert issues a single
+// INSERT ... ON CONFLICT DO UPDATE statement over the whole discovered set,
+// and Postgres rejects a statement that would affect the same row twice
+// ("ON CONFLICT DO UPDATE command cannot affect row a second time") — so
+// de-duplicating client-side is required for correctness, not just hygiene.
+func normalizeGatewayModels(entries []openAIModelEntry) []normalizedModel {
+	seen := make(map[string]int, len(entries))
+	normalized := make([]normalizedModel, 0, len(entries))
+	for _, e := range entries {
+		if e.ID == "" {
+			continue
+		}
+		providerName := e.OwnedBy
+		if providerName == "" {
+			providerName = "vllm"
+		}
+		nm := normalizedModel{
+			ID:           e.ID,
+			Provider:     providerName,
+			BackendClass: normalizeBackendClass(e.BackendClass),
+		}
+		if idx, ok := seen[e.ID]; ok {
+			normalized[idx] = nm
+			continue
+		}
+		seen[e.ID] = len(normalized)
+		normalized = append(normalized, nm)
+	}
+	return normalized
 }

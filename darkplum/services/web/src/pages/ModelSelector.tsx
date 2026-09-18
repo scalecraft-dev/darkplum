@@ -58,8 +58,7 @@ export function ModelSelector({ models, isLoading, error, value, onChange }: Pro
   }
 
   const selected = models.find((m) => m.id === value) ?? null
-  const selectedClass = selected ? backendClassOf(selected) : 'self_hosted'
-  const isCloud = selectedClass === 'cloud_managed'
+  const isCloud = selected ? backendClassOf(selected) === 'cloud_managed' : false
 
   return (
     <div className={styles.wrapper}>
@@ -93,12 +92,18 @@ export function ModelSelector({ models, isLoading, error, value, onChange }: Pro
         )}
       </select>
 
-      <span className={styles.status}>
+      {/* With nothing selected there is no backend to describe, and naming one
+          anyway would claim a routing decision the person has not made yet. */}
+      <span className={styles.status} role={selected ? undefined : 'status'}>
         <span
-          className={`${styles.dot} ${isCloud ? styles.dotCloud : styles.dotGreen}`}
+          className={`${styles.dot} ${
+            !selected ? styles.dotAmber : isCloud ? styles.dotCloud : styles.dotGreen
+          }`}
           aria-hidden="true"
         />
-        <span className={styles.statusLabel}>{backendClassChatLabel(selectedClass)}</span>
+        <span className={styles.statusLabel}>
+          {selected ? backendClassChatLabel(backendClassOf(selected)) : 'No model selected'}
+        </span>
       </span>
 
       {selected?.alias_of && (

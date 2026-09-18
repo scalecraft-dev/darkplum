@@ -15,7 +15,7 @@ func TestModelIsAvailable(t *testing.T) {
 	}{
 		{"just now", now, true},
 		{"1 minute ago", now.Add(-1 * time.Minute), true},
-		{"just under the 3-minute cutoff", now.Add(-modelAvailabilityWindow + time.Second), true},
+		{"just under the 2-minute cutoff", now.Add(-modelAvailabilityWindow + time.Second), true},
 		{"exactly at the cutoff (exclusive)", now.Add(-modelAvailabilityWindow), false},
 		{"just over the cutoff", now.Add(-modelAvailabilityWindow - time.Second), false},
 		{"long stale (well within the 7-day purge window)", now.Add(-24 * time.Hour), false},
@@ -55,7 +55,7 @@ func TestBuildModelsList_NoPolicyIncludesEverything(t *testing.T) {
 		{Alias: "smart", TargetModelID: "claude-3-sonnet", OwnedBy: "bedrock", BackendClass: backendClassCloudManaged, TargetDiscoveredAt: now},
 	}
 
-	got := buildModelsList(models, aliases, residencyAny, now)
+	got := buildModelsList(models, aliases, residencyAny, now, modelAvailabilityWindow)
 	if len(got) != 4 {
 		t.Fatalf("len(got) = %d, want 4: %+v", len(got), got)
 	}
@@ -91,7 +91,7 @@ func TestBuildModelsList_SelfHostedOnlyOmitsCloudManaged(t *testing.T) {
 		{Alias: "smart", TargetModelID: "claude-3-sonnet", OwnedBy: "bedrock", BackendClass: backendClassCloudManaged, TargetDiscoveredAt: now},
 	}
 
-	got := buildModelsList(models, aliases, residencySelfHostedOnly, now)
+	got := buildModelsList(models, aliases, residencySelfHostedOnly, now, modelAvailabilityWindow)
 
 	for _, e := range got {
 		if e.BackendClass == backendClassCloudManaged {
@@ -107,7 +107,7 @@ func TestBuildModelsList_SelfHostedOnlyOmitsCloudManaged(t *testing.T) {
 }
 
 func TestBuildModelsList_EmptyInputsProduceEmptySlice(t *testing.T) {
-	got := buildModelsList(nil, nil, residencyAny, time.Now())
+	got := buildModelsList(nil, nil, residencyAny, time.Now(), modelAvailabilityWindow)
 	if got == nil {
 		t.Fatal("buildModelsList returned nil, want a non-nil empty slice so JSON encodes []")
 	}
@@ -135,7 +135,7 @@ func TestBuildModelsList_UnavailableModelAndAliasOmitted(t *testing.T) {
 		{Alias: "cold", TargetModelID: "stale", OwnedBy: "vllm", BackendClass: backendClassSelfHosted, TargetDiscoveredAt: stale},
 	}
 
-	got := buildModelsList(models, aliases, residencyAny, now)
+	got := buildModelsList(models, aliases, residencyAny, now, modelAvailabilityWindow)
 
 	ids := map[string]bool{}
 	for _, e := range got {
@@ -149,5 +149,48 @@ func TestBuildModelsList_UnavailableModelAndAliasOmitted(t *testing.T) {
 	}
 	if len(got) != 2 {
 		t.Fatalf("len(got) = %d, want 2: %+v", len(got), got)
+	}
+}
+
+// TestNormalizeGatewayModels covers the field defaulting and de-dup
+// normalizeGatewayModels applies before SyncModels ever touches the
+// database: this is what protects the batch upsert from Postgres's
+// "ON CONFLICT DO UPDATE command cannot affect row a second time" error if
+// the gateway (against contract) reports the same model id twice.
+func TestNormalizeGatewayModels(t *testing.T) {
+	entries := []openAIModelEntry{
+		{ID: "", OwnedBy: "vllm"}, // empty id must be dropped
+		{ID: "llama3", OwnedBy: "vllm", BackendClass: backendClassSelfHosted},
+		{ID: "no-owner"}, // OwnedBy defaults to "vllm", BackendClass defaults to self_hosted
+		{ID: "llama3", OwnedBy: "bedrock", BackendClass: backendClassCloudManaged}, // duplicate id, last one wins
+	}
+
+	got := normalizeGatewayModels(entries)
+	if len(got) != 2 {
+		t.Fatalf("len(got) = %d, want 2 (empty id dropped, duplicate id collapsed): %+v", len(got), got)
+	}
+
+	byID := map[string]normalizedModel{}
+	for _, m := range got {
+		byID[m.ID] = m
+	}
+
+	llama, ok := byID["llama3"]
+	if !ok {
+		t.Fatalf("expected llama3 in normalized output, got %+v", got)
+	}
+	if llama.Provider != "bedrock" || llama.BackendClass != backendClassCloudManaged {
+		t.Errorf("llama3 = %+v, want the last-seen occurrence (bedrock/cloud_managed) to win", llama)
+	}
+
+	noOwner, ok := byID["no-owner"]
+	if !ok {
+		t.Fatalf("expected no-owner in normalized output, got %+v", got)
+	}
+	if noOwner.Provider != "vllm" {
+		t.Errorf("no-owner Provider = %q, want vllm default", noOwner.Provider)
+	}
+	if noOwner.BackendClass != backendClassSelfHosted {
+		t.Errorf("no-owner BackendClass = %q, want self_hosted default", noOwner.BackendClass)
 	}
 }

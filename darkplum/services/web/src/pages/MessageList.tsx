@@ -17,6 +17,9 @@ export interface ChatFailure {
   code?: string
   /** The model id the request was sent with. */
   model?: string
+  /** Set once a fresh read of the model list came back without that model:
+   *  the refusal is not a transient blip, the choice has to be made again. */
+  modelGone?: boolean
 }
 
 interface Props {
@@ -28,8 +31,14 @@ interface Props {
   onRetry?: () => void
 }
 
-/** Headline and next step for each routing refusal the gateway can return. */
-function failureCopy(code: string | undefined, isAdmin: boolean): { title: string; hint: string } {
+/** Headline and next step for each routing refusal the gateway can return.
+ *  When a re-read of the list has confirmed the model is gone, the next step is
+ *  the same for everyone — choose another one — so it replaces the per-role
+ *  advice, which would otherwise point at a model that no longer exists. */
+function failureCopy(
+  code: string | undefined,
+  isAdmin: boolean,
+): { title: string; hint: string } {
   switch (code) {
     case 'model_not_found':
       return {
@@ -77,6 +86,7 @@ const FailureNotice = ({
   onRetry?: () => void
 }) => {
   const { title, hint } = failureCopy(failure.code, isAdmin)
+  const modelGone = failure.modelGone ?? false
   const policyRelated =
     failure.code === 'model_not_found' ||
     failure.code === 'model_not_enabled' ||
@@ -104,7 +114,13 @@ const FailureNotice = ({
         <span className={styles.failureTitle}>{title}</span>
       </div>
       <p className={styles.failureMessage}>{failure.message}</p>
-      <p className={styles.failureHint}>{hint}</p>
+      {/* A confirmed disappearance overrides the per-role advice: telling an
+          admin to enable a model the gateway no longer discovers is a dead end. */}
+      <p className={styles.failureHint}>
+        {modelGone
+          ? 'This model is no longer available. Choose another model at the top of the page, then try again.'
+          : hint}
+      </p>
       <div className={styles.failureActions}>
         {onRetry && (
           <button type="button" className={styles.failureBtn} onClick={onRetry}>

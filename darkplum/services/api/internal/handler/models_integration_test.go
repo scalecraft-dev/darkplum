@@ -197,7 +197,7 @@ func TestSyncModels_NotRediscoveredSurvivesAndBecomesUnavailable(t *testing.T) {
 		t.Fatalf("expected enabled to remain true after an empty sync, got false")
 	}
 
-	// Push discovered_at back past the 3-minute availability cutoff (but well
+	// Push discovered_at back past the 2-minute availability cutoff (but well
 	// under the 7-day purge window) to simulate time passing without a
 	// rediscovery, without waiting in the test.
 	if _, err := pool.Exec(ctx,
@@ -390,7 +390,10 @@ func TestSyncModels_WarnsWhenDiscoveredModelShadowsAlias(t *testing.T) {
 
 // One row the database rejects must not abort the whole sync transaction: the
 // other discovered models still land. A NUL byte is valid JSON but Postgres
-// refuses it in a TEXT column, which makes that one upsert fail.
+// refuses it in a TEXT column, which makes that one upsert fail — and since
+// the batch upsert is a single statement over the whole discovered set, the
+// bad row fails the entire batch, which must trigger the per-row fallback
+// path (asserted below via the log line) rather than losing the good rows.
 func TestSyncModels_OneBadRowDoesNotAbortTheSync(t *testing.T) {
 	pool := setupTestDB(t)
 	ctx := context.Background()
@@ -408,6 +411,7 @@ func TestSyncModels_OneBadRowDoesNotAbortTheSync(t *testing.T) {
 	}))
 	defer gw.Close()
 
+	logs := captureLogs(t)
 	h := NewModelHandler(gw.URL, "unused", pool)
 	h.SyncModels(ctx)
 
@@ -419,5 +423,94 @@ func TestSyncModels_OneBadRowDoesNotAbortTheSync(t *testing.T) {
 	}
 	if count != 2 {
 		t.Fatalf("expected both valid models to be synced despite the rejected row, got %d", count)
+	}
+
+	// The bad row must have failed the batch statement as a whole and forced
+	// the per-row fallback — prove the fallback path actually ran rather than
+	// the batch silently succeeding some other way.
+	logOutput := logs.String()
+	if !strings.Contains(logOutput, "falling back to per-row upserts") {
+		t.Fatalf("expected a log line proving the per-row fallback ran, got logs: %s", logOutput)
+	}
+}
+
+// TestSyncModels_HappyPathUsesBatchUpsert is the counterpart to
+// TestSyncModels_OneBadRowDoesNotAbortTheSync: a sync where every row is
+// valid must go through the single set-based batch upsert, not the per-row
+// fallback, and must produce correct inserted/updated counts for a mix of
+// brand-new and already-known models.
+func TestSyncModels_HappyPathUsesBatchUpsert(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+
+	// Pre-existing rows: re-discovering these should count as "updated".
+	insertModel(t, ctx, pool, "existing-1", backendClassSelfHosted, true)
+	insertModel(t, ctx, pool, "existing-2", backendClassSelfHosted, false)
+
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(gatewayModelsResponse{
+			Object: "list",
+			Data: []openAIModelEntry{
+				{ID: "existing-1", Object: "model", Created: 1, OwnedBy: "vllm", BackendClass: backendClassSelfHosted},
+				{ID: "existing-2", Object: "model", Created: 1, OwnedBy: "vllm", BackendClass: backendClassSelfHosted},
+				{ID: "brand-new-1", Object: "model", Created: 1, OwnedBy: "vllm", BackendClass: backendClassSelfHosted},
+				{ID: "brand-new-2", Object: "model", Created: 1, OwnedBy: "bedrock", BackendClass: backendClassCloudManaged},
+			},
+		})
+	}))
+	defer gw.Close()
+
+	logs := captureLogs(t)
+	h := NewModelHandler(gw.URL, "unused", pool)
+	h.SyncModels(ctx)
+
+	logOutput := logs.String()
+	if !strings.Contains(logOutput, "batch upsert succeeded") {
+		t.Fatalf("expected the happy-path sync to log that the batch upsert succeeded, got logs: %s", logOutput)
+	}
+	if strings.Contains(logOutput, "falling back to per-row upserts") {
+		t.Fatalf("expected the happy-path sync to NOT fall back to per-row upserts, got logs: %s", logOutput)
+	}
+	if !strings.Contains(logOutput, "inserted=2") {
+		t.Fatalf("expected the batch success log to report inserted=2, got logs: %s", logOutput)
+	}
+	if !strings.Contains(logOutput, "updated=2") {
+		t.Fatalf("expected the batch success log to report updated=2, got logs: %s", logOutput)
+	}
+
+	var count int
+	if err := pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM models WHERE model_id IN ('existing-1', 'existing-2', 'brand-new-1', 'brand-new-2')`,
+	).Scan(&count); err != nil {
+		t.Fatalf("count models: %v", err)
+	}
+	if count != 4 {
+		t.Fatalf("expected all 4 models present after sync, got %d", count)
+	}
+
+	// Pre-existing settings (enabled) must survive the batch resync just like
+	// the per-row path guarantees.
+	var enabled1, enabled2 bool
+	if err := pool.QueryRow(ctx, `SELECT enabled FROM models WHERE model_id = 'existing-1'`).Scan(&enabled1); err != nil {
+		t.Fatalf("fetch existing-1: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT enabled FROM models WHERE model_id = 'existing-2'`).Scan(&enabled2); err != nil {
+		t.Fatalf("fetch existing-2: %v", err)
+	}
+	if !enabled1 {
+		t.Errorf("existing-1 enabled = false, want true (must survive batch resync)")
+	}
+	if enabled2 {
+		t.Errorf("existing-2 enabled = true, want false (must survive batch resync)")
+	}
+
+	// New rows default to enabled = false regardless of backend_class.
+	var newEnabled bool
+	if err := pool.QueryRow(ctx, `SELECT enabled FROM models WHERE model_id = 'brand-new-1'`).Scan(&newEnabled); err != nil {
+		t.Fatalf("fetch brand-new-1: %v", err)
+	}
+	if newEnabled {
+		t.Errorf("brand-new-1 enabled = true, want false (schema default)")
 	}
 }

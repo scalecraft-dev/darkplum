@@ -37,7 +37,13 @@ type Config struct {
 	// source's models leave the route table (so requests get a clean 404
 	// model_not_found instead of silently dialling a backend that has been
 	// down for many discovery cycles). ROUTE_LAST_GOOD_TTL_SECONDS, default
-	// 180; must be >= DiscoveryIntervalSeconds.
+	// 120 (>= 2 missed 60s discovery ticks); must be >= DiscoveryIntervalSeconds.
+	//
+	// This is the largest term in the "picker still offers a dead model"
+	// window end to end: the api only hides a model from its picker once the
+	// gateway stops listing it on GET /v1/models, and the gateway only stops
+	// listing it once this TTL expires the source's last-good list. Lowering
+	// it shortens how long a user can select a model that is actually down.
 	RouteLastGoodTTLSeconds int
 	// PolicyRefreshSeconds controls how often policy.PgStore reloads its
 	// snapshot from Postgres. POLICY_REFRESH_SECONDS, default 5.
@@ -159,7 +165,7 @@ func Load() (*Config, error) {
 	// Minimum is the discovery interval: a TTL shorter than the interval that
 	// refreshes it would expire a healthy, merely-not-yet-re-polled source on
 	// every single tick.
-	routeLastGoodTTL := 180
+	routeLastGoodTTL := 120
 	if v := os.Getenv("ROUTE_LAST_GOOD_TTL_SECONDS"); v != "" {
 		n, err := strconv.Atoi(v)
 		if err != nil || n <= 0 {

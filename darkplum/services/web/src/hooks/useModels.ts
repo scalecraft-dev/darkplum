@@ -7,20 +7,30 @@ const SLOW_POLL_MS = 60_000
 
 interface UseModelsResult {
   models: Model[]
+  /** True only until the first fetch settles. Later fetches keep the list on
+   *  screen, so a poll or a retry never replaces a usable page with skeletons. */
   isLoading: boolean
+  /** A caller-triggered re-read is in flight, for button feedback only. */
+  isRefetching: boolean
   error: string | null
-  /** Re-runs the fetch immediately — used by the "Try again" action. */
-  refetch: () => Promise<void>
+  /**
+   * Re-runs the fetch immediately — used by "Try again" and by chat when a
+   * routing refusal proves the list is stale. Resolves with the models the
+   * fetch returned, or null if it failed, so the caller can act on the fresh
+   * list without racing the poll.
+   */
+  refetch: () => Promise<Model[] | null>
 }
 
 export function useModels(): UseModelsResult {
   const [models, setModels] = useState<Model[]>([])
   const [isLoading, setIsLoading] = useState(true)
+  const [isRefetching, setIsRefetching] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const hasModelsRef = useRef(false)
 
-  const fetchModels = useCallback(async () => {
+  const fetchModels = useCallback(async (): Promise<Model[] | null> => {
     try {
       const result = await listModels()
       setModels(result.data)
@@ -36,8 +46,10 @@ export function useModels(): UseModelsResult {
         clearInterval(intervalRef.current)
         intervalRef.current = setInterval(() => void fetchModels(), FAST_POLL_MS)
       }
+      return result.data
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to load models')
+      return null
     } finally {
       setIsLoading(false)
     }
@@ -69,9 +81,13 @@ export function useModels(): UseModelsResult {
   }, [fetchModels])
 
   const refetch = useCallback(async () => {
-    setIsLoading(true)
-    await fetchModels()
+    setIsRefetching(true)
+    try {
+      return await fetchModels()
+    } finally {
+      setIsRefetching(false)
+    }
   }, [fetchModels])
 
-  return { models, isLoading, error, refetch }
+  return { models, isLoading, isRefetching, error, refetch }
 }

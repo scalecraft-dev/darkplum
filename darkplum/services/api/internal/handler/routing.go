@@ -35,11 +35,20 @@ func validResidency(v string) bool {
 type RoutingHandler struct {
 	db       *pgxpool.Pool
 	activity *activity.Recorder
+	// availabilityWindow must match ModelHandler's so an alias's
+	// target_available flips at the same moment as the model's available.
+	availabilityWindow time.Duration
 }
 
 // NewRoutingHandler returns a RoutingHandler backed by db.
 func NewRoutingHandler(db *pgxpool.Pool, rec *activity.Recorder) *RoutingHandler {
-	return &RoutingHandler{db: db, activity: rec}
+	return &RoutingHandler{db: db, activity: rec, availabilityWindow: modelAvailabilityWindow}
+}
+
+// SetAvailabilityWindow applies the operator-configured
+// MODEL_AVAILABILITY_WINDOW_SECONDS; see ModelHandler.SetAvailabilityWindow.
+func (h *RoutingHandler) SetAvailabilityWindow(w time.Duration) {
+	h.availabilityWindow = w
 }
 
 // aliasResponse is the wire shape for one row in the model-aliases endpoints.
@@ -91,7 +100,7 @@ func (h *RoutingHandler) ListAliases(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "scan alias failed"})
 			return
 		}
-		a.TargetAvailable = targetDiscoveredAt != nil && modelIsAvailable(*targetDiscoveredAt, now)
+		a.TargetAvailable = targetDiscoveredAt != nil && modelIsAvailableWithin(*targetDiscoveredAt, now, h.availabilityWindow)
 		aliases = append(aliases, a)
 	}
 	if err := rows.Err(); err != nil {
@@ -212,7 +221,7 @@ func (h *RoutingHandler) PutAlias(c *gin.Context) {
 	row.TargetExists = true
 	row.TargetEnabled = targetEnabled
 	row.TargetBackendClass = &targetBackendClass
-	row.TargetAvailable = modelIsAvailable(targetDiscoveredAt, time.Now())
+	row.TargetAvailable = modelIsAvailableWithin(targetDiscoveredAt, time.Now(), h.availabilityWindow)
 
 	if err := tx.Commit(ctx); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "commit alias failed"})

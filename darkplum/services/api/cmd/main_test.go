@@ -27,3 +27,26 @@ func TestParseModelSyncInterval(t *testing.T) {
 		})
 	}
 }
+
+func TestParseModelAvailabilityWindow(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want time.Duration
+	}{
+		{"empty uses default", "", 120 * time.Second},
+		{"valid value passes through", "90", 90 * time.Second},
+		{"non-numeric falls back to default", "not-a-number", 120 * time.Second},
+		{"below the floor is clamped up", "10", 30 * time.Second},
+		{"zero is clamped up", "0", 30 * time.Second},
+		{"negative is clamped up", "-5", 30 * time.Second},
+		{"exactly the floor is accepted", "30", 30 * time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := parseModelAvailabilityWindow(tc.raw); got != tc.want {
+				t.Errorf("parseModelAvailabilityWindow(%q) = %v, want %v", tc.raw, got, tc.want)
+			}
+		})
+	}
+}

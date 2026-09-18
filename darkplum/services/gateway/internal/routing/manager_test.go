@@ -456,8 +456,8 @@ func TestManager_Status(t *testing.T) {
 	if okStatus.LastSuccessSecondsAgo == nil || *okStatus.LastSuccessSecondsAgo != 0 {
 		t.Errorf("vllm-default.LastSuccessSecondsAgo = %v, want 0", okStatus.LastSuccessSecondsAgo)
 	}
-	if okStatus.LastError != "" {
-		t.Errorf("vllm-default.LastError = %q, want empty", okStatus.LastError)
+	if okStatus.LastErrorKind != "" {
+		t.Errorf("vllm-default.LastErrorKind = %q, want empty", okStatus.LastErrorKind)
 	}
 
 	failStatus, ok := status.Sources["bedrock"]
@@ -470,8 +470,8 @@ func TestManager_Status(t *testing.T) {
 	if failStatus.LastSuccessSecondsAgo != nil {
 		t.Errorf("bedrock.LastSuccessSecondsAgo = %v, want nil (never succeeded)", failStatus.LastSuccessSecondsAgo)
 	}
-	if failStatus.LastError != "access denied" {
-		t.Errorf("bedrock.LastError = %q, want %q", failStatus.LastError, "access denied")
+	if failStatus.LastErrorKind != errKindError {
+		t.Errorf("bedrock.LastErrorKind = %q, want %q (a plain error, not typed/net/http-shaped)", failStatus.LastErrorKind, errKindError)
 	}
 }
 

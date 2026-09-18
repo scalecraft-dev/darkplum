@@ -103,6 +103,12 @@ func Recording(rec *recorder.Recorder) gin.HandlerFunc {
 		providerName := c.GetString("provider_name")
 		providerRegion := c.GetString("provider_region")
 
+		// inference_events.model is TEXT NOT NULL, so it would technically
+		// accept an empty string for a request that never named a model (an
+		// unparseable body, or a body missing the `model` field). ChatHandler
+		// instead sets resolved_model to the literal "(none)" on both of those
+		// 400 paths so the recorded row reads clearly to an auditor instead of
+		// showing a blank model column.
 		model := fields.Model
 		if resolved := c.GetString("resolved_model"); resolved != "" {
 			model = resolved
