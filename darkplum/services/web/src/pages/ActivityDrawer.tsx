@@ -13,7 +13,7 @@ import {
 import { getUsageStats, listActivity, listUsage } from '../lib/api'
 import { useTheme } from '../context/ThemeContext'
 import type { InferenceEvent, KeyUsageSummary, TimeRange, UsageBucket, UserUsageSummary } from '../types'
-import { eventLabel, eventVariant, formatEventDetail, type EventVariant } from '../lib/activityEvents'
+import { eventLabel, eventVariant, formatEventDetail, inferenceEventLabel, type EventVariant } from '../lib/activityEvents'
 import { denialLabel, routerReasonText } from '../lib/modelRouting'
 import { useToast } from '../components/Toast'
 import { Avatar, Badge, Skeleton } from '../components/ui'
@@ -82,17 +82,7 @@ function inferenceToRow(e: InferenceEvent): {
   variant: EventVariant
   detail: string
 } {
-  const purpose = e.purpose ?? 'inference'
-  const label =
-    e.status_code >= 400
-      ? e.denial_code
-        ? 'Refused'
-        : 'Error'
-      : purpose === 'routing'
-        ? 'Classifier'
-        : purpose === 'routing_dryrun'
-          ? 'Route test'
-          : 'Request'
+  const { label, variant } = inferenceEventLabel(e)
   const detail = [
     e.denial_code ? `${denialLabel(e.denial_code)} (${e.denial_code})` : '',
     `model: ${e.model}`,
@@ -107,7 +97,7 @@ function inferenceToRow(e: InferenceEvent): {
     id: e.id,
     created_at: e.created_at,
     label,
-    variant: e.status_code >= 400 ? 'danger' : purpose === 'inference' ? 'success' : 'info',
+    variant,
     detail,
   }
 }

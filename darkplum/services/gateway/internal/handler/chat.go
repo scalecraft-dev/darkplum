@@ -884,6 +884,15 @@ type policyImpactResponse struct {
 	// A locked-out principal is also narrowed unless it already had nothing.
 	// Never null.
 	Narrowed []policyImpactPrincipal `json:"narrowed"`
+	// UnresolvedModels lists enabled models the proposed org policy allows
+	// whose class is unknown (the route table has never seen them — a
+	// backend still starting, or not yet discovered) at a time when it
+	// matters: the proposed residency is self_hosted_only. They are left out
+	// of the Narrowed/OrgNarrowed comparison, which states only what is
+	// certain; the caller says separately that any of these that turn out
+	// to be cloud-managed will also be refused. Empty under residency any.
+	// Never null.
+	UnresolvedModels []string `json:"unresolved_models"`
 	// Evaluated is how many user/key principals were re-merged.
 	Evaluated int `json:"evaluated"`
 }
@@ -979,7 +988,7 @@ func (h *ChatHandler) HandleEffectivePolicyImpact(c *gin.Context) {
 // hence every inheriting principal's — shrinks (OrgNarrowed). Split from the
 // handler so tests can drive it with a hand-built Snapshot and route table.
 func policyImpact(snap policy.Snapshot, table *routing.Table, override *policy.PolicyOverride) policyImpactResponse {
-	resp := policyImpactResponse{LockedOut: []policyImpactPrincipal{}, Narrowed: []policyImpactPrincipal{}}
+	resp := policyImpactResponse{LockedOut: []policyImpactPrincipal{}, Narrowed: []policyImpactPrincipal{}, UnresolvedModels: []string{}}
 
 	// The org's own chain is just its row (ChainFor's first element; the
 	// user placeholder is dropped so an inheriting principal's view is
@@ -992,7 +1001,14 @@ func policyImpact(snap policy.Snapshot, table *routing.Table, override *policy.P
 		resp.OrgNarrowed = len(allowedModels(orgNow, snap, table)) > 0
 		return resp
 	}
-	resp.OrgNarrowed = losesAny(allowedModels(orgNow, snap, table), allowedModels(orgAfter, snap, table))
+	// Models whose fate under the proposed policy cannot be judged are
+	// reported, not counted: the comparison below is made without them.
+	resp.UnresolvedModels = unresolvedModels(orgAfter, snap, table)
+	unresolved := make(map[string]bool, len(resp.UnresolvedModels))
+	for _, id := range resp.UnresolvedModels {
+		unresolved[id] = true
+	}
+	resp.OrgNarrowed = losesAny(without(allowedModels(orgNow, snap, table), unresolved), allowedModels(orgAfter, snap, table))
 
 	users := make(map[string]bool, len(snap.UserRows)+len(snap.KeyRows))
 	for userID := range snap.UserRows {
@@ -1022,7 +1038,7 @@ func policyImpact(snap policy.Snapshot, table *routing.Table, override *policy.P
 		if keyID != "" {
 			_, ownRow = snap.KeyRows[keyID]
 		}
-		if ownRow && losesAny(allowedModels(now, snap, table), allowedModels(after, snap, table)) {
+		if ownRow && losesAny(without(allowedModels(now, snap, table), unresolved), allowedModels(after, snap, table)) {
 			resp.Narrowed = append(resp.Narrowed, p)
 		}
 	}
@@ -1040,11 +1056,12 @@ func policyImpact(snap policy.Snapshot, table *routing.Table, override *policy.P
 // test. Impact counts are about what an admin's policy change takes away,
 // and must not move because a backend happens to be down at save time.
 // Under self_hosted_only a model the route table has never seen has no
-// known class and is EXCLUDED — the same deny-when-uncertain rule
-// enforcement applies (such a request is refused anyway), and the safe
-// direction for a preview: it may warn of a loss that turns out not to be
-// one, never stay silent about one that is. Under residency any, class is
-// irrelevant and the model is kept.
+// known class and is EXCLUDED (the same deny-when-uncertain rule enforcement
+// applies). policyImpact does not let that exclusion count as a loss,
+// though: such models are reported as UnresolvedModels and taken out of the
+// before/after comparison, so the counts state only what is certain and
+// the caveat is said separately. Under residency any, class is irrelevant
+// and the model is kept.
 func allowedModels(eff policy.EffectivePolicy, snap policy.Snapshot, table *routing.Table) []string {
 	ids := make([]string, 0, len(snap.Enabled))
 	for id, enabled := range snap.Enabled {
@@ -1065,6 +1082,40 @@ func allowedModels(eff policy.EffectivePolicy, snap policy.Snapshot, table *rout
 			}
 		}
 		out = append(out, id)
+	}
+	return out
+}
+
+// unresolvedModels lists the enabled models eff allows whose class the route
+// table does not know, when eff's residency is self_hosted_only (the only
+// time class decides anything). See policyImpactResponse.UnresolvedModels.
+func unresolvedModels(eff policy.EffectivePolicy, snap policy.Snapshot, table *routing.Table) []string {
+	if eff.Residency != policy.ResidencySelfHostedOnly {
+		return []string{}
+	}
+	out := []string{}
+	for id, enabled := range snap.Enabled {
+		if !enabled || !eff.Allows(id) {
+			continue
+		}
+		if _, ok := table.Lookup(id); !ok {
+			out = append(out, id)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// without returns ids minus the members of drop, preserving order.
+func without(ids []string, drop map[string]bool) []string {
+	if len(drop) == 0 {
+		return ids
+	}
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if !drop[id] {
+			out = append(out, id)
+		}
 	}
 	return out
 }

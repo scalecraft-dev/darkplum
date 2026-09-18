@@ -34,6 +34,9 @@ interface Props {
     /** Whether everyone who simply inherits the organisation's policy now
      *  reaches fewer models too. Independent of affectedPrincipals. */
     orgNarrowed: boolean
+    /** Enabled, allowed models no backend has reported yet (class unknown)
+     *  under a self-hosted-only policy. Neither counted lost nor kept. */
+    unresolvedModels: string[]
     lockedOut: string[]
   }>
 }
@@ -95,6 +98,9 @@ export function RoutingPolicyCard({
    *  Independent of `affected` — a principal with its own row is never
    *  counted here even if the org narrowed under it as well. */
   const [orgNarrowed, setOrgNarrowed] = useState(false)
+  /** Models the count could not judge (see onChange). Said separately, so the
+   *  sentences above state only what is certain. */
+  const [unresolved, setUnresolved] = useState<string[]>([])
   /** Who the API said the last attempt would have locked out of every model.
    *  Non-empty means the save was refused and nothing changed. */
   const [lockedOut, setLockedOut] = useState<string[]>([])
@@ -158,6 +164,7 @@ export function RoutingPolicyCard({
     setWarnings(result.warnings)
     setAffected(result.affectedPrincipals)
     setOrgNarrowed(result.orgNarrowed)
+    setUnresolved(result.unresolvedModels)
     if (result.warnings.length === 0) setConfirmOpen(false)
   }
 
@@ -166,6 +173,7 @@ export function RoutingPolicyCard({
     setWarnings([])
     setAffected(null)
     setOrgNarrowed(false)
+    setUnresolved([])
     setLockedOut([])
     if (tightening) {
       setConfirmOpen(true)
@@ -369,7 +377,20 @@ export function RoutingPolicyCard({
 
           {affected !== null && !changed && !orgNarrowed && affected === 0 && (
             <p className={styles.affectedQuiet} role="status">
-              No one is allowed fewer models than before.
+              {unresolved.length > 0
+                ? 'No one is allowed fewer of the models a backend has reported.'
+                : 'No one is allowed fewer models than before.'}
+            </p>
+          )}
+
+          {/* What the counts above could not judge: enabled, allowed models no
+              backend has reported yet, so their class is unknown. Said on its
+              own rather than folded into the count either way. */}
+          {affected !== null && !changed && unresolved.length > 0 && (
+            <p className={styles.affectedQuiet} role="status">
+              {unresolved.length === 1
+                ? `1 enabled model has not been seen by a backend yet (${modelLabel(unresolved[0], models)}); if it turns out to be cloud-managed it will also be refused.`
+                : `${unresolved.length} enabled models have not been seen by a backend yet (${unresolved.map((id) => modelLabel(id, models)).join(', ')}); any that turn out to be cloud-managed will also be refused.`}
             </p>
           )}
 

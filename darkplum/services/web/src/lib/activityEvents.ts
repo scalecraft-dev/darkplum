@@ -6,6 +6,30 @@
 
 export type EventVariant = 'neutral' | 'info' | 'warning' | 'danger' | 'success'
 
+/** What one inference row is called and coloured. Both the activity table and
+ *  the per-user drawer render inference events, so the decision lives here:
+ *  a deliberate refusal (policy, unknown model, bad request) is "Refused"; a
+ *  caller pressing Stop is "Cancelled" and not red; anything else at >= 400 is
+ *  an "Error" (the backend fell over). Below 400 the row is named for what it
+ *  did — a classifier call chose a route, it did not answer anyone. */
+export function inferenceEventLabel(e: {
+  status_code: number
+  denial_code?: string | null
+  purpose?: 'inference' | 'routing' | 'routing_dryrun' | null
+}): { label: string; variant: EventVariant; cancelled: boolean } {
+  const purpose = e.purpose ?? 'inference'
+  if (e.status_code < 400) {
+    return {
+      label: purpose === 'routing' ? 'Classifier' : purpose === 'routing_dryrun' ? 'Route test' : 'Request',
+      variant: purpose === 'inference' ? 'success' : 'info',
+      cancelled: false,
+    }
+  }
+  if (e.denial_code === 'request_canceled') return { label: 'Cancelled', variant: 'neutral', cancelled: true }
+  if (e.denial_code) return { label: 'Refused', variant: 'danger', cancelled: false }
+  return { label: 'Error', variant: 'danger', cancelled: false }
+}
+
 export const EVENT_LABELS: Record<string, { label: string; variant: EventVariant }> = {
   'user.login':            { label: 'Login',            variant: 'neutral'  },
   'user.login_failed':     { label: 'Login Failed',     variant: 'danger'   },

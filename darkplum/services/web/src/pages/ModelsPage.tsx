@@ -536,7 +536,13 @@ export function ModelsPage() {
    *  as `lockedOut`, the API's list of who, so the card can show it in place. */
   const handlePolicyChange = async (
     draft: OrgPolicyDraft,
-  ): Promise<{ warnings: string[]; affectedPrincipals: number; orgNarrowed: boolean; lockedOut: string[] }> => {
+  ): Promise<{
+    warnings: string[]
+    affectedPrincipals: number
+    orgNarrowed: boolean
+    unresolvedModels: string[]
+    lockedOut: string[]
+  }> => {
     setPolicySaving(true)
     try {
       const updated = await updateRoutingPolicy({
@@ -554,6 +560,7 @@ export function ModelsPage() {
         warnings: updated.warnings ?? [],
         affectedPrincipals: updated.affected_principals ?? 0,
         orgNarrowed: updated.org_narrowed ?? false,
+        unresolvedModels: updated.unresolved_models ?? [],
         lockedOut: [],
       }
     } catch (err) {
@@ -563,11 +570,12 @@ export function ModelsPage() {
           warnings: [],
           affectedPrincipals: 0,
           orgNarrowed: false,
+          unresolvedModels: [],
           lockedOut: lockedOut.length > 0 ? lockedOut : ['(organisation)'],
         }
       }
       toast((err as Error).message, 'error')
-      return { warnings: [], affectedPrincipals: 0, orgNarrowed: false, lockedOut: [] }
+      return { warnings: [], affectedPrincipals: 0, orgNarrowed: false, unresolvedModels: [], lockedOut: [] }
     } finally {
       setPolicySaving(false)
     }

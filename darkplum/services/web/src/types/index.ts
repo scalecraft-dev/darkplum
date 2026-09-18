@@ -230,6 +230,10 @@ export interface RoutingPolicy {
    *  inherits the organisation's policy — no row of their own — now reaches
    *  fewer models too. `affected_principals` never counts these people. */
   org_narrowed?: boolean
+  /** Enabled, allowed models no backend has reported yet when the new
+   *  residency is self-hosted only: their class is unknown, so the API neither
+   *  counts them as lost nor as kept. Present only when non-empty. */
+  unresolved_models?: string[]
 }
 
 // ---------------------------------------------------------------------------

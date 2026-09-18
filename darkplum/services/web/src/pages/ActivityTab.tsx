@@ -42,6 +42,7 @@ import {
   eventVariant,
   formatEventDetail,
   type EventVariant,
+  inferenceEventLabel,
 } from '../lib/activityEvents'
 import { DENIAL_CODES, denialLabel, routerReasonText } from '../lib/modelRouting'
 import { useToast } from '../components/Toast'
@@ -86,12 +87,6 @@ const PURPOSES: { label: string; value: PurposeFilter }[] = [
   { label: 'Route tests', value: 'routing_dryrun' },
   { label: 'All',         value: 'all'            },
 ]
-
-const PURPOSE_LABEL: Record<InferencePurpose, string> = {
-  inference: 'Request',
-  routing: 'Classifier',
-  routing_dryrun: 'Route test',
-}
 
 // Hex values directly since CSS vars are unreliable in SVG attributes.
 // Defined per-theme because the dark grid color (#1A1E2A) is invisible on
@@ -222,22 +217,7 @@ function ExportIcon() {
 
 function inferenceEventToUnified(e: InferenceEvent): UnifiedEvent {
   const display = e.user_name ?? e.user_email ?? (e.user_id ? shortenId(e.user_id) : '—')
-  const purpose: InferencePurpose = e.purpose ?? 'inference'
-  // A classifier call is named for what it did: it chose a route, it did not
-  // answer anyone. A deliberate refusal (policy, unknown model, bad request)
-  // is "Refused", not "Error" — an admin scanning the table must be able to
-  // tell a rule firing from a backend falling over without reading detail.
-  // A caller pressing Stop (request_canceled) is neither; it gets its own
-  // neutral label rather than the red one.
-  const cancelled = e.denial_code === 'request_canceled'
-  const label =
-    e.status_code < 400
-      ? PURPOSE_LABEL[purpose]
-      : cancelled
-        ? 'Cancelled'
-        : e.denial_code
-          ? 'Refused'
-          : 'Error'
+  const { label, variant } = inferenceEventLabel(e)
   // requested_model is set when the caller asked for something other than
   // what `model` records (an alias that resolved, or a routed pick); it is
   // shown whenever it differs. (A body with no model at all records neither.)
@@ -257,8 +237,7 @@ function inferenceEventToUnified(e: InferenceEvent): UnifiedEvent {
     user_id:        e.user_id,
     user_display:   display,
     action_label:   label,
-    action_variant:
-      e.status_code >= 400 ? (cancelled ? 'neutral' : 'danger') : purpose === 'inference' ? 'success' : 'info',
+    action_variant: variant,
     detail_text,
     ip_address:     e.ip_address,
     route:          e.route_name ?? null,

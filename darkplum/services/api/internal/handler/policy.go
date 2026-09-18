@@ -375,7 +375,10 @@ type gatewayPolicyImpact struct {
 	LockedOut    []gatewayPolicyImpactPrincipal `json:"locked_out"`
 	OrgNarrowed  bool                           `json:"org_narrowed"`
 	Narrowed     []gatewayPolicyImpactPrincipal `json:"narrowed"`
-	Evaluated    int                            `json:"evaluated"`
+	// UnresolvedModels: enabled, allowed models of unknown class under a
+	// self_hosted_only proposal -- reported to the admin, not counted.
+	UnresolvedModels []string `json:"unresolved_models"`
+	Evaluated        int      `json:"evaluated"`
 }
 
 // impact calls POST {gatewayURL}/v1/policy/impact with an org-level
@@ -718,7 +721,7 @@ func (h *PolicyHandler) PutUserPolicy(c *gin.Context) {
 		return
 	}
 
-	h.recordPrincipalChanged(c, principalTypeUser, id, before, &req)
+	h.recordPrincipalWrite(c, principalTypeUser, id, before, req)
 	c.JSON(http.StatusOK, resp)
 }
 
@@ -775,7 +778,7 @@ func (h *PolicyHandler) PutAPIKeyPolicy(c *gin.Context) {
 		return
 	}
 
-	h.recordPrincipalChanged(c, principalTypeAPIKey, id, before, &req)
+	h.recordPrincipalWrite(c, principalTypeAPIKey, id, before, req)
 	c.JSON(http.StatusOK, resp)
 }
 
@@ -826,6 +829,21 @@ func (h *PolicyHandler) upsertPolicy(ctx context.Context, c *gin.Context, princi
 	`, col, col, col), principalType, id, req.Residency, req.AllowedModels, req.DefaultModel, updatedBy).
 		Scan(&resp.Residency, &resp.AllowedModels, &resp.DefaultModel, &resp.UpdatedAt)
 	return resp, err
+}
+
+// recordPrincipalWrite logs a PUT the way the operation it performed should
+// read in the audit trail: an all-null body is a delete (see upsertPolicy),
+// so it is logged as one -- after = nil, and nothing at all when there was no
+// row to remove -- exactly like DELETE .../routing-policy. Otherwise the
+// stored body is the "after".
+func (h *PolicyHandler) recordPrincipalWrite(c *gin.Context, principalType, id string, before *policyObject, req policyObject) {
+	if req.Residency == nil && req.AllowedModels == nil && req.DefaultModel == nil {
+		if before != nil {
+			h.recordPrincipalChanged(c, principalType, id, before, nil)
+		}
+		return
+	}
+	h.recordPrincipalChanged(c, principalType, id, before, &req)
 }
 
 func (h *PolicyHandler) recordPrincipalChanged(c *gin.Context, principalType, id string, before *policyObject, after *policyObject) {

@@ -931,11 +931,12 @@ type impactPrincipalForTest struct {
 }
 
 type policyImpactBodyForTest struct {
-	OrgLockedOut bool                     `json:"org_locked_out"`
-	LockedOut    []impactPrincipalForTest `json:"locked_out"`
-	OrgNarrowed  bool                     `json:"org_narrowed"`
-	Narrowed     []impactPrincipalForTest `json:"narrowed"`
-	Evaluated    int                      `json:"evaluated"`
+	OrgLockedOut     bool                     `json:"org_locked_out"`
+	LockedOut        []impactPrincipalForTest `json:"locked_out"`
+	OrgNarrowed      bool                     `json:"org_narrowed"`
+	Narrowed         []impactPrincipalForTest `json:"narrowed"`
+	UnresolvedModels []string                 `json:"unresolved_models"`
+	Evaluated        int                      `json:"evaluated"`
 }
 
 func impactSet(ps []impactPrincipalForTest) map[string]bool {
@@ -1174,12 +1175,12 @@ func TestHandleEffectivePolicyImpact_ResidencyTighteningWithoutCloudModelsNarrow
 	}
 }
 
-func TestHandleEffectivePolicyImpact_UnknownClassIsExcludedUnderSelfHostedOnly(t *testing.T) {
+func TestHandleEffectivePolicyImpact_UnknownClassIsReportedNotCounted(t *testing.T) {
 	// m4 is enabled in the catalogue but the route table has never seen it
-	// (backend not yet discovered), so its class is unknown. Under residency
-	// "any" it is allowed; tightening to self_hosted_only must treat it as
-	// lost (deny when uncertain) — the org is narrowed even though no
-	// cloud-managed model is known.
+	// (backend not yet discovered), so its class is unknown. Tightening to
+	// self_hosted_only cannot say whether m4 is lost: it is reported in
+	// unresolved_models and left OUT of the comparison, so with every known
+	// model self-hosted nothing is stated as lost.
 	snap := impactSnapshot()
 	snap.Enabled["m4"] = true
 	snap.OrgRow.AllowedModels = &[]string{"m1", "m2", "m3", "m4"}
@@ -1190,11 +1191,17 @@ func TestHandleEffectivePolicyImpact_UnknownClassIsExcludedUnderSelfHostedOnly(t
 		t.Fatalf("expected 200, got %d; body=%s", w.Code, w.Body.String())
 	}
 	got := decodePolicyImpact(t, w.Body.Bytes())
-	if !got.OrgNarrowed {
-		t.Errorf("an enabled model of unknown class must count as lost under self_hosted_only; org_narrowed=false")
+	if len(got.UnresolvedModels) != 1 || got.UnresolvedModels[0] != "m4" {
+		t.Errorf("unresolved_models = %v, want [m4]", got.UnresolvedModels)
 	}
-	// previewUserID's own row allows m1 only (known, self-hosted): unchanged.
-	if impactSet(got.Narrowed)[previewUserID+"/"] {
-		t.Errorf("previewUserID (m1 only) must not be narrowed, got %+v", got.Narrowed)
+	if got.OrgNarrowed || len(got.Narrowed) != 0 {
+		t.Errorf("an unknown-class model must not be stated as lost: org_narrowed=%v narrowed=%+v", got.OrgNarrowed, got.Narrowed)
+	}
+	// Under residency any nothing is unresolved, even with m4 present.
+	w, c = newPolicyImpactRequest(t, middleware.KeyTypeService, `{"override":{"level":"org","policy":{"allowed_models":["m1","m2","m3","m4"]}}}`)
+	h.HandleEffectivePolicyImpact(c)
+	got = decodePolicyImpact(t, w.Body.Bytes())
+	if len(got.UnresolvedModels) != 0 {
+		t.Errorf("unresolved_models must be empty under residency any, got %v", got.UnresolvedModels)
 	}
 }

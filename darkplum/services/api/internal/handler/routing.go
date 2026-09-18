@@ -942,6 +942,11 @@ type routingPolicyResponse struct {
 	Warnings           []string  `json:"warnings,omitempty"`
 	AffectedPrincipals *int      `json:"affected_principals,omitempty"`
 	OrgNarrowed        *bool     `json:"org_narrowed,omitempty"`
+	// UnresolvedModels lists enabled, allowed models the gateway has not yet
+	// seen a backend for, when the new residency is self_hosted_only: their
+	// class is unknown, so they are neither counted as lost nor as kept. Any
+	// that turn out cloud-managed will be refused. Omitted when empty.
+	UnresolvedModels []string `json:"unresolved_models,omitempty"`
 }
 
 // orgResidencyString converts the org row's nullable residency column
@@ -1194,6 +1199,7 @@ func (h *RoutingHandler) PutRoutingPolicy(c *gin.Context) {
 		resp.AffectedPrincipals = &count
 		narrowed := impact.OrgNarrowed
 		resp.OrgNarrowed = &narrowed
+		resp.UnresolvedModels = impact.UnresolvedModels
 	}
 
 	evt := activity.FromContext(c, activity.RoutingPolicyOrgChanged)

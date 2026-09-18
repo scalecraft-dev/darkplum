@@ -422,7 +422,7 @@ func (fg *fakePolicyGateway) effective(ctx context.Context, userID, apiKeyID str
 // models (no residency/routing awareness -- see the type's doc comment). An
 // empty org allowlist short-circuits to org_locked_out.
 func (fg *fakePolicyGateway) impact(ctx context.Context, override *gatewayPolicyOverride) (gatewayPolicyImpact, error) {
-	out := gatewayPolicyImpact{LockedOut: []gatewayPolicyImpactPrincipal{}, Narrowed: []gatewayPolicyImpactPrincipal{}}
+	out := gatewayPolicyImpact{LockedOut: []gatewayPolicyImpactPrincipal{}, Narrowed: []gatewayPolicyImpactPrincipal{}, UnresolvedModels: []string{}}
 
 	var enabled []string
 	eRows, err := fg.pool.Query(ctx, `SELECT model_id FROM models WHERE enabled ORDER BY model_id`)
