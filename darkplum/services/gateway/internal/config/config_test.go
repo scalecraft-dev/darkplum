@@ -86,3 +86,121 @@ func TestLoad_RouteLastGoodTTLSecondsAcceptsEqualToDiscoveryInterval(t *testing.
 		t.Errorf("RouteLastGoodTTLSeconds = %d, want 300", cfg.RouteLastGoodTTLSeconds)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Routed-alias classifier config (CLASSIFIER_*, SEMANTIC_ROUTER_*)
+// ---------------------------------------------------------------------------
+
+func TestLoad_ClassifierDefaults(t *testing.T) {
+	baseEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.ClassifierTimeoutMS != 500 {
+		t.Errorf("ClassifierTimeoutMS = %d, want default 500", cfg.ClassifierTimeoutMS)
+	}
+	if cfg.ClassifierBreakerFailures != 5 {
+		t.Errorf("ClassifierBreakerFailures = %d, want default 5", cfg.ClassifierBreakerFailures)
+	}
+	if cfg.ClassifierBreakerOpenSeconds != 30 {
+		t.Errorf("ClassifierBreakerOpenSeconds = %d, want default 30", cfg.ClassifierBreakerOpenSeconds)
+	}
+	if cfg.SemanticRouterURL != "" {
+		t.Errorf("SemanticRouterURL = %q, want empty (unconfigured) by default", cfg.SemanticRouterURL)
+	}
+	if cfg.SemanticRouterMinConfidence != 0.6 {
+		t.Errorf("SemanticRouterMinConfidence = %v, want default 0.6", cfg.SemanticRouterMinConfidence)
+	}
+}
+
+// TestLoad_ClassifierTimeoutMSRejectsOutOfBounds matches the pattern of
+// every other bounded knob in this file (e.g.
+// TestLoad_PolicyMaxStalenessSecondsRejectsBelowMinimum): a value outside
+// [50, 2000] fails Load with an error rather than being silently clamped.
+func TestLoad_ClassifierTimeoutMSRejectsOutOfBounds(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("CLASSIFIER_TIMEOUT_MS", "1")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected an error for CLASSIFIER_TIMEOUT_MS below the 50ms minimum")
+	}
+
+	t.Setenv("CLASSIFIER_TIMEOUT_MS", "999999")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected an error for CLASSIFIER_TIMEOUT_MS above the 2000ms maximum")
+	}
+}
+
+func TestLoad_ClassifierTimeoutMSAcceptsBounds(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("CLASSIFIER_TIMEOUT_MS", "50")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error at the minimum boundary: %v", err)
+	}
+	if cfg.ClassifierTimeoutMS != 50 {
+		t.Errorf("ClassifierTimeoutMS = %d, want 50", cfg.ClassifierTimeoutMS)
+	}
+
+	t.Setenv("CLASSIFIER_TIMEOUT_MS", "2000")
+	cfg, err = Load()
+	if err != nil {
+		t.Fatalf("unexpected error at the maximum boundary: %v", err)
+	}
+	if cfg.ClassifierTimeoutMS != 2000 {
+		t.Errorf("ClassifierTimeoutMS = %d, want 2000", cfg.ClassifierTimeoutMS)
+	}
+}
+
+func TestLoad_ClassifierBreakerFailuresRejectsBelowMinimum(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("CLASSIFIER_BREAKER_FAILURES", "0")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected an error for CLASSIFIER_BREAKER_FAILURES below the 1 minimum")
+	}
+}
+
+func TestLoad_ClassifierBreakerOpenSecondsRejectsBelowMinimum(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("CLASSIFIER_BREAKER_OPEN_SECONDS", "1")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected an error for CLASSIFIER_BREAKER_OPEN_SECONDS below the 5s minimum")
+	}
+}
+
+func TestLoad_SemanticRouterURLAndMinConfidence(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("SEMANTIC_ROUTER_URL", "http://semantic-router.darkplum-system.svc.cluster.local:8080")
+	t.Setenv("SEMANTIC_ROUTER_MIN_CONFIDENCE", "0.8")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.SemanticRouterURL != "http://semantic-router.darkplum-system.svc.cluster.local:8080" {
+		t.Errorf("SemanticRouterURL = %q", cfg.SemanticRouterURL)
+	}
+	if cfg.SemanticRouterMinConfidence != 0.8 {
+		t.Errorf("SemanticRouterMinConfidence = %v, want 0.8", cfg.SemanticRouterMinConfidence)
+	}
+}
+
+func TestLoad_SemanticRouterMinConfidenceRejectsOutOfUnitInterval(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("SEMANTIC_ROUTER_MIN_CONFIDENCE", "-1")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected an error for SEMANTIC_ROUTER_MIN_CONFIDENCE below 0")
+	}
+
+	t.Setenv("SEMANTIC_ROUTER_MIN_CONFIDENCE", "5")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected an error for SEMANTIC_ROUTER_MIN_CONFIDENCE above 1")
+	}
+}
+
+func TestLoad_ClassifierTimeoutMSRejectsNonInteger(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("CLASSIFIER_TIMEOUT_MS", "not-a-number")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected an error for a non-integer CLASSIFIER_TIMEOUT_MS")
+	}
+}

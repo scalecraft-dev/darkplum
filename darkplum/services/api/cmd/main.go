@@ -241,7 +241,7 @@ func run() error {
 	keys := handler.NewAPIKeyHandler(pool, activityRecorder)
 	chat := handler.NewChatHandler(gatewayURL, serviceKey)
 	activityH := handler.NewActivityHandler(pool)
-	routing := handler.NewRoutingHandler(pool, activityRecorder)
+	routing := handler.NewRoutingHandler(pool, activityRecorder, gatewayURL, serviceKey)
 	routing.SetAvailabilityWindow(modelAvailabilityWindowFromEnv())
 	conversations := handler.NewConversationHandler(pool, activityRecorder)
 
@@ -319,6 +319,7 @@ func run() error {
 			adminOnly.GET("/model-aliases", routing.ListAliases)
 			adminOnly.PUT("/model-aliases/:alias", routing.PutAlias)
 			adminOnly.DELETE("/model-aliases/:alias", routing.DeleteAlias)
+			adminOnly.POST("/model-aliases/:alias/test", routing.TestAlias)
 
 			adminOnly.GET("/routing-policy", routing.GetRoutingPolicy)
 			adminOnly.PUT("/routing-policy", routing.PutRoutingPolicy)
@@ -525,7 +526,7 @@ func corsMiddleware() gin.HandlerFunc {
 		AllowOrigins:     origins,
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization", "X-Request-Id", "X-Requested-With"},
-		ExposeHeaders:    []string{"Content-Type", "X-Request-Id"},
+		ExposeHeaders:    []string{"Content-Type", "X-Request-Id", "X-Darkplum-Model", "X-Darkplum-Route", "X-Darkplum-Router-Reason"},
 		AllowCredentials: true,
 		MaxAge:           12 * time.Hour,
 	}

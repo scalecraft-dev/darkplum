@@ -68,17 +68,31 @@ type modelRow struct {
 	UpdatedAt    time.Time `json:"updated_at"`
 }
 
+// routeSummary is the chat-facing (non-admin) shape of one route on a routed
+// alias: name, description, and the target's backend_class (so the picker
+// can say "varies by route" when a routed alias mixes self_hosted and
+// cloud_managed targets) — no target model id, keywords, or availability,
+// which stay admin-only (routing.go's aliasRouteResponse).
+type routeSummary struct {
+	RouteName    string `json:"route_name"`
+	Description  string `json:"description"`
+	BackendClass string `json:"backend_class"`
+}
+
 // openAIModelEntry is the wire shape for one model in the OpenAI-compatible
 // /v1/models response. It doubles as the decode target for the gateway's own
 // GET /v1/models response in SyncModels — the gateway sends the same fields
-// (minus alias_of, which only the api's chat-facing endpoint produces).
+// (minus alias_of/alias_kind/routes, which only the api's chat-facing
+// endpoint produces).
 type openAIModelEntry struct {
-	ID           string  `json:"id"`
-	Object       string  `json:"object"`
-	Created      int64   `json:"created"`
-	OwnedBy      string  `json:"owned_by"`
-	BackendClass string  `json:"backend_class"`
-	AliasOf      *string `json:"alias_of,omitempty"`
+	ID           string         `json:"id"`
+	Object       string         `json:"object"`
+	Created      int64          `json:"created"`
+	OwnedBy      string         `json:"owned_by"`
+	BackendClass string         `json:"backend_class"`
+	AliasOf      *string        `json:"alias_of,omitempty"`
+	AliasKind    string         `json:"alias_kind,omitempty"`
+	Routes       []routeSummary `json:"routes,omitempty"`
 }
 
 // openAIModelsResponse is the OpenAI-compatible envelope for the models list.
@@ -161,7 +175,62 @@ func (h *ModelHandler) ListModels(c *gin.Context) {
 		return
 	}
 
-	data := buildModelsList(models, aliases, residency, time.Now(), h.availabilityWindow)
+	// Routed aliases: every route for every kind='routed' alias, left-joined
+	// against its (possibly missing/disabled) target model. Fetched as one
+	// query and grouped in Go (by alias, ordered by r.position) rather than
+	// one query per alias, avoiding an N+1 over however many routed aliases
+	// exist.
+	routedRows, err := h.pool.Query(ctx, `
+		SELECT
+			a.alias, a.default_route,
+			r.route_name, r.description, r.target_model_id,
+			(m.model_id IS NOT NULL) AS target_exists,
+			COALESCE(m.enabled, false) AS target_enabled,
+			COALESCE(m.provider, ''), COALESCE(m.backend_class, ''),
+			m.discovered_at
+		FROM model_aliases a
+		JOIN model_alias_routes r ON r.alias = a.alias
+		LEFT JOIN models m ON m.model_id = r.target_model_id
+		WHERE a.kind = 'routed'
+		ORDER BY a.alias, r.position
+	`)
+	if err != nil {
+		slog.ErrorContext(ctx, "list routed model aliases query failed", "err", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "list models failed"})
+		return
+	}
+	defer routedRows.Close()
+
+	var routedAliases []routedAliasDBRow
+	routedIndex := make(map[string]int, 4) // alias -> index into routedAliases
+	for routedRows.Next() {
+		var aliasName, defaultRoute string
+		var rt routedAliasRouteDBRow
+		var discoveredAt *time.Time
+		if err := routedRows.Scan(&aliasName, &defaultRoute, &rt.RouteName, &rt.Description, &rt.TargetModelID,
+			&rt.TargetExists, &rt.TargetEnabled, &rt.TargetProvider, &rt.TargetBackendClass, &discoveredAt); err != nil {
+			slog.ErrorContext(ctx, "scan routed model alias row failed", "err", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "scan models failed"})
+			return
+		}
+		if discoveredAt != nil {
+			rt.TargetDiscoveredAt = *discoveredAt
+		}
+		idx, ok := routedIndex[aliasName]
+		if !ok {
+			idx = len(routedAliases)
+			routedIndex[aliasName] = idx
+			routedAliases = append(routedAliases, routedAliasDBRow{Alias: aliasName, DefaultRoute: defaultRoute})
+		}
+		routedAliases[idx].Routes = append(routedAliases[idx].Routes, rt)
+	}
+	if err := routedRows.Err(); err != nil {
+		slog.ErrorContext(ctx, "routed model aliases rows error", "err", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "rows error"})
+		return
+	}
+
+	data := buildModelsList(models, aliases, routedAliases, residency, time.Now(), h.availabilityWindow)
 	c.JSON(http.StatusOK, openAIModelsResponse{Object: "list", Data: data})
 }
 

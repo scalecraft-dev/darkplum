@@ -1,4 +1,4 @@
-import type { User, ApiKey, ChatMessage, ActivityEvent, InferenceEvent, UsageBucket, UsageSummary, UserUsageSummary, KeyUsageSummary, Model, AdminModel, ModelAlias, Residency, RoutingPolicy, ConversationSummary, ConversationFull, ConversationMessage, ConversationMessageInput } from '../types'
+import type { User, ApiKey, ChatMessage, ActivityEvent, AliasRouteTest, InferenceEvent, InferencePurpose, UsageBucket, UsageSummary, UserUsageSummary, KeyUsageSummary, Model, AdminModel, ModelAlias, ModelAliasInput, Residency, RoutingPolicy, ConversationSummary, ConversationFull, ConversationMessage, ConversationMessageInput } from '../types'
 
 const BASE = '/api/v1'
 
@@ -149,9 +149,12 @@ export function listActivity(params: {
   return fetchJSON<{ events: ActivityEvent[]; total: number }>(`/activity?${searchParams}`)
 }
 
+/** `purpose` defaults to 'inference' on the server, so a caller that wants the
+ *  classifier's own calls must ask for them: 'all' removes the filter. */
 export function listUsage(params: {
   user_id?: string
   api_key_id?: string
+  purpose?: InferencePurpose | 'all'
   since?: string
   until?: string
   limit?: number
@@ -221,11 +224,21 @@ export function listModelAliases(): Promise<ModelAlias[]> {
   return fetchJSON<ModelAlias[]>('/model-aliases')
 }
 
-/** Creates the alias, or points an existing one at a new target. */
-export function putModelAlias(alias: string, targetModelId: string): Promise<ModelAlias> {
+/** Creates the alias, or replaces what it points at. A routed body replaces the
+ *  whole set of routes in one write — there is no per-route endpoint. */
+export function putModelAlias(alias: string, body: ModelAliasInput): Promise<ModelAlias> {
   return fetchJSON<ModelAlias>(`/model-aliases/${encodeURIComponent(alias)}`, {
     method: 'PUT',
-    body: JSON.stringify({ target_model_id: targetModelId }),
+    body: JSON.stringify(body),
+  })
+}
+
+/** Runs one prompt through a routed alias's classifier and reports the route it
+ *  would take. The target model is never called. */
+export function testModelAlias(alias: string, text: string): Promise<AliasRouteTest> {
+  return fetchJSON<AliasRouteTest>(`/model-aliases/${encodeURIComponent(alias)}/test`, {
+    method: 'POST',
+    body: JSON.stringify({ text }),
   })
 }
 
@@ -239,6 +252,8 @@ export function getRoutingPolicy(): Promise<RoutingPolicy> {
   return fetchJSON<RoutingPolicy>('/routing-policy')
 }
 
+/** The response carries `warnings` when the new policy leaves routed aliases
+ *  with routes that will be refused. Still a success. */
 export function updateRoutingPolicy(residency: Residency): Promise<RoutingPolicy> {
   return fetchJSON<RoutingPolicy>('/routing-policy', {
     method: 'PUT',
@@ -272,9 +287,10 @@ export function getConversation(id: string): Promise<ConversationFull> {
   return fetchJSON<ConversationFull>(`/conversations/${id}`)
 }
 
+/** `pinned_model: null` clears the pin — the alias classifies again next turn. */
 export function updateConversation(
   id: string,
-  patch: { title?: string; model?: string },
+  patch: { title?: string; model?: string; pinned_model?: string | null },
 ): Promise<ConversationSummary> {
   return fetchJSON<ConversationSummary>(`/conversations/${id}`, {
     method: 'PATCH',
@@ -350,9 +366,16 @@ export class ChatError extends Error {
 
 /** What the gateway said about the request itself, as soon as the response
  *  headers land. The request id ties a stored assistant turn to the audit
- *  record of the call that produced it. */
+ *  record of the call that produced it; the model is the one that actually
+ *  answered, which is the only way to know what a routed alias resolved to. */
 export interface ChatResponseMeta {
   requestId: string | null
+  /** X-Darkplum-Model — the resolved model id. */
+  model: string | null
+  /** X-Darkplum-Route — routed aliases only. */
+  route: string | null
+  /** X-Darkplum-Router-Reason — closed vocabulary, see routerReasonText(). */
+  routerReason: string | null
 }
 
 export async function streamChat(
@@ -384,7 +407,12 @@ export async function streamChat(
     return
   }
 
-  onMeta?.({ requestId: res.headers.get('X-Request-Id') })
+  onMeta?.({
+    requestId: res.headers.get('X-Request-Id'),
+    model: res.headers.get('X-Darkplum-Model'),
+    route: res.headers.get('X-Darkplum-Route'),
+    routerReason: res.headers.get('X-Darkplum-Router-Reason'),
+  })
 
   if (!res.ok) {
     // Routing refusals (403/404/503) arrive as a JSON body even when the

@@ -10,7 +10,7 @@ import {
 } from '../lib/api'
 import { formatModelName } from '../lib/formatModelName'
 import { UNREACHABLE_HINT, backendClassLabel, backendClassOf, isReachable } from '../lib/modelRouting'
-import type { AdminModel, ModelAlias, Residency, RoutingPolicy } from '../types'
+import type { AdminModel, ModelAlias, ModelAliasInput, Residency, RoutingPolicy } from '../types'
 import { useToast } from '../components/Toast'
 import { Badge, Table, TableEmpty } from '../components/ui'
 import { CopyButton } from '../components/ui/CopyButton'
@@ -400,7 +400,9 @@ export function ModelsPage() {
     void loadAliases()
   }, [loadModels, loadPolicy, loadAliases])
 
-  const handlePolicyChange = async (next: Residency) => {
+  /** Resolves with the API's own warnings — the routed aliases whose routes
+   *  will now be refused. The card shows them; an empty list means none. */
+  const handlePolicyChange = async (next: Residency): Promise<string[]> => {
     setPolicySaving(true)
     try {
       const updated = await updateRoutingPolicy(next)
@@ -411,22 +413,30 @@ export function ModelsPage() {
           : 'Any model allowed. Cloud-managed models can answer again.',
         'success',
       )
+      // The aliases carry per-route health, which this may have just changed.
+      void loadAliases()
+      return updated.warnings ?? []
     } catch (err) {
       toast((err as Error).message, 'error')
+      return []
     } finally {
       setPolicySaving(false)
     }
   }
 
-  // Throws on failure so the dialog can attach the server's message to a field.
-  const handleSaveAlias = async (alias: string, targetModelId: string) => {
+  // Throws on failure so the editor can attach the server's message to a field.
+  const handleSaveAlias = async (alias: string, body: ModelAliasInput) => {
     const existing = aliases.some((a) => a.alias === alias)
-    const saved = await putModelAlias(alias, targetModelId)
+    const saved = await putModelAlias(alias, body)
     setAliases((prev) => {
       const next = prev.filter((a) => a.alias !== saved.alias)
       return [...next, saved].sort((a, b) => a.alias.localeCompare(b.alias))
     })
-    toast(existing ? `Alias ${alias} now points at ${targetModelId}` : `Alias ${alias} created`, 'success')
+    const changed =
+      'kind' in body
+        ? `now has ${body.routes.length} ${body.routes.length === 1 ? 'route' : 'routes'}`
+        : `now points at ${body.target_model_id}`
+    toast(existing ? `Alias ${alias} ${changed}` : `Alias ${alias} created`, 'success')
   }
 
   const handleDeleteAlias = async (alias: string) => {

@@ -13,7 +13,8 @@ interface Props {
   /** Every discovered model — used to say what a tighter policy would block. */
   models: AdminModel[]
   onRetry: () => void
-  onChange: (residency: Residency) => Promise<void>
+  /** Resolves with the routed-alias routes the new policy will refuse. */
+  onChange: (residency: Residency) => Promise<string[]>
 }
 
 const OPTIONS: { value: Residency; label: string; consequence: string }[] = [
@@ -41,6 +42,9 @@ export function RoutingPolicyCard({
   onChange,
 }: Props) {
   const [confirmOpen, setConfirmOpen] = useState(false)
+  /** What the API said the new policy breaks. Written by the API, shown as it
+   *  came: these name routed aliases that will start refusing. */
+  const [warnings, setWarnings] = useState<string[]>([])
 
   const residency: Residency = policy?.residency ?? 'any'
   const cloudEnabled = models.filter(
@@ -50,15 +54,19 @@ export function RoutingPolicyCard({
   const handleSelect = (value: Residency) => {
     if (value === residency || saving) return
     if (value === 'self_hosted_only') {
+      setWarnings([])
       setConfirmOpen(true)
       return
     }
-    void onChange(value)
+    void onChange(value).then(setWarnings)
   }
 
+  /** The switch happens, then the consequences are named. Anything the API
+   *  warns about stays on screen after the dialog closes — it is work to do. */
   const handleConfirm = async () => {
-    await onChange('self_hosted_only')
-    setConfirmOpen(false)
+    const next = await onChange('self_hosted_only')
+    setWarnings(next)
+    if (next.length === 0) setConfirmOpen(false)
   }
 
   return (
@@ -128,17 +136,61 @@ export function RoutingPolicyCard({
                 : `${cloudEnabled.length} enabled cloud-managed ${cloudEnabled.length === 1 ? 'model is' : 'models are'} refused by this policy.`}
             </p>
           )}
+
+          {warnings.length > 0 && (
+            <div className={styles.warnings} role="status">
+              <p className={styles.warningsTitle}>
+                {warnings.length === 1
+                  ? 'One route will be refused under this policy:'
+                  : `${warnings.length} routes will be refused under this policy:`}
+              </p>
+              <ul className={styles.warningsList}>
+                {warnings.map((w) => (
+                  <li key={w}>{w}</li>
+                ))}
+              </ul>
+              <p className={styles.warningsHint}>
+                A message that takes one of these routes is refused with the route named. It is not
+                sent to a different model instead. Repoint the route, or change the policy.
+              </p>
+            </div>
+          )}
         </>
       )}
 
       <Modal
         open={confirmOpen}
         onClose={() => setConfirmOpen(false)}
-        title="Switch to self-hosted only?"
-        description="Requests to cloud-managed models such as AWS Bedrock will be refused with a policy error, even when the model is enabled."
+        title={warnings.length > 0 ? 'Now self-hosted only' : 'Switch to self-hosted only?'}
+        description={
+          warnings.length > 0
+            ? 'The policy has changed. These routes need your attention.'
+            : 'Requests to cloud-managed models such as AWS Bedrock will be refused with a policy error, even when the model is enabled.'
+        }
       >
         <div className={styles.confirmBody}>
-          {cloudEnabled.length === 0 ? (
+          {warnings.length > 0 ? (
+            <>
+              <p className={styles.confirmText}>
+                The policy is now self-hosted only.{' '}
+                {warnings.length === 1
+                  ? 'One routed alias has a route that will be refused:'
+                  : `${warnings.length} routed-alias routes will be refused:`}
+              </p>
+              <ul className={styles.confirmList}>
+                {warnings.map((w) => (
+                  <li key={w}>{w}</li>
+                ))}
+              </ul>
+              <p className={styles.confirmText}>
+                A message that takes one of these routes is refused with the route named — it is
+                never sent to another model instead.
+              </p>
+              <div className={styles.confirmFooter}>
+                <Button type="button" onClick={() => setConfirmOpen(false)}>Done</Button>
+              </div>
+            </>
+          ) : cloudEnabled.length === 0 ? (
             <p className={styles.confirmText}>
               No cloud-managed models are enabled today, so no one loses access right now. The
               policy still applies to anything you enable later.
@@ -159,14 +211,16 @@ export function RoutingPolicyCard({
               )}
             </>
           )}
-          <div className={styles.confirmFooter}>
-            <Button type="button" variant="ghost" onClick={() => setConfirmOpen(false)}>
-              Cancel
-            </Button>
-            <Button type="button" onClick={() => void handleConfirm()} disabled={saving}>
-              {saving ? 'Switching...' : 'Switch to self-hosted only'}
-            </Button>
-          </div>
+          {warnings.length === 0 && (
+            <div className={styles.confirmFooter}>
+              <Button type="button" variant="ghost" onClick={() => setConfirmOpen(false)}>
+                Cancel
+              </Button>
+              <Button type="button" onClick={() => void handleConfirm()} disabled={saving}>
+                {saving ? 'Switching...' : 'Switch to self-hosted only'}
+              </Button>
+            </div>
+          )}
         </div>
       </Modal>
     </section>

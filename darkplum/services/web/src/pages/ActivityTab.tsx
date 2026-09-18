@@ -20,6 +20,7 @@ import {
 import type {
   ActivityEvent,
   InferenceEvent,
+  InferencePurpose,
   KeyUsageSummary,
   TimeRange,
   UsageBucket,
@@ -32,6 +33,7 @@ import {
   formatEventDetail,
   type EventVariant,
 } from '../lib/activityEvents'
+import { routerReasonText } from '../lib/modelRouting'
 import { useToast } from '../components/Toast'
 import { Badge, Button, Skeleton, Table, TableEmpty } from '../components/ui'
 import { ActivityDrawer } from './ActivityDrawer'
@@ -54,6 +56,24 @@ const LOG_VIEWS: { label: string; value: 'admin' | 'api' | 'all' }[] = [
   { label: 'API Requests', value: 'api'   },
   { label: 'All',          value: 'all'   },
 ]
+
+/** Requests are recorded for three different jobs. Answers are what people
+ *  mean by usage; the other two are the routing machinery, kept apart so a
+ *  classifier call is never mistaken for a conversation. */
+type PurposeFilter = InferencePurpose | 'all'
+
+const PURPOSES: { label: string; value: PurposeFilter }[] = [
+  { label: 'Requests',    value: 'inference'      },
+  { label: 'Classifier',  value: 'routing'        },
+  { label: 'Route tests', value: 'routing_dryrun' },
+  { label: 'All',         value: 'all'            },
+]
+
+const PURPOSE_LABEL: Record<InferencePurpose, string> = {
+  inference: 'Request',
+  routing: 'Classifier',
+  routing_dryrun: 'Route test',
+}
 
 // Hex values directly since CSS vars are unreliable in SVG attributes.
 // Defined per-theme because the dark grid color (#1A1E2A) is invisible on
@@ -87,6 +107,9 @@ interface UnifiedEvent {
   action_variant: EventVariant
   detail_text: string
   ip_address: string | null
+  /** Routed aliases only: the route that answered and the recorded reason. */
+  route: string | null
+  reason: string | null
 }
 
 // ---------------------------------------------------------------------------
@@ -158,6 +181,8 @@ function adminEventToUnified(e: ActivityEvent): UnifiedEvent {
     action_variant: eventVariant(e.event_type),
     detail_text:    formatEventDetail(e.detail),
     ip_address:     e.ip_address,
+    route:          null,
+    reason:         null,
   }
 }
 
@@ -169,16 +194,22 @@ function shortenId(id: string): string {
 
 function inferenceEventToUnified(e: InferenceEvent): UnifiedEvent {
   const display = e.user_name ?? e.user_email ?? (e.user_id ? shortenId(e.user_id) : '—')
+  const purpose: InferencePurpose = e.purpose ?? 'inference'
+  // A classifier call is named for what it did: it chose a route, it did not
+  // answer anyone. Failures still read as errors whatever their job was.
+  const label = e.status_code < 400 ? PURPOSE_LABEL[purpose] : 'Error'
   return {
     id:             e.id,
     created_at:     e.created_at,
     source:         'api',
     user_id:        e.user_id,
     user_display:   display,
-    action_label:   e.status_code < 400 ? 'Request' : 'Error',
-    action_variant: e.status_code < 400 ? 'success' : 'danger',
+    action_label:   label,
+    action_variant: e.status_code >= 400 ? 'danger' : purpose === 'inference' ? 'success' : 'info',
     detail_text:    `model: ${e.model}, latency: ${e.latency_ms}ms, status: ${e.status_code}`,
     ip_address:     e.ip_address,
+    route:          e.route_name ?? null,
+    reason:         e.router_reason ?? null,
   }
 }
 
@@ -223,6 +254,9 @@ export function ActivityTab() {
 
   const [timeRange, setTimeRange] = useState<TimeRange>('24h')
   const [logView, setLogView]     = useState<'admin' | 'api' | 'all'>('all')
+  /** Answers by default: the classifier calls behind a routed alias are real
+   *  records, but they are not what anyone means by "who used what". */
+  const [purpose, setPurpose]     = useState<PurposeFilter>('inference')
   const [page, setPage]           = useState(0)
 
   const [summary, setSummary]         = useState<UsageSummary | null>(null)
@@ -284,6 +318,9 @@ export function ActivityTab() {
     setLoadingEvents(true)
     const { since, until } = getTimeRange(timeRange)
     const offset = page * PAGE_SIZE
+    // The server filters to answers unless told otherwise, so the choice is
+    // always sent — including 'all', which is how it is asked to stop filtering.
+    const purposeParam = { purpose }
 
     try {
       if (logView === 'admin') {
@@ -291,7 +328,7 @@ export function ActivityTab() {
         setUnifiedEvents(res.events.map(adminEventToUnified))
         setTotal(res.total)
       } else if (logView === 'api') {
-        const res = await listUsage({ since, until, limit: PAGE_SIZE, offset })
+        const res = await listUsage({ since, until, limit: PAGE_SIZE, offset, ...purposeParam })
         setUnifiedEvents(res.events.map(inferenceEventToUnified))
         setTotal(res.total)
       } else {
@@ -300,7 +337,7 @@ export function ActivityTab() {
         const fetchLimit = PAGE_SIZE * 2
         const [adminRes, apiRes] = await Promise.all([
           listActivity({ since, until, limit: fetchLimit, offset: 0 }),
-          listUsage({ since, until, limit: fetchLimit, offset: 0 }),
+          listUsage({ since, until, limit: fetchLimit, offset: 0, ...purposeParam }),
         ])
         const merged = [
           ...adminRes.events.map(adminEventToUnified),
@@ -318,7 +355,7 @@ export function ActivityTab() {
     } finally {
       setLoadingEvents(false)
     }
-  }, [timeRange, logView, page, toast])
+  }, [timeRange, logView, purpose, page, toast])
 
   // ---------------------------------------------------------------------------
   // Export
@@ -328,6 +365,7 @@ export function ActivityTab() {
     const { since, until } = getTimeRange(timeRange)
     const params = new URLSearchParams({ since, until })
     const path = logView === 'api' ? 'usage' : 'activity'
+    if (path === 'usage') params.set('purpose', purpose)
     try {
       const res = await fetch(`/api/v1/${path}/export?${params}`, {
         headers: { 'X-Requested-With': 'XMLHttpRequest' },
@@ -350,10 +388,10 @@ export function ActivityTab() {
   // Effects
   // ---------------------------------------------------------------------------
 
-  // Reset page when time range or log view changes
+  // Reset page when time range, log view or purpose changes
   useEffect(() => {
     setPage(0)
-  }, [timeRange, logView])
+  }, [timeRange, logView, purpose])
 
   useEffect(() => {
     void fetchSummaryAndChart()
@@ -378,6 +416,11 @@ export function ActivityTab() {
   const hasNext   = (page + 1) * PAGE_SIZE < total
 
   const requestChange = summary ? pctChange(summary.total_requests, summary.total_requests_previous) : null
+
+  // Routing columns appear only when this page of events has routing to show:
+  // two empty columns on every ordinary request would be clutter.
+  const showRouting = unifiedEvents.some((e) => e.route || e.reason)
+  const columnCount = showRouting ? 7 : 5
 
   // ---------------------------------------------------------------------------
   // Render
@@ -579,17 +622,34 @@ export function ActivityTab() {
 
       {/* Activity log */}
       <div className={styles.logHeader}>
-        <div className={styles.logToggle}>
+        <div className={styles.logToggle} role="group" aria-label="Which events to show">
           {LOG_VIEWS.map((v) => (
             <button
               key={v.value}
               className={`${styles.logToggleBtn} ${logView === v.value ? styles.logToggleActive : ''}`}
               onClick={() => setLogView(v.value)}
+              aria-pressed={logView === v.value}
             >
               {v.label}
             </button>
           ))}
         </div>
+
+        {/* Only requests have a purpose; admin events do not. */}
+        {logView !== 'admin' && (
+          <div className={styles.logToggle} role="group" aria-label="Which requests to show">
+            {PURPOSES.map((p) => (
+              <button
+                key={p.value}
+                className={`${styles.logToggleBtn} ${purpose === p.value ? styles.logToggleActive : ''}`}
+                onClick={() => setPurpose(p.value)}
+                aria-pressed={purpose === p.value}
+              >
+                {p.label}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
 
       <div className={styles.tableCard}>
@@ -600,14 +660,16 @@ export function ActivityTab() {
               <th>User</th>
               <th>Action</th>
               <th>Details</th>
+              {showRouting && <th>Route</th>}
+              {showRouting && <th>Why</th>}
               <th>IP</th>
             </tr>
           </thead>
           <tbody>
             {loadingEvents ? (
-              Array.from({ length: 8 }).map((_, i) => <SkeletonRow key={i} cols={5} />)
+              Array.from({ length: 8 }).map((_, i) => <SkeletonRow key={i} cols={columnCount} />)
             ) : unifiedEvents.length === 0 ? (
-              <TableEmpty colSpan={5}>
+              <TableEmpty colSpan={columnCount}>
                 <div className={styles.empty}>
                   <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
                     <line x1="18" y1="20" x2="18" y2="10" />
@@ -650,6 +712,22 @@ export function ActivityTab() {
                         {e.detail_text}
                       </span>
                     </td>
+                    {showRouting && (
+                      <td>
+                        {e.route ? <code className={styles.routeName}>{e.route}</code> : <span className={styles.muted}>—</span>}
+                      </td>
+                    )}
+                    {showRouting && (
+                      <td className={styles.muted}>
+                        {e.reason ? (
+                          <span className={styles.detailText} title={e.reason}>
+                            {routerReasonText(e.reason)}
+                          </span>
+                        ) : (
+                          '—'
+                        )}
+                      </td>
+                    )}
                     <td className={styles.muted}>{e.ip_address ?? '—'}</td>
                   </tr>
                 )

@@ -11,6 +11,11 @@ const (
 
 	residencyAny            = "any"
 	residencySelfHostedOnly = "self_hosted_only"
+
+	// aliasKindStatic and aliasKindRouted mirror model_aliases.kind's CHECK
+	// constraint (migration 013_routed_aliases.sql).
+	aliasKindStatic = "static"
+	aliasKindRouted = "routed"
 )
 
 // modelAvailabilityWindow is the default value for how recently a model must
@@ -89,11 +94,35 @@ type aliasDBRow struct {
 	TargetDiscoveredAt time.Time
 }
 
-// buildModelsList combines enabled+available models and aliases-to-enabled-
-// available-models into the OpenAI-compatible /v1/models entry list,
-// honouring the residency policy. It is pure so alias-entry construction,
-// residency filtering, and the availability cutoff can be unit tested without
-// a database.
+// routedAliasRouteDBRow is one model_alias_routes row, left-joined against
+// its target model, as read for the chat-facing model list. TargetExists is
+// false when the target model row has been purged (see models.go's
+// modelPurgeAfter) — a route in that state can never be viable.
+type routedAliasRouteDBRow struct {
+	RouteName          string
+	Description        string
+	TargetModelID      string
+	TargetExists       bool
+	TargetEnabled      bool
+	TargetProvider     string
+	TargetBackendClass string
+	TargetDiscoveredAt time.Time
+}
+
+// routedAliasDBRow is one routed model_aliases row plus its ordered routes,
+// as read for the chat-facing model list.
+type routedAliasDBRow struct {
+	Alias        string
+	DefaultRoute string
+	Routes       []routedAliasRouteDBRow
+}
+
+// buildModelsList combines enabled+available models, static aliases-to-
+// enabled-available-models, and routed aliases with at least one viable
+// route into the OpenAI-compatible /v1/models entry list, honouring the
+// residency policy. It is pure so alias-entry construction, residency
+// filtering, and the availability cutoff can be unit tested without a
+// database.
 //
 // Note: this filtering is a UX convenience for the model picker. It is not
 // the enforcement point — a request for a filtered-out cloud_managed or
@@ -105,9 +134,9 @@ type aliasDBRow struct {
 // availabilityWindow is caller-supplied (rather than the modelAvailabilityWindow
 // default baked in) so ModelHandler can apply an operator-configured
 // MODEL_AVAILABILITY_WINDOW_SECONDS override; see cmd/main.go.
-func buildModelsList(models []modelDBRow, aliases []aliasDBRow, residency string, now time.Time, availabilityWindow time.Duration) []openAIModelEntry {
+func buildModelsList(models []modelDBRow, aliases []aliasDBRow, routedAliases []routedAliasDBRow, residency string, now time.Time, availabilityWindow time.Duration) []openAIModelEntry {
 	created := now.Unix()
-	entries := make([]openAIModelEntry, 0, len(models)+len(aliases))
+	entries := make([]openAIModelEntry, 0, len(models)+len(aliases)+len(routedAliases))
 
 	for _, m := range models {
 		if residency == residencySelfHostedOnly && m.BackendClass == backendClassCloudManaged {
@@ -140,6 +169,49 @@ func buildModelsList(models []modelDBRow, aliases []aliasDBRow, residency string
 			OwnedBy:      a.OwnedBy,
 			BackendClass: a.BackendClass,
 			AliasOf:      &target,
+			AliasKind:    aliasKindStatic,
+		})
+	}
+
+	for _, ra := range routedAliases {
+		var viable bool
+		var defaultTarget, defaultOwner, defaultBackendClass string
+		routes := make([]routeSummary, 0, len(ra.Routes))
+		for _, rt := range ra.Routes {
+			routes = append(routes, routeSummary{RouteName: rt.RouteName, Description: rt.Description, BackendClass: rt.TargetBackendClass})
+			if rt.RouteName == ra.DefaultRoute {
+				defaultTarget = rt.TargetModelID
+				defaultOwner = rt.TargetProvider
+				defaultBackendClass = rt.TargetBackendClass
+			}
+			if !rt.TargetExists || !rt.TargetEnabled {
+				continue
+			}
+			if residency == residencySelfHostedOnly && rt.TargetBackendClass == backendClassCloudManaged {
+				continue
+			}
+			if !modelIsAvailableWithin(rt.TargetDiscoveredAt, now, availabilityWindow) {
+				continue
+			}
+			viable = true
+		}
+		// A routed alias is omitted entirely when none of its routes'
+		// targets is currently enabled+available+residency-permitted — even
+		// though the default route's target (below) is always what alias_of
+		// names, regardless of whether that specific route is the viable one.
+		if !viable {
+			continue
+		}
+		target := defaultTarget
+		entries = append(entries, openAIModelEntry{
+			ID:           ra.Alias,
+			Object:       "model",
+			Created:      created,
+			OwnedBy:      defaultOwner,
+			BackendClass: defaultBackendClass,
+			AliasOf:      &target,
+			AliasKind:    aliasKindRouted,
+			Routes:       routes,
 		})
 	}
 

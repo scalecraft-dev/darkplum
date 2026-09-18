@@ -45,6 +45,14 @@ type ChatRequest struct {
 type Message struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+	// HasNonTextContent is true when the original content was an array of
+	// content blocks containing at least one non-"text" block (e.g.
+	// image_url). Content itself already drops non-text blocks when
+	// flattening to a plain string (see UnmarshalJSON); this is the one
+	// signal that flattening would otherwise lose, needed by a routed
+	// alias's builtin:multimodal rules signal (see internal/router). Always
+	// false for a plain string content body.
+	HasNonTextContent bool `json:"-"`
 }
 
 func (m *Message) UnmarshalJSON(data []byte) error {
@@ -75,6 +83,8 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 		for _, b := range blocks {
 			if b.Type == "text" {
 				combined += b.Text
+			} else {
+				m.HasNonTextContent = true
 			}
 		}
 		m.Content = combined

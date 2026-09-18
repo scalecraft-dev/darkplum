@@ -20,7 +20,7 @@ func TestPgStore_RefreshSuccessPopulatesSnapshot(t *testing.T) {
 		loadFn: func(_ context.Context) (Snapshot, error) {
 			return Snapshot{
 				Enabled:   map[string]bool{"llama-3-8b": true},
-				Aliases:   map[string]string{"default": "llama-3-8b"},
+				Aliases:   map[string]AliasDef{"default": {Kind: AliasKindStatic, Target: "llama-3-8b"}},
 				Residency: ResidencyAny,
 			}, nil
 		},
@@ -37,7 +37,7 @@ func TestPgStore_RefreshSuccessPopulatesSnapshot(t *testing.T) {
 	if !snap.Enabled["llama-3-8b"] {
 		t.Error("expected llama-3-8b to be enabled")
 	}
-	if snap.Aliases["default"] != "llama-3-8b" {
+	if target, ok := snap.StaticTarget("default"); !ok || target != "llama-3-8b" {
 		t.Error("expected alias default -> llama-3-8b")
 	}
 	if snap.Residency != ResidencyAny {

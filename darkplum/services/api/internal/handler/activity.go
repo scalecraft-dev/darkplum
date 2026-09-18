@@ -161,6 +161,9 @@ type inferenceEvent struct {
 	UserName         *string   `json:"user_name,omitempty"`
 	UserEmail        *string   `json:"user_email,omitempty"`
 	Model            string    `json:"model"`
+	Purpose          string    `json:"purpose"`
+	RouteName        *string   `json:"route_name,omitempty"`
+	RouterReason     *string   `json:"router_reason,omitempty"`
 	StatusCode       int       `json:"status_code"`
 	LatencyMS        int       `json:"latency_ms"`
 	PromptTokens     *int      `json:"prompt_tokens,omitempty"`
@@ -168,6 +171,23 @@ type inferenceEvent struct {
 	Stream           bool      `json:"stream"`
 	IPAddress        *string   `json:"ip_address,omitempty"`
 	CreatedAt        time.Time `json:"created_at"`
+}
+
+// validUsagePurposeFilter mirrors inference_events.purpose's CHECK constraint
+// (migration 013_routed_aliases.sql) plus the "all" sentinel accepted only by
+// the ?purpose= query param (never stored) to mean "don't filter by purpose
+// at all". Every other admin usage aggregation in this file has no override
+// and always behaves as if purpose were "inference" -- that default is what
+// keeps a classifier's own model call (purpose='routing') or an admin's
+// "test a prompt" dry run (purpose='routing_dryrun') out of request counts,
+// token sums, and latency percentiles meant to describe end-user traffic.
+func validUsagePurposeFilter(v string) bool {
+	switch v {
+	case "inference", "routing", "routing_dryrun", "all":
+		return true
+	default:
+		return false
+	}
 }
 
 // usageListResponse wraps inference events with a total count for pagination.
@@ -215,6 +235,23 @@ func (h *ActivityHandler) ListUsage(c *gin.Context) {
 		argN++
 	}
 
+	// purpose defaults to "inference" so classifier calls (purpose='routing')
+	// and admin dry runs (purpose='routing_dryrun') don't show up in the
+	// usage list unless explicitly asked for; "all" removes the filter.
+	purpose := c.Query("purpose")
+	if purpose == "" {
+		purpose = "inference"
+	}
+	if !validUsagePurposeFilter(purpose) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "purpose must be one of inference, routing, routing_dryrun, all"})
+		return
+	}
+	if purpose != "all" {
+		where += fmt.Sprintf(" AND ie.purpose = $%d", argN)
+		args = append(args, purpose)
+		argN++
+	}
+
 	if v := c.Query("since"); v != "" {
 		t, err := time.Parse(time.RFC3339, v)
 		if err != nil {
@@ -251,7 +288,8 @@ func (h *ActivityHandler) ListUsage(c *gin.Context) {
 		SELECT
 			ie.id::text, ie.request_id, ie.api_key_id::text, ie.user_id::text,
 			u.name, u.email,
-			ie.model, ie.status_code, ie.latency_ms, ie.prompt_tokens, ie.completion_tokens,
+			ie.model, ie.purpose, ie.route_name, ie.router_reason,
+			ie.status_code, ie.latency_ms, ie.prompt_tokens, ie.completion_tokens,
 			ie.stream, ie.ip_address::text, ie.created_at
 		FROM inference_events ie
 		LEFT JOIN users u ON u.id = ie.user_id
@@ -272,7 +310,8 @@ func (h *ActivityHandler) ListUsage(c *gin.Context) {
 		var ie inferenceEvent
 		if err := rows.Scan(
 			&ie.ID, &ie.RequestID, &ie.APIKeyID, &ie.UserID, &ie.UserName, &ie.UserEmail,
-			&ie.Model, &ie.StatusCode, &ie.LatencyMS, &ie.PromptTokens, &ie.CompletionTokens,
+			&ie.Model, &ie.Purpose, &ie.RouteName, &ie.RouterReason,
+			&ie.StatusCode, &ie.LatencyMS, &ie.PromptTokens, &ie.CompletionTokens,
 			&ie.Stream, &ie.IPAddress, &ie.CreatedAt,
 		); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "scan usage failed"})
@@ -318,7 +357,11 @@ func (h *ActivityHandler) UsageStats(c *gin.Context) {
 	truncExpr := fmt.Sprintf("date_trunc('%s', created_at)", interval)
 
 	args := []any{since, until}
-	where := "WHERE created_at >= $1 AND created_at <= $2"
+	// purpose = 'inference' is not admin-overridable here (unlike ListUsage's
+	// ?purpose=): a classifier's own model call or an admin dry run has no
+	// business skewing the request-count/token/latency series a chart labelled
+	// "usage" implies is end-user traffic.
+	where := "WHERE created_at >= $1 AND created_at <= $2 AND purpose = 'inference'"
 	argN := 3
 
 	if v := c.Query("user_id"); v != "" {
@@ -425,7 +468,7 @@ func (h *ActivityHandler) UsageSummary(c *gin.Context) {
 				PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY latency_ms)::numeric
 			, 2)::float8, 0)                                               AS p95_latency_ms
 		FROM inference_events
-		WHERE created_at >= $1 AND created_at <= $2
+		WHERE created_at >= $1 AND created_at <= $2 AND purpose = 'inference'
 	`, since, until).Scan(
 		&summary.TotalRequests, &summary.ActiveUsers, &summary.ActiveAPIKeys,
 		&summary.AvgLatencyMS, &summary.P95LatencyMS,
@@ -437,7 +480,7 @@ func (h *ActivityHandler) UsageSummary(c *gin.Context) {
 
 	// Previous-period request count for comparison.
 	if err := h.db.QueryRow(c.Request.Context(),
-		`SELECT COUNT(*) FROM inference_events WHERE created_at >= $1 AND created_at < $2`,
+		`SELECT COUNT(*) FROM inference_events WHERE created_at >= $1 AND created_at < $2 AND purpose = 'inference'`,
 		prevSince, prevUntil,
 	).Scan(&summary.TotalRequestsPrevious); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "previous period query failed"})
@@ -603,6 +646,22 @@ func (h *ActivityHandler) ExportUsage(c *gin.Context) {
 		argN++
 	}
 
+	// See ListUsage: same default-to-"inference", "all"-removes-the-filter
+	// contract, so an export matches what the admin was just looking at.
+	purpose := c.Query("purpose")
+	if purpose == "" {
+		purpose = "inference"
+	}
+	if !validUsagePurposeFilter(purpose) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "purpose must be one of inference, routing, routing_dryrun, all"})
+		return
+	}
+	if purpose != "all" {
+		where += fmt.Sprintf(" AND ie.purpose = $%d", argN)
+		args = append(args, purpose)
+		argN++
+	}
+
 	if v := c.Query("since"); v != "" {
 		t, err := time.Parse(time.RFC3339, v)
 		if err != nil {
@@ -635,6 +694,9 @@ func (h *ActivityHandler) ExportUsage(c *gin.Context) {
 			u.email,
 			ie.api_key_id::text,
 			ie.model,
+			ie.purpose,
+			ie.route_name,
+			ie.router_reason,
 			ie.status_code,
 			ie.latency_ms,
 			ie.prompt_tokens,
@@ -659,7 +721,7 @@ func (h *ActivityHandler) ExportUsage(c *gin.Context) {
 	c.Header("Content-Disposition", `attachment; filename="inference_events.csv"`)
 
 	w := csv.NewWriter(c.Writer)
-	_ = w.Write([]string{"timestamp", "request_id", "user_id", "user_name", "user_email", "api_key_id", "model", "status_code", "latency_ms", "prompt_tokens", "completion_tokens", "stream", "ip_address"})
+	_ = w.Write([]string{"timestamp", "request_id", "user_id", "user_name", "user_email", "api_key_id", "model", "purpose", "route_name", "router_reason", "status_code", "latency_ms", "prompt_tokens", "completion_tokens", "stream", "ip_address"})
 
 	for rows.Next() {
 		var (
@@ -670,6 +732,9 @@ func (h *ActivityHandler) ExportUsage(c *gin.Context) {
 			userEmail        *string
 			apiKeyID         *string
 			model            string
+			purpose          string
+			routeName        *string
+			routerReason     *string
 			statusCode       int
 			latencyMS        int
 			promptTokens     *int
@@ -679,6 +744,7 @@ func (h *ActivityHandler) ExportUsage(c *gin.Context) {
 		)
 		if err := rows.Scan(
 			&createdAt, &requestID, &userID, &userName, &userEmail, &apiKeyID, &model,
+			&purpose, &routeName, &routerReason,
 			&statusCode, &latencyMS, &promptTokens, &completionTokens, &stream, &ipAddress,
 		); err != nil {
 			w.Flush()
@@ -692,6 +758,9 @@ func (h *ActivityHandler) ExportUsage(c *gin.Context) {
 			derefStr(userEmail),
 			derefStr(apiKeyID),
 			model,
+			purpose,
+			derefStr(routeName),
+			derefStr(routerReason),
 			strconv.Itoa(statusCode),
 			strconv.Itoa(latencyMS),
 			derefInt(promptTokens),
@@ -734,6 +803,7 @@ func (h *ActivityHandler) UserSummary(c *gin.Context) {
 		LEFT JOIN users u ON u.id = ie.user_id
 		WHERE ie.created_at >= $1 AND ie.created_at <= $2
 		  AND ie.user_id IS NOT NULL
+		  AND ie.purpose = 'inference'
 		GROUP BY ie.user_id, u.name, u.email
 		ORDER BY request_count DESC
 	`, since, until)
@@ -793,6 +863,7 @@ func (h *ActivityHandler) KeySummary(c *gin.Context) {
 		JOIN api_keys k ON k.id = ie.api_key_id
 		LEFT JOIN users u ON u.id = k.user_id
 		WHERE ie.created_at >= $1 AND ie.created_at <= $2
+		  AND ie.purpose = 'inference'
 		GROUP BY ie.api_key_id, k.name, k.prefix, u.name
 		ORDER BY request_count DESC
 	`, since, until)

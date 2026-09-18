@@ -38,7 +38,7 @@ export DOCKER_CLI_HINTS = false
 export DOCKER_CLI_HOOKS = 0
 
 .PHONY: help check-prereqs _require-outputs _deploy-vllm deploy deploy-infra deploy-k8s deploy-platform build-images push-images configure-sso test status destroy \
-       deploy-model remove-model list-models verify-bedrock-iam expose-web unexpose-web set-hf-token \
+       deploy-model remove-model list-models verify-bedrock-iam expose-web unexpose-web set-hf-token deploy-semantic-router remove-semantic-router \
        dev-up dev-down dev-build-gateway dev-build-api dev-build-web dev-status dev-logs dev-test
 
 help: ## Show this help
@@ -382,6 +382,8 @@ destroy: ## Tear down all resources
 	@kubectl delete -f $(K8S_DIR)/base/network-policies/vllm-ingress.yaml --ignore-not-found 2>/dev/null || true
 	@kubectl delete -f $(K8S_DIR)/base/network-policies/gateway-egress.yaml --ignore-not-found 2>/dev/null || true
 	@kubectl delete -f $(K8S_DIR)/base/network-policies/inference-egress.yaml --ignore-not-found 2>/dev/null || true
+	@helm uninstall semantic-router -n darkplum-system >/dev/null 2>&1 || true
+	@kubectl delete -f $(K8S_DIR)/semantic-router/network-policies.yaml --ignore-not-found 2>/dev/null || true
 	@kubectl delete deploy,svc -n $(NAMESPACE) -l darkplum.ai/model-instance --ignore-not-found 2>/dev/null || true
 	@kubectl delete -f $(K8S_DIR)/overlays/prod/resources/vllm-service.yaml --ignore-not-found 2>/dev/null || true
 	@kubectl delete -f $(K8S_DIR)/overlays/prod/resources/vllm-deployment.yaml --ignore-not-found 2>/dev/null || true
@@ -411,6 +413,38 @@ verify-bedrock-iam: ## Prove the gateway's IAM role allows only the configured B
 	check implicitDeny "arn:aws:bedrock:$$REGION::foundation-model/darkplum.not-an-allowed-model-v1:0"; \
 	check implicitDeny "arn:aws:bedrock:ap-southeast-7::foundation-model/anthropic.claude-example-v1:0"; \
 	[ $$FAIL -eq 0 ] && echo "Layer 1 allowlist behaves as configured." || { echo "Layer 1 allowlist does NOT behave as configured."; exit 1; }
+
+# =============================================================================
+# Optional in-cluster intent classifier (vLLM Semantic Router, Apache-2.0)
+# =============================================================================
+
+SR_CHART   := oci://ghcr.io/vllm-project/charts/semantic-router
+SR_VERSION := 0.3.0
+SR_VALUES  ?= $(K8S_DIR)/semantic-router/values.yaml
+
+deploy-semantic-router: ## Install the open-source intent classifier for routed aliases [SR_VALUES=k8s/semantic-router/values.yaml]
+	@command -v helm >/dev/null 2>&1 || { echo "ERROR: helm not found. Install: https://helm.sh/docs/intro/install/"; exit 1; }
+	@kubectl get deploy darkplum-gateway -n darkplum-system >/dev/null 2>&1 || { echo "ERROR: gateway not deployed. Run 'make deploy' (or 'make dev-up') first."; exit 1; }
+	@echo "Installing vLLM Semantic Router ($(SR_VERSION)) from $(SR_VALUES)..."
+	@helm upgrade --install semantic-router $(SR_CHART) --version $(SR_VERSION) -n darkplum-system -f $(SR_VALUES) >/dev/null
+	@kubectl apply -f $(K8S_DIR)/semantic-router/network-policies.yaml >/dev/null
+	@echo "Waiting for it to download its classifier models and become ready (usually 1-3 minutes)..."
+	@kubectl rollout status deploy/semantic-router -n darkplum-system --timeout=900s
+	@echo "Pointing the gateway at it..."
+	@kubectl set env deploy/darkplum-gateway -n darkplum-system \
+		SEMANTIC_ROUTER_URL=http://semantic-router.darkplum-system.svc.cluster.local:8080 >/dev/null
+	@kubectl rollout status deploy/darkplum-gateway -n darkplum-system --timeout=180s
+	@echo ""
+	@echo "Semantic router ready. Its decisions (category names) come from $(SR_VALUES):"
+	@grep -E '^\s+- name: [a-z0-9_-]+$$' $(SR_VALUES) | sed -n '/decisions/,$$p' >/dev/null 2>&1; \
+		awk '/^    decisions:/{f=1} f && /^      - name:/{print "  " $$3}' $(SR_VALUES)
+	@echo "A routed alias with classifier 'Semantic Router' maps each name onto a route of the same name."
+
+remove-semantic-router: ## Remove the intent classifier; routed aliases using it fall back to their default route
+	@kubectl set env deploy/darkplum-gateway -n darkplum-system SEMANTIC_ROUTER_URL- >/dev/null 2>&1 || true
+	@helm uninstall semantic-router -n darkplum-system >/dev/null 2>&1 || true
+	@kubectl delete -f $(K8S_DIR)/semantic-router/network-policies.yaml --ignore-not-found >/dev/null
+	@echo "Semantic router removed."
 
 # =============================================================================
 # Exposing the web UI (production)

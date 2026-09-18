@@ -155,6 +155,8 @@ See `terraform/aws/variables.tf` for the full list.
 | `make list-models` | List self-hosted model deployments and gateway upstreams |
 | `make verify-bedrock-iam` | Prove the gateway's IAM role allows only the configured Bedrock models |
 | `make set-hf-token` | Store a Hugging Face token for gated models (from `$HF_TOKEN`) |
+| `make deploy-semantic-router` | Install the open-source intent classifier for routed aliases |
+| `make remove-semantic-router` | Remove it (routed aliases fall back to their default route) |
 | `make expose-web [SCHEME=internal] [CERT_ARN=]` | Publish the web UI on an AWS load balancer |
 | `make unexpose-web` | Back to cluster-internal (port-forward) |
 | `make test` | Send a test chat completion request |
@@ -279,6 +281,40 @@ if anything outside the allowlist would be permitted.
 - *Aliases* — stable names such as `default-chat` that point at a model, so
   swapping models is an admin change rather than a code change. The usage log
   records both the alias requested and the model that served it.
+- *Routed aliases* — an alias whose administrator writes a short list of routes
+  (a named intent, a description, one target model each) and picks a classifier:
+  explainable rules (keywords, code detection, prompt length), or a model you host
+  in your own cluster. The classifier chooses among those routes and no others;
+  the chosen model still passes the enabled and residency checks, and a route the
+  policy forbids is refused, never swapped. Every request records the route, the
+  reason, and every model that saw the prompt — the classifier included — and the
+  chat shows which model answered. Regulated intents can stay on in-account
+  models while everything else may use the frontier gateway. Test any prompt
+  against a routed alias from the admin page without sending it to a model.
+
+  Three classifiers are available per routed alias:
+  - **Rules** — admin keywords plus three built-in signals (`builtin:code`,
+    `builtin:long`, `builtin:multimodal`). No model, no added latency, one-line
+    explanations.
+  - **Semantic Router** — the open-source [vLLM Semantic Router](https://vllm-sr.ai)
+    (Apache-2.0) running on CPU inside the cluster, installed with
+    `make deploy-semantic-router`. About 100 ms per decision. Its decision names
+    are configured in `k8s/semantic-router/values.yaml` (defaults: `legal`,
+    `code`, `general`) and must match your route names. The gateway only calls
+    its classification API; it never carries traffic.
+  - **Model** — any self-hosted instruct model from your catalog, asked with the
+    Arch-Router prompt protocol (routes as JSON, answer `{"route": ...}`),
+    temperature 0, 8 tokens, last user turn only. Note: Katanemo's own
+    Arch-Router-1.5B weights are licensed for non-commercial use only and are not
+    bundled; Apache-2.0 instruct models such as Qwen2.5 work with the same protocol.
+
+  Whatever the classifier says, the chosen model still passes the enabled and
+  residency checks; a forbidden pick is refused with the route named, never
+  swapped. Classification runs in-cluster with a 500 ms budget and a circuit
+  breaker; on timeout or breaker-open the alias falls back to its default route
+  and the reason is recorded. A model classifier's look at the prompt is itself
+  an audit row (`purpose = routing`), so "which models saw this prompt" stays one
+  query.
 
 **Gated models** (Llama, Gemma and other licence-gated weights on Hugging Face):
 accept the licence on huggingface.co with your account, then store a read token

@@ -127,6 +127,16 @@ func (h *ChatHandler) ProxyChat(c *gin.Context) {
 		"Content-Type",
 		"X-Request-Id",
 		"Cache-Control",
+		// Routing headers (routed aliases only, but harmless to check
+		// unconditionally): the resolved model, the route the classifier
+		// picked, and its one-line reason. Set by the gateway before its
+		// first response byte, for both stream and non-stream requests (see
+		// DESIGN3's Semantics section) -- passed through here unmodified so
+		// the webchat can show "answered by <model> (route <name>)" and
+		// implement pinned_model stickiness without a second round trip.
+		"X-Darkplum-Model",
+		"X-Darkplum-Route",
+		"X-Darkplum-Router-Reason",
 	} {
 		if v := resp.Header.Get(header); v != "" {
 			c.Header(header, v)

@@ -5,6 +5,7 @@ import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
 import type { ChatMessage } from '../types'
 import { formatModelName } from '../lib/formatModelName'
+import { routerReasonText } from '../lib/modelRouting'
 import { CodeBlock } from '../components/ui/CodeBlock'
 import { CopyButton } from '../components/ui/CopyButton'
 import styles from './MessageList.module.css'
@@ -199,9 +200,60 @@ const ThinkingIndicator = () => (
   </div>
 )
 
+/** Which model answered, and — for a routed alias — the route the administrator
+ *  wrote that it came through. Never a guess: both come from the gateway's own
+ *  response headers, and the model is re-read from history on reload. */
+const Provenance = ({
+  model,
+  route,
+  routerReason,
+  rerouted,
+}: {
+  model: string
+  route?: string | null
+  routerReason?: string | null
+  rerouted?: boolean
+}) => {
+  const reason = routerReasonText(routerReason)
+  const spoken = [
+    `Answered by ${formatModelName(model)}`,
+    route ? `route ${route}` : '',
+    reason,
+    rerouted ? 'the model this conversation had been using was no longer available' : '',
+  ]
+    .filter(Boolean)
+    .join('. ')
+
+  return (
+    <span className={styles.provenance}>
+      <span aria-hidden="true">
+        answered by <span className={styles.provenanceId} title={model}>{formatModelName(model)}</span>
+        {route && (
+          <>
+            {' · route '}
+            <span className={styles.provenanceId} title={reason || undefined}>{route}</span>
+          </>
+        )}
+        {rerouted && (
+          <span
+            className={styles.provenanceNote}
+            title="The model this conversation had been using is no longer available, so the alias chose again."
+          >
+            re-routed
+          </span>
+        )}
+      </span>
+      <span className={styles.srOnly}>{spoken}</span>
+    </span>
+  )
+}
+
 const AssistantBubble = memo(({
   content,
   model,
+  route,
+  routerReason,
+  rerouted,
   isStreaming,
   isLast,
   onRegenerate,
@@ -210,6 +262,11 @@ const AssistantBubble = memo(({
   /** The model the server recorded as having produced this reply. A thread can
    *  span several, so the answer says which one it came from. */
   model?: string | null
+  /** Routed aliases: the route this reply came through, and why it was chosen.
+   *  Known for the turn that just arrived; history keeps the model only. */
+  route?: string | null
+  routerReason?: string | null
+  rerouted?: boolean
   isStreaming: boolean
   isLast: boolean
   onRegenerate?: () => void
@@ -232,9 +289,12 @@ const AssistantBubble = memo(({
             <div className={styles.actions}>
               <CopyButton value={content} label="Copy" />
               {model && (
-                <span className={styles.messageModel} title={model}>
-                  {formatModelName(model)}
-                </span>
+                <Provenance
+                  model={model}
+                  route={route}
+                  routerReason={routerReason}
+                  rerouted={rerouted}
+                />
               )}
               {isLast && onRegenerate && (
                 <button className={styles.regenerate} onClick={onRegenerate} type="button">
@@ -304,6 +364,9 @@ export function MessageList({
                 key={i}
                 content={msg.content}
                 model={msg.model}
+                route={msg.route}
+                routerReason={msg.routerReason}
+                rerouted={msg.rerouted}
                 isStreaming={isLast && streaming}
                 isLast={isLast}
                 onRegenerate={onRegenerate}

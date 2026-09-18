@@ -23,6 +23,7 @@ import (
 	"github.com/scalecraft/darkplum/gateway/internal/provider/mock"
 	"github.com/scalecraft/darkplum/gateway/internal/provider/openaicompat"
 	"github.com/scalecraft/darkplum/gateway/internal/recorder"
+	"github.com/scalecraft/darkplum/gateway/internal/router"
 	"github.com/scalecraft/darkplum/gateway/internal/routing"
 )
 
@@ -173,18 +174,33 @@ func main() {
 	}
 	upstreamChecker := health.NewChecker(healthEntries)
 
-	chatHandler := handler.NewChatHandler(reg, routeMgr, polStore)
-
 	rec := recorder.New(dbPool)
 
+	// Routed-alias classifiers. rulesClassifier is stateless; modelClassifier
+	// and semanticClassifier each own a circuit breaker over
+	// CLASSIFIER_TIMEOUT_MS/CLASSIFIER_BREAKER_FAILURES/
+	// CLASSIFIER_BREAKER_OPEN_SECONDS, surfaced on /health below.
+	// SemanticRouterURL empty (SEMANTIC_ROUTER_URL unset) is a supported,
+	// permanent "unconfigured" state — every semantic_router alias just
+	// degrades to default_route until an operator sets it.
+	rulesClassifier := router.NewRulesClassifier()
+	classifierTimeout := time.Duration(cfg.ClassifierTimeoutMS) * time.Millisecond
+	classifierBreakerOpen := time.Duration(cfg.ClassifierBreakerOpenSeconds) * time.Second
+	modelClassifier := router.NewModelClassifier(reg, routeMgr, polStore, classifierTimeout, cfg.ClassifierBreakerFailures, classifierBreakerOpen)
+	semanticClassifier := router.NewSemanticRouterClassifier(cfg.SemanticRouterURL, cfg.SemanticRouterMinConfidence, classifierTimeout, cfg.ClassifierBreakerFailures, classifierBreakerOpen)
+	log.Printf("gateway: routed-alias classifiers configured: timeout=%s breaker_failures=%d breaker_open=%s semantic_router_url=%q semantic_router_min_confidence=%.2f",
+		classifierTimeout, cfg.ClassifierBreakerFailures, classifierBreakerOpen, cfg.SemanticRouterURL, cfg.SemanticRouterMinConfidence)
+
+	chatHandler := handler.NewChatHandler(reg, routeMgr, polStore, rulesClassifier, modelClassifier, semanticClassifier, rec)
+
 	gin.SetMode(gin.ReleaseMode)
-	healthHandler := newHealthHandler(upstreamChecker, routeMgr, polStore)
-	router := buildRouter(chatHandler, middleware.APIKey(dbPool), middleware.Recording(rec), healthHandler)
+	healthHandler := newHealthHandler(upstreamChecker, routeMgr, polStore, modelClassifier, semanticClassifier)
+	httpRouter := buildRouter(chatHandler, middleware.APIKey(dbPool), middleware.Recording(rec), healthHandler)
 
 	addr := ":" + cfg.Port
 	srv := &http.Server{
 		Addr:         addr,
-		Handler:      router,
+		Handler:      httpRouter,
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 0, // streaming responses can run for minutes
 		IdleTimeout:  120 * time.Second,
@@ -224,27 +240,40 @@ func main() {
 // dependencies so tests can substitute no-op fakes for the auth/audit
 // machinery, which already has its own package-level tests.
 func buildRouter(chatHandler *handler.ChatHandler, apiKeyMW, recordingMW, healthHandler gin.HandlerFunc) *gin.Engine {
-	router := gin.New()
-	router.Use(gin.Logger())
-	router.Use(gin.Recovery())
+	engine := gin.New()
+	engine.Use(gin.Logger())
+	engine.Use(gin.Recovery())
 
-	router.GET("/health", healthHandler)
+	engine.GET("/health", healthHandler)
 
-	v1 := router.Group("/v1")
+	v1 := engine.Group("/v1")
 	v1.Use(apiKeyMW)
-	v1.Use(recordingMW)
 
-	// Only two endpoints are served under /v1. There is no reverse-proxy
+	// GET /v1/models and POST /v1/routing/dryrun are authenticated but not
+	// wrapped in recordingMW: recordingMW builds and records exactly one
+	// purpose="inference" InferenceEvent per POST, which is right for
+	// /chat/completions but wrong for a dryrun (it never dispatches to any
+	// model, so there is no "inference" to record — HandleRoutingDryrun
+	// records its own, single, purpose="routing_dryrun" row directly,
+	// only when a model classifier call actually happened). GET /v1/models
+	// is unaffected either way (Recording is a POST-only middleware) but is
+	// kept out of the recorded group for the same reason: it never produces
+	// an inference_events row.
+	v1.GET("/models", chatHandler.HandleListModels)
+	v1.POST("/routing/dryrun", chatHandler.HandleRoutingDryrun)
+
+	// Only three endpoints are served under /v1. There is no reverse-proxy
 	// passthrough: the previous behaviour forwarded every other
 	// GET/DELETE/PUT/PATCH /v1/* request straight to the default vLLM
 	// upstream with no policy check — an open allowlist onto a third party's
 	// route table that also leaked GET /v1/models/{id} metadata for arbitrary
-	// ids. Every other /v1/* path, and every other method on these two paths,
-	// falls through to the NoRoute handler below.
-	v1.GET("/models", chatHandler.HandleListModels)
-	v1.POST("/chat/completions", chatHandler.HandleChatCompletions)
+	// ids. Every other /v1/* path, and every other method on these three
+	// paths, falls through to the NoRoute handler below.
+	recorded := v1.Group("")
+	recorded.Use(recordingMW)
+	recorded.POST("/chat/completions", chatHandler.HandleChatCompletions)
 
-	router.NoRoute(func(c *gin.Context) {
+	engine.NoRoute(func(c *gin.Context) {
 		if strings.HasPrefix(c.Request.URL.Path, "/v1/") {
 			respondUnknownEndpoint(c)
 			return
@@ -252,7 +281,7 @@ func buildRouter(chatHandler *handler.ChatHandler, apiKeyMW, recordingMW, health
 		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
 	})
 
-	return router
+	return engine
 }
 
 // respondUnknownEndpoint writes the OpenAI-compatible 404 for any /v1/* path
@@ -270,13 +299,27 @@ func respondUnknownEndpoint(c *gin.Context) {
 	})
 }
 
+// classifierBreakerStatus is the subset of *router.ModelClassifier that
+// newHealthHandler needs. Defined as an interface so tests can substitute a
+// fake without constructing a real classifier/registry/routes/policy chain.
+type classifierBreakerStatus interface {
+	Status() (breakerOpen bool, consecutiveFailures int)
+}
+
+// semanticRouterHealthStatus is the subset of *router.SemanticRouterClassifier
+// that newHealthHandler needs, for the same reason as classifierBreakerStatus.
+type semanticRouterHealthStatus interface {
+	HealthStatus(ctx context.Context) string
+}
+
 // newHealthHandler builds the /health handler. /health is the liveness AND
 // readiness probe endpoint: it always returns 200 as long as the process is
-// healthy — upstream reachability, routing source state, and policy
-// staleness are OBSERVABILITY, never a kill switch. A down lmstudio/vllm
-// upstream, an expired routing source, or a stale policy snapshot must never
-// flip the pod to unready and take out unrelated traffic (e.g. a
-// Bedrock-only deployment).
+// healthy — upstream reachability, routing source state, policy staleness,
+// and classifier breaker/reachability state are OBSERVABILITY, never a kill
+// switch. A down lmstudio/vllm upstream, an expired routing source, a stale
+// policy snapshot, an open classifier breaker, or an unreachable semantic
+// router must never flip the pod to unready and take out unrelated traffic
+// (e.g. a deployment that doesn't use routed aliases at all).
 //
 // The response is unauthenticated, so routing source status reports model
 // COUNTS only (never model ids or secrets), and a discovery failure is
@@ -284,8 +327,10 @@ func respondUnknownEndpoint(c *gin.Context) {
 // routing.classifyError) — never the raw error string. The raw error
 // (which, for an HTTP discovery failure, is an *url.Error whose message
 // embeds the full upstream URL) is only ever written to the gateway's own
-// log by routing.Manager.Refresh.
-func newHealthHandler(upstreamChecker *health.Checker, routeMgr *routing.Manager, polStore *policy.PgStore) gin.HandlerFunc {
+// log by routing.Manager.Refresh. Similarly, semanticClassifier.HealthStatus
+// is a cached, rate-limited probe (see SemanticRouterClassifier) — this
+// handler never triggers a network call itself.
+func newHealthHandler(upstreamChecker *health.Checker, routeMgr *routing.Manager, polStore *policy.PgStore, modelClassifier classifierBreakerStatus, semanticClassifier semanticRouterHealthStatus) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		upstreams := upstreamChecker.Check(c.Request.Context())
 		upstreamBody := make(map[string]string, len(upstreams))
@@ -305,12 +350,19 @@ func newHealthHandler(upstreamChecker *health.Checker, routeMgr *routing.Manager
 
 		policyStatus := polStore.Status()
 
+		breakerOpen, consecutiveFailures := modelClassifier.Status()
+
 		c.JSON(http.StatusOK, gin.H{
 			"status":    "ok",
 			"upstreams": upstreamBody,
 			"routing": gin.H{
 				"models":  routingStatus.Models,
 				"sources": sourcesBody,
+				"classifier": gin.H{
+					"breaker_open":         breakerOpen,
+					"consecutive_failures": consecutiveFailures,
+					"semantic_router":      semanticClassifier.HealthStatus(c.Request.Context()),
+				},
 			},
 			"policy": gin.H{
 				"loaded":      policyStatus.Loaded,

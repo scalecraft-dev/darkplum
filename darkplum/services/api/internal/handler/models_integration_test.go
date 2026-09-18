@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/scalecraft/darkplum/api/internal/activity"
 )
 
 func newModelsTestRouter(h *ModelHandler) *gin.Engine {
@@ -512,5 +514,72 @@ func TestSyncModels_HappyPathUsesBatchUpsert(t *testing.T) {
 	}
 	if newEnabled {
 		t.Errorf("brand-new-1 enabled = true, want false (schema default)")
+	}
+}
+
+// TestListModels_RoutedAlias_EndToEnd exercises the real SQL grouping in
+// ModelHandler.ListModels (not just the pure buildModelsList logic): a routed
+// alias created through RoutingHandler.PutAlias must show up in the
+// chat-facing /v1/models list with alias_kind, alias_of, and a routes[]
+// summary, and disappear once every route's target is disabled.
+func TestListModels_RoutedAlias_EndToEnd(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	userID := newTestUser(t, ctx, pool)
+	insertModel(t, ctx, pool, "llama3", backendClassSelfHosted, true)
+	insertModel(t, ctx, pool, "llama3-code", backendClassSelfHosted, true)
+
+	routingH := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
+	routingRouter := newRoutingTestRouter(routingH, userID)
+	resp := doJSON(t, routingRouter, http.MethodPut, "/api/v1/model-aliases/smart",
+		routedBody("general", [2]string{"general", "llama3"}, [2]string{"code", "llama3-code"}))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("create routed alias: status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+
+	h := NewModelHandler("http://unused.invalid", "unused", pool)
+	r := newModelsTestRouter(h)
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	var listResp openAIModelsResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &listResp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	var entry *openAIModelEntry
+	for i := range listResp.Data {
+		if listResp.Data[i].ID == "smart" {
+			entry = &listResp.Data[i]
+		}
+	}
+	if entry == nil {
+		t.Fatalf("routed alias 'smart' missing from /v1/models: %+v", listResp.Data)
+	}
+	if entry.AliasKind != aliasKindRouted {
+		t.Fatalf("alias_kind = %q, want routed", entry.AliasKind)
+	}
+	if entry.AliasOf == nil || *entry.AliasOf != "llama3" {
+		t.Fatalf("alias_of = %v, want llama3 (the default route's target)", entry.AliasOf)
+	}
+	if len(entry.Routes) != 2 {
+		t.Fatalf("routes = %+v, want 2", entry.Routes)
+	}
+
+	// Disable both route targets: the alias must disappear entirely.
+	if _, err := pool.Exec(ctx, `UPDATE models SET enabled = false WHERE model_id IN ('llama3', 'llama3-code')`); err != nil {
+		t.Fatalf("disable targets: %v", err)
+	}
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if err := json.Unmarshal(rec.Body.Bytes(), &listResp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	for _, e := range listResp.Data {
+		if e.ID == "smart" {
+			t.Fatalf("expected routed alias to disappear once all targets are disabled, got %+v", e)
+		}
 	}
 }

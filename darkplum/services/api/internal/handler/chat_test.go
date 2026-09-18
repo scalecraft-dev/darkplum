@@ -69,3 +69,48 @@ func TestProxyChat_GatewayErrorPassthrough(t *testing.T) {
 		}
 	}
 }
+
+// TestProxyChat_RoutingHeadersForwarded covers the gateway's
+// X-Darkplum-Model/X-Darkplum-Route/X-Darkplum-Router-Reason response
+// headers being copied through to the browser unchanged, for both
+// stream:true and stream:false requests (set before the first byte on both
+// paths per DESIGN3's Semantics section).
+func TestProxyChat_RoutingHeadersForwarded(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		t.Run(fmt.Sprintf("stream=%v", stream), func(t *testing.T) {
+			gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.Header().Set("X-Darkplum-Model", "llama3-code")
+				w.Header().Set("X-Darkplum-Route", "code")
+				w.Header().Set("X-Darkplum-Router-Reason", "rules:code:builtin:code")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(`{"id":"x","choices":[]}`))
+			}))
+			defer gw.Close()
+
+			gin.SetMode(gin.TestMode)
+			h := NewChatHandler(gw.URL, "dp_test_service_key_000000000000000000000")
+			r := gin.New()
+			r.POST("/v1/chat/completions", h.ProxyChat)
+
+			reqBody := fmt.Sprintf(`{"model":"smart","messages":[{"role":"user","content":"hi"}],"stream":%v}`, stream)
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+			}
+			if got := rec.Header().Get("X-Darkplum-Model"); got != "llama3-code" {
+				t.Errorf("X-Darkplum-Model = %q, want llama3-code", got)
+			}
+			if got := rec.Header().Get("X-Darkplum-Route"); got != "code" {
+				t.Errorf("X-Darkplum-Route = %q, want code", got)
+			}
+			if got := rec.Header().Get("X-Darkplum-Router-Reason"); got != "rules:code:builtin:code" {
+				t.Errorf("X-Darkplum-Router-Reason = %q, want rules:code:builtin:code", got)
+			}
+		})
+	}
+}

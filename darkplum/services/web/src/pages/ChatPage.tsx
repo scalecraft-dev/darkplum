@@ -17,6 +17,7 @@ import {
   openConversation,
   renameConversation,
   setConversationModel,
+  setConversationPinnedModel,
   startConversation,
   toWireMessages,
   truncateFrom,
@@ -53,8 +54,25 @@ const STALE_MODEL_CODES = new Set([
   'model_residency_violation',
 ])
 
+/** Refusals that say the model this conversation was pinned to has gone. The
+ *  alias is still good, so the message is sent again through it and whichever
+ *  route the administrator wrote for it answers. */
+const PIN_LOST_CODES = new Set(['model_not_found', 'model_not_enabled'])
+
 function errorText(err: unknown, fallback: string): string {
   return err instanceof Error && err.message ? err.message : fallback
+}
+
+/** What one pass of the stream produced, including what the gateway said in
+ *  its response headers about which model and route answered. */
+interface Attempt {
+  outcome: 'done' | 'error' | 'aborted'
+  error: Error | null
+  text: string
+  requestId: string | null
+  servedModel: string | null
+  route: string | null
+  reason: string | null
 }
 
 export function ChatPage() {
@@ -87,6 +105,13 @@ export function ChatPage() {
   const [failure, setFailure] = useState<ChatFailure | null>(null)
   const abortRef = useRef<AbortController | null>(null)
   const modelIds = useMemo(() => models.map((m) => m.id), [models])
+  /** Entries that are routed aliases: an administrator wrote several routes for
+   *  them, so a reply names the route it came through and the conversation is
+   *  held to the model that answered first. */
+  const routedAliases = useMemo(
+    () => new Set(models.filter((m) => m.alias_kind === 'routed').map((m) => m.id)),
+    [models],
+  )
   const modelsReady = models.length > 0
   /** The default below is a convenience for the first visit only. Once it has
    *  fired, an empty selection is a deliberate one and stays empty. */
@@ -214,15 +239,21 @@ export function ChatPage() {
    *  written to the conversation as well. Without that, a send would still go
    *  out on whatever model the conversation was last opened with. The failure
    *  card stays put: it is the only remaining way back to the refused message. */
+  /** Picking a different entry ends any stickiness: the model this conversation
+   *  was held to belonged to the entry that has just been replaced. */
   const handleModelChange = useCallback((id: string) => {
     setModel(id)
     autoPickedRef.current = true
     if (!id || !active || active.model === id) return
-    patchConv(active.id, (c) => ({ ...c, model: id }))
+    const hadPin = active.pinnedModel !== null
+    patchConv(active.id, (c) => ({ ...c, model: id, pinnedModel: null }))
     // A preference, not content: a conversation that has not been created yet
     // carries it along on the first send, and a failed write is not worth
     // interrupting anyone over.
-    if (!active.draft) void setConversationModel(active.id, id).catch(() => {})
+    if (!active.draft) {
+      void setConversationModel(active.id, id).catch(() => {})
+      if (hadPin) void setConversationPinnedModel(active.id, null).catch(() => {})
+    }
   }, [active, patchConv])
 
   const handleNewChat = useCallback(() => {
@@ -325,8 +356,14 @@ export function ChatPage() {
       // Only ever the active conversation reaches here, so the picker is this
       // conversation's current choice and outranks the model it was last sent
       // on: what is on screen is what the data goes to.
-      const sendModel = model || conv.model
-      if (!sendModel) return
+      const picked = model || conv.model
+      if (!picked) return
+
+      // A routed alias resolves to one of the models the administrator wrote
+      // routes for. Once one of them has answered, the rest of the conversation
+      // goes to that same model rather than being classified again.
+      const routed = routedAliases.has(picked)
+      const pinned = routed ? conv.pinnedModel : null
 
       const isDraft = conv.draft === true
       const title =
@@ -341,7 +378,9 @@ export function ChatPage() {
             ? {
                 ...c,
                 title,
-                model: sendModel,
+                // The picker's entry, not the model it resolved to: the alias is
+                // what this conversation reopens on.
+                model: picked,
                 updatedAt: new Date().toISOString(),
                 messages: [...messagesToSend, { role: 'assistant' as const, content: '' }],
               }
@@ -366,7 +405,7 @@ export function ChatPage() {
       }> => {
         try {
           if (isDraft) {
-            const created = await startConversation({ title, model: sendModel, messages: unsent })
+            const created = await startConversation({ title, model: picked, messages: unsent })
             liveId = created.id
             setConversations((prev) =>
               prev.map((c) =>
@@ -404,46 +443,85 @@ export function ChatPage() {
         }
       })()
 
-      const ctrl = new AbortController()
-      abortRef.current = ctrl
-
-      let accum = ''
-      let requestId: string | null = null
-      // Held on an object rather than in locals: the stream reports through
-      // callbacks, and these are read after it has finished.
-      const result: { outcome: 'done' | 'error' | 'aborted'; error: Error | null } = {
-        outcome: 'aborted',
-        error: null,
+      // One pass of the stream. Held on an object rather than in locals: the
+      // stream reports through callbacks and these are read after it finishes.
+      const streamOnce = async (modelId: string): Promise<Attempt> => {
+        const ctrl = new AbortController()
+        abortRef.current = ctrl
+        let accum = ''
+        const attempt: Attempt = {
+          outcome: 'aborted',
+          error: null,
+          text: '',
+          requestId: null,
+          servedModel: null,
+          route: null,
+          reason: null,
+        }
+        await streamChat(
+          toWireMessages(messagesToSend),
+          modelId,
+          (token) => {
+            accum += token
+            setConversations((prev) =>
+              prev.map((c) =>
+                c.id === liveId
+                  ? { ...c, messages: [...messagesToSend, { role: 'assistant' as const, content: accum }] }
+                  : c,
+              ),
+            )
+          },
+          () => {
+            attempt.outcome = 'done'
+          },
+          (err) => {
+            attempt.outcome = 'error'
+            attempt.error = err
+          },
+          ctrl.signal,
+          (meta) => {
+            attempt.requestId = meta.requestId
+            attempt.servedModel = meta.model
+            attempt.route = meta.route
+            attempt.reason = meta.routerReason
+          },
+        )
+        abortRef.current = null
+        attempt.text = accum
+        return attempt
       }
 
-      await streamChat(
-        toWireMessages(messagesToSend),
-        sendModel,
-        (token) => {
-          accum += token
-          setConversations((prev) =>
-            prev.map((c) =>
-              c.id === liveId
-                ? { ...c, messages: [...messagesToSend, { role: 'assistant' as const, content: accum }] }
-                : c,
-            ),
-          )
-        },
-        () => {
-          result.outcome = 'done'
-        },
-        (err) => {
-          result.outcome = 'error'
-          result.error = err
-        },
-        ctrl.signal,
-        (meta) => {
-          requestId = meta.requestId
-        },
-      )
+      let sendModel = pinned ?? picked
+      let result = await streamOnce(sendModel)
+      let rerouted = false
+
+      // The model this conversation was held to has gone. The alias has not, so
+      // the message goes out once more through it and whichever route the
+      // administrator wrote answers instead. Said plainly under the reply.
+      const pinRefusedCode =
+        pinned !== null && sendModel === pinned && result.outcome === 'error' && !result.text
+          ? result.error instanceof ChatError
+            ? result.error.code
+            : undefined
+          : undefined
+      if (pinRefusedCode && STALE_MODEL_CODES.has(pinRefusedCode)) {
+        // Whatever the refusal was, holding the conversation to a model the
+        // gateway will not serve only repeats it. Let the alias choose again.
+        setConversations((prev) =>
+          prev.map((c) => (c.id === liveId ? { ...c, pinnedModel: null } : c)),
+        )
+        if (!isDraft) void setConversationPinnedModel(liveId, null).catch(() => {})
+        // A model that is gone or off is worth one more try through the alias.
+        // A policy refusal is the administrator's decision and stands: it is
+        // reported, and the next send classifies afresh.
+        if (PIN_LOST_CODES.has(pinRefusedCode)) {
+          sendModel = picked
+          rerouted = true
+          result = await streamOnce(picked)
+        }
+      }
 
       setStreaming(false)
-      abortRef.current = null
 
       const target = await saveUserTurn
 
@@ -466,7 +544,7 @@ export function ChatPage() {
         return
       }
 
-      const reply = accum
+      const reply = result.text
       if (!reply.trim()) {
         // Stopped before a word arrived: there is no turn worth keeping.
         setConversations((prev) =>
@@ -475,20 +553,35 @@ export function ChatPage() {
         return
       }
 
+      // The gateway names the model that answered in a response header. That is
+      // the only thing that knows what a routed alias resolved to — the picker
+      // held an alias, and the alias is not a model.
+      const resolved = result.servedModel ?? sendModel
+
+      // Hold the rest of the conversation to it, so turn 2 is answered by the
+      // same model that answered turn 1.
+      if (routed && result.servedModel && result.servedModel !== pinned) {
+        const pinTo = result.servedModel
+        setConversations((prev) =>
+          prev.map((c) => (c.id === target.id ? { ...c, pinnedModel: pinTo } : c)),
+        )
+        if (target.stored) void setConversationPinnedModel(target.id, pinTo).catch(() => {})
+      }
+
       let stored = false
-      let servedBy: string | null = sendModel
+      let servedBy: string | null = resolved
       let storedSeq: number | null = null
       let diverged = target.diverged
       if (target.stored) {
         try {
           const appended = await appendTurns(target.id, [
-            assistantTurn(reply, sendModel, requestId),
+            assistantTurn(reply, resolved, result.requestId),
           ])
           const saved = appended.messages[appended.messages.length - 1]
           // The server names the model that actually served the request; it
           // knows, and the picker only ever held an intention.
           if (saved) {
-            servedBy = saved.model ?? sendModel
+            servedBy = saved.model ?? resolved
             storedSeq = saved.seq
           }
           diverged = diverged || appended.diverged
@@ -500,7 +593,16 @@ export function ChatPage() {
 
       const finalMessages: ChatMessage[] = [
         ...messagesToSend,
-        { role: 'assistant', content: reply, model: servedBy },
+        {
+          role: 'assistant',
+          content: reply,
+          model: servedBy,
+          // History keeps the model per turn, not the route, so these last only
+          // as long as this copy of the conversation does.
+          route: result.route,
+          routerReason: result.reason,
+          rerouted,
+        },
       ]
       setConversations((prev) =>
         prev.map((c) =>
@@ -533,7 +635,7 @@ export function ChatPage() {
         }
       }
     },
-    [streaming, model, reconcileModels],
+    [streaming, model, routedAliases, reconcileModels],
   )
 
   const handleSend = useCallback(

@@ -144,6 +144,15 @@
   white-space: nowrap;
 }
 
+/* The administrator's own route name, in the monospace used for every other
+   identifier on these pages. */
+.routeName {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--fg-default);
+  white-space: nowrap;
+}
+
 /* --- Empty state --- */
 
 .empty {
@@ -235,6 +244,8 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
+  gap: var(--space-3);
+  flex-wrap: wrap;
   margin-bottom: var(--space-3);
 }
 

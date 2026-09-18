@@ -1,6 +1,10 @@
 package handler
 
-import "testing"
+import (
+	"fmt"
+	"strings"
+	"testing"
+)
 
 func TestValidAliasFormat(t *testing.T) {
 	valid := []string{
@@ -53,6 +57,173 @@ func repeat(s string, n int) string {
 		out = append(out, s...)
 	}
 	return string(out)
+}
+
+func TestValidRouteName(t *testing.T) {
+	ok32 := "a" + repeat("b", 31)    // 32 chars, max length
+	tooLong := "a" + repeat("b", 32) // 33 chars
+
+	valid := []string{"general", "code", "a", "route-1", "route_1", ok32}
+	for _, v := range valid {
+		if !validRouteName(v) {
+			t.Errorf("validRouteName(%q) = false, want true", v)
+		}
+	}
+	invalid := []string{"", "-leading-dash", "_leading-underscore", "Uppercase", "has space", "has.dot", tooLong}
+	for _, v := range invalid {
+		if validRouteName(v) {
+			t.Errorf("validRouteName(%q) = true, want false", v)
+		}
+	}
+}
+
+func TestValidRouteDescription(t *testing.T) {
+	if validRouteDescription("") {
+		t.Error("empty description should be invalid")
+	}
+	if !validRouteDescription("a") {
+		t.Error("1-character description should be valid")
+	}
+	if !validRouteDescription(repeat("a", 500)) {
+		t.Error("500-character description should be valid")
+	}
+	if validRouteDescription(repeat("a", 501)) {
+		t.Error("501-character description should be invalid")
+	}
+}
+
+func TestNormalizeKeyword(t *testing.T) {
+	cases := []struct {
+		in     string
+		want   string
+		wantOK bool
+	}{
+		{"  Code  ", "code", true},
+		{"BUILTIN:CODE", "builtin:code", true},
+		{"", "", false},
+		{"   ", "", false},
+		{repeat("a", 64), repeat("a", 64), true},
+		{repeat("a", 65), "", false},
+	}
+	for _, tc := range cases {
+		got, ok := normalizeKeyword(tc.in)
+		if ok != tc.wantOK || (ok && got != tc.want) {
+			t.Errorf("normalizeKeyword(%q) = (%q, %v), want (%q, %v)", tc.in, got, ok, tc.want, tc.wantOK)
+		}
+	}
+}
+
+func validRouteInput(name, target string) putAliasRouteInput {
+	return putAliasRouteInput{RouteName: name, Description: "a description", TargetModelID: target, Keywords: nil}
+}
+
+func TestValidateRoutedAliasShape_Valid(t *testing.T) {
+	req := putAliasRequest{
+		DefaultRoute: "general",
+		Classifier:   &putAliasClassifierInput{Kind: "rules"},
+		Routes: []putAliasRouteInput{
+			validRouteInput("general", "llama3"),
+			{RouteName: "code", Description: "code stuff", TargetModelID: "llama3-code", Keywords: []string{"  Code  ", "builtin:code"}},
+		},
+	}
+	normalized, err := validateRoutedAliasShape(req)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(normalized) != 2 {
+		t.Fatalf("len(normalized) = %d, want 2", len(normalized))
+	}
+	if normalized[1].Keywords[0] != "code" || normalized[1].Keywords[1] != "builtin:code" {
+		t.Errorf("keywords not case-folded/trimmed: %+v", normalized[1].Keywords)
+	}
+}
+
+func TestValidateRoutedAliasShape_NoRoutes(t *testing.T) {
+	_, err := validateRoutedAliasShape(putAliasRequest{DefaultRoute: "general", Classifier: &putAliasClassifierInput{Kind: "rules"}})
+	if err == nil {
+		t.Fatal("expected error for zero routes")
+	}
+}
+
+func TestValidateRoutedAliasShape_InvalidRouteName(t *testing.T) {
+	req := putAliasRequest{
+		DefaultRoute: "General",
+		Classifier:   &putAliasClassifierInput{Kind: "rules"},
+		Routes:       []putAliasRouteInput{validRouteInput("General", "llama3")},
+	}
+	if _, err := validateRoutedAliasShape(req); err == nil {
+		t.Fatal("expected error for invalid route_name")
+	}
+}
+
+func TestValidateRoutedAliasShape_DuplicateRouteNames(t *testing.T) {
+	req := putAliasRequest{
+		DefaultRoute: "general",
+		Classifier:   &putAliasClassifierInput{Kind: "rules"},
+		Routes: []putAliasRouteInput{
+			validRouteInput("general", "llama3"),
+			validRouteInput("general", "llama3-v2"),
+		},
+	}
+	_, err := validateRoutedAliasShape(req)
+	if err == nil || !strings.Contains(err.Error(), "duplicate route name") {
+		t.Fatalf("err = %v, want a duplicate route name error", err)
+	}
+}
+
+func TestValidateRoutedAliasShape_DefaultRouteNotInRoutes(t *testing.T) {
+	req := putAliasRequest{
+		DefaultRoute: "missing",
+		Classifier:   &putAliasClassifierInput{Kind: "rules"},
+		Routes:       []putAliasRouteInput{validRouteInput("general", "llama3")},
+	}
+	_, err := validateRoutedAliasShape(req)
+	if err == nil || !strings.Contains(err.Error(), "default_route") {
+		t.Fatalf("err = %v, want a default_route error", err)
+	}
+}
+
+func TestValidateRoutedAliasShape_TooManyKeywords(t *testing.T) {
+	kws := make([]string, 33)
+	for i := range kws {
+		kws[i] = fmt.Sprintf("kw%d", i)
+	}
+	req := putAliasRequest{
+		DefaultRoute: "general",
+		Classifier:   &putAliasClassifierInput{Kind: "rules"},
+		Routes:       []putAliasRouteInput{{RouteName: "general", Description: "d", TargetModelID: "llama3", Keywords: kws}},
+	}
+	if _, err := validateRoutedAliasShape(req); err == nil {
+		t.Fatal("expected error for >32 keywords")
+	}
+}
+
+func TestValidateRoutedAliasShape_ClassifierKindValidation(t *testing.T) {
+	baseRoutes := []putAliasRouteInput{validRouteInput("general", "llama3")}
+
+	cases := []struct {
+		name       string
+		classifier *putAliasClassifierInput
+		wantErr    bool
+	}{
+		{"rules with no model id", &putAliasClassifierInput{Kind: "rules"}, false},
+		{"rules with model id set", &putAliasClassifierInput{Kind: "rules", ModelID: strPtr("llama3")}, true},
+		{"semantic_router with no model id", &putAliasClassifierInput{Kind: "semantic_router"}, false},
+		{"semantic_router with model id set", &putAliasClassifierInput{Kind: "semantic_router", ModelID: strPtr("llama3")}, true},
+		{"model with model id", &putAliasClassifierInput{Kind: "model", ModelID: strPtr("llama3")}, false},
+		{"model without model id", &putAliasClassifierInput{Kind: "model"}, true},
+		{"unknown kind", &putAliasClassifierInput{Kind: "bogus"}, true},
+		{"nil classifier", nil, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req := putAliasRequest{DefaultRoute: "general", Classifier: tc.classifier, Routes: baseRoutes}
+			_, err := validateRoutedAliasShape(req)
+			if (err != nil) != tc.wantErr {
+				t.Errorf("err = %v, wantErr = %v", err, tc.wantErr)
+			}
+		})
+	}
 }
 
 func TestValidResidency(t *testing.T) {

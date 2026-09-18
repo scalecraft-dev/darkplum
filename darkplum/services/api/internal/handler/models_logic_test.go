@@ -55,7 +55,7 @@ func TestBuildModelsList_NoPolicyIncludesEverything(t *testing.T) {
 		{Alias: "smart", TargetModelID: "claude-3-sonnet", OwnedBy: "bedrock", BackendClass: backendClassCloudManaged, TargetDiscoveredAt: now},
 	}
 
-	got := buildModelsList(models, aliases, residencyAny, now, modelAvailabilityWindow)
+	got := buildModelsList(models, aliases, nil, residencyAny, now, modelAvailabilityWindow)
 	if len(got) != 4 {
 		t.Fatalf("len(got) = %d, want 4: %+v", len(got), got)
 	}
@@ -91,7 +91,7 @@ func TestBuildModelsList_SelfHostedOnlyOmitsCloudManaged(t *testing.T) {
 		{Alias: "smart", TargetModelID: "claude-3-sonnet", OwnedBy: "bedrock", BackendClass: backendClassCloudManaged, TargetDiscoveredAt: now},
 	}
 
-	got := buildModelsList(models, aliases, residencySelfHostedOnly, now, modelAvailabilityWindow)
+	got := buildModelsList(models, aliases, nil, residencySelfHostedOnly, now, modelAvailabilityWindow)
 
 	for _, e := range got {
 		if e.BackendClass == backendClassCloudManaged {
@@ -107,7 +107,7 @@ func TestBuildModelsList_SelfHostedOnlyOmitsCloudManaged(t *testing.T) {
 }
 
 func TestBuildModelsList_EmptyInputsProduceEmptySlice(t *testing.T) {
-	got := buildModelsList(nil, nil, residencyAny, time.Now(), modelAvailabilityWindow)
+	got := buildModelsList(nil, nil, nil, residencyAny, time.Now(), modelAvailabilityWindow)
 	if got == nil {
 		t.Fatal("buildModelsList returned nil, want a non-nil empty slice so JSON encodes []")
 	}
@@ -135,7 +135,7 @@ func TestBuildModelsList_UnavailableModelAndAliasOmitted(t *testing.T) {
 		{Alias: "cold", TargetModelID: "stale", OwnedBy: "vllm", BackendClass: backendClassSelfHosted, TargetDiscoveredAt: stale},
 	}
 
-	got := buildModelsList(models, aliases, residencyAny, now, modelAvailabilityWindow)
+	got := buildModelsList(models, aliases, nil, residencyAny, now, modelAvailabilityWindow)
 
 	ids := map[string]bool{}
 	for _, e := range got {
@@ -192,5 +192,141 @@ func TestNormalizeGatewayModels(t *testing.T) {
 	}
 	if noOwner.BackendClass != backendClassSelfHosted {
 		t.Errorf("no-owner BackendClass = %q, want self_hosted default", noOwner.BackendClass)
+	}
+}
+
+// TestBuildModelsList_RoutedAlias_ViableEntryShape covers a routed alias with
+// all routes viable: it must appear with alias_kind="routed", alias_of set
+// to the DEFAULT route's target (even though "code" isn't first), and a
+// routes[] listing every route's name+description only (no target ids).
+func TestBuildModelsList_RoutedAlias_ViableEntryShape(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	routed := []routedAliasDBRow{
+		{
+			Alias:        "smart",
+			DefaultRoute: "general",
+			Routes: []routedAliasRouteDBRow{
+				{RouteName: "code", Description: "code stuff", TargetModelID: "llama3-code", TargetExists: true, TargetEnabled: true, TargetProvider: "vllm", TargetBackendClass: backendClassSelfHosted, TargetDiscoveredAt: now},
+				{RouteName: "general", Description: "general stuff", TargetModelID: "llama3", TargetExists: true, TargetEnabled: true, TargetProvider: "vllm", TargetBackendClass: backendClassSelfHosted, TargetDiscoveredAt: now},
+			},
+		},
+	}
+
+	got := buildModelsList(nil, nil, routed, residencyAny, now, modelAvailabilityWindow)
+	if len(got) != 1 {
+		t.Fatalf("len(got) = %d, want 1: %+v", len(got), got)
+	}
+	e := got[0]
+	if e.ID != "smart" || e.AliasKind != aliasKindRouted {
+		t.Fatalf("entry = %+v, want id=smart alias_kind=routed", e)
+	}
+	if e.AliasOf == nil || *e.AliasOf != "llama3" {
+		t.Fatalf("alias_of = %v, want the default route's target (llama3)", e.AliasOf)
+	}
+	if len(e.Routes) != 2 {
+		t.Fatalf("routes = %+v, want 2 entries", e.Routes)
+	}
+	for _, rs := range e.Routes {
+		if rs.RouteName == "" || rs.Description == "" || rs.BackendClass != backendClassSelfHosted {
+			t.Errorf("route summary missing name/description/backend_class: %+v", rs)
+		}
+	}
+}
+
+// TestBuildModelsList_RoutedAlias_OmittedWhenNoViableRoute covers the omission
+// rule: a routed alias where every route's target is disabled, missing, or
+// residency-forbidden must not appear at all, even though its default route
+// names a real (but currently unreachable) target.
+func TestBuildModelsList_RoutedAlias_OmittedWhenNoViableRoute(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	stale := now.Add(-10 * time.Minute)
+
+	cases := []struct {
+		name   string
+		routed []routedAliasDBRow
+	}{
+		{
+			"target disabled",
+			[]routedAliasDBRow{{Alias: "smart", DefaultRoute: "general", Routes: []routedAliasRouteDBRow{
+				{RouteName: "general", Description: "d", TargetModelID: "llama3", TargetExists: true, TargetEnabled: false, TargetBackendClass: backendClassSelfHosted, TargetDiscoveredAt: now},
+			}}},
+		},
+		{
+			"target missing",
+			[]routedAliasDBRow{{Alias: "smart", DefaultRoute: "general", Routes: []routedAliasRouteDBRow{
+				{RouteName: "general", Description: "d", TargetModelID: "llama3", TargetExists: false, TargetEnabled: false, TargetDiscoveredAt: now},
+			}}},
+		},
+		{
+			"target stale (unavailable)",
+			[]routedAliasDBRow{{Alias: "smart", DefaultRoute: "general", Routes: []routedAliasRouteDBRow{
+				{RouteName: "general", Description: "d", TargetModelID: "llama3", TargetExists: true, TargetEnabled: true, TargetBackendClass: backendClassSelfHosted, TargetDiscoveredAt: stale},
+			}}},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildModelsList(nil, nil, tc.routed, residencyAny, now, modelAvailabilityWindow)
+			if len(got) != 0 {
+				t.Fatalf("expected the routed alias to be omitted, got %+v", got)
+			}
+		})
+	}
+}
+
+// TestBuildModelsList_RoutedAlias_ResidencyOmitsCloudManagedRouteButAliasSurvives
+// covers the partial-viability case: under self_hosted_only, a route whose
+// target is cloud_managed can't make the alias viable by itself, but the
+// alias still appears if at least one OTHER route is self_hosted+viable.
+func TestBuildModelsList_RoutedAlias_ResidencyPartialViability(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	routed := []routedAliasDBRow{
+		{
+			Alias:        "smart",
+			DefaultRoute: "general",
+			Routes: []routedAliasRouteDBRow{
+				{RouteName: "general", Description: "d", TargetModelID: "llama3", TargetExists: true, TargetEnabled: true, TargetProvider: "vllm", TargetBackendClass: backendClassSelfHosted, TargetDiscoveredAt: now},
+				{RouteName: "cloud", Description: "d", TargetModelID: "claude-3-sonnet", TargetExists: true, TargetEnabled: true, TargetProvider: "bedrock", TargetBackendClass: backendClassCloudManaged, TargetDiscoveredAt: now},
+			},
+		},
+	}
+
+	got := buildModelsList(nil, nil, routed, residencySelfHostedOnly, now, modelAvailabilityWindow)
+	if len(got) != 1 {
+		t.Fatalf("expected the alias to survive on its self_hosted route, got %+v", got)
+	}
+	if len(got[0].Routes) != 2 {
+		t.Fatalf("routes summary should still list both routes (names/descriptions only), got %+v", got[0].Routes)
+	}
+	// Routes' backend_class must reflect each route's own target (mixed here),
+	// even though the alias as a whole survives on the self_hosted one — this
+	// is what lets the picker say "varies by route".
+	if got[0].Routes[0].BackendClass != backendClassSelfHosted || got[0].Routes[1].BackendClass != backendClassCloudManaged {
+		t.Fatalf("routes backend_class mismatch: %+v", got[0].Routes)
+	}
+
+	// Now BOTH routes are cloud_managed: nothing is viable, alias omitted.
+	routed[0].Routes[0].TargetBackendClass = backendClassCloudManaged
+	got = buildModelsList(nil, nil, routed, residencySelfHostedOnly, now, modelAvailabilityWindow)
+	if len(got) != 0 {
+		t.Fatalf("expected the alias to be omitted when no route is residency-permitted, got %+v", got)
+	}
+}
+
+// TestBuildModelsList_StaticAliasGetsAliasKind covers the "static entries
+// gain alias_kind:'static'" rule.
+func TestBuildModelsList_StaticAliasGetsAliasKind(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	models := []modelDBRow{{ModelID: "llama3", Provider: "vllm", BackendClass: backendClassSelfHosted, DiscoveredAt: now}}
+	aliases := []aliasDBRow{{Alias: "default", TargetModelID: "llama3", OwnedBy: "vllm", BackendClass: backendClassSelfHosted, TargetDiscoveredAt: now}}
+
+	got := buildModelsList(models, aliases, nil, residencyAny, now, modelAvailabilityWindow)
+	for _, e := range got {
+		if e.ID == "default" && e.AliasKind != aliasKindStatic {
+			t.Errorf("static alias entry AliasKind = %q, want %q", e.AliasKind, aliasKindStatic)
+		}
+		if e.ID == "llama3" && e.AliasKind != "" {
+			t.Errorf("plain model entry AliasKind = %q, want empty", e.AliasKind)
+		}
 	}
 }

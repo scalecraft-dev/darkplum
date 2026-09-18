@@ -179,15 +179,43 @@
   border-top: 1px solid var(--border-muted);
 }
 
-/* Which model answered. Sits with the other footnotes on a reply, in the same
-   monospace the rest of the product uses for identifiers. */
-.messageModel {
-  font-family: var(--font-mono);
+/* Which model answered, and the route it came through. Sits with the other
+   footnotes on a reply: sentence in the reading face, identifiers in the same
+   monospace the rest of the product uses for names. */
+.provenance {
+  min-width: 0;
   font-size: var(--fs-xs);
   color: var(--fg-subtle);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.provenanceId {
+  font-family: var(--font-mono);
+  color: var(--fg-muted);
+}
+
+/* The alias had to choose again mid-conversation. Rare, and worth a mark of
+   its own rather than a colour change on the line. */
+.provenanceNote {
+  margin-left: var(--space-2);
+  padding: 0 var(--space-1);
+  color: var(--warning-fg);
+  border: 1px solid var(--warning-border);
+  border-radius: var(--radius-sm);
+}
+
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 /* A turn plus the note that it never reached the server. */

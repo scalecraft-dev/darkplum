@@ -15,13 +15,17 @@
 package handler
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
@@ -61,11 +65,14 @@ type messageInput struct {
 }
 
 // conversationSummary is the wire shape returned by list/patch and embedded
-// in conversationFull.
+// in conversationFull. PinnedModel is always present (never omitted) so a
+// client can distinguish "no pin" (null) from a field the server forgot to
+// send -- see patchConversationRequest for how it is set/cleared.
 type conversationSummary struct {
 	ID           string    `json:"id"`
 	Title        string    `json:"title"`
 	Model        string    `json:"model"`
+	PinnedModel  *string   `json:"pinned_model"`
 	MessageCount int       `json:"message_count"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
@@ -104,7 +111,7 @@ func resolveAssistantProvenance(ctx context.Context, q rowQuerier, userID string
 	var m, r string
 	err = q.QueryRow(ctx, `
 		SELECT model, request_id FROM inference_events
-		WHERE request_id = $1 AND user_id = $2
+		WHERE request_id = $1 AND user_id = $2 AND purpose = 'inference'
 		ORDER BY created_at DESC
 		LIMIT 1
 	`, *requestID, userID).Scan(&m, &r)
@@ -137,7 +144,7 @@ func (h *ConversationHandler) backfillProvenance(ctx context.Context, userID, co
 		var model string
 		err := h.db.QueryRow(ctx, `
 			SELECT model FROM inference_events
-			WHERE request_id = $1 AND user_id = $2
+			WHERE request_id = $1 AND user_id = $2 AND purpose = 'inference'
 			ORDER BY created_at DESC
 			LIMIT 1
 		`, *m.RequestID, userID).Scan(&model)
@@ -182,10 +189,10 @@ func resolveMessageProvenance(ctx context.Context, q rowQuerier, userID string, 
 func (h *ConversationHandler) loadConversationFull(ctx context.Context, userID, convID string) (*conversationFull, error) {
 	var full conversationFull
 	err := h.db.QueryRow(ctx, `
-		SELECT id, title, model, created_at, updated_at
+		SELECT id, title, model, pinned_model, created_at, updated_at
 		FROM conversations
 		WHERE id = $1 AND user_id = $2
-	`, convID, userID).Scan(&full.ID, &full.Title, &full.Model, &full.CreatedAt, &full.UpdatedAt)
+	`, convID, userID).Scan(&full.ID, &full.Title, &full.Model, &full.PinnedModel, &full.CreatedAt, &full.UpdatedAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -255,7 +262,7 @@ func (h *ConversationHandler) ListConversations(c *gin.Context) {
 	}
 
 	rows, err := h.db.Query(ctx, `
-		SELECT id, title, model, created_at, updated_at,
+		SELECT id, title, model, pinned_model, created_at, updated_at,
 			(SELECT COUNT(*) FROM conversation_messages cm WHERE cm.conversation_id = c.id) AS message_count
 		FROM conversations c
 		WHERE user_id = $1
@@ -272,7 +279,7 @@ func (h *ConversationHandler) ListConversations(c *gin.Context) {
 	summaries := make([]conversationSummary, 0)
 	for rows.Next() {
 		var s conversationSummary
-		if err := rows.Scan(&s.ID, &s.Title, &s.Model, &s.CreatedAt, &s.UpdatedAt, &s.MessageCount); err != nil {
+		if err := rows.Scan(&s.ID, &s.Title, &s.Model, &s.PinnedModel, &s.CreatedAt, &s.UpdatedAt, &s.MessageCount); err != nil {
 			slog.ErrorContext(ctx, "scan conversation row failed", "err", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "list conversations failed"})
 			return
@@ -457,14 +464,32 @@ func (h *ConversationHandler) GetConversation(c *gin.Context) {
 	c.JSON(http.StatusOK, full)
 }
 
+// pinnedModelMaxLen mirrors no DB CHECK (pinned_model has none) but is
+// validated the same defensive way conversation titles/import keys are.
+const pinnedModelMaxLen = 200
+
+func validPinnedModel(s string) bool {
+	return utf8.RuneCountInString(s) <= pinnedModelMaxLen
+}
+
 // patchConversationRequest is the body of PATCH /api/v1/conversations/:id.
+// PinnedModel is json.RawMessage, not *string, so PatchConversation can tell
+// "the key is absent" (nil slice, zero value -- no change) apart from "the
+// key is present with the JSON literal null" (RawMessage("null") -- clear
+// the pin) apart from "the key is present with a string" (RawMessage(`"x"`)
+// -- set the pin). A plain *string can't make that distinction:
+// encoding/json's null-handling for pointer-typed struct fields sets the
+// field to Go nil for BOTH an absent key and an explicit JSON null, without
+// ever running custom unmarshal logic -- there is no hook to tell them apart
+// once the field itself is declared as a pointer.
 type patchConversationRequest struct {
-	Title *string `json:"title,omitempty"`
-	Model *string `json:"model,omitempty"`
+	Title       *string         `json:"title,omitempty"`
+	Model       *string         `json:"model,omitempty"`
+	PinnedModel json.RawMessage `json:"pinned_model,omitempty"`
 }
 
 // PatchConversation handles PATCH /api/v1/conversations/:id. Always bumps
-// updated_at, even if neither field is set.
+// updated_at, even if no field is set.
 func (h *ConversationHandler) PatchConversation(c *gin.Context) {
 	id := c.Param("id")
 	if !isValidUUID(id) {
@@ -484,16 +509,37 @@ func (h *ConversationHandler) PatchConversation(c *gin.Context) {
 		return
 	}
 
+	var setPinnedModel bool
+	var pinnedModelValue *string
+	if req.PinnedModel != nil {
+		setPinnedModel = true
+		trimmed := bytes.TrimSpace(req.PinnedModel)
+		if !bytes.Equal(trimmed, []byte("null")) {
+			var s string
+			if err := json.Unmarshal(req.PinnedModel, &s); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "pinned_model must be a string or null"})
+				return
+			}
+			if !validPinnedModel(s) {
+				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("pinned_model must be at most %d characters", pinnedModelMaxLen)})
+				return
+			}
+			pinnedModelValue = &s
+		}
+	}
+
 	var s conversationSummary
 	err := h.db.QueryRow(ctx, `
 		UPDATE conversations
 		SET title = COALESCE($1, title),
 			model = COALESCE($2, model),
+			pinned_model = CASE WHEN $5 THEN $6 ELSE pinned_model END,
 			updated_at = now()
 		WHERE id = $3 AND user_id = $4
-		RETURNING id, title, model, created_at, updated_at,
+		RETURNING id, title, model, pinned_model, created_at, updated_at,
 			(SELECT COUNT(*) FROM conversation_messages cm WHERE cm.conversation_id = conversations.id)
-	`, req.Title, req.Model, id, userID).Scan(&s.ID, &s.Title, &s.Model, &s.CreatedAt, &s.UpdatedAt, &s.MessageCount)
+	`, req.Title, req.Model, id, userID, setPinnedModel, pinnedModelValue).Scan(
+		&s.ID, &s.Title, &s.Model, &s.PinnedModel, &s.CreatedAt, &s.UpdatedAt, &s.MessageCount)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "conversation not found"})

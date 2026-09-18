@@ -1,0 +1,156 @@
+// Package router decides, for one request against a routed alias
+// (policy.AliasKindRouted), which of the alias's candidate routes should
+// handle it. This is the "which model should answer this?" decision from a
+// routed alias's ordered [{route_name, target_model_id, keywords}] list plus
+// a default_route — never a retry or a swap to a different model once a
+// route is chosen: handler/chat.go still runs the resolved target through
+// the unchanged route/enabled/residency chain, and a forbidden pick is
+// refused rather than silently redirected.
+//
+// Three Classifier implementations exist:
+//   - RulesClassifier: ordered keyword/builtin-signal matching, no I/O.
+//   - ModelClassifier: asks a self-hosted LLM (via the provider registry) to
+//     name a route.
+//   - SemanticRouterClassifier: calls an in-cluster vLLM Semantic Router
+//     classification API (CPU-only, not an LLM inference).
+package router
+
+import (
+	"context"
+	"errors"
+
+	"github.com/scalecraft/darkplum/gateway/internal/policy"
+)
+
+// Input bundles everything a Classifier needs to decide a route for one
+// request.
+type Input struct {
+	// Text is the text to classify: the last user turn, system prompt
+	// excluded, truncated via Truncate before being handed to a Classifier.
+	// Both RulesClassifier's keyword matching and ModelClassifier/
+	// SemanticRouterClassifier's calls operate on this value.
+	Text string
+	// OriginalLen is the rune length of the untruncated last-user-turn text.
+	// Used for the builtin:long signal (text > 8000 chars) — Text itself is
+	// always capped at Truncate's max, so checking len(Text) there would
+	// never see past it.
+	OriginalLen int
+	// HasNonText is true when the last user turn's original content was an
+	// OpenAI content-block array containing at least one non-"text" block
+	// (e.g. image_url). Used for the builtin:multimodal signal — Text itself
+	// has already had non-text blocks dropped by
+	// provider.Message.UnmarshalJSON, so this is the one bit that flattening
+	// would otherwise lose.
+	HasNonText bool
+}
+
+// Decision is the result of classifying one request against a routed alias.
+type Decision struct {
+	// RouteName names either one of the alias's routes or its DefaultRoute.
+	// Always resolvable via AliasDef.Route for any alias actually present in
+	// a loaded policy.Snapshot (see policy.buildAliases's drop-if-
+	// inconsistent rule).
+	RouteName string
+	// Reason is a one-line, closed-vocabulary explanation of why RouteName
+	// was chosen. See the Reason* and Builtin* constants for every value a
+	// Classifier in this package can produce.
+	Reason string
+	// ModelCall is non-nil only when this Decision came from an actual LLM
+	// call (ModelClassifier that reached prov.Complete) — never for
+	// RulesClassifier, SemanticRouterClassifier (CPU classification, not an
+	// LLM inference), or a ModelClassifier fallback that short-circuited
+	// before calling the model (classifier_invalid, circuit_open). The
+	// caller (handler/chat.go) uses this to build the second, purpose=
+	// "routing" audit row — "no model saw the prompt" means no second row.
+	ModelCall *ModelCallInfo
+}
+
+// ModelCallInfo carries the audit-relevant metadata of one classifier model
+// call, mirroring the subset of recorder.InferenceEvent fields that describe
+// a single provider call (see handler/chat.go's use of this to build the
+// purpose="routing" event).
+type ModelCallInfo struct {
+	Model            string
+	Provider         string
+	Region           string
+	PromptTokens     *int
+	CompletionTokens *int
+	LatencyMS        int
+	StatusCode       int
+}
+
+// Classifier decides a route for one request against a routed alias. Classify
+// never fails permanently — every non-abort outcome is a valid Decision
+// (falling back to alias.DefaultRoute when the classifier can't produce a
+// confident pick). The only error Classify ever returns is ErrAborted, when
+// ctx was canceled — the caller must not dispatch to any route at all in
+// that case.
+type Classifier interface {
+	Classify(ctx context.Context, alias policy.AliasDef, in Input) (Decision, error)
+}
+
+// ErrAborted is returned by Classify when ctx is canceled (the caller
+// disconnected, or an upstream deadline fired) mid-classification. It is
+// distinct from every fallback Decision: a fallback still names a route to
+// dispatch to; ErrAborted means the handler must not dispatch anywhere.
+var ErrAborted = errors.New("router: classification aborted, do not dispatch")
+
+// Reason vocabulary. Every Classifier in this package produces exactly one
+// of these (rules match/default reasons are built with fmt.Sprintf — see
+// rules.go — but always start with "rules:"; model-classifier success
+// reasons start with "model:"; semantic-router success reasons start with
+// "semantic:").
+const (
+	// ReasonRulesDefault is used by RulesClassifier when no route's keywords
+	// or builtin signals matched.
+	ReasonRulesDefault = "rules:default"
+
+	// ReasonFallbackClassifierInvalid is used by ModelClassifier and
+	// SemanticRouterClassifier when the per-request validity check fails:
+	// for a model classifier, classifier_model_id is not currently a
+	// self_hosted, enabled model; for the semantic router, SEMANTIC_ROUTER_URL
+	// is unset.
+	ReasonFallbackClassifierInvalid = "fallback:classifier_invalid"
+
+	// ReasonFallbackUnparseable is used by ModelClassifier when the model's
+	// response, trimmed, does not exactly (case-insensitively) match any of
+	// the alias's route names.
+	ReasonFallbackUnparseable = "fallback:unparseable"
+
+	// ReasonFallbackTimeout is used by ModelClassifier and
+	// SemanticRouterClassifier when the call did not produce a usable
+	// response within the configured budget (a context.DeadlineExceeded) —
+	// and, since the closed vocabulary has no separate bucket for a hard
+	// transport failure, for any other non-canceled call error too: from the
+	// request's perspective the effect (no answer, fall back to
+	// default_route) is identical either way.
+	ReasonFallbackTimeout = "fallback:timeout"
+
+	// ReasonFallbackCircuitOpen is used when the classifier's circuit
+	// breaker is currently open (CLASSIFIER_BREAKER_FAILURES consecutive
+	// failures within the current window) — the call is skipped entirely.
+	ReasonFallbackCircuitOpen = "fallback:circuit_open"
+
+	// ReasonFallbackLowConfidence is used by SemanticRouterClassifier when
+	// the classification API returns a confidence below
+	// SEMANTIC_ROUTER_MIN_CONFIDENCE.
+	ReasonFallbackLowConfidence = "fallback:low_confidence"
+
+	// ReasonFallbackUnknownCategory is used by SemanticRouterClassifier when
+	// the returned category does not case-insensitively match any of the
+	// alias's route names.
+	ReasonFallbackUnknownCategory = "fallback:unknown_category"
+)
+
+// Reserved rules keywords bindable to a route (see rules.go). An admin binds
+// one of these instead of a literal substring to route on a signal that
+// isn't a literal keyword match.
+const (
+	BuiltinCode       = "builtin:code"
+	BuiltinLong       = "builtin:long"
+	BuiltinMultimodal = "builtin:multimodal"
+)
+
+// builtinLongThreshold is the character count above which BuiltinLong
+// matches (Input.OriginalLen > builtinLongThreshold).
+const builtinLongThreshold = 8000

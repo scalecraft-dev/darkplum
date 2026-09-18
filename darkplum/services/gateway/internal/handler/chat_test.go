@@ -16,6 +16,7 @@ import (
 
 	"github.com/scalecraft/darkplum/gateway/internal/policy"
 	"github.com/scalecraft/darkplum/gateway/internal/provider"
+	"github.com/scalecraft/darkplum/gateway/internal/router"
 	"github.com/scalecraft/darkplum/gateway/internal/routing"
 )
 
@@ -127,8 +128,49 @@ func (f *fakePolicyStore) Current() (policy.Snapshot, bool) { return f.snap, f.l
 var _ policy.Store = (*fakePolicyStore)(nil)
 
 // newTestHandler wires a ChatHandler from plain fakes — no network, no DB.
+// The three classifiers are a real RulesClassifier for all of them: none of
+// these tests exercise a routed alias, so the classifier is never invoked,
+// but a real (rather than nil) Classifier keeps NewChatHandler's contract
+// (all three always non-nil) honest even for tests that don't care.
 func newTestHandler(providers fakeProviders, routes map[string]routing.Route, snap policy.Snapshot, loaded bool) *ChatHandler {
-	return NewChatHandler(providers, staticRoutes{table: routing.NewTable(routes)}, &fakePolicyStore{snap: snap, loaded: loaded})
+	rules := router.NewRulesClassifier()
+	return NewChatHandler(providers, staticRoutes{table: routing.NewTable(routes)}, &fakePolicyStore{snap: snap, loaded: loaded}, rules, rules, rules, nil)
+}
+
+// fakeClassifier is a router.Classifier test double whose Decision/error is
+// scripted per call, and which records every alias/input it was invoked
+// with — used by the routed-alias handler tests below to assert dispatch
+// order, headers, and audit-pair construction without a real classifier.
+type fakeClassifier struct {
+	decisions []router.Decision
+	errs      []error
+	calls     []router.Input
+}
+
+func (f *fakeClassifier) Classify(_ context.Context, _ policy.AliasDef, in router.Input) (router.Decision, error) {
+	i := len(f.calls)
+	f.calls = append(f.calls, in)
+	var d router.Decision
+	if i < len(f.decisions) {
+		d = f.decisions[i]
+	}
+	var err error
+	if i < len(f.errs) {
+		err = f.errs[i]
+	}
+	return d, err
+}
+
+var _ router.Classifier = (*fakeClassifier)(nil)
+
+// newRoutedTestHandler wires a ChatHandler for the routed-alias tests, with
+// a scripted classifier standing in for whichever classifier_kind the test's
+// alias uses (rules/model/semantic_router — the handler only cares that
+// classifierFor's dispatch reaches the SAME fake regardless of kind, so one
+// fake wired to all three slots keeps these tests independent of that
+// dispatch detail unless a test overrides it directly).
+func newRoutedTestHandler(providers fakeProviders, routes map[string]routing.Route, snap policy.Snapshot, classifier router.Classifier) *ChatHandler {
+	return NewChatHandler(providers, staticRoutes{table: routing.NewTable(routes)}, &fakePolicyStore{snap: snap, loaded: true}, classifier, classifier, classifier, nil)
 }
 
 // ---------------------------------------------------------------------------
@@ -295,7 +337,7 @@ func TestHandleChatCompletions_AliasResolvesAndSetsCtxKeys(t *testing.T) {
 		map[string]routing.Route{"llama-3-8b": {ProviderKey: "vllm-default", Kind: "vllm", Class: routing.ClassSelfHosted}},
 		policy.Snapshot{
 			Enabled:   map[string]bool{"llama-3-8b": true},
-			Aliases:   map[string]string{"prod-default": "llama-3-8b"},
+			Aliases:   map[string]policy.AliasDef{"prod-default": {Kind: policy.AliasKindStatic, Target: "llama-3-8b"}},
 			Residency: policy.ResidencyAny,
 		},
 		true,
@@ -350,7 +392,7 @@ func TestHandleChatCompletions_AliasWinsOverSameNamedRoute(t *testing.T) {
 		},
 		policy.Snapshot{
 			Enabled:   map[string]bool{"claude": true, "claude-target": true},
-			Aliases:   map[string]string{"claude": "claude-target"},
+			Aliases:   map[string]policy.AliasDef{"claude": {Kind: policy.AliasKindStatic, Target: "claude-target"}},
 			Residency: policy.ResidencyAny,
 		},
 		true,
@@ -372,7 +414,7 @@ func TestHandleChatCompletions_AliasToUnknownTargetRefused404(t *testing.T) {
 		map[string]routing.Route{}, // ghost-model was never discovered
 		policy.Snapshot{
 			Enabled:   map[string]bool{},
-			Aliases:   map[string]string{"broken-alias": "ghost-model"},
+			Aliases:   map[string]policy.AliasDef{"broken-alias": {Kind: policy.AliasKindStatic, Target: "ghost-model"}},
 			Residency: policy.ResidencyAny,
 		},
 		true,
@@ -411,7 +453,7 @@ func TestHandleChatCompletions_AliasToDisabledTargetRefused403(t *testing.T) {
 		map[string]routing.Route{"model-x": {ProviderKey: "vllm-default", Kind: "vllm", Class: routing.ClassSelfHosted}},
 		policy.Snapshot{
 			Enabled:   map[string]bool{"model-x": false},
-			Aliases:   map[string]string{"disabled-alias": "model-x"},
+			Aliases:   map[string]policy.AliasDef{"disabled-alias": {Kind: policy.AliasKindStatic, Target: "model-x"}},
 			Residency: policy.ResidencyAny,
 		},
 		true,
@@ -454,7 +496,7 @@ func TestHandleChatCompletions_AliasToResidencyBlockedTargetRefused403(t *testin
 		map[string]routing.Route{"us.anthropic.claude-3-5-sonnet": {ProviderKey: "bedrock", Kind: "bedrock", Class: routing.ClassCloudManaged}},
 		policy.Snapshot{
 			Enabled:   map[string]bool{"us.anthropic.claude-3-5-sonnet": true},
-			Aliases:   map[string]string{"prod-claude": "us.anthropic.claude-3-5-sonnet"},
+			Aliases:   map[string]policy.AliasDef{"prod-claude": {Kind: policy.AliasKindStatic, Target: "us.anthropic.claude-3-5-sonnet"}},
 			Residency: policy.ResidencySelfHostedOnly,
 		},
 		true,

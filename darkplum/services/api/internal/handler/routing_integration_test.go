@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -45,6 +46,7 @@ func newRoutingTestRouter(h *RoutingHandler, userID string) *gin.Engine {
 	r.GET("/api/v1/model-aliases", h.ListAliases)
 	r.PUT("/api/v1/model-aliases/:alias", h.PutAlias)
 	r.DELETE("/api/v1/model-aliases/:alias", h.DeleteAlias)
+	r.POST("/api/v1/model-aliases/:alias/test", h.TestAlias)
 	r.GET("/api/v1/routing-policy", h.GetRoutingPolicy)
 	r.PUT("/api/v1/routing-policy", h.PutRoutingPolicy)
 	return r
@@ -98,7 +100,7 @@ func TestPutAlias_CreateAndRetarget(t *testing.T) {
 	insertModel(t, ctx, pool, "llama3-v2", backendClassSelfHosted, false)
 
 	rec := activity.NewRecorder(pool)
-	h := NewRoutingHandler(pool, rec)
+	h := NewRoutingHandler(pool, rec, "http://unused.invalid", "unused")
 	r := newRoutingTestRouter(h, userID)
 
 	// Create.
@@ -164,7 +166,7 @@ func TestPutAlias_InvalidFormat(t *testing.T) {
 	pool := setupTestDB(t)
 	ctx := context.Background()
 	userID := newTestUser(t, ctx, pool)
-	h := NewRoutingHandler(pool, activity.NewRecorder(pool))
+	h := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
 	r := newRoutingTestRouter(h, userID)
 
 	resp := doJSON(t, r, http.MethodPut, "/api/v1/model-aliases/Not%20Valid", map[string]string{"target_model_id": "llama3"})
@@ -177,7 +179,7 @@ func TestPutAlias_MissingTarget(t *testing.T) {
 	pool := setupTestDB(t)
 	ctx := context.Background()
 	userID := newTestUser(t, ctx, pool)
-	h := NewRoutingHandler(pool, activity.NewRecorder(pool))
+	h := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
 	r := newRoutingTestRouter(h, userID)
 
 	resp := doJSON(t, r, http.MethodPut, "/api/v1/model-aliases/default", map[string]string{})
@@ -191,7 +193,7 @@ func TestPutAlias_TargetIsItselfAnAlias(t *testing.T) {
 	ctx := context.Background()
 	userID := newTestUser(t, ctx, pool)
 	insertModel(t, ctx, pool, "llama3", backendClassSelfHosted, true)
-	h := NewRoutingHandler(pool, activity.NewRecorder(pool))
+	h := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
 	r := newRoutingTestRouter(h, userID)
 
 	resp := doJSON(t, r, http.MethodPut, "/api/v1/model-aliases/base", map[string]string{"target_model_id": "llama3"})
@@ -212,7 +214,7 @@ func TestPutAlias_TargetNotFound(t *testing.T) {
 	pool := setupTestDB(t)
 	ctx := context.Background()
 	userID := newTestUser(t, ctx, pool)
-	h := NewRoutingHandler(pool, activity.NewRecorder(pool))
+	h := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
 	r := newRoutingTestRouter(h, userID)
 
 	resp := doJSON(t, r, http.MethodPut, "/api/v1/model-aliases/default", map[string]string{"target_model_id": "does-not-exist"})
@@ -230,7 +232,7 @@ func TestPutAlias_ConflictsWithExistingModelID(t *testing.T) {
 	userID := newTestUser(t, ctx, pool)
 	insertModel(t, ctx, pool, "llama3", backendClassSelfHosted, true)
 	insertModel(t, ctx, pool, "mistral", backendClassSelfHosted, true)
-	h := NewRoutingHandler(pool, activity.NewRecorder(pool))
+	h := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
 	r := newRoutingTestRouter(h, userID)
 
 	resp := doJSON(t, r, http.MethodPut, "/api/v1/model-aliases/mistral", map[string]string{"target_model_id": "llama3"})
@@ -247,7 +249,7 @@ func TestDeleteAlias(t *testing.T) {
 	ctx := context.Background()
 	userID := newTestUser(t, ctx, pool)
 	insertModel(t, ctx, pool, "llama3", backendClassSelfHosted, true)
-	h := NewRoutingHandler(pool, activity.NewRecorder(pool))
+	h := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
 	r := newRoutingTestRouter(h, userID)
 
 	resp := doJSON(t, r, http.MethodPut, "/api/v1/model-aliases/default", map[string]string{"target_model_id": "llama3"})
@@ -286,7 +288,7 @@ func TestPutAlias_TargetAvailableReflectsDiscoveredAt(t *testing.T) {
 	ctx := context.Background()
 	userID := newTestUser(t, ctx, pool)
 	insertModel(t, ctx, pool, "llama3", backendClassSelfHosted, true)
-	h := NewRoutingHandler(pool, activity.NewRecorder(pool))
+	h := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
 	r := newRoutingTestRouter(h, userID)
 
 	resp := doJSON(t, r, http.MethodPut, "/api/v1/model-aliases/default", map[string]string{"target_model_id": "llama3"})
@@ -331,7 +333,7 @@ func TestListAliases_ReflectsTargetState(t *testing.T) {
 	ctx := context.Background()
 	userID := newTestUser(t, ctx, pool)
 	insertModel(t, ctx, pool, "llama3", backendClassSelfHosted, true)
-	h := NewRoutingHandler(pool, activity.NewRecorder(pool))
+	h := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
 	r := newRoutingTestRouter(h, userID)
 
 	resp := doJSON(t, r, http.MethodPut, "/api/v1/model-aliases/default", map[string]string{"target_model_id": "llama3"})
@@ -373,7 +375,7 @@ func TestRoutingPolicy_GetPutAndInvalidValue(t *testing.T) {
 	pool := setupTestDB(t)
 	ctx := context.Background()
 	userID := newTestUser(t, ctx, pool)
-	h := NewRoutingHandler(pool, activity.NewRecorder(pool))
+	h := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
 	r := newRoutingTestRouter(h, userID)
 
 	resp := doJSON(t, r, http.MethodGet, "/api/v1/routing-policy", nil)
@@ -444,7 +446,7 @@ func TestListAliases_TargetAvailableHonoursConfiguredWindow(t *testing.T) {
 		{2 * time.Minute, false}, // default: unseen for 4 min -> unavailable
 		{10 * time.Minute, true}, // operator widened the window
 	} {
-		h := NewRoutingHandler(pool, activity.NewRecorder(pool))
+		h := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
 		h.SetAvailabilityWindow(tc.window)
 		r := gin.New()
 		r.GET("/api/v1/model-aliases", h.ListAliases)
@@ -461,4 +463,482 @@ func TestListAliases_TargetAvailableHonoursConfiguredWindow(t *testing.T) {
 			t.Fatalf("window %v: expected target_available=%v, got %+v", tc.window, tc.want, rows)
 		}
 	}
+}
+
+// routedBody builds a PUT /model-aliases/:alias request body for a routed
+// alias with a rules classifier, using routes as (route_name, target_model_id)
+// pairs. defaultRoute must name one of routes' route_names for the body to
+// be valid.
+func routedBody(defaultRoute string, routes ...[2]string) map[string]any {
+	rs := make([]map[string]any, len(routes))
+	for i, r := range routes {
+		rs[i] = map[string]any{
+			"route_name":      r[0],
+			"description":     "route " + r[0],
+			"target_model_id": r[1],
+			"keywords":        []string{r[0]},
+		}
+	}
+	return map[string]any{
+		"kind":          "routed",
+		"default_route": defaultRoute,
+		"classifier":    map[string]any{"kind": "rules"},
+		"routes":        rs,
+	}
+}
+
+func TestPutAlias_Routed_CreateListAndDeleteCascades(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	userID := newTestUser(t, ctx, pool)
+	insertModel(t, ctx, pool, "llama3", backendClassSelfHosted, true)
+	insertModel(t, ctx, pool, "llama3-code", backendClassSelfHosted, true)
+	h := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
+	r := newRoutingTestRouter(h, userID)
+
+	body := routedBody("general", [2]string{"general", "llama3"}, [2]string{"code", "llama3-code"})
+	resp := doJSON(t, r, http.MethodPut, "/api/v1/model-aliases/smart", body)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("create routed alias: status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+	var row aliasResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &row); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if row.Kind != aliasKindRouted {
+		t.Fatalf("kind = %q, want %q", row.Kind, aliasKindRouted)
+	}
+	if row.DefaultRoute != "general" {
+		t.Fatalf("default_route = %q, want general", row.DefaultRoute)
+	}
+	if row.Classifier == nil || row.Classifier.Kind != "rules" || row.Classifier.ModelID != nil {
+		t.Fatalf("classifier = %+v, want rules with no model_id", row.Classifier)
+	}
+	if len(row.Routes) != 2 {
+		t.Fatalf("routes = %+v, want 2 entries", row.Routes)
+	}
+	if row.Routes[0].RouteName != "general" || row.Routes[0].TargetModelID != "llama3" {
+		t.Fatalf("routes[0] = %+v", row.Routes[0])
+	}
+	if !row.Routes[0].TargetExists || !row.Routes[0].TargetEnabled || !row.Routes[0].TargetAvailable {
+		t.Fatalf("routes[0] target_* = %+v, want all true", row.Routes[0])
+	}
+	if row.Routes[0].TargetBackendClass == nil || *row.Routes[0].TargetBackendClass != backendClassSelfHosted {
+		t.Fatalf("routes[0] target_backend_class = %v, want self_hosted", row.Routes[0].TargetBackendClass)
+	}
+	if row.Routes[1].Keywords[0] != "code" {
+		t.Fatalf("routes[1] keywords = %v, want normalized [code]", row.Routes[1].Keywords)
+	}
+
+	// ListAliases must return the same shape.
+	resp = doJSON(t, r, http.MethodGet, "/api/v1/model-aliases", nil)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("list: status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+	var aliases []aliasResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &aliases); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	if len(aliases) != 1 || aliases[0].Kind != aliasKindRouted || len(aliases[0].Routes) != 2 {
+		t.Fatalf("list aliases = %+v", aliases)
+	}
+
+	var eventCount int
+	if err := pool.QueryRow(ctx,
+		`SELECT COUNT(*) FROM activity_events WHERE event_type = $1 AND detail->>'kind' = 'routed' AND (detail->>'route_count')::int = 2`,
+		string(activity.ModelAliasCreated),
+	).Scan(&eventCount); err != nil {
+		t.Fatalf("count created events: %v", err)
+	}
+	if eventCount != 1 {
+		t.Fatalf("expected 1 model_alias.created event with kind/route_count detail, got %d", eventCount)
+	}
+
+	// DELETE must cascade the routes (FK ON DELETE CASCADE, migration 013).
+	resp = doJSON(t, r, http.MethodDelete, "/api/v1/model-aliases/smart", nil)
+	if resp.Code != http.StatusNoContent {
+		t.Fatalf("delete: status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+	var routeCount int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM model_alias_routes WHERE alias = 'smart'`).Scan(&routeCount); err != nil {
+		t.Fatalf("count routes after delete: %v", err)
+	}
+	if routeCount != 0 {
+		t.Fatalf("expected routes to cascade-delete, found %d", routeCount)
+	}
+
+	var deleteDetail []byte
+	if err := pool.QueryRow(ctx,
+		`SELECT detail FROM activity_events WHERE event_type = $1`, string(activity.ModelAliasDeleted),
+	).Scan(&deleteDetail); err != nil {
+		t.Fatalf("fetch delete event detail: %v", err)
+	}
+	var detail map[string]any
+	if err := json.Unmarshal(deleteDetail, &detail); err != nil {
+		t.Fatalf("decode delete detail: %v", err)
+	}
+	if detail["kind"] != aliasKindRouted || detail["route_count"] != float64(2) {
+		t.Fatalf("delete event detail = %+v, want kind=routed route_count=2", detail)
+	}
+}
+
+func TestPutAlias_Routed_SemanticRouterClassifierEchoedBack(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	userID := newTestUser(t, ctx, pool)
+	insertModel(t, ctx, pool, "llama3", backendClassSelfHosted, true)
+	h := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
+	r := newRoutingTestRouter(h, userID)
+
+	body := routedBody("general", [2]string{"general", "llama3"})
+	body["classifier"] = map[string]any{"kind": "semantic_router"}
+
+	resp := doJSON(t, r, http.MethodPut, "/api/v1/model-aliases/smart", body)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+	var row aliasResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &row); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if row.Classifier == nil || row.Classifier.Kind != "semantic_router" || row.Classifier.ModelID != nil {
+		t.Fatalf("classifier = %+v, want semantic_router with no model_id", row.Classifier)
+	}
+}
+
+func TestPutAlias_Routed_ValidationErrors(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	userID := newTestUser(t, ctx, pool)
+	insertModel(t, ctx, pool, "llama3", backendClassSelfHosted, true)
+	insertModel(t, ctx, pool, "claude-3-sonnet", backendClassCloudManaged, true)
+	insertModel(t, ctx, pool, "not-self-hosted", backendClassCloudManaged, true)
+	h := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
+	r := newRoutingTestRouter(h, userID)
+
+	// Alias-of-alias: create a base static alias first, then try to route to it.
+	resp := doJSON(t, r, http.MethodPut, "/api/v1/model-aliases/base", map[string]string{"target_model_id": "llama3"})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("setup base alias: status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+
+	cases := []struct {
+		name       string
+		body       map[string]any
+		wantStatus int
+	}{
+		{"no routes", func() map[string]any { b := routedBody("general"); return b }(), http.StatusBadRequest},
+		{"default_route not in routes", routedBody("missing", [2]string{"general", "llama3"}), http.StatusBadRequest},
+		{"duplicate route names", routedBody("general", [2]string{"general", "llama3"}, [2]string{"general", "claude-3-sonnet"}), http.StatusBadRequest},
+		{"target not found", routedBody("general", [2]string{"general", "does-not-exist"}), http.StatusNotFound},
+		{"target is itself an alias", routedBody("general", [2]string{"general", "base"}), http.StatusBadRequest},
+		{"classifier model not self_hosted", func() map[string]any {
+			b := routedBody("general", [2]string{"general", "llama3"})
+			b["classifier"] = map[string]any{"kind": "model", "model_id": "not-self-hosted"}
+			return b
+		}(), http.StatusBadRequest},
+		{"classifier model not found", func() map[string]any {
+			b := routedBody("general", [2]string{"general", "llama3"})
+			b["classifier"] = map[string]any{"kind": "model", "model_id": "does-not-exist"}
+			return b
+		}(), http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			resp := doJSON(t, r, http.MethodPut, "/api/v1/model-aliases/smart", tc.body)
+			if resp.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d; body = %s", resp.Code, tc.wantStatus, resp.Body.String())
+			}
+		})
+	}
+}
+
+func TestPutAlias_Routed_ClassifierModelSelfHostedSucceeds(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	userID := newTestUser(t, ctx, pool)
+	insertModel(t, ctx, pool, "llama3", backendClassSelfHosted, true)
+	insertModel(t, ctx, pool, "classifier-model", backendClassSelfHosted, true)
+	h := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
+	r := newRoutingTestRouter(h, userID)
+
+	body := routedBody("general", [2]string{"general", "llama3"})
+	body["classifier"] = map[string]any{"kind": "model", "model_id": "classifier-model"}
+
+	resp := doJSON(t, r, http.MethodPut, "/api/v1/model-aliases/smart", body)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+	var row aliasResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &row); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if row.Classifier == nil || row.Classifier.Kind != "model" || row.Classifier.ModelID == nil || *row.Classifier.ModelID != "classifier-model" {
+		t.Fatalf("classifier = %+v", row.Classifier)
+	}
+}
+
+func TestPutAlias_Routed_ResidencyConflict409(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	userID := newTestUser(t, ctx, pool)
+	insertModel(t, ctx, pool, "llama3", backendClassSelfHosted, true)
+	insertModel(t, ctx, pool, "claude-3-sonnet", backendClassCloudManaged, true)
+	if _, err := pool.Exec(ctx, `UPDATE routing_policy SET residency = 'self_hosted_only' WHERE id = true`); err != nil {
+		t.Fatalf("set residency: %v", err)
+	}
+	h := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
+	r := newRoutingTestRouter(h, userID)
+
+	body := routedBody("general", [2]string{"general", "llama3"}, [2]string{"cloud", "claude-3-sonnet"})
+	resp := doJSON(t, r, http.MethodPut, "/api/v1/model-aliases/smart", body)
+	if resp.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body = %s", resp.Code, resp.Body.String())
+	}
+	if msg := decodeErrorBody(t, resp); !strings.Contains(msg, "cloud") || !strings.Contains(msg, "claude-3-sonnet") {
+		t.Fatalf("error = %q, want it to name the conflicting route and target", msg)
+	}
+
+	// No route conflicts with residency -> succeeds even under self_hosted_only.
+	body = routedBody("general", [2]string{"general", "llama3"})
+	resp = doJSON(t, r, http.MethodPut, "/api/v1/model-aliases/smart2", body)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("all-self-hosted routed alias under self_hosted_only: status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestPutAlias_KindSwitch_RoutedToStaticClearsRoutes(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	userID := newTestUser(t, ctx, pool)
+	insertModel(t, ctx, pool, "llama3", backendClassSelfHosted, true)
+	h := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
+	r := newRoutingTestRouter(h, userID)
+
+	resp := doJSON(t, r, http.MethodPut, "/api/v1/model-aliases/flip", routedBody("general", [2]string{"general", "llama3"}))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("create routed: status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+
+	resp = doJSON(t, r, http.MethodPut, "/api/v1/model-aliases/flip", map[string]string{"target_model_id": "llama3"})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("switch to static: status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+	var row aliasResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &row); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if row.Kind != aliasKindStatic || row.TargetModelID != "llama3" || len(row.Routes) != 0 {
+		t.Fatalf("expected a clean static alias after kind switch, got %+v", row)
+	}
+
+	var routeCount int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM model_alias_routes WHERE alias = 'flip'`).Scan(&routeCount); err != nil {
+		t.Fatalf("count routes: %v", err)
+	}
+	if routeCount != 0 {
+		t.Fatalf("expected routes cleared on kind switch to static, found %d", routeCount)
+	}
+}
+
+func TestPutRoutingPolicy_WarningsListCloudManagedRoutes(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	userID := newTestUser(t, ctx, pool)
+	insertModel(t, ctx, pool, "llama3", backendClassSelfHosted, true)
+	insertModel(t, ctx, pool, "claude-3-sonnet", backendClassCloudManaged, true)
+	h := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
+	r := newRoutingTestRouter(h, userID)
+
+	// Create the routed alias while residency is still "any", so the PUT
+	// itself doesn't 409 -- the warning fires later, on the residency flip.
+	resp := doJSON(t, r, http.MethodPut, "/api/v1/model-aliases/smart",
+		routedBody("general", [2]string{"general", "llama3"}, [2]string{"cloud", "claude-3-sonnet"}))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("create routed alias: status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+
+	resp = doJSON(t, r, http.MethodPut, "/api/v1/routing-policy", map[string]string{"residency": residencySelfHostedOnly})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("set residency: status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+	var policy routingPolicyResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &policy); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	want := "alias smart: route 'cloud' → claude-3-sonnet will be refused"
+	found := false
+	for _, w := range policy.Warnings {
+		if w == want {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("warnings = %v, want to contain %q", policy.Warnings, want)
+	}
+
+	// Flipping back to "any" must not carry stale warnings. Decoded into a
+	// fresh variable -- json.Unmarshal only overwrites keys present in the
+	// input, and "warnings" is omitted (omitempty) on this response, so
+	// reusing `policy` here would silently keep the previous response's value.
+	resp = doJSON(t, r, http.MethodPut, "/api/v1/routing-policy", map[string]string{"residency": residencyAny})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("reset residency: status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+	var resetPolicy routingPolicyResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &resetPolicy); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resetPolicy.Warnings) != 0 {
+		t.Fatalf("expected no warnings when residency = any, got %v", resetPolicy.Warnings)
+	}
+}
+
+func TestTestAlias_AliasNotFound(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	userID := newTestUser(t, ctx, pool)
+	h := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
+	r := newRoutingTestRouter(h, userID)
+
+	resp := doJSON(t, r, http.MethodPost, "/api/v1/model-aliases/does-not-exist/test", map[string]string{"text": "hello"})
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404; body = %s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestTestAlias_TextValidation(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	userID := newTestUser(t, ctx, pool)
+	insertModel(t, ctx, pool, "llama3", backendClassSelfHosted, true)
+	h := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
+	r := newRoutingTestRouter(h, userID)
+
+	resp := doJSON(t, r, http.MethodPut, "/api/v1/model-aliases/smart", routedBody("general", [2]string{"general", "llama3"}))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("setup routed alias: status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+
+	resp = doJSON(t, r, http.MethodPost, "/api/v1/model-aliases/smart/test", map[string]string{"text": ""})
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("empty text: status = %d, want 400; body = %s", resp.Code, resp.Body.String())
+	}
+
+	resp = doJSON(t, r, http.MethodPost, "/api/v1/model-aliases/smart/test", map[string]string{"text": strings.Repeat("a", aliasTestMaxTextBytes+1)})
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("oversized text: status = %d, want 400; body = %s", resp.Code, resp.Body.String())
+	}
+}
+
+func TestTestAlias_ProxiesToGatewayDryrunVerbatim(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	userID := newTestUser(t, ctx, pool)
+	insertModel(t, ctx, pool, "llama3", backendClassSelfHosted, true)
+
+	var gotPath, gotAuth, gotUserID, gotRequestID string
+	var gotBody map[string]any
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		gotPath = req.URL.Path
+		gotAuth = req.Header.Get("Authorization")
+		gotUserID = req.Header.Get("X-Darkplum-User-Id")
+		gotRequestID = req.Header.Get("X-Request-Id")
+		_ = json.NewDecoder(req.Body).Decode(&gotBody)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"route_name":"general","target_model_id":"llama3","reason":"rules:default","latency_ms":1,"would_be_refused":null}`))
+	}))
+	defer gw.Close()
+
+	h := NewRoutingHandler(pool, activity.NewRecorder(pool), gw.URL, "dp_test_service_key")
+
+	// A router that sets both user_id and request_id in the gin context, like
+	// production's session middleware + requestID() (cmd/main.go) together
+	// do, so this test can assert TestAlias propagates X-Request-Id too.
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(func(c *gin.Context) {
+		c.Set("user_id", userID)
+		c.Set("request_id", c.GetHeader("X-Request-Id"))
+		c.Next()
+	})
+	r.PUT("/api/v1/model-aliases/:alias", h.PutAlias)
+	r.POST("/api/v1/model-aliases/:alias/test", h.TestAlias)
+
+	resp := doJSON(t, r, http.MethodPut, "/api/v1/model-aliases/smart", routedBody("general", [2]string{"general", "llama3"}))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("setup routed alias: status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/model-aliases/smart/test", bytes.NewReader(mustJSON(t, map[string]string{"text": "hello there"})))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Request-Id", "req-123")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	if gotPath != "/v1/routing/dryrun" {
+		t.Errorf("gateway path = %q, want /v1/routing/dryrun", gotPath)
+	}
+	if gotAuth != "Bearer dp_test_service_key" {
+		t.Errorf("Authorization = %q, want service key bearer token", gotAuth)
+	}
+	if gotUserID != userID {
+		t.Errorf("X-Darkplum-User-Id = %q, want %q", gotUserID, userID)
+	}
+	if gotRequestID != "req-123" {
+		t.Errorf("X-Request-Id = %q, want req-123 passed through", gotRequestID)
+	}
+	if gotBody["alias"] != "smart" || gotBody["text"] != "hello there" {
+		t.Errorf("gateway request body = %+v", gotBody)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if body["route_name"] != "general" {
+		t.Errorf("response body not passed through verbatim: %+v", body)
+	}
+}
+
+func TestTestAlias_ProxiesGatewayErrorStatusVerbatim(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	userID := newTestUser(t, ctx, pool)
+	insertModel(t, ctx, pool, "llama3", backendClassSelfHosted, true)
+
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"alias is not routed","type":"invalid_request_error","code":"alias_not_routed"}}`))
+	}))
+	defer gw.Close()
+
+	h := NewRoutingHandler(pool, activity.NewRecorder(pool), gw.URL, "dp_test_service_key")
+	r := newRoutingTestRouter(h, userID)
+
+	resp := doJSON(t, r, http.MethodPut, "/api/v1/model-aliases/smart", routedBody("general", [2]string{"general", "llama3"}))
+	if resp.Code != http.StatusOK {
+		t.Fatalf("setup routed alias: status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+
+	resp = doJSON(t, r, http.MethodPost, "/api/v1/model-aliases/smart/test", map[string]string{"text": "hello"})
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 passed through from the gateway; body = %s", resp.Code, resp.Body.String())
+	}
+	if !strings.Contains(resp.Body.String(), "alias_not_routed") {
+		t.Fatalf("body not passed through verbatim: %s", resp.Body.String())
+	}
+}
+
+func mustJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return b
 }

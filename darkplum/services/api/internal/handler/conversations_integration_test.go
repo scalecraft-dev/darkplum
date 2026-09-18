@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 
@@ -967,5 +968,128 @@ func TestCreateConversation_ConcurrentImportsOfSameKeyYieldOneConversation(t *te
 	}
 	if convs != 1 || msgs != 2 {
 		t.Fatalf("expected 1 conversation with 2 messages, got %d / %d", convs, msgs)
+	}
+}
+
+// TestPatchConversation_PinnedModel covers the three-state pinned_model
+// contract: absent (no change), a string (set), and explicit null (clear) --
+// a plain *string field can't distinguish "absent" from "explicit null",
+// which is exactly why patchConversationRequest uses nullableString.
+func TestPatchConversation_PinnedModel(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	userID := newTestUser(t, ctx, pool)
+	h := NewConversationHandler(pool, activity.NewRecorder(pool))
+	r := newConversationsTestRouter(h, userID)
+
+	created := doJSON(t, r, http.MethodPost, "/api/v1/conversations", map[string]any{"title": "t"})
+	var full conversationFull
+	if err := json.Unmarshal(created.Body.Bytes(), &full); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if full.PinnedModel != nil {
+		t.Fatalf("expected pinned_model = nil on create, got %v", full.PinnedModel)
+	}
+
+	// Field absent -> no change.
+	resp := doJSON(t, r, http.MethodPatch, "/api/v1/conversations/"+full.ID, map[string]any{"title": "still t"})
+	var s conversationSummary
+	if err := json.Unmarshal(resp.Body.Bytes(), &s); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if s.PinnedModel != nil {
+		t.Fatalf("expected pinned_model to stay nil when absent from PATCH body, got %v", s.PinnedModel)
+	}
+
+	// Set it.
+	resp = doJSON(t, r, http.MethodPatch, "/api/v1/conversations/"+full.ID, map[string]any{"pinned_model": "llama3"})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("set pinned_model: status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &s); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if s.PinnedModel == nil || *s.PinnedModel != "llama3" {
+		t.Fatalf("pinned_model = %v, want llama3", s.PinnedModel)
+	}
+
+	// A subsequent PATCH with an unrelated field must not clear it.
+	resp = doJSON(t, r, http.MethodPatch, "/api/v1/conversations/"+full.ID, map[string]any{"title": "still pinned"})
+	if err := json.Unmarshal(resp.Body.Bytes(), &s); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if s.PinnedModel == nil || *s.PinnedModel != "llama3" {
+		t.Fatalf("expected pinned_model to survive an unrelated PATCH, got %v", s.PinnedModel)
+	}
+
+	// Explicit null clears it.
+	resp = doJSON(t, r, http.MethodPatch, "/api/v1/conversations/"+full.ID, map[string]any{"pinned_model": nil})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("clear pinned_model: status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &s); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if s.PinnedModel != nil {
+		t.Fatalf("expected pinned_model = nil after explicit null PATCH, got %v", s.PinnedModel)
+	}
+
+	// Validation: > 200 characters is rejected.
+	resp = doJSON(t, r, http.MethodPatch, "/api/v1/conversations/"+full.ID, map[string]any{"pinned_model": strings.Repeat("a", 201)})
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("oversized pinned_model: status = %d, want 400; body = %s", resp.Code, resp.Body.String())
+	}
+}
+
+// TestResolveAssistantProvenance_IgnoresNonInferencePurposeRows covers the
+// "AND purpose = 'inference'" filter added to resolveAssistantProvenance and
+// backfillProvenance: a routing (classifier) row sharing the SAME request_id
+// as a real inference row must never be picked as an assistant turn's
+// provenance -- if it were, an admin could not trust conversation history to
+// name the model that actually answered, only some model that was consulted
+// along the way.
+func TestResolveAssistantProvenance_IgnoresNonInferencePurposeRows(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	userID := newTestUser(t, ctx, pool)
+	h := NewConversationHandler(pool, activity.NewRecorder(pool))
+	r := newConversationsTestRouter(h, userID)
+
+	const reqID = "shared-request-id"
+	// A routing (classifier) row is written first with a later created_at
+	// tiebreak potential -- purpose alone must exclude it regardless of
+	// ordering.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO inference_events (request_id, user_id, model, purpose, status_code, latency_ms)
+		VALUES ($1, $2, 'classifier-model', 'routing', 200, 5)
+	`, reqID, userID); err != nil {
+		t.Fatalf("insert routing row: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO inference_events (request_id, user_id, model, purpose, status_code, latency_ms)
+		VALUES ($1, $2, 'llama3', 'inference', 200, 50)
+	`, reqID, userID); err != nil {
+		t.Fatalf("insert inference row: %v", err)
+	}
+
+	created := doJSON(t, r, http.MethodPost, "/api/v1/conversations", map[string]any{
+		"messages": []map[string]any{
+			{"role": "user", "content": "hi"},
+			{"role": "assistant", "content": "hello", "request_id": reqID},
+		},
+	})
+	if created.Code != http.StatusCreated {
+		t.Fatalf("create conversation: status = %d, body = %s", created.Code, created.Body.String())
+	}
+	var full conversationFull
+	if err := json.Unmarshal(created.Body.Bytes(), &full); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(full.Messages) != 2 {
+		t.Fatalf("expected 2 messages, got %+v", full.Messages)
+	}
+	assistant := full.Messages[1]
+	if assistant.Model == nil || *assistant.Model != "llama3" {
+		t.Fatalf("assistant.Model = %v, want llama3 (the purpose='inference' row), never the routing row", assistant.Model)
 	}
 }

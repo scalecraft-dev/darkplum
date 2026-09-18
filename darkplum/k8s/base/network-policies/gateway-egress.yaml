@@ -67,6 +67,16 @@ spec:
         - protocol: TCP
           port: 8000
 
+    # Optional in-cluster intent classifier (vLLM Semantic Router) behind
+    # routed aliases. Classification only; never inference.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: semantic-router
+      ports:
+        - protocol: TCP
+          port: 8080
+
     - ports:
         - protocol: TCP
           port: 5432

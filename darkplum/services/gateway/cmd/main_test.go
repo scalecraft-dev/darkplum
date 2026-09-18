@@ -18,6 +18,7 @@ import (
 	"github.com/scalecraft/darkplum/gateway/internal/health"
 	"github.com/scalecraft/darkplum/gateway/internal/policy"
 	"github.com/scalecraft/darkplum/gateway/internal/provider"
+	"github.com/scalecraft/darkplum/gateway/internal/router"
 	"github.com/scalecraft/darkplum/gateway/internal/routing"
 )
 
@@ -66,6 +67,7 @@ func noopMiddleware(c *gin.Context) { c.Next() }
 func stubHealthHandler(c *gin.Context) { c.JSON(http.StatusOK, gin.H{"status": "ok"}) }
 
 func testChatHandler() *handler.ChatHandler {
+	rules := router.NewRulesClassifier()
 	return handler.NewChatHandler(
 		fakeProviders{"vllm-default": fakeChatProvider{}},
 		staticRoutes{table: routing.NewTable(map[string]routing.Route{
@@ -75,6 +77,8 @@ func testChatHandler() *handler.ChatHandler {
 			snap:   policy.Snapshot{Enabled: map[string]bool{"llama-3-8b": true}, Residency: policy.ResidencyAny},
 			loaded: true,
 		},
+		rules, rules, rules,
+		nil,
 	)
 }
 
@@ -108,6 +112,27 @@ func TestBuildRouter_ChatCompletions(t *testing.T) {
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("POST /v1/chat/completions: expected 200, got %d; body=%s", w.Code, w.Body.String())
+	}
+}
+
+// TestBuildRouter_RoutingDryrun asserts POST /v1/routing/dryrun is
+// registered (authenticated, not proxied) rather than falling through to the
+// unknown-endpoint 404 — it must 400 for an alias that isn't routed, not 404
+// for being an unrecognised path.
+func TestBuildRouter_RoutingDryrun(t *testing.T) {
+	router := buildRouter(testChatHandler(), noopMiddleware, noopMiddleware, stubHealthHandler)
+
+	body, _ := json.Marshal(map[string]any{"alias": "llama-3-8b", "text": "hello"})
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/routing/dryrun", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	router.ServeHTTP(w, req)
+
+	// llama-3-8b is a plain model id, not a routed alias — HandleRoutingDryrun
+	// itself returns 400, but the important assertion here is that the route
+	// exists at all (a 404 would mean it fell through to the NoRoute handler).
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 (not a routed alias), got %d; body=%s", w.Code, w.Body.String())
 	}
 }
 
@@ -211,7 +236,9 @@ func TestNewHealthHandler_IncludesRoutingAndPolicyStatus(t *testing.T) {
 	polStore := policy.NewPgStore(nil, 900*time.Second)
 
 	upstreamChecker := health.NewChecker(nil)
-	h := newHealthHandler(upstreamChecker, routeMgr, polStore)
+	modelClassifier := router.NewModelClassifier(nil, staticRoutes{table: routing.NewTable(nil)}, fakePolicyStore{}, time.Second, 5, 30*time.Second)
+	semanticClassifier := router.NewSemanticRouterClassifier("", 0.6, time.Second, 5, 30*time.Second)
+	h := newHealthHandler(upstreamChecker, routeMgr, polStore, modelClassifier, semanticClassifier)
 
 	router := gin.New()
 	router.GET("/health", h)
@@ -232,6 +259,11 @@ func TestNewHealthHandler_IncludesRoutingAndPolicyStatus(t *testing.T) {
 				LastSuccessSecondsAgo *int64  `json:"last_success_seconds_ago"`
 				LastErrorKind         *string `json:"last_error_kind"`
 			} `json:"sources"`
+			Classifier struct {
+				BreakerOpen         bool   `json:"breaker_open"`
+				ConsecutiveFailures int    `json:"consecutive_failures"`
+				SemanticRouter      string `json:"semantic_router"`
+			} `json:"classifier"`
 		} `json:"routing"`
 		Policy struct {
 			Loaded     bool   `json:"loaded"`
@@ -266,6 +298,16 @@ func TestNewHealthHandler_IncludesRoutingAndPolicyStatus(t *testing.T) {
 	}
 	if failingStatus.LastErrorKind == nil || *failingStatus.LastErrorKind != "unreachable" {
 		t.Errorf("routing.sources.lmstudio-dev.last_error_kind = %v, want \"unreachable\"", failingStatus.LastErrorKind)
+	}
+
+	if body.Routing.Classifier.BreakerOpen {
+		t.Error("expected routing.classifier.breaker_open=false for a fresh classifier")
+	}
+	if body.Routing.Classifier.ConsecutiveFailures != 0 {
+		t.Errorf("routing.classifier.consecutive_failures = %d, want 0", body.Routing.Classifier.ConsecutiveFailures)
+	}
+	if body.Routing.Classifier.SemanticRouter != "unconfigured" {
+		t.Errorf("routing.classifier.semantic_router = %q, want unconfigured (SEMANTIC_ROUTER_URL unset)", body.Routing.Classifier.SemanticRouter)
 	}
 
 	// The raw response must never contain the model ids themselves outside of

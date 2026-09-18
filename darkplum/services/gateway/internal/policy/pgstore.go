@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -11,7 +12,8 @@ import (
 )
 
 // PgStore loads Snapshots from Postgres and caches the last-good result.
-// Refresh performs exactly 3 SELECTs (models, model_aliases, routing_policy).
+// Refresh performs exactly 4 SELECTs (models, model_aliases,
+// model_alias_routes, routing_policy).
 //
 // A freshly onboarded customer database may not have run the api's migration
 // 010 yet when the gateway starts — model_aliases/routing_policy simply don't
@@ -198,31 +200,155 @@ func (s *PgStore) loadFromDB(ctx context.Context) (Snapshot, error) {
 	}
 	rows.Close()
 
-	aliases := make(map[string]string)
-	aliasRows, err := s.pool.Query(ctx, `SELECT alias, target_model_id FROM model_aliases`)
+	// routeRows and aliasRows are scanned into plain structs (rawRouteRow /
+	// rawAliasRow) and handed to buildAliases, which is pure — no pgx, no
+	// network — so the assembly/drop-if-inconsistent logic (the part with
+	// real branching to get right) is unit-testable with fakes instead of a
+	// live model_alias_routes migration.
+	var routeRows []rawRouteRow
+	rrows, err := s.pool.Query(ctx, `
+		SELECT alias, route_name, description, target_model_id, keywords
+		  FROM model_alias_routes
+		 ORDER BY alias, position`)
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("policy: query model_alias_routes: %w", err)
+	}
+	for rrows.Next() {
+		var r rawRouteRow
+		if err := rrows.Scan(&r.Alias, &r.Name, &r.Description, &r.Target, &r.Keywords); err != nil {
+			rrows.Close()
+			return Snapshot{}, fmt.Errorf("policy: scan model_alias_routes row: %w", err)
+		}
+		routeRows = append(routeRows, r)
+	}
+	if err := rrows.Err(); err != nil {
+		rrows.Close()
+		return Snapshot{}, fmt.Errorf("policy: read model_alias_routes rows: %w", err)
+	}
+	rrows.Close()
+
+	var aliasRows []rawAliasRow
+	arows, err := s.pool.Query(ctx, `
+		SELECT alias, kind, target_model_id, default_route, classifier_kind, classifier_model_id
+		  FROM model_aliases`)
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("policy: query model_aliases: %w", err)
 	}
-	for aliasRows.Next() {
-		var alias, target string
-		if err := aliasRows.Scan(&alias, &target); err != nil {
-			aliasRows.Close()
+	for arows.Next() {
+		var a rawAliasRow
+		if err := arows.Scan(&a.Alias, &a.Kind, &a.Target, &a.DefaultRoute, &a.ClassifierKind, &a.ClassifierModel); err != nil {
+			arows.Close()
 			return Snapshot{}, fmt.Errorf("policy: scan model_aliases row: %w", err)
 		}
-		aliases[alias] = target
+		aliasRows = append(aliasRows, a)
 	}
-	if err := aliasRows.Err(); err != nil {
-		aliasRows.Close()
+	if err := arows.Err(); err != nil {
+		arows.Close()
 		return Snapshot{}, fmt.Errorf("policy: read model_aliases rows: %w", err)
 	}
-	aliasRows.Close()
+	arows.Close()
 
 	var residency string
 	if err := s.pool.QueryRow(ctx, `SELECT residency FROM routing_policy WHERE id = true`).Scan(&residency); err != nil {
 		return Snapshot{}, fmt.Errorf("policy: query routing_policy: %w", err)
 	}
 
-	return Snapshot{Enabled: enabled, Aliases: aliases, Residency: residency}, nil
+	return Snapshot{Enabled: enabled, Aliases: buildAliases(aliasRows, routeRows), Residency: residency}, nil
+}
+
+// rawRouteRow is one scanned model_alias_routes row (migration 013), in
+// model_alias_routes.position order per the ORDER BY in loadFromDB.
+type rawRouteRow struct {
+	Alias       string
+	Name        string
+	Description string
+	Target      string
+	Keywords    []string
+}
+
+// rawAliasRow is one scanned model_aliases row (migration 013). Target,
+// DefaultRoute, ClassifierKind, and ClassifierModel are nullable per the
+// alias_kind_shape CHECK constraint (NULL for the fields that don't apply to
+// this row's Kind).
+type rawAliasRow struct {
+	Alias           string
+	Kind            string
+	Target          *string
+	DefaultRoute    *string
+	ClassifierKind  *string
+	ClassifierModel *string
+}
+
+// buildAliases assembles the Aliases map of a Snapshot from the raw scanned
+// rows of model_aliases and model_alias_routes. Pure (no I/O) so the
+// drop-if-inconsistent rule below can be unit-tested with fakes ahead of (and
+// independently of) migration 013 landing against a real database.
+//
+// A routed alias whose rows are inconsistent — zero routes, or a
+// default_route that does not name one of them — is dropped from the
+// snapshot with one WARN log line; it never fails the whole load. The api
+// enforces both invariants at PUT time inside the same transaction that
+// writes model_alias_routes, but the gateway does not trust that to hold for
+// every possible write path (a partially-applied migration, a direct DB
+// edit, or simply two independently-deployed services never being perfectly
+// in sync) — resolving a request to an empty target would be worse than
+// dropping the alias and refusing it with 404 model_not_found instead.
+func buildAliases(aliasRows []rawAliasRow, routeRows []rawRouteRow) map[string]AliasDef {
+	// routesByAlias holds every candidate route for a routed alias, still in
+	// model_alias_routes.position order. A static alias never has an entry.
+	routesByAlias := make(map[string][]RouteDef)
+	for _, r := range routeRows {
+		rd := RouteDef{Name: r.Name, Description: r.Description, Target: r.Target}
+		// Case-fold defensively: the api case-folds keywords on write, but
+		// the gateway must not depend on that holding for every write path
+		// that reaches this table, since keyword matching itself is done
+		// against already-lower-cased text (see internal/router).
+		rd.Keywords = make([]string, len(r.Keywords))
+		for i, kw := range r.Keywords {
+			rd.Keywords[i] = strings.ToLower(kw)
+		}
+		routesByAlias[r.Alias] = append(routesByAlias[r.Alias], rd)
+	}
+
+	aliases := make(map[string]AliasDef, len(aliasRows))
+	for _, a := range aliasRows {
+		if a.Kind == AliasKindStatic {
+			if a.Target == nil {
+				// Violates alias_kind_shape; should be unreachable, but a
+				// static alias with no target is unusable — drop it rather
+				// than resolve every caller of it to the empty string.
+				log.Printf("policy: WARNING static alias %q has no target_model_id, dropping from snapshot", a.Alias)
+				continue
+			}
+			aliases[a.Alias] = AliasDef{Kind: AliasKindStatic, Target: *a.Target}
+			continue
+		}
+
+		// a.Kind == AliasKindRouted (the only other value alias_kind_shape
+		// permits — a value outside {static, routed} would itself violate
+		// the kind CHECK constraint and could not have been written).
+		def := AliasDef{Kind: AliasKindRouted, Routes: routesByAlias[a.Alias]}
+		if a.DefaultRoute != nil {
+			def.DefaultRoute = *a.DefaultRoute
+		}
+		if a.ClassifierKind != nil {
+			def.ClassifierKind = *a.ClassifierKind
+		}
+		if a.ClassifierModel != nil {
+			def.ClassifierModel = *a.ClassifierModel
+		}
+
+		if len(def.Routes) == 0 {
+			log.Printf("policy: WARNING routed alias %q has zero routes, dropping from snapshot", a.Alias)
+			continue
+		}
+		if _, ok := def.Route(def.DefaultRoute); !ok {
+			log.Printf("policy: WARNING routed alias %q default_route %q is not among its routes, dropping from snapshot", a.Alias, def.DefaultRoute)
+			continue
+		}
+		aliases[a.Alias] = def
+	}
+	return aliases
 }
 
 // compile-time interface check.

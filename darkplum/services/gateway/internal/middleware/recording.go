@@ -130,7 +130,24 @@ func Recording(rec *recorder.Recorder) gin.HandlerFunc {
 			completionTokens = &ct
 		}
 
-		rec.Record(recorder.InferenceEvent{
+		// route_name/router_reason/router_latency_ms are set by
+		// handler.ChatHandler only when a routed alias was resolved (see
+		// HandleChatCompletions) — empty/nil otherwise, which is correct:
+		// purposeOrDefault fills in "inference" for Purpose (left at its Go
+		// zero value here; this middleware never records a "routing" or
+		// "routing_dryrun" row itself, only the main request), and
+		// nullableStr/a nil *int turn the routed-alias fields into NULL for a
+		// plain model id or a static alias.
+		routeName := c.GetString("route_name")
+		routerReason := c.GetString("router_reason")
+		var routerLatencyMS *int
+		if v, ok := c.Get("router_latency_ms"); ok {
+			if ms, ok := v.(int); ok {
+				routerLatencyMS = &ms
+			}
+		}
+
+		main := recorder.InferenceEvent{
 			RequestID:        requestID,
 			APIKeyID:         keyID,
 			UserID:           userID,
@@ -145,7 +162,29 @@ func Recording(rec *recorder.Recorder) gin.HandlerFunc {
 			Region:           providerRegion,
 			PromptTokens:     promptTokens,
 			CompletionTokens: completionTokens,
-		})
+			RouteName:        routeName,
+			RouterReason:     routerReason,
+			RouterLatencyMS:  routerLatencyMS,
+		}
+
+		// A routed alias's model classifier call produces a second,
+		// purpose="routing" event — set on ctx by ChatHandler.
+		// HandleChatCompletions right after the classifier call, since only
+		// the handler has the classifier call's own provider/tokens/latency/
+		// status metadata. The pair is enqueued atomically (both or
+		// neither — see Recorder.RecordPair): a partial write would leave a
+		// purpose="routing" row with no matching purpose="inference" row to
+		// explain, or vice versa. No such event exists for a rules or
+		// semantic-router classifier decision (no LLM saw the prompt), so
+		// the ordinary single-event Record path below is unchanged for
+		// those and for every non-routed request.
+		if v, ok := c.Get("routing_audit_event"); ok {
+			if routingEvt, ok := v.(recorder.InferenceEvent); ok {
+				rec.RecordPair(main, routingEvt)
+				return
+			}
+		}
+		rec.Record(main)
 	}
 }
 

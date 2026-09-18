@@ -18,16 +18,92 @@ const (
 	ResidencySelfHostedOnly = "self_hosted_only"
 )
 
+// Alias kinds for model_aliases.kind (migration 013).
+const (
+	AliasKindStatic = "static"
+	AliasKindRouted = "routed"
+)
+
+// Classifier kinds for model_aliases.classifier_kind (migration 013).
+// ClassifierKindSemanticRouter is a later addition (see internal/router's
+// SemanticRouterClassifier): it calls an in-cluster vLLM Semantic Router
+// classification API rather than an LLM, and never carries a
+// classifier_model_id.
+const (
+	ClassifierKindRules          = "rules"
+	ClassifierKindModel          = "model"
+	ClassifierKindSemanticRouter = "semantic_router"
+)
+
+// RouteDef is one candidate route of a routed alias, loaded from
+// model_alias_routes and ordered by position (see AliasDef.Routes).
+type RouteDef struct {
+	// Name is model_alias_routes.route_name.
+	Name string
+	// Description is shown to admins and, for a model classifier, sent as
+	// part of the classification prompt.
+	Description string
+	// Target is model_alias_routes.target_model_id — always a concrete model
+	// id, never another alias (enforced by the api at PUT time).
+	Target string
+	// Keywords are case-folded literal substrings (or reserved builtin:*
+	// tokens) a rules classifier matches against, in list order.
+	Keywords []string
+}
+
+// AliasDef describes one row of model_aliases. A static alias only ever
+// populates Kind and Target (StaticTarget mirrors the pre-routed-alias
+// map[string]string shape for callers that only care about that case). A
+// routed alias additionally populates DefaultRoute, ClassifierKind, and
+// Routes (ordered by model_alias_routes.position); ClassifierModel is set
+// only when ClassifierKind == ClassifierKindModel.
+type AliasDef struct {
+	Kind            string
+	Target          string
+	DefaultRoute    string
+	ClassifierKind  string
+	ClassifierModel string
+	Routes          []RouteDef
+}
+
+// Route returns the named route from a.Routes, or false if no route with
+// that name exists. Every Decision a router.Classifier produces names either
+// a.DefaultRoute or one of a.Routes — both are guaranteed (by the loader's
+// drop-if-inconsistent rule) to resolve here for any AliasDef actually
+// present in a loaded Snapshot.
+func (a AliasDef) Route(name string) (RouteDef, bool) {
+	for _, r := range a.Routes {
+		if r.Name == name {
+			return r, true
+		}
+	}
+	return RouteDef{}, false
+}
+
 // Snapshot is the routing-enforcement policy in effect at a point in time.
 type Snapshot struct {
 	// Enabled maps model_id -> models.enabled. A model absent from this map
 	// (not yet synced by the api) is treated as not enabled.
 	Enabled map[string]bool
-	// Aliases maps alias -> target_model_id. Never chained: a target is
-	// looked up as-is, not re-resolved through Aliases again.
-	Aliases map[string]string
+	// Aliases maps alias -> AliasDef. Never chained: a static alias's Target
+	// and a routed alias's route targets are looked up as-is, never
+	// re-resolved through Aliases again (model_aliases guarantees a target is
+	// never itself an alias).
+	Aliases map[string]AliasDef
 	// Residency is ResidencyAny or ResidencySelfHostedOnly.
 	Residency string
+}
+
+// StaticTarget returns the target of a static alias, mirroring the
+// pre-routed-alias Aliases map[string]string shape. Returns false for a
+// routed alias or an unknown alias — callers that need routed-alias fields
+// use Aliases directly.
+func (s Snapshot) StaticTarget(alias string) (string, bool) {
+	a, ok := s.Aliases[alias]
+	if !ok || a.Kind != AliasKindStatic {
+		return "", false
+	}
+	return a.Target, true
 }
 
 // Store exposes the current policy snapshot to request handlers.

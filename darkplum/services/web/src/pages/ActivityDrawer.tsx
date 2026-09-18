@@ -12,8 +12,9 @@ import {
 } from 'recharts'
 import { getUsageStats, listActivity, listUsage } from '../lib/api'
 import { useTheme } from '../context/ThemeContext'
-import type { KeyUsageSummary, TimeRange, UsageBucket, UserUsageSummary } from '../types'
+import type { InferenceEvent, KeyUsageSummary, TimeRange, UsageBucket, UserUsageSummary } from '../types'
 import { eventLabel, eventVariant, formatEventDetail, type EventVariant } from '../lib/activityEvents'
+import { routerReasonText } from '../lib/modelRouting'
 import { useToast } from '../components/Toast'
 import { Avatar, Badge, Skeleton } from '../components/ui'
 import styles from './ActivityDrawer.module.css'
@@ -69,6 +70,43 @@ function formatXAxisTick(bucket: string, interval: 'hour' | 'day'): string {
     return d.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', hour12: false })
   }
   return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+}
+
+/** One recorded call as a drawer row. A classifier call is named for the job it
+ *  did — it chose a route, it did not answer anyone — and carries the route it
+ *  chose so the row explains itself without a second lookup. */
+function inferenceToRow(e: InferenceEvent): {
+  id: string
+  created_at: string
+  label: string
+  variant: EventVariant
+  detail: string
+} {
+  const purpose = e.purpose ?? 'inference'
+  const label =
+    e.status_code >= 400
+      ? 'Error'
+      : purpose === 'routing'
+        ? 'Classifier'
+        : purpose === 'routing_dryrun'
+          ? 'Route test'
+          : 'Request'
+  const detail = [
+    `model: ${e.model}`,
+    e.route_name ? `route: ${e.route_name}` : '',
+    e.router_reason ? routerReasonText(e.router_reason).toLowerCase() : '',
+    `${e.latency_ms}ms`,
+    `status: ${e.status_code}`,
+  ]
+    .filter(Boolean)
+    .join(', ')
+  return {
+    id: e.id,
+    created_at: e.created_at,
+    label,
+    variant: e.status_code >= 400 ? 'danger' : purpose === 'inference' ? 'success' : 'info',
+    detail,
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -154,13 +192,7 @@ export function ActivityDrawer({ open, onClose, user, apiKey, timeRange }: Drawe
           detail: e.detail ? formatEventDetail(e.detail) : '',
         }))
 
-        const inferenceMapped = usageRes.events.map((e) => ({
-          id: e.id,
-          created_at: e.created_at,
-          label: e.status_code < 400 ? 'Request' : 'Error',
-          variant: (e.status_code < 400 ? 'success' : 'danger') as EventVariant,
-          detail: `model: ${e.model}, ${e.latency_ms}ms, status: ${e.status_code}`,
-        }))
+        const inferenceMapped = usageRes.events.map(inferenceToRow)
 
         const merged = [...adminMapped, ...inferenceMapped]
           .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
@@ -168,14 +200,7 @@ export function ActivityDrawer({ open, onClose, user, apiKey, timeRange }: Drawe
         setRecentEvents(merged)
       } else if (apiKey) {
         const usageRes = await listUsage({ api_key_id: apiKey.api_key_id, since, until, limit: 10, offset: 0 })
-        const mapped = usageRes.events.map((e) => ({
-          id: e.id,
-          created_at: e.created_at,
-          label: e.status_code < 400 ? 'Request' : 'Error',
-          variant: (e.status_code < 400 ? 'success' : 'danger') as EventVariant,
-          detail: `model: ${e.model}, ${e.latency_ms}ms, status: ${e.status_code}`,
-        }))
-        setRecentEvents(mapped)
+        setRecentEvents(usageRes.events.map(inferenceToRow))
       }
     } catch (err) {
       toast((err as Error).message, 'error')

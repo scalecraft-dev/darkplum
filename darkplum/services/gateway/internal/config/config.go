@@ -59,6 +59,33 @@ type Config struct {
 	// URLs. Set DEV_MODE=true when running locally against LM Studio or a local
 	// vLLM instance. Must never be set in production.
 	DevMode bool
+
+	// ClassifierTimeoutMS bounds a routed alias's model or semantic-router
+	// classifier call. CLASSIFIER_TIMEOUT_MS, default 500, clamped to
+	// [50, 2000].
+	ClassifierTimeoutMS int
+	// ClassifierBreakerFailures is the number of consecutive classifier call
+	// failures that opens the circuit breaker. CLASSIFIER_BREAKER_FAILURES,
+	// default 5, minimum 1.
+	ClassifierBreakerFailures int
+	// ClassifierBreakerOpenSeconds is how long the breaker stays open (the
+	// classifier is skipped, falling back to default_route) once it trips.
+	// CLASSIFIER_BREAKER_OPEN_SECONDS, default 30, minimum 5.
+	ClassifierBreakerOpenSeconds int
+
+	// SemanticRouterURL is the base URL of an in-cluster vLLM Semantic
+	// Router deployment (e.g.
+	// http://semantic-router.darkplum-system.svc.cluster.local:8080).
+	// SEMANTIC_ROUTER_URL, empty by default — a routed alias using the
+	// semantic_router classifier_kind degrades to default_route with
+	// fallback:classifier_invalid until this is set.
+	SemanticRouterURL string
+	// SemanticRouterMinConfidence is the minimum classification confidence
+	// the semantic router must report to use its picked category; below
+	// this, the request falls back to default_route with
+	// fallback:low_confidence. SEMANTIC_ROUTER_MIN_CONFIDENCE, default 0.6,
+	// clamped to [0, 1].
+	SemanticRouterMinConfidence float64
 }
 
 // Load reads environment variables and returns a populated Config.
@@ -177,6 +204,51 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("ROUTE_LAST_GOOD_TTL_SECONDS (%d) must be >= DISCOVERY_INTERVAL_SECONDS (%d)", routeLastGoodTTL, discoveryInterval)
 	}
 
+	// classifierTimeoutMS/classifierBreakerFailures/
+	// classifierBreakerOpenSeconds govern a routed alias's model and
+	// semantic-router classifiers (internal/router). Rejected (not clamped)
+	// out of bounds, matching every other bounded knob in this file
+	// (POLICY_MAX_STALENESS_SECONDS, ROUTE_LAST_GOOD_TTL_SECONDS): a
+	// misconfigured env value should fail loudly at startup, not silently
+	// run with a different value than the operator asked for.
+	classifierTimeoutMS := 500
+	if v := os.Getenv("CLASSIFIER_TIMEOUT_MS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 50 || n > 2000 {
+			return nil, fmt.Errorf("CLASSIFIER_TIMEOUT_MS must be an integer between 50 and 2000, got %q", v)
+		}
+		classifierTimeoutMS = n
+	}
+
+	classifierBreakerFailures := 5
+	if v := os.Getenv("CLASSIFIER_BREAKER_FAILURES"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			return nil, fmt.Errorf("CLASSIFIER_BREAKER_FAILURES must be an integer >= 1, got %q", v)
+		}
+		classifierBreakerFailures = n
+	}
+
+	classifierBreakerOpenSeconds := 30
+	if v := os.Getenv("CLASSIFIER_BREAKER_OPEN_SECONDS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 5 {
+			return nil, fmt.Errorf("CLASSIFIER_BREAKER_OPEN_SECONDS must be an integer >= 5, got %q", v)
+		}
+		classifierBreakerOpenSeconds = n
+	}
+
+	semanticRouterURL := strings.TrimSpace(os.Getenv("SEMANTIC_ROUTER_URL"))
+
+	semanticRouterMinConfidence := 0.6
+	if v := os.Getenv("SEMANTIC_ROUTER_MIN_CONFIDENCE"); v != "" {
+		f, err := strconv.ParseFloat(v, 64)
+		if err != nil || f < 0 || f > 1 {
+			return nil, fmt.Errorf("SEMANTIC_ROUTER_MIN_CONFIDENCE must be a number between 0 and 1, got %q", v)
+		}
+		semanticRouterMinConfidence = f
+	}
+
 	return &Config{
 		Port:                      port,
 		VLLMUpstream:              upstream,
@@ -192,6 +264,12 @@ func Load() (*Config, error) {
 		PolicyMaxStalenessSeconds: policyMaxStaleness,
 		RouteLastGoodTTLSeconds:   routeLastGoodTTL,
 		DevMode:                   devMode,
+
+		ClassifierTimeoutMS:          classifierTimeoutMS,
+		ClassifierBreakerFailures:    classifierBreakerFailures,
+		ClassifierBreakerOpenSeconds: classifierBreakerOpenSeconds,
+		SemanticRouterURL:            semanticRouterURL,
+		SemanticRouterMinConfidence:  semanticRouterMinConfidence,
 	}, nil
 }
 
