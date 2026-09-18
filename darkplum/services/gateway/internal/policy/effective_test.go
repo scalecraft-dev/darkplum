@@ -1,14 +1,23 @@
 package policy
 
 import (
+	"encoding/json"
 	"reflect"
+	"strings"
 	"testing"
 )
 
 func strP(s string) *string { return &s }
 func selfHostedP() *string  { v := ResidencySelfHostedOnly; return &v }
+
+// modelsP builds a *[]string test input. Deliberately make()+copy, not
+// append([]string(nil), ids...): with zero ids that append form returns nil,
+// not a non-nil empty slice, which would make modelsP() (no args, the
+// "explicit deny-all" case several tests below rely on) indistinguishable
+// from a nil *[]string in anything that round-trips through JSON.
 func modelsP(ids ...string) *[]string {
-	s := append([]string(nil), ids...)
+	s := make([]string, len(ids))
+	copy(s, ids)
 	return &s
 }
 
@@ -71,6 +80,33 @@ func TestEffective_OnlyOrgSetsAllowedModels_SourceIsOrg(t *testing.T) {
 	}
 	if eff.Sources.AllowedModels != PrincipalTypeOrg {
 		t.Errorf("Sources.AllowedModels = %q, want %q", eff.Sources.AllowedModels, PrincipalTypeOrg)
+	}
+}
+
+// TestEffective_EmptyAllowlistAtOnlyLevelMarshalsAsEmptyArrayNotNull guards
+// the exact bug this fixes: when the FIRST (most specific) level to set an
+// allowlist sets an explicit empty one (deny-all), the merged
+// EffectivePolicy.AllowedModels must marshal over the wire as
+// "allowed_models":[], never "allowed_models":null -- null is
+// indistinguishable from "no restriction" to every HTTP consumer of this
+// package (the api, via GET/POST /v1/policy/effective), which would then
+// treat a locked-out principal as having full access. In-process callers
+// (Allows, the request-time enforcement path) are unaffected either way --
+// this is purely a wire-representation bug.
+func TestEffective_EmptyAllowlistAtOnlyLevelMarshalsAsEmptyArrayNotNull(t *testing.T) {
+	eff := Effective([]PolicyRow{
+		{Level: PrincipalTypeOrg},
+		{Level: PrincipalTypeUser, AllowedModels: modelsP()}, // explicit deny-all, the only level that sets one
+	})
+	if eff.AllowedModels == nil || len(*eff.AllowedModels) != 0 {
+		t.Fatalf("AllowedModels = %v, want a non-nil empty slice", eff.AllowedModels)
+	}
+	b, err := json.Marshal(eff)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(b), `"allowed_models":[]`) {
+		t.Errorf("marshaled JSON = %s, want \"allowed_models\":[] (not null)", b)
 	}
 }
 
@@ -256,6 +292,113 @@ func TestSnapshot_EffectiveFor_ServiceKeyIgnoresKeyPolicies(t *testing.T) {
 	got := snap.EffectiveFor("user-1", "key-1", KeyTypeService)
 	if got.AllowedModels == nil || (*got.AllowedModels)[0] != "user-model" {
 		t.Errorf("expected the service caller's impersonated user's policy, got %+v", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Snapshot.ChainFor / PolicyOverride.Apply: the POST /v1/policy/effective
+// preview path's chain reconstruction and substitution
+// ---------------------------------------------------------------------------
+
+func TestSnapshot_ChainFor_UserAndKeyWithNoRowsAreInheritPlaceholders(t *testing.T) {
+	snap := Snapshot{OrgRow: PolicyRow{AllowedModels: modelsP("a", "b")}}
+
+	chain := snap.ChainFor("user-with-no-row", "key-with-no-row")
+	if len(chain) != 3 {
+		t.Fatalf("expected a 3-row chain (org, user, api_key), got %d", len(chain))
+	}
+	if chain[0].Level != PrincipalTypeOrg || chain[0].AllowedModels == nil || len(*chain[0].AllowedModels) != 2 {
+		t.Errorf("chain[0] (org) = %+v, want the snapshot's OrgRow", chain[0])
+	}
+	if chain[1].Level != PrincipalTypeUser || chain[1].AllowedModels != nil {
+		t.Errorf("chain[1] (user) = %+v, want an empty inherit placeholder", chain[1])
+	}
+	if chain[2].Level != PrincipalTypeAPIKey || chain[2].AllowedModels != nil {
+		t.Errorf("chain[2] (api_key) = %+v, want an empty inherit placeholder", chain[2])
+	}
+}
+
+func TestSnapshot_ChainFor_NoKeyIDOmitsAPIKeyLevel(t *testing.T) {
+	snap := Snapshot{}
+	chain := snap.ChainFor("user-1", "")
+	if len(chain) != 2 {
+		t.Fatalf("expected a 2-row chain (org, user) when keyID is empty, got %d", len(chain))
+	}
+}
+
+func TestSnapshot_ChainFor_UsesExplicitRowsWhenPresent(t *testing.T) {
+	snap := Snapshot{
+		OrgRow:   PolicyRow{Residency: selfHostedP()},
+		UserRows: map[string]PolicyRow{"user-1": {AllowedModels: modelsP("a")}},
+		KeyRows:  map[string]PolicyRow{"key-1": {DefaultModel: strP("d")}},
+	}
+
+	chain := snap.ChainFor("user-1", "key-1")
+	if chain[0].Residency == nil || *chain[0].Residency != ResidencySelfHostedOnly {
+		t.Errorf("chain[0] (org) Residency = %v, want self_hosted_only", chain[0].Residency)
+	}
+	if chain[1].AllowedModels == nil || (*chain[1].AllowedModels)[0] != "a" {
+		t.Errorf("chain[1] (user) AllowedModels = %v, want [a]", chain[1].AllowedModels)
+	}
+	if chain[2].DefaultModel == nil || *chain[2].DefaultModel != "d" {
+		t.Errorf("chain[2] (api_key) DefaultModel = %v, want d", chain[2].DefaultModel)
+	}
+}
+
+func TestPolicyOverride_Apply_SubstitutesTheNamedLevelOnly(t *testing.T) {
+	chain := []PolicyRow{
+		{Level: PrincipalTypeOrg, AllowedModels: modelsP("a", "b")},
+		{Level: PrincipalTypeUser, AllowedModels: modelsP("a")},
+		{Level: PrincipalTypeAPIKey},
+	}
+	override := PolicyOverride{Level: PrincipalTypeUser, Policy: &PolicyRow{AllowedModels: modelsP("a", "b")}}
+
+	out := override.Apply(chain)
+	if len(out) != 3 {
+		t.Fatalf("expected Apply to preserve chain length, got %d", len(out))
+	}
+	if out[0].AllowedModels == nil || len(*out[0].AllowedModels) != 2 {
+		t.Errorf("org row must be untouched, got %+v", out[0])
+	}
+	if out[1].AllowedModels == nil || len(*out[1].AllowedModels) != 2 {
+		t.Errorf("user row = %+v, want the override's allowlist substituted", out[1])
+	}
+	if out[1].Level != PrincipalTypeUser {
+		t.Errorf("substituted row Level = %q, want %q (forced regardless of the override's own Level field)", out[1].Level, PrincipalTypeUser)
+	}
+	// The original chain must not be mutated.
+	if len(*chain[1].AllowedModels) != 1 {
+		t.Errorf("Apply must not mutate its input chain, got chain[1] = %+v", chain[1])
+	}
+}
+
+func TestPolicyOverride_Apply_NilPolicyMeansInherit(t *testing.T) {
+	chain := []PolicyRow{
+		{Level: PrincipalTypeOrg},
+		{Level: PrincipalTypeUser, AllowedModels: modelsP("a"), Residency: selfHostedP(), DefaultModel: strP("d")},
+	}
+	out := PolicyOverride{Level: PrincipalTypeUser, Policy: nil}.Apply(chain)
+
+	if out[1].AllowedModels != nil || out[1].Residency != nil || out[1].DefaultModel != nil {
+		t.Errorf("nil Policy must remove the row entirely (inherit), got %+v", out[1])
+	}
+	if out[1].Level != PrincipalTypeUser {
+		t.Errorf("Level must be preserved even when inheriting, got %q", out[1].Level)
+	}
+}
+
+func TestPolicyOverride_Apply_NoMatchingLevelIsANoop(t *testing.T) {
+	// ChainFor never omits org/user, so this only happens for an api_key-level
+	// override applied to a 2-row (org, user) chain -- HandleEffectivePolicyOverride
+	// rejects that combination with 400 before ever calling Apply, but Apply
+	// itself must not panic or corrupt the chain if it somehow happens.
+	chain := []PolicyRow{{Level: PrincipalTypeOrg}, {Level: PrincipalTypeUser}}
+	out := PolicyOverride{Level: PrincipalTypeAPIKey, Policy: &PolicyRow{AllowedModels: modelsP("x")}}.Apply(chain)
+	if len(out) != 2 {
+		t.Fatalf("expected chain length unchanged, got %d", len(out))
+	}
+	if out[0].AllowedModels != nil || out[1].AllowedModels != nil {
+		t.Errorf("expected no substitution when no row matches Level, got %+v", out)
 	}
 }
 

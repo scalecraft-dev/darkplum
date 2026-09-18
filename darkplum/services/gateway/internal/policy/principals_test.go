@@ -35,29 +35,32 @@ func TestIsUndefinedTableError_OtherCodesAreNotClassified(t *testing.T) {
 // the 42P01-tolerance path: loadFromDB passes rows=nil (the table doesn't
 // exist yet) and the already-fetched routing_policy.residency as fallback.
 func TestBuildPrincipalPolicies_ZeroRowsFallsBackToRoutingPolicyResidency(t *testing.T) {
-	orgPolicy, users, keys, counts := buildPrincipalPolicies(nil, ResidencySelfHostedOnly)
+	built := buildPrincipalPolicies(nil, ResidencySelfHostedOnly)
 
-	if orgPolicy == nil {
+	if built.OrgPolicy == nil {
 		t.Fatal("expected a non-nil org policy even with zero rows")
 	}
-	if orgPolicy.Residency != ResidencySelfHostedOnly {
-		t.Errorf("org Residency = %q, want %q (from routing_policy fallback)", orgPolicy.Residency, ResidencySelfHostedOnly)
+	if built.OrgPolicy.Residency != ResidencySelfHostedOnly {
+		t.Errorf("org Residency = %q, want %q (from routing_policy fallback)", built.OrgPolicy.Residency, ResidencySelfHostedOnly)
 	}
-	if orgPolicy.AllowedModels != nil {
-		t.Errorf("org AllowedModels = %v, want nil", orgPolicy.AllowedModels)
+	if built.OrgPolicy.AllowedModels != nil {
+		t.Errorf("org AllowedModels = %v, want nil", built.OrgPolicy.AllowedModels)
 	}
-	if len(users) != 0 || len(keys) != 0 {
-		t.Errorf("expected zero explicit user/key policies, got users=%d keys=%d", len(users), len(keys))
+	if len(built.UserPolicies) != 0 || len(built.KeyPolicies) != 0 {
+		t.Errorf("expected zero explicit user/key policies, got users=%d keys=%d", len(built.UserPolicies), len(built.KeyPolicies))
 	}
-	if counts != (PrincipalCounts{}) {
-		t.Errorf("counts = %+v, want zero value", counts)
+	if built.Counts != (PrincipalCounts{}) {
+		t.Errorf("counts = %+v, want zero value", built.Counts)
+	}
+	if len(built.UserRows) != 0 || len(built.KeyRows) != 0 {
+		t.Errorf("expected zero raw user/key rows, got users=%d keys=%d", len(built.UserRows), len(built.KeyRows))
 	}
 }
 
 func TestBuildPrincipalPolicies_ZeroRowsWithAnyResidencyFallback(t *testing.T) {
-	orgPolicy, _, _, _ := buildPrincipalPolicies(nil, ResidencyAny)
-	if orgPolicy.Residency != ResidencyAny {
-		t.Errorf("org Residency = %q, want %q", orgPolicy.Residency, ResidencyAny)
+	built := buildPrincipalPolicies(nil, ResidencyAny)
+	if built.OrgPolicy.Residency != ResidencyAny {
+		t.Errorf("org Residency = %q, want %q", built.OrgPolicy.Residency, ResidencyAny)
 	}
 }
 
@@ -68,9 +71,9 @@ func TestBuildPrincipalPolicies_ExplicitOrgRowWinsOverFallback(t *testing.T) {
 	rows := []rawPrincipalPolicyRow{
 		{PrincipalType: PrincipalTypeOrg, Residency: nil}, // explicit "any"
 	}
-	orgPolicy, _, _, _ := buildPrincipalPolicies(rows, ResidencySelfHostedOnly)
-	if orgPolicy.Residency != ResidencyAny {
-		t.Errorf("org Residency = %q, want %q (explicit org row overrides the fallback)", orgPolicy.Residency, ResidencyAny)
+	built := buildPrincipalPolicies(rows, ResidencySelfHostedOnly)
+	if built.OrgPolicy.Residency != ResidencyAny {
+		t.Errorf("org Residency = %q, want %q (explicit org row overrides the fallback)", built.OrgPolicy.Residency, ResidencyAny)
 	}
 }
 
@@ -85,17 +88,24 @@ func TestBuildPrincipalPolicies_UserRowChainsWithOrg(t *testing.T) {
 		{PrincipalType: PrincipalTypeOrg, AllowedModels: &orgModels},
 		{PrincipalType: PrincipalTypeUser, UserID: strP("user-1"), AllowedModels: &userModels},
 	}
-	_, users, _, counts := buildPrincipalPolicies(rows, ResidencyAny)
+	built := buildPrincipalPolicies(rows, ResidencyAny)
 
-	up, ok := users["user-1"]
+	up, ok := built.UserPolicies["user-1"]
 	if !ok {
 		t.Fatal("expected user-1 to have a precomputed effective policy")
 	}
 	if up.AllowedModels == nil || len(*up.AllowedModels) != 1 || (*up.AllowedModels)[0] != "a" {
 		t.Errorf("user-1 AllowedModels = %v, want [a] (intersected with org)", up.AllowedModels)
 	}
-	if counts.Users != 1 {
-		t.Errorf("counts.Users = %d, want 1", counts.Users)
+	if built.Counts.Users != 1 {
+		t.Errorf("counts.Users = %d, want 1", built.Counts.Users)
+	}
+	rawUser, ok := built.UserRows["user-1"]
+	if !ok {
+		t.Fatal("expected user-1 to have a raw row")
+	}
+	if rawUser.AllowedModels == nil || len(*rawUser.AllowedModels) != 1 || (*rawUser.AllowedModels)[0] != "a" {
+		t.Errorf("user-1 raw AllowedModels = %v, want [a] (UNmerged -- just what the row itself set)", rawUser.AllowedModels)
 	}
 }
 
@@ -109,9 +119,9 @@ func TestBuildPrincipalPolicies_KeyChainsThroughOwningUser(t *testing.T) {
 		{PrincipalType: PrincipalTypeUser, UserID: strP("user-1"), AllowedModels: &userModels},
 		{PrincipalType: PrincipalTypeAPIKey, APIKeyID: strP("key-1"), KeyOwnerUserID: strP("user-1")},
 	}
-	_, _, keys, counts := buildPrincipalPolicies(rows, ResidencyAny)
+	built := buildPrincipalPolicies(rows, ResidencyAny)
 
-	kp, ok := keys["key-1"]
+	kp, ok := built.KeyPolicies["key-1"]
 	if !ok {
 		t.Fatal("expected key-1 to have a precomputed effective policy")
 	}
@@ -125,8 +135,15 @@ func TestBuildPrincipalPolicies_KeyChainsThroughOwningUser(t *testing.T) {
 	if kp.Sources.AllowedModels != PrincipalTypeUser {
 		t.Errorf("key-1 Sources.AllowedModels = %q, want %q", kp.Sources.AllowedModels, PrincipalTypeUser)
 	}
-	if counts.APIKeys != 1 {
-		t.Errorf("counts.APIKeys = %d, want 1", counts.APIKeys)
+	if built.Counts.APIKeys != 1 {
+		t.Errorf("counts.APIKeys = %d, want 1", built.Counts.APIKeys)
+	}
+	rawKey, ok := built.KeyRows["key-1"]
+	if !ok {
+		t.Fatal("expected key-1 to have a raw row")
+	}
+	if rawKey.AllowedModels != nil {
+		t.Errorf("key-1 raw AllowedModels = %v, want nil (the row itself set nothing -- UNmerged)", rawKey.AllowedModels)
 	}
 }
 
@@ -137,9 +154,9 @@ func TestBuildPrincipalPolicies_KeyOwnerWithNoRowOfItsOwn(t *testing.T) {
 	rows := []rawPrincipalPolicyRow{
 		{PrincipalType: PrincipalTypeAPIKey, APIKeyID: strP("key-1"), KeyOwnerUserID: strP("user-with-no-row"), AllowedModels: &keyModels},
 	}
-	_, _, keys, _ := buildPrincipalPolicies(rows, ResidencyAny)
+	built := buildPrincipalPolicies(rows, ResidencyAny)
 
-	kp := keys["key-1"]
+	kp := built.KeyPolicies["key-1"]
 	if kp == nil || kp.AllowedModels == nil || len(*kp.AllowedModels) != 1 || (*kp.AllowedModels)[0] != "only-this-one" {
 		t.Errorf("got %+v, want AllowedModels=[only-this-one]", kp)
 	}
@@ -154,8 +171,8 @@ func TestBuildPrincipalPolicies_MalformedRowsAreDroppedNotPanicked(t *testing.T)
 		{PrincipalType: PrincipalTypeAPIKey, APIKeyID: nil},
 		{PrincipalType: "workspace"}, // not yet a supported level
 	}
-	_, users, keys, counts := buildPrincipalPolicies(rows, ResidencyAny)
-	if len(users) != 0 || len(keys) != 0 || counts != (PrincipalCounts{}) {
-		t.Errorf("expected every malformed/unrecognised row to be dropped, got users=%v keys=%v counts=%+v", users, keys, counts)
+	built := buildPrincipalPolicies(rows, ResidencyAny)
+	if len(built.UserPolicies) != 0 || len(built.KeyPolicies) != 0 || built.Counts != (PrincipalCounts{}) {
+		t.Errorf("expected every malformed/unrecognised row to be dropped, got users=%v keys=%v counts=%+v", built.UserPolicies, built.KeyPolicies, built.Counts)
 	}
 }

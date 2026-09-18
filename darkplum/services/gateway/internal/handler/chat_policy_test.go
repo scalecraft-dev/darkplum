@@ -9,8 +9,10 @@ package handler
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -571,5 +573,339 @@ func TestHandleEffectivePolicy_PolicyUnavailable503(t *testing.T) {
 
 	if w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("expected 503, got %d; body=%s", w.Code, w.Body.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// POST /v1/policy/effective — the override preview path
+// ---------------------------------------------------------------------------
+
+const (
+	previewUserID = "11111111-1111-1111-1111-111111111111"
+	previewKeyID  = "22222222-2222-2222-2222-222222222222"
+	previewKeyID2 = "33333333-3333-3333-3333-333333333333"
+)
+
+func newEffectivePolicyOverrideRequest(t *testing.T, ctxType string, body string) (*httptest.ResponseRecorder, *gin.Context) {
+	t.Helper()
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	req, err := http.NewRequest(http.MethodPost, "/v1/policy/effective", strings.NewReader(body))
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	c.Request = req
+	c.Set(middleware.ContextKeyType, ctxType)
+	return w, c
+}
+
+type overridePreviewBody struct {
+	AllowedModels   []string                         `json:"allowed_models"`
+	Residency       string                           `json:"residency"`
+	DefaultModel    *string                          `json:"default_model"`
+	Sources         policy.PolicySources             `json:"sources"`
+	ReachableModels []string                         `json:"reachable_models"`
+	Keys            []overridePreviewKeyEntryForTest `json:"keys"`
+}
+
+type overridePreviewKeyEntryForTest struct {
+	APIKeyID  string              `json:"api_key_id"`
+	Effective overridePreviewBody `json:"effective"`
+}
+
+func decodeOverridePreview(t *testing.T, body []byte) overridePreviewBody {
+	t.Helper()
+	var out overridePreviewBody
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatalf("unmarshal preview response: %v; body=%s", err, body)
+	}
+	return out
+}
+
+// baseOverrideSnapshot builds a Snapshot with an org allowlist of three
+// models and no residency/default set anywhere, plus routing/enabled data so
+// reachable_models resolves. previewUserID owns two keys (previewKeyID,
+// previewKeyID2), neither with a row of its own.
+func baseOverrideSnapshot() policy.Snapshot {
+	orgRow := policy.PolicyRow{Level: policy.PrincipalTypeOrg, AllowedModels: &[]string{"m1", "m2", "m3"}}
+	orgEff := policy.Effective([]policy.PolicyRow{orgRow})
+	return policy.Snapshot{
+		Enabled:   map[string]bool{"m1": true, "m2": true, "m3": true},
+		Residency: policy.ResidencyAny,
+		OrgRow:    orgRow,
+		// OrgPolicy is the precomputed counterpart of OrgRow, kept in sync
+		// exactly like buildPrincipalPolicies does for a real snapshot load --
+		// GET /v1/policy/effective (EffectiveFor) reads OrgPolicy, while POST's
+		// override path (ChainFor) reads OrgRow/UserRows/KeyRows directly; a
+		// test that compares the two (see NoOverrideMatchesGET) needs both.
+		OrgPolicy: &orgEff,
+		UserKeys: map[string][]string{
+			previewUserID: {previewKeyID, previewKeyID2},
+		},
+	}
+}
+
+func baseOverrideRoutes() map[string]routing.Route {
+	return map[string]routing.Route{
+		"m1": {ProviderKey: "vllm-default", Kind: "vllm", Class: routing.ClassSelfHosted},
+		"m2": {ProviderKey: "vllm-default", Kind: "vllm", Class: routing.ClassSelfHosted},
+		"m3": {ProviderKey: "vllm-default", Kind: "vllm", Class: routing.ClassSelfHosted},
+	}
+}
+
+func TestHandleEffectivePolicyOverride_403ForNonServiceKey(t *testing.T) {
+	h := newTestHandler(fakeProviders{}, baseOverrideRoutes(), baseOverrideSnapshot(), true)
+
+	body := fmt.Sprintf(`{"user_id":%q}`, previewUserID)
+	w, c := newEffectivePolicyOverrideRequest(t, middleware.KeyTypeUser, body)
+	h.HandleEffectivePolicyOverride(c)
+
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 for a non-service key, got %d; body=%s", w.Code, w.Body.String())
+	}
+	if e := decodeError(t, w.Body.Bytes()); e.Error.Code != "service_key_required" {
+		t.Errorf("expected code service_key_required, got %q", e.Error.Code)
+	}
+}
+
+func TestHandleEffectivePolicyOverride_400InvalidBody(t *testing.T) {
+	h := newTestHandler(fakeProviders{}, baseOverrideRoutes(), baseOverrideSnapshot(), true)
+
+	w, c := newEffectivePolicyOverrideRequest(t, middleware.KeyTypeService, `not json`)
+	h.HandleEffectivePolicyOverride(c)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d; body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandleEffectivePolicyOverride_400MissingUserID(t *testing.T) {
+	h := newTestHandler(fakeProviders{}, baseOverrideRoutes(), baseOverrideSnapshot(), true)
+
+	w, c := newEffectivePolicyOverrideRequest(t, middleware.KeyTypeService, `{}`)
+	h.HandleEffectivePolicyOverride(c)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d; body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandleEffectivePolicyOverride_400UnknownOverrideLevel(t *testing.T) {
+	h := newTestHandler(fakeProviders{}, baseOverrideRoutes(), baseOverrideSnapshot(), true)
+
+	body := fmt.Sprintf(`{"user_id":%q,"override":{"level":"workspace","policy":null}}`, previewUserID)
+	w, c := newEffectivePolicyOverrideRequest(t, middleware.KeyTypeService, body)
+	h.HandleEffectivePolicyOverride(c)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an unknown override.level, got %d; body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandleEffectivePolicyOverride_400APIKeyLevelWithoutAPIKeyID(t *testing.T) {
+	h := newTestHandler(fakeProviders{}, baseOverrideRoutes(), baseOverrideSnapshot(), true)
+
+	body := fmt.Sprintf(`{"user_id":%q,"override":{"level":"api_key","policy":null}}`, previewUserID)
+	w, c := newEffectivePolicyOverrideRequest(t, middleware.KeyTypeService, body)
+	h.HandleEffectivePolicyOverride(c)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for override.level=api_key with no api_key_id, got %d; body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandleEffectivePolicyOverride_400BadResidency(t *testing.T) {
+	h := newTestHandler(fakeProviders{}, baseOverrideRoutes(), baseOverrideSnapshot(), true)
+
+	body := fmt.Sprintf(`{"user_id":%q,"override":{"level":"org","policy":{"residency":"anywhere"}}}`, previewUserID)
+	w, c := newEffectivePolicyOverrideRequest(t, middleware.KeyTypeService, body)
+	h.HandleEffectivePolicyOverride(c)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for an invalid residency value, got %d; body=%s", w.Code, w.Body.String())
+	}
+}
+
+func TestHandleEffectivePolicyOverride_PolicyUnavailable503(t *testing.T) {
+	h := newTestHandler(fakeProviders{}, baseOverrideRoutes(), policy.Snapshot{}, false)
+
+	body := fmt.Sprintf(`{"user_id":%q}`, previewUserID)
+	w, c := newEffectivePolicyOverrideRequest(t, middleware.KeyTypeService, body)
+	h.HandleEffectivePolicyOverride(c)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503, got %d; body=%s", w.Code, w.Body.String())
+	}
+}
+
+// TestHandleEffectivePolicyOverride_NoOverrideMatchesGET asserts a POST with
+// no override object at all reproduces exactly what GET /v1/policy/effective
+// would report for the same user_id/api_key_id — the "before" half of the
+// api's preview diff can use either.
+func TestHandleEffectivePolicyOverride_NoOverrideMatchesGET(t *testing.T) {
+	snap := baseOverrideSnapshot()
+	userRow := policy.PolicyRow{Level: policy.PrincipalTypeUser, AllowedModels: &[]string{"m1", "m2"}}
+	snap.UserRows = map[string]policy.PolicyRow{previewUserID: userRow}
+	// UserPolicies is GET's precomputed counterpart of UserRows -- kept in
+	// sync exactly like buildPrincipalPolicies does for a real snapshot load.
+	userEff := policy.Effective([]policy.PolicyRow{snap.OrgRow, userRow})
+	snap.UserPolicies = map[string]*policy.EffectivePolicy{previewUserID: &userEff}
+	h := newTestHandler(fakeProviders{}, baseOverrideRoutes(), snap, true)
+
+	postBody := fmt.Sprintf(`{"user_id":%q}`, previewUserID)
+	wPost, cPost := newEffectivePolicyOverrideRequest(t, middleware.KeyTypeService, postBody)
+	h.HandleEffectivePolicyOverride(cPost)
+	if wPost.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body=%s", wPost.Code, wPost.Body.String())
+	}
+	post := decodeOverridePreview(t, wPost.Body.Bytes())
+
+	wGet, cGet := newEffectivePolicyRequest(t, "user_id="+previewUserID, middleware.KeyTypeService)
+	h.HandleEffectivePolicy(cGet)
+	var getBody overridePreviewBody
+	if err := json.Unmarshal(wGet.Body.Bytes(), &getBody); err != nil {
+		t.Fatalf("unmarshal GET response: %v", err)
+	}
+
+	if len(post.AllowedModels) != len(getBody.AllowedModels) {
+		t.Errorf("POST (no override) allowed_models = %v, want to match GET %v", post.AllowedModels, getBody.AllowedModels)
+	}
+	if post.Residency != getBody.Residency {
+		t.Errorf("POST residency = %q, want %q (match GET)", post.Residency, getBody.Residency)
+	}
+}
+
+// TestHandleEffectivePolicyOverride_OrgLevel asserts an override.level="org"
+// substitution narrows the user's effective allowlist exactly like a real
+// org policy tightening would.
+func TestHandleEffectivePolicyOverride_OrgLevel(t *testing.T) {
+	h := newTestHandler(fakeProviders{}, baseOverrideRoutes(), baseOverrideSnapshot(), true)
+
+	body := fmt.Sprintf(`{"user_id":%q,"override":{"level":"org","policy":{"allowed_models":["m1"]}}}`, previewUserID)
+	w, c := newEffectivePolicyOverrideRequest(t, middleware.KeyTypeService, body)
+	h.HandleEffectivePolicyOverride(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body=%s", w.Code, w.Body.String())
+	}
+	got := decodeOverridePreview(t, w.Body.Bytes())
+	if len(got.AllowedModels) != 1 || got.AllowedModels[0] != "m1" {
+		t.Errorf("allowed_models = %v, want [m1]", got.AllowedModels)
+	}
+	if got.Sources.AllowedModels != policy.PrincipalTypeOrg {
+		t.Errorf("sources.allowed_models = %q, want %q", got.Sources.AllowedModels, policy.PrincipalTypeOrg)
+	}
+}
+
+// TestHandleEffectivePolicyOverride_UserLevel asserts an override.level="user"
+// substitution is used instead of whatever (if anything) is actually stored
+// for that user.
+func TestHandleEffectivePolicyOverride_UserLevel(t *testing.T) {
+	snap := baseOverrideSnapshot()
+	snap.UserRows = map[string]policy.PolicyRow{previewUserID: {AllowedModels: &[]string{"m1", "m2", "m3"}}}
+	h := newTestHandler(fakeProviders{}, baseOverrideRoutes(), snap, true)
+
+	body := fmt.Sprintf(`{"user_id":%q,"override":{"level":"user","policy":{"allowed_models":["m2"]}}}`, previewUserID)
+	w, c := newEffectivePolicyOverrideRequest(t, middleware.KeyTypeService, body)
+	h.HandleEffectivePolicyOverride(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body=%s", w.Code, w.Body.String())
+	}
+	got := decodeOverridePreview(t, w.Body.Bytes())
+	if len(got.AllowedModels) != 1 || got.AllowedModels[0] != "m2" {
+		t.Errorf("allowed_models = %v, want [m2] (the override, not the stored row)", got.AllowedModels)
+	}
+}
+
+// TestHandleEffectivePolicyOverride_APIKeyLevel asserts an override.level=
+// "api_key" substitution only affects the named key's own chain, and the
+// top-level response is that key's effective, not the owning user's.
+func TestHandleEffectivePolicyOverride_APIKeyLevel(t *testing.T) {
+	snap := baseOverrideSnapshot()
+	snap.UserRows = map[string]policy.PolicyRow{previewUserID: {AllowedModels: &[]string{"m1", "m2", "m3"}}}
+	h := newTestHandler(fakeProviders{}, baseOverrideRoutes(), snap, true)
+
+	body := fmt.Sprintf(`{"user_id":%q,"api_key_id":%q,"override":{"level":"api_key","policy":{"allowed_models":["m1"]}}}`,
+		previewUserID, previewKeyID)
+	w, c := newEffectivePolicyOverrideRequest(t, middleware.KeyTypeService, body)
+	h.HandleEffectivePolicyOverride(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body=%s", w.Code, w.Body.String())
+	}
+	got := decodeOverridePreview(t, w.Body.Bytes())
+	if len(got.AllowedModels) != 1 || got.AllowedModels[0] != "m1" {
+		t.Errorf("allowed_models = %v, want [m1]", got.AllowedModels)
+	}
+	if got.Sources.AllowedModels != policy.PrincipalTypeAPIKey {
+		t.Errorf("sources.allowed_models = %q, want %q", got.Sources.AllowedModels, policy.PrincipalTypeAPIKey)
+	}
+	// api_key-level override with an api_key_id must not also return a keys
+	// list — the top-level response already IS that key's view.
+	if len(got.Keys) != 0 {
+		t.Errorf("expected no keys list for an api_key-level override, got %v", got.Keys)
+	}
+}
+
+// TestHandleEffectivePolicyOverride_InheritRemovesTheRow covers policy=null
+// ("inherit"): the level's existing row is removed entirely rather than kept.
+func TestHandleEffectivePolicyOverride_InheritRemovesTheRow(t *testing.T) {
+	snap := baseOverrideSnapshot()
+	snap.UserRows = map[string]policy.PolicyRow{previewUserID: {AllowedModels: &[]string{"m1"}}}
+	h := newTestHandler(fakeProviders{}, baseOverrideRoutes(), snap, true)
+
+	body := fmt.Sprintf(`{"user_id":%q,"override":{"level":"user","policy":null}}`, previewUserID)
+	w, c := newEffectivePolicyOverrideRequest(t, middleware.KeyTypeService, body)
+	h.HandleEffectivePolicyOverride(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body=%s", w.Code, w.Body.String())
+	}
+	got := decodeOverridePreview(t, w.Body.Bytes())
+	// With the user's row inherited away, only the org's 3-model allowlist
+	// remains — NOT the stored [m1].
+	if len(got.AllowedModels) != 3 {
+		t.Errorf("allowed_models = %v, want all 3 org models (user row inherited away)", got.AllowedModels)
+	}
+	if got.Sources.AllowedModels != policy.PrincipalTypeOrg {
+		t.Errorf("sources.allowed_models = %q, want %q", got.Sources.AllowedModels, policy.PrincipalTypeOrg)
+	}
+}
+
+// TestHandleEffectivePolicyOverride_KeysListForUserWithTwoKeys is the design's
+// explicit "N keys affected" case: a user-level override must report BOTH of
+// the user's keys' resulting effective policies, keyed by id only (no name —
+// the gateway doesn't have one).
+func TestHandleEffectivePolicyOverride_KeysListForUserWithTwoKeys(t *testing.T) {
+	snap := baseOverrideSnapshot()
+	// key2 has its own tighter row; key1 has none (inherits the user).
+	snap.KeyRows = map[string]policy.PolicyRow{
+		previewKeyID2: {AllowedModels: &[]string{"m1"}},
+	}
+	h := newTestHandler(fakeProviders{}, baseOverrideRoutes(), snap, true)
+
+	body := fmt.Sprintf(`{"user_id":%q,"override":{"level":"user","policy":{"allowed_models":["m1","m2"]}}}`, previewUserID)
+	w, c := newEffectivePolicyOverrideRequest(t, middleware.KeyTypeService, body)
+	h.HandleEffectivePolicyOverride(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body=%s", w.Code, w.Body.String())
+	}
+	got := decodeOverridePreview(t, w.Body.Bytes())
+	if len(got.Keys) != 2 {
+		t.Fatalf("expected 2 keys in the keys list, got %d: %+v", len(got.Keys), got.Keys)
+	}
+	byID := map[string]overridePreviewKeyEntryForTest{}
+	for _, k := range got.Keys {
+		byID[k.APIKeyID] = k
+	}
+	k1, ok := byID[previewKeyID]
+	if !ok {
+		t.Fatalf("expected %s in keys list", previewKeyID)
+	}
+	if len(k1.Effective.AllowedModels) != 2 {
+		t.Errorf("key1 (no row of its own) effective allowed_models = %v, want the user override's [m1 m2]", k1.Effective.AllowedModels)
+	}
+	k2, ok := byID[previewKeyID2]
+	if !ok {
+		t.Fatalf("expected %s in keys list", previewKeyID2)
+	}
+	if len(k2.Effective.AllowedModels) != 1 || k2.Effective.AllowedModels[0] != "m1" {
+		t.Errorf("key2 (own row [m1]) effective allowed_models = %v, want [m1] (intersected with the user override)", k2.Effective.AllowedModels)
+	}
+	// api_key_id fields must be present on every entry, and no "name" field
+	// leaks through (the gateway has none to give).
+	if strings.Contains(string(w.Body.Bytes()), `"name"`) {
+		t.Errorf("expected no \"name\" field in the gateway's keys list, got body=%s", w.Body.String())
 	}
 }

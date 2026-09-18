@@ -24,10 +24,10 @@ import {
 } from '../lib/policy'
 import type {
   AdminModel,
-  EffectivePolicy,
   ModelAlias,
   PolicyPreview,
   PolicySource,
+  PreviewEffectivePolicy,
   PrincipalPolicy,
 } from '../types'
 import { useToast } from '../components/Toast'
@@ -84,8 +84,17 @@ function errorText(err: unknown, fallback: string): string {
 // ---------------------------------------------------------------------------
 
 /** Which level a field's value came from. Sits beside the value, never instead
- *  of it: the source explains the value, it is not the value. */
-function SourceChip({ source }: { source: PolicySource }) {
+ *  of it: the source explains the value, it is not the value. A preview that
+ *  did not say keeps the chip's place with a dash rather than claiming 'Unset',
+ *  which would read as a policy fact rather than a missing one. */
+function SourceChip({ source }: { source?: PolicySource }) {
+  if (!source) {
+    return (
+      <span className={styles.source} title="Not reported by this preview">
+        —
+      </span>
+    )
+  }
   return <span className={styles.source}>{sourceChip(source)}</span>
 }
 
@@ -134,6 +143,10 @@ export function PrincipalPolicyDrawer({ principal, models, aliases, onClose, onS
   const open = principal !== null
 
   const [loading, setLoading] = useState(true)
+  /** Which principal the state below belongs to. The load runs in an effect,
+   *  which is after paint, so without this the drawer shows the previous row's
+   *  answer for a frame when it is reopened on another one. */
+  const [loadedFor, setLoadedFor] = useState<string | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
   const [stored, setStored] = useState<PrincipalPolicy | null>(null)
   const [draft, setDraft] = useState<PrincipalPolicy>(INHERIT_ALL)
@@ -169,12 +182,16 @@ export function PrincipalPolicyDrawer({ principal, models, aliases, onClose, onS
 
   // --- load -----------------------------------------------------------------
 
+  const loadSeqRef = useRef(0)
+
   const load = useCallback(async () => {
     if (!principal) return
+    const seq = ++loadSeqRef.current
     setLoading(true)
     setLoadError(null)
     try {
       const result = await ENDPOINTS[principal.type].effective(principal.id)
+      if (seq !== loadSeqRef.current) return
       const row = result.stored ?? null
       setStored(row)
       setDraft(row ?? INHERIT_ALL)
@@ -183,17 +200,26 @@ export function PrincipalPolicyDrawer({ principal, models, aliases, onClose, onS
       setPreview({ effective: result, keys_affected: [], would_lock_out: [] })
       setPreviewError(null)
     } catch (err) {
+      if (seq !== loadSeqRef.current) return
       setLoadError(errorText(err, 'This policy could not be read'))
     } finally {
-      setLoading(false)
+      if (seq === loadSeqRef.current) {
+        setLoadedFor(principal.id)
+        setLoading(false)
+      }
     }
   }, [principal])
 
   useEffect(() => {
     if (!principal) return
     setPreview(null)
+    setPreviewError(null)
     void load()
   }, [principal, load])
+
+  /** The drawer is open on a principal whose policy has not been read yet. It
+   *  shows the skeleton until it has one: nothing below it is true before. */
+  const busy = loading || (principal !== null && loadedFor !== principal.id)
 
   // --- live impact ----------------------------------------------------------
   //
@@ -205,7 +231,7 @@ export function PrincipalPolicyDrawer({ principal, models, aliases, onClose, onS
   const seqRef = useRef(0)
 
   useEffect(() => {
-    if (!principal || loading || loadError) return
+    if (!principal || busy || loadError) return
     const seq = ++seqRef.current
     const body = JSON.parse(draftKey) as PrincipalPolicy
     const timer = setTimeout(() => {
@@ -226,11 +252,14 @@ export function PrincipalPolicyDrawer({ principal, models, aliases, onClose, onS
         })
     }, PREVIEW_DEBOUNCE_MS)
     return () => clearTimeout(timer)
-  }, [principal, draftKey, loading, loadError])
+  }, [principal, draftKey, busy, loadError])
 
   // --- derived --------------------------------------------------------------
 
-  const effective: EffectivePolicy | null = preview?.effective ?? null
+  /** Partial by type: a preview may answer without the parts computed from live
+   *  backend state, and every read below is written for that. */
+  const effective: PreviewEffectivePolicy | null = preview?.effective ?? null
+  const reachable = effective?.reachable_models
   const keysAffected = preview?.keys_affected ?? []
   const wouldLockOut = preview?.would_lock_out ?? []
   const lockedOut = wouldLockOut.length > 0
@@ -257,7 +286,7 @@ export function PrincipalPolicyDrawer({ principal, models, aliases, onClose, onS
   const emptyAllowlist = draft.allowed_models !== null && draft.allowed_models.length === 0
   const changed = !samePolicy(draft, stored ?? INHERIT_ALL)
   const canSave =
-    !loading && !loadError && changed && !saving && !lockedOut && !defaultOutsideAllowlist && !emptyAllowlist
+    !busy && !loadError && changed && !saving && !lockedOut && !defaultOutsideAllowlist && !emptyAllowlist
 
   // --- editing --------------------------------------------------------------
 
@@ -328,7 +357,7 @@ export function PrincipalPolicyDrawer({ principal, models, aliases, onClose, onS
             <p className={styles.rule}>{POLICY_RULE}</p>
           </header>
 
-          {loading ? (
+          {busy ? (
             <div className={styles.body}>
               <Skeleton width="100%" height="92px" borderRadius="var(--radius-md)" />
               <Skeleton width="100%" height="180px" borderRadius="var(--radius-md)" />
@@ -476,7 +505,7 @@ export function PrincipalPolicyDrawer({ principal, models, aliases, onClose, onS
                       <dt>Where it runs</dt>
                       <dd>
                         {residencyLabel(effective.residency)}
-                        <SourceChip source={effective.sources.residency} />
+                        <SourceChip source={effective.sources?.residency} />
                       </dd>
 
                       <dt>Models allowed</dt>
@@ -484,7 +513,7 @@ export function PrincipalPolicyDrawer({ principal, models, aliases, onClose, onS
                         {effective.allowed_models === null
                           ? 'Every enabled model'
                           : `${effective.allowed_models.length} ${effective.allowed_models.length === 1 ? 'model' : 'models'}`}
-                        <SourceChip source={effective.sources.allowed_models} />
+                        <SourceChip source={effective.sources?.allowed_models} />
                       </dd>
 
                       <dt>Default model</dt>
@@ -492,26 +521,33 @@ export function PrincipalPolicyDrawer({ principal, models, aliases, onClose, onS
                         {effective.default_model
                           ? modelLabel(effective.default_model, models)
                           : 'None — a request must name a model'}
-                        <SourceChip source={effective.sources.default_model} />
+                        <SourceChip source={effective.sources?.default_model} />
                       </dd>
 
-                      <dt>Reachable now</dt>
-                      <dd>
-                        {effective.reachable_models.length === 0 ? (
-                          <span className={styles.none}>Nothing</span>
-                        ) : (
-                          <span className={styles.chips}>
-                            {effective.reachable_models.slice(0, 8).map((id) => (
-                              <code key={id} className={styles.chip}>{modelLabel(id, models)}</code>
-                            ))}
-                            {effective.reachable_models.length > 8 && (
-                              <span className={styles.chipMore}>
-                                and {effective.reachable_models.length - 8} more
+                      {/* Reachability is computed from live backend state. A
+                          preview that did not report it says nothing here,
+                          rather than claiming nothing is reachable. */}
+                      {reachable !== undefined && (
+                        <>
+                          <dt>Reachable now</dt>
+                          <dd>
+                            {reachable.length === 0 ? (
+                              <span className={styles.none}>Nothing</span>
+                            ) : (
+                              <span className={styles.chips}>
+                                {reachable.slice(0, 8).map((id) => (
+                                  <code key={id} className={styles.chip}>{modelLabel(id, models)}</code>
+                                ))}
+                                {reachable.length > 8 && (
+                                  <span className={styles.chipMore}>
+                                    and {reachable.length - 8} more
+                                  </span>
+                                )}
                               </span>
                             )}
-                          </span>
-                        )}
-                      </dd>
+                          </dd>
+                        </>
+                      )}
                     </dl>
                   )}
 
@@ -549,7 +585,7 @@ export function PrincipalPolicyDrawer({ principal, models, aliases, onClose, onS
                           <li key={k.id}>
                             <span className={styles.impactKey}>{k.name}</span>
                             <span className={styles.impactCounts}>
-                              {k.before.length} → {k.after.length} models
+                              {(k.before ?? []).length} → {(k.after ?? []).length} models
                             </span>
                           </li>
                         ))}

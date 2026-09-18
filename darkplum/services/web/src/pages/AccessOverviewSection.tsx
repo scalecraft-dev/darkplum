@@ -22,7 +22,10 @@ function editHref(p: PolicyPrincipal): string {
   return `/admin/users?tab=${tab}&policy=${encodeURIComponent(id ?? '')}`
 }
 
-function ReachableCell({ ids, models }: { ids: string[]; models: AdminModel[] }) {
+function ReachableCell({ ids, models }: { ids?: string[]; models: AdminModel[] }) {
+  // A row the API sent without a reachable set says nothing, rather than
+  // taking a missing field for an empty one.
+  if (!ids) return <span className={styles.nothing}>—</span>
   if (ids.length === 0) {
     return <span className={styles.nothing}>Nothing reachable</span>
   }

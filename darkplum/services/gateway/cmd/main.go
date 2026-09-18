@@ -247,26 +247,29 @@ func buildRouter(chatHandler *handler.ChatHandler, apiKeyMW, recordingMW, health
 	v1 := engine.Group("/v1")
 	v1.Use(apiKeyMW)
 
-	// GET /v1/models, POST /v1/routing/dryrun, and GET /v1/policy/effective
-	// are authenticated but not wrapped in recordingMW: recordingMW builds
-	// and records exactly one purpose="inference" InferenceEvent per POST,
-	// which is right for /chat/completions but wrong for a dryrun (it never
-	// dispatches to any model, and records nothing itself — see
-	// HandleRoutingDryrun) or an effective-policy lookup (a metadata read,
-	// not an inference). GET /v1/models and GET /v1/policy/effective are
-	// unaffected either way (Recording is a POST-only middleware) but are
-	// kept out of the recorded group for the same reason: neither ever
-	// produces an inference_events row.
+	// GET /v1/models, POST /v1/routing/dryrun, and GET/POST
+	// /v1/policy/effective are authenticated but not wrapped in recordingMW:
+	// recordingMW builds and records exactly one purpose="inference"
+	// InferenceEvent per POST, which is right for /chat/completions but wrong
+	// for a dryrun (it never dispatches to any model, and records nothing
+	// itself — see HandleRoutingDryrun) or an effective-policy lookup/preview
+	// (a metadata read, not an inference — POST /v1/policy/effective never
+	// dispatches to a model either, it only re-runs the pure Effective()
+	// merge). GET /v1/models and GET /v1/policy/effective are unaffected
+	// either way (Recording is a POST-only middleware) but are kept out of
+	// the recorded group for the same reason: neither ever produces an
+	// inference_events row.
 	v1.GET("/models", chatHandler.HandleListModels)
 	v1.POST("/routing/dryrun", chatHandler.HandleRoutingDryrun)
 	v1.GET("/policy/effective", chatHandler.HandleEffectivePolicy)
+	v1.POST("/policy/effective", chatHandler.HandleEffectivePolicyOverride)
 
-	// Only four endpoints are served under /v1. There is no reverse-proxy
+	// Only five endpoints are served under /v1. There is no reverse-proxy
 	// passthrough: the previous behaviour forwarded every other
 	// GET/DELETE/PUT/PATCH /v1/* request straight to the default vLLM
 	// upstream with no policy check — an open allowlist onto a third party's
 	// route table that also leaked GET /v1/models/{id} metadata for arbitrary
-	// ids. Every other /v1/* path, and every other method on these four
+	// ids. Every other /v1/* path, and every other method on these five
 	// paths, falls through to the NoRoute handler below.
 	recorded := v1.Group("")
 	recorded.Use(recordingMW)

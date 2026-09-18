@@ -131,7 +131,19 @@ func Effective(chain []PolicyRow) EffectivePolicy {
 
 		if row.AllowedModels != nil {
 			if allowed == nil {
-				cp := append([]string(nil), (*row.AllowedModels)...)
+				// make + copy, NOT append([]string(nil), ...): appending zero
+				// elements to a nil slice returns nil, not a non-nil empty
+				// slice, when *row.AllowedModels is itself a deliberate empty
+				// "deny all" ([]string{}, never nil per PolicyRow's doc
+				// comment). A nil *[]string here would still Allow()/lock-out
+				// correctly in-process (nil and empty slices behave
+				// identically to len()/range), but JSON-marshals as
+				// "allowed_models": null — indistinguishable from "every
+				// model" to every HTTP consumer of this package (GET/POST
+				// /v1/policy/effective) once it leaves the process. make()
+				// always returns non-nil, even for length 0.
+				cp := make([]string, len(*row.AllowedModels))
+				copy(cp, *row.AllowedModels)
 				allowed = &cp
 			} else {
 				narrowed := intersect(*allowed, *row.AllowedModels)
@@ -161,6 +173,45 @@ func Effective(chain []PolicyRow) EffectivePolicy {
 
 	eff.AllowedModels = allowed
 	return eff
+}
+
+// PolicyOverride is a hypothetical substitution at exactly one level of a
+// chain returned by Snapshot.ChainFor, used by POST /v1/policy/effective --
+// the gateway's impact-preview surface -- to answer "what would this
+// principal's effective policy be if this level's row were X" without
+// writing anything to principal_routing_policies. Level is one of the
+// PrincipalType* constants. Policy nil means "inherit": remove whatever row
+// this level currently has and replace it with an unrestricted one, exactly
+// like DELETE .../routing-policy does today.
+type PolicyOverride struct {
+	Level  string
+	Policy *PolicyRow
+}
+
+// Apply returns a copy of chain (in Snapshot.ChainFor's canonical order) with
+// the row whose Level equals o.Level replaced by o.Policy (Level is forced to
+// o.Level regardless of what the caller set it to, so a mistake there can
+// never silently substitute the wrong slot). If no row in chain has that
+// Level -- only possible for Level == PrincipalTypeAPIKey when chain was
+// built without a key id, since ChainFor never omits org or user -- chain is
+// returned unmodified; HandleEffectivePolicyOverride rejects an api_key-level
+// override with no api_key_id before ever reaching here.
+func (o PolicyOverride) Apply(chain []PolicyRow) []PolicyRow {
+	out := append([]PolicyRow(nil), chain...)
+	for i, row := range out {
+		if row.Level != o.Level {
+			continue
+		}
+		if o.Policy == nil {
+			out[i] = PolicyRow{Level: o.Level}
+		} else {
+			p := *o.Policy
+			p.Level = o.Level
+			out[i] = p
+		}
+		break
+	}
+	return out
 }
 
 // intersect returns the elements of a that are also present in b, preserving

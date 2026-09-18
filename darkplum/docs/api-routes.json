@@ -418,5 +418,13 @@
     "auth": "service",
     "surface": "machine",
     "reason": "Single effective-policy implementation, consulted by the api for every effective/preview/me view with the service key"
+  },
+  {
+    "service": "gateway",
+    "method": "POST",
+    "path": "/v1/policy/effective",
+    "auth": "service",
+    "surface": "machine",
+    "reason": "Preview counterpart of GET /v1/policy/effective, consulted by the api's routing-policy impact-preview endpoints (POST .../users/:id/routing-policy/preview, .../api-keys/:id/routing-policy/preview) so preview and real save share the one gateway merge implementation"
   }
 ]

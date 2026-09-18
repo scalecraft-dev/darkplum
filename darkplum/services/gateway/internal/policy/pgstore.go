@@ -267,17 +267,63 @@ func (s *PgStore) loadFromDB(ctx context.Context) (Snapshot, error) {
 		log.Printf("policy: WARNING principal_routing_policies does not exist yet (migration 015 not applied) — treating as zero explicit principal policies for this snapshot")
 		principalRows = nil
 	}
-	orgPolicy, userPolicies, keyPolicies, counts := buildPrincipalPolicies(principalRows, residency)
+	built := buildPrincipalPolicies(principalRows, residency)
+
+	// api_keys ownership (ALL non-revoked keys, not just the ones with an
+	// explicit principal_routing_policies row) -- feeds Snapshot.KeyOwner/
+	// UserKeys, which the POST /v1/policy/effective override path uses to
+	// enumerate "every key owned by this user" for its "keys" list. A
+	// separate query from loadPrincipalPolicyRows' LEFT JOIN above, which only
+	// resolves ownership for keys that already have a policy row.
+	keyOwner, userKeys, err := s.loadAPIKeyOwners(ctx)
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("policy: query api_keys: %w", err)
+	}
 
 	return Snapshot{
 		Enabled:         enabled,
 		Aliases:         buildAliases(aliasRows, routeRows),
 		Residency:       residency,
-		OrgPolicy:       orgPolicy,
-		UserPolicies:    userPolicies,
-		KeyPolicies:     keyPolicies,
-		PrincipalCounts: counts,
+		OrgPolicy:       built.OrgPolicy,
+		UserPolicies:    built.UserPolicies,
+		KeyPolicies:     built.KeyPolicies,
+		PrincipalCounts: built.Counts,
+		OrgRow:          built.OrgRow,
+		UserRows:        built.UserRows,
+		KeyRows:         built.KeyRows,
+		KeyOwner:        keyOwner,
+		UserKeys:        userKeys,
 	}, nil
+}
+
+// loadAPIKeyOwners queries every non-revoked api_keys row for its owning
+// user_id and returns both the key_id -> user_id map and its inverse,
+// user_id -> []key_id. Unlike loadPrincipalPolicyRows' LEFT JOIN (which only
+// resolves ownership for a key that already has a principal_routing_policies
+// row), this covers every api_key that exists -- api_keys has existed since
+// migration 001, so unlike principal_routing_policies there is no rollout
+// tolerance needed here.
+func (s *PgStore) loadAPIKeyOwners(ctx context.Context) (keyOwner map[string]string, userKeys map[string][]string, err error) {
+	rows, err := s.pool.Query(ctx, `SELECT id::text, user_id::text FROM api_keys WHERE revoked_at IS NULL`)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer rows.Close()
+
+	keyOwner = make(map[string]string)
+	userKeys = make(map[string][]string)
+	for rows.Next() {
+		var keyID, userID string
+		if err := rows.Scan(&keyID, &userID); err != nil {
+			return nil, nil, fmt.Errorf("scan api_keys row: %w", err)
+		}
+		keyOwner[keyID] = userID
+		userKeys[userID] = append(userKeys[userID], keyID)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("read api_keys rows: %w", err)
+	}
+	return keyOwner, userKeys, nil
 }
 
 // undefinedTableErrorCode is the Postgres SQLSTATE for "undefined_table". See
@@ -372,7 +418,24 @@ func nullableSlicePtr(s []string) *[]string {
 // because the table doesn't exist yet) and the — should be unreachable given
 // prp_org_singleton plus migration 015's seed INSERT, but not trusted to hold
 // forever — case where the table exists yet somehow has no org row.
-func buildPrincipalPolicies(rows []rawPrincipalPolicyRow, orgResidencyFallback string) (orgPolicy *EffectivePolicy, userPolicies, keyPolicies map[string]*EffectivePolicy, counts PrincipalCounts) {
+// principalPolicies is buildPrincipalPolicies' return value: the precomputed
+// EffectivePolicy per level (used by Snapshot.EffectiveFor at request time)
+// alongside the raw, unmerged PolicyRow per level (used by
+// Snapshot.ChainFor/PolicyOverride, the POST /v1/policy/effective preview
+// path, to reconstruct a principal's chain and substitute exactly one level
+// without a second query or an un-merge).
+type principalPolicies struct {
+	OrgPolicy    *EffectivePolicy
+	UserPolicies map[string]*EffectivePolicy
+	KeyPolicies  map[string]*EffectivePolicy
+	Counts       PrincipalCounts
+
+	OrgRow   PolicyRow
+	UserRows map[string]PolicyRow
+	KeyRows  map[string]PolicyRow
+}
+
+func buildPrincipalPolicies(rows []rawPrincipalPolicyRow, orgResidencyFallback string) principalPolicies {
 	orgRow := PolicyRow{Level: PrincipalTypeOrg}
 	foundOrgRow := false
 
@@ -422,15 +485,16 @@ func buildPrincipalPolicies(rows []rawPrincipalPolicyRow, orgResidencyFallback s
 	}
 
 	orgEff := Effective([]PolicyRow{orgRow})
-	orgPolicy = &orgEff
+	orgPolicy := &orgEff
 
-	userPolicies = make(map[string]*EffectivePolicy, len(userRows))
+	userPolicies := make(map[string]*EffectivePolicy, len(userRows))
 	for id, row := range userRows {
 		eff := Effective([]PolicyRow{orgRow, row})
 		userPolicies[id] = &eff
 	}
 
-	keyPolicies = make(map[string]*EffectivePolicy, len(keyRows))
+	keyPolicies := make(map[string]*EffectivePolicy, len(keyRows))
+	keyRowsPlain := make(map[string]PolicyRow, len(keyRows))
 	for id, kr := range keyRows {
 		chain := []PolicyRow{orgRow}
 		if kr.owner != "" {
@@ -441,10 +505,18 @@ func buildPrincipalPolicies(rows []rawPrincipalPolicyRow, orgResidencyFallback s
 		chain = append(chain, kr.row)
 		eff := Effective(chain)
 		keyPolicies[id] = &eff
+		keyRowsPlain[id] = kr.row
 	}
 
-	counts = PrincipalCounts{Users: len(userRows), APIKeys: len(keyRows)}
-	return orgPolicy, userPolicies, keyPolicies, counts
+	return principalPolicies{
+		OrgPolicy:    orgPolicy,
+		UserPolicies: userPolicies,
+		KeyPolicies:  keyPolicies,
+		Counts:       PrincipalCounts{Users: len(userRows), APIKeys: len(keyRows)},
+		OrgRow:       orgRow,
+		UserRows:     userRows,
+		KeyRows:      keyRowsPlain,
+	}
 }
 
 // rawRouteRow is one scanned model_alias_routes row (migration 013), in

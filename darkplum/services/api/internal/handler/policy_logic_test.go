@@ -2,61 +2,11 @@ package handler
 
 import (
 	"encoding/json"
-	"reflect"
 	"strings"
 	"testing"
 )
 
 func strs(ss ...string) *[]string { return &ss }
-
-func TestMergeAllowedModels_NoRestriction(t *testing.T) {
-	if got := mergeAllowedModels(nil, nil, nil); got != nil {
-		t.Fatalf("mergeAllowedModels(nil,nil,nil) = %v, want nil (unrestricted)", got)
-	}
-}
-
-func TestMergeAllowedModels_SingleRestriction(t *testing.T) {
-	got := mergeAllowedModels(nil, strs("a", "b"), nil)
-	if got == nil || !reflect.DeepEqual(*got, []string{"a", "b"}) {
-		t.Fatalf("mergeAllowedModels = %v, want [a b]", got)
-	}
-}
-
-func TestMergeAllowedModels_Intersection(t *testing.T) {
-	got := mergeAllowedModels(strs("a", "b", "c"), strs("b", "c", "d"))
-	if got == nil || !reflect.DeepEqual(*got, []string{"b", "c"}) {
-		t.Fatalf("mergeAllowedModels intersection = %v, want [b c]", got)
-	}
-}
-
-func TestMergeAllowedModels_EmptyIntersectionIsNonNilEmpty(t *testing.T) {
-	got := mergeAllowedModels(strs("a"), strs("b"))
-	if got == nil {
-		t.Fatal("expected a non-nil empty slice for a disjoint intersection, got nil (unrestricted)")
-	}
-	if len(*got) != 0 {
-		t.Fatalf("expected empty slice, got %v", *got)
-	}
-}
-
-// An explicit empty allowlist at any level in the chain must produce an
-// empty (never nil) effective set -- this is the exact signal
-// PutUserPolicy/PutAPIKeyPolicy use to 409 a lock-out.
-func TestMergeAllowedModels_ExplicitEmptyPropagates(t *testing.T) {
-	empty := []string{}
-	got := mergeAllowedModels(nil, &empty)
-	if got == nil || len(*got) != 0 {
-		t.Fatalf("mergeAllowedModels with an explicit [] = %v, want non-nil empty", got)
-	}
-}
-
-func TestMergeAllowedModels_OrderIndependent(t *testing.T) {
-	a := mergeAllowedModels(strs("x", "y"), strs("y", "z"))
-	b := mergeAllowedModels(strs("y", "z"), strs("x", "y"))
-	if !reflect.DeepEqual(a, b) {
-		t.Fatalf("mergeAllowedModels not order-independent: %v vs %v", a, b)
-	}
-}
 
 func TestModelAllowed(t *testing.T) {
 	if !modelAllowed(nil, "anything") {

@@ -5,13 +5,16 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/scalecraft/darkplum/api/internal/activity"
@@ -110,6 +113,296 @@ func fakeGatewayEffective(t *testing.T, resp gatewayEffectivePolicy) *httptest.S
 	return srv
 }
 
+// capturedGatewayRequest records one call the api made to a fakeCapturingGateway.
+// Body is the zero value for a GET (query params land in Query instead).
+type capturedGatewayRequest struct {
+	Method string
+	Query  url.Values
+	Body   gatewayEffectiveOverrideRequest
+}
+
+// fakeCapturingGateway returns the SAME canned gatewayEffectivePolicy for
+// every GET/POST /v1/policy/effective call (so PUT/preview never lock out --
+// these tests are about the request WIRE SHAPE, not the merge decision; see
+// fakePolicyGateway above for that), and records every request so tests can
+// assert the api sends the override body correctly.
+type fakeCapturingGateway struct {
+	*httptest.Server
+	mu       sync.Mutex
+	requests []capturedGatewayRequest
+	resp     gatewayEffectivePolicy
+}
+
+func newFakeCapturingGateway(t *testing.T, resp gatewayEffectivePolicy) *fakeCapturingGateway {
+	t.Helper()
+	fg := &fakeCapturingGateway{resp: resp}
+	fg.Server = httptest.NewServer(http.HandlerFunc(fg.handle))
+	t.Cleanup(fg.Server.Close)
+	return fg
+}
+
+func (fg *fakeCapturingGateway) handle(w http.ResponseWriter, req *http.Request) {
+	if req.Header.Get("Authorization") != "Bearer testkey" {
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+	rec := capturedGatewayRequest{Method: req.Method}
+	if req.Method == http.MethodPost {
+		if err := json.NewDecoder(req.Body).Decode(&rec.Body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	} else {
+		rec.Query = req.URL.Query()
+	}
+	fg.mu.Lock()
+	fg.requests = append(fg.requests, rec)
+	fg.mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(fg.resp)
+}
+
+// all returns every request captured so far, in call order.
+func (fg *fakeCapturingGateway) all() []capturedGatewayRequest {
+	fg.mu.Lock()
+	defer fg.mu.Unlock()
+	return append([]capturedGatewayRequest(nil), fg.requests...)
+}
+
+// newFakePolicyGateway spins an httptest.Server implementing GET/POST
+// /v1/policy/effective for real, by reading the SAME
+// principal_routing_policies/api_keys rows the api itself just wrote via
+// pool -- a simplified (no aliases, no residency/enabled/routing awareness)
+// reimplementation of the gateway's buildPrincipalPolicies/ChainFor/Effective
+// (see gateway/internal/policy), good enough for the api's PUT/preview
+// lock-out and merge assertions. The real merge algorithm's correctness is
+// the gateway package's own responsibility and is tested there; this fake
+// exists only to prove the api sends the override body correctly and
+// consumes the response correctly, end to end against a real database.
+type fakePolicyGateway struct {
+	*httptest.Server
+	pool *pgxpool.Pool
+}
+
+func newFakePolicyGateway(t *testing.T, pool *pgxpool.Pool) *fakePolicyGateway {
+	t.Helper()
+	fg := &fakePolicyGateway{pool: pool}
+	fg.Server = httptest.NewServer(http.HandlerFunc(fg.handle))
+	t.Cleanup(fg.Server.Close)
+	return fg
+}
+
+func (fg *fakePolicyGateway) handle(w http.ResponseWriter, req *http.Request) {
+	if req.URL.Path != "/v1/policy/effective" {
+		w.WriteHeader(http.StatusNotFound)
+		return
+	}
+	if req.Header.Get("Authorization") != "Bearer testkey" {
+		w.WriteHeader(http.StatusForbidden)
+		return
+	}
+	ctx := req.Context()
+
+	var userID, apiKeyID string
+	var override *gatewayPolicyOverride
+	switch req.Method {
+	case http.MethodGet:
+		userID = req.URL.Query().Get("user_id")
+		apiKeyID = req.URL.Query().Get("api_key_id")
+	case http.MethodPost:
+		var body gatewayEffectiveOverrideRequest
+		if err := json.NewDecoder(req.Body).Decode(&body); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		userID, apiKeyID, override = body.UserID, body.APIKeyID, body.Override
+	default:
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	resp, err := fg.effective(ctx, userID, apiKeyID, override)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+// fakeGatewayRow reads one principal's own stored row directly (empty id
+// short-circuits to an all-nil "inherit" row, covering a key with no owner
+// row and a top-level call with no api_key_id).
+func (fg *fakePolicyGateway) fakeGatewayRow(ctx context.Context, principalType, id string) (policyObject, error) {
+	var p policyObject
+	var err error
+	switch {
+	case principalType == principalTypeOrg:
+		err = fg.pool.QueryRow(ctx,
+			`SELECT residency, allowed_models, default_model FROM principal_routing_policies WHERE principal_type = 'org'`,
+		).Scan(&p.Residency, &p.AllowedModels, &p.DefaultModel)
+	case id == "":
+		return policyObject{}, nil
+	case principalType == principalTypeAPIKey:
+		err = fg.pool.QueryRow(ctx,
+			`SELECT residency, allowed_models, default_model FROM principal_routing_policies WHERE principal_type = 'api_key' AND api_key_id = $1`, id,
+		).Scan(&p.Residency, &p.AllowedModels, &p.DefaultModel)
+	default:
+		err = fg.pool.QueryRow(ctx,
+			`SELECT residency, allowed_models, default_model FROM principal_routing_policies WHERE principal_type = 'user' AND user_id = $1`, id,
+		).Scan(&p.Residency, &p.AllowedModels, &p.DefaultModel)
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		return policyObject{}, nil
+	}
+	if err != nil {
+		return policyObject{}, err
+	}
+	return p, nil
+}
+
+// mergeRows re-implements Effective(chain) (gateway/internal/policy/effective.go)
+// for exactly [org, user, api_key] in that order -- see that package's own
+// tests for the authoritative version of this algorithm.
+func mergeRows(rows [3]policyObject, present [3]bool) gatewayEffectivePolicy {
+	levels := [3]string{principalTypeOrg, principalTypeUser, principalTypeAPIKey}
+	eff := gatewayEffectivePolicy{
+		Residency: residencyAny,
+		Sources:   map[string]string{"allowed_models": "none", "residency": "none", "default_model": "none"},
+	}
+	var allowed *[]string
+	haveAllowed, haveResidency, haveDefault := false, false, false
+	for i := 2; i >= 0; i-- {
+		if !present[i] {
+			continue
+		}
+		r := rows[i]
+		if r.AllowedModels != nil {
+			if allowed == nil {
+				// make + copy, NOT append([]string(nil), ...): see the real
+				// gateway's Effective() (gateway/internal/policy/effective.go)
+				// for why -- appending zero elements to a nil slice returns
+				// nil, which would marshal this fake's JSON response as
+				// "allowed_models":null instead of [] for an explicit
+				// deny-all, exactly the bug this whole file's tests exist to
+				// catch the api mishandling.
+				cp := make([]string, len(*r.AllowedModels))
+				copy(cp, *r.AllowedModels)
+				allowed = &cp
+			} else {
+				set := make(map[string]bool, len(*r.AllowedModels))
+				for _, id := range *r.AllowedModels {
+					set[id] = true
+				}
+				next := make([]string, 0, len(*allowed))
+				for _, id := range *allowed {
+					if set[id] {
+						next = append(next, id)
+					}
+				}
+				allowed = &next
+			}
+			if !haveAllowed {
+				eff.Sources["allowed_models"] = levels[i]
+				haveAllowed = true
+			}
+		}
+		if r.Residency != nil && *r.Residency == residencySelfHostedOnly {
+			eff.Residency = residencySelfHostedOnly
+			if !haveResidency {
+				eff.Sources["residency"] = levels[i]
+				haveResidency = true
+			}
+		}
+		if !haveDefault && r.DefaultModel != nil {
+			dm := *r.DefaultModel
+			eff.DefaultModel = &dm
+			eff.Sources["default_model"] = levels[i]
+			haveDefault = true
+		}
+	}
+	eff.AllowedModels = allowed
+	return eff
+}
+
+// effective computes userID/apiKeyID's chain (org, user, api_key) from the
+// database, applies override (if non-nil) at the named level, and returns
+// the merged result -- with Keys populated exactly like the real gateway's
+// HandleEffectivePolicyOverride: whenever apiKeyID is empty, or override
+// targets "user"/"org".
+func (fg *fakePolicyGateway) effective(ctx context.Context, userID, apiKeyID string, override *gatewayPolicyOverride) (gatewayEffectivePolicy, error) {
+	orgRow, err := fg.fakeGatewayRow(ctx, principalTypeOrg, "org")
+	if err != nil {
+		return gatewayEffectivePolicy{}, err
+	}
+	if override != nil && override.Level == principalTypeOrg {
+		orgRow = overriddenRow(override)
+	}
+
+	build := func(uid, kid string) (gatewayEffectivePolicy, error) {
+		userRow, err := fg.fakeGatewayRow(ctx, principalTypeUser, uid)
+		if err != nil {
+			return gatewayEffectivePolicy{}, err
+		}
+		if override != nil && override.Level == principalTypeUser {
+			userRow = overriddenRow(override)
+		}
+		rows := [3]policyObject{orgRow, userRow, {}}
+		present := [3]bool{true, true, kid != ""}
+		if kid != "" {
+			keyRow, err := fg.fakeGatewayRow(ctx, principalTypeAPIKey, kid)
+			if err != nil {
+				return gatewayEffectivePolicy{}, err
+			}
+			if override != nil && override.Level == principalTypeAPIKey {
+				keyRow = overriddenRow(override)
+			}
+			rows[2] = keyRow
+		}
+		return mergeRows(rows, present), nil
+	}
+
+	top, err := build(userID, apiKeyID)
+	if err != nil {
+		return gatewayEffectivePolicy{}, err
+	}
+
+	needKeys := apiKeyID == "" || (override != nil && (override.Level == principalTypeUser || override.Level == principalTypeOrg))
+	if needKeys && userID != "" {
+		rows, err := fg.pool.Query(ctx, `SELECT id::text FROM api_keys WHERE user_id = $1 AND revoked_at IS NULL`, userID)
+		if err != nil {
+			return gatewayEffectivePolicy{}, err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var kid string
+			if err := rows.Scan(&kid); err != nil {
+				return gatewayEffectivePolicy{}, err
+			}
+			keyEff, err := build(userID, kid)
+			if err != nil {
+				return gatewayEffectivePolicy{}, err
+			}
+			top.Keys = append(top.Keys, gatewayKeyEffective{APIKeyID: kid, Effective: keyEff})
+		}
+		if err := rows.Err(); err != nil {
+			return gatewayEffectivePolicy{}, err
+		}
+	}
+	return top, nil
+}
+
+// overriddenRow converts a gatewayPolicyOverride into the row it substitutes
+// -- nil Policy ("inherit") becomes an all-nil row, exactly like the real
+// gateway's PolicyOverride.Apply.
+func overriddenRow(o *gatewayPolicyOverride) policyObject {
+	if o.Policy == nil {
+		return policyObject{}
+	}
+	return *o.Policy
+}
+
 func decodeJSON[T any](t *testing.T, body []byte) T {
 	t.Helper()
 	var v T
@@ -129,8 +422,9 @@ func TestUserPolicy_GetPutDeleteRoundTrip(t *testing.T) {
 	insertModel(t, ctx, pool, "m1", backendClassSelfHosted, true)
 	insertModel(t, ctx, pool, "m2", backendClassSelfHosted, true)
 
-	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
-	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
+	gw := newFakePolicyGateway(t, pool)
+	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
 	r := newPolicyTestRouter(ph, rh, adminID)
 
 	// No row yet: everything nil.
@@ -206,8 +500,9 @@ func TestUserPolicy_GetPutDeleteRoundTrip(t *testing.T) {
 func TestUserPolicy_UnknownUser404(t *testing.T) {
 	pool := setupTestDB(t)
 	adminID := newPolicyTestUser(t, context.Background(), pool)
-	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
-	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
+	gw := newFakePolicyGateway(t, pool)
+	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
 	r := newPolicyTestRouter(ph, rh, adminID)
 
 	resp := doJSON(t, r, http.MethodGet, "/api/v1/users/00000000-0000-0000-0000-000000000000/routing-policy", nil)
@@ -221,8 +516,9 @@ func TestUserPolicy_UnknownModelIDRejected(t *testing.T) {
 	ctx := context.Background()
 	adminID := newPolicyTestUser(t, ctx, pool)
 	targetID := newPolicyTestUser(t, ctx, pool)
-	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
-	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
+	gw := newFakePolicyGateway(t, pool)
+	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
 	r := newPolicyTestRouter(ph, rh, adminID)
 
 	resp := doJSON(t, r, http.MethodPut, "/api/v1/users/"+targetID+"/routing-policy", policyObject{AllowedModels: strs("does-not-exist")})
@@ -243,8 +539,9 @@ func TestUserPolicy_AliasRejectedInAllowlist(t *testing.T) {
 	if _, err := pool.Exec(ctx, `INSERT INTO model_aliases (alias, kind, target_model_id) VALUES ('default', 'static', 'm1')`); err != nil {
 		t.Fatalf("insert alias: %v", err)
 	}
-	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
-	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
+	gw := newFakePolicyGateway(t, pool)
+	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
 	r := newPolicyTestRouter(ph, rh, adminID)
 
 	resp := doJSON(t, r, http.MethodPut, "/api/v1/users/"+targetID+"/routing-policy", policyObject{AllowedModels: strs("default")})
@@ -263,8 +560,9 @@ func TestUserPolicy_DefaultModelMustBeInEffectiveAllowlist(t *testing.T) {
 	targetID := newPolicyTestUser(t, ctx, pool)
 	insertModel(t, ctx, pool, "m1", backendClassSelfHosted, true)
 	insertModel(t, ctx, pool, "m2", backendClassSelfHosted, true)
-	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
-	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
+	gw := newFakePolicyGateway(t, pool)
+	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
 	r := newPolicyTestRouter(ph, rh, adminID)
 
 	m2 := "m2"
@@ -280,8 +578,9 @@ func TestUserPolicy_ResidencyRejectsAny(t *testing.T) {
 	ctx := context.Background()
 	adminID := newPolicyTestUser(t, ctx, pool)
 	targetID := newPolicyTestUser(t, ctx, pool)
-	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
-	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
+	gw := newFakePolicyGateway(t, pool)
+	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
 	r := newPolicyTestRouter(ph, rh, adminID)
 
 	any := residencyAny
@@ -299,8 +598,9 @@ func TestUserPolicy_EmptyAllowlistLocksOutUser409(t *testing.T) {
 	adminID := newPolicyTestUser(t, ctx, pool)
 	targetID := newPolicyTestUser(t, ctx, pool)
 	insertModel(t, ctx, pool, "m1", backendClassSelfHosted, true)
-	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
-	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
+	gw := newFakePolicyGateway(t, pool)
+	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
 	r := newPolicyTestRouter(ph, rh, adminID)
 
 	empty := []string{}
@@ -326,8 +626,9 @@ func TestUserPolicy_TighteningLocksOutOwnedKey409(t *testing.T) {
 	insertModel(t, ctx, pool, "m2", backendClassSelfHosted, true)
 	keyID := newTestAPIKey(t, ctx, pool, targetID, "ci-key")
 
-	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
-	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
+	gw := newFakePolicyGateway(t, pool)
+	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
 	r := newPolicyTestRouter(ph, rh, adminID)
 
 	// The key is narrowed to m2 only.
@@ -356,8 +657,9 @@ func TestUserPolicy_RevokedKeyIgnoredForLockout(t *testing.T) {
 	insertModel(t, ctx, pool, "m2", backendClassSelfHosted, true)
 	keyID := newTestAPIKey(t, ctx, pool, targetID, "ci-key")
 
-	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
-	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
+	gw := newFakePolicyGateway(t, pool)
+	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
 	r := newPolicyTestRouter(ph, rh, adminID)
 
 	resp := doJSON(t, r, http.MethodPut, "/api/v1/api-keys/"+keyID+"/routing-policy", policyObject{AllowedModels: strs("m2")})
@@ -382,8 +684,9 @@ func TestUserPolicy_RevokedKeyIgnoredForLockout(t *testing.T) {
 func TestAPIKeyPolicy_UnknownKey404(t *testing.T) {
 	pool := setupTestDB(t)
 	adminID := newPolicyTestUser(t, context.Background(), pool)
-	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
-	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
+	gw := newFakePolicyGateway(t, pool)
+	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
 	r := newPolicyTestRouter(ph, rh, adminID)
 
 	resp := doJSON(t, r, http.MethodGet, "/api/v1/api-keys/00000000-0000-0000-0000-000000000000/routing-policy", nil)
@@ -402,8 +705,9 @@ func TestAPIKeyPolicy_EffectiveRespectsOwnerChain(t *testing.T) {
 	insertModel(t, ctx, pool, "m3", backendClassSelfHosted, true)
 	keyID := newTestAPIKey(t, ctx, pool, targetID, "ci-key")
 
-	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
-	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
+	gw := newFakePolicyGateway(t, pool)
+	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
 	r := newPolicyTestRouter(ph, rh, adminID)
 
 	// Owner restricted to m1+m2.
@@ -432,8 +736,9 @@ func TestAPIKeyPolicy_EmptyAllowlistLocksOutKey409(t *testing.T) {
 	targetID := newPolicyTestUser(t, ctx, pool)
 	insertModel(t, ctx, pool, "m1", backendClassSelfHosted, true)
 	keyID := newTestAPIKey(t, ctx, pool, targetID, "ci-key")
-	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
-	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
+	gw := newFakePolicyGateway(t, pool)
+	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
 	r := newPolicyTestRouter(ph, rh, adminID)
 
 	empty := []string{}
@@ -450,8 +755,9 @@ func TestAPIKeyRevocation_KeepsPolicyRow(t *testing.T) {
 	targetID := newPolicyTestUser(t, ctx, pool)
 	insertModel(t, ctx, pool, "m1", backendClassSelfHosted, true)
 	keyID := newTestAPIKey(t, ctx, pool, targetID, "ci-key")
-	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
-	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
+	gw := newFakePolicyGateway(t, pool)
+	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
 	r := newPolicyTestRouter(ph, rh, adminID)
 
 	resp := doJSON(t, r, http.MethodPut, "/api/v1/api-keys/"+keyID+"/routing-policy", policyObject{AllowedModels: strs("m1")})
@@ -480,8 +786,9 @@ func TestUserDeletion_CascadesPolicyRows(t *testing.T) {
 	targetID := newPolicyTestUser(t, ctx, pool)
 	insertModel(t, ctx, pool, "m1", backendClassSelfHosted, true)
 	keyID := newTestAPIKey(t, ctx, pool, targetID, "ci-key")
-	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
-	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
+	gw := newFakePolicyGateway(t, pool)
+	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
 	r := newPolicyTestRouter(ph, rh, adminID)
 
 	if resp := doJSON(t, r, http.MethodPut, "/api/v1/users/"+targetID+"/routing-policy", policyObject{AllowedModels: strs("m1")}); resp.Code != http.StatusOK {
@@ -518,8 +825,9 @@ func TestPreviewUserPolicy_NoWritesAndReportsLockOut(t *testing.T) {
 	insertModel(t, ctx, pool, "m2", backendClassSelfHosted, true)
 	keyID := newTestAPIKey(t, ctx, pool, targetID, "ci-key")
 
-	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
-	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
+	gw := newFakePolicyGateway(t, pool)
+	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
 	r := newPolicyTestRouter(ph, rh, adminID)
 
 	if resp := doJSON(t, r, http.MethodPut, "/api/v1/api-keys/"+keyID+"/routing-policy", policyObject{AllowedModels: strs("m2")}); resp.Code != http.StatusOK {
@@ -563,8 +871,9 @@ func TestOrgPolicy_AffectedPrincipalsOnTighten(t *testing.T) {
 	insertModel(t, ctx, pool, "m2", backendClassSelfHosted, true)
 	keyID := newTestAPIKey(t, ctx, pool, targetID, "ci-key")
 
-	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
-	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
+	gw := newFakePolicyGateway(t, pool)
+	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
 	r := newPolicyTestRouter(ph, rh, adminID)
 
 	if resp := doJSON(t, r, http.MethodPut, "/api/v1/users/"+targetID+"/routing-policy", policyObject{DefaultModel: nil}); resp.Code != http.StatusOK {
@@ -740,5 +1049,241 @@ func TestParsePositiveIntUsedByQueryEscape(t *testing.T) {
 	n, err := parsePositiveInt(v.Get("limit"))
 	if err != nil || n != 10 {
 		t.Fatalf("parsePositiveInt(%q) = (%d, %v), want (10, nil)", v.Get("limit"), n, err)
+	}
+}
+
+// --- Wire contract: the api sends the override body correctly, and the
+// preview response has the same shape as GET .../effective (sources,
+// reachable_models) -- this is the exact bug being fixed: the preview
+// endpoint used to return a LOCAL approximation missing both, causing
+// `effective.sources.residency` to throw in the web drawer. -----------------
+
+func TestPutUserPolicy_SendsOverrideBodyToGateway(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	adminID := newPolicyTestUser(t, ctx, pool)
+	targetID := newPolicyTestUser(t, ctx, pool)
+	insertModel(t, ctx, pool, "m1", backendClassSelfHosted, true)
+
+	gw := newFakeCapturingGateway(t, gatewayEffectivePolicy{
+		Residency: residencyAny, AllowedModels: strs("m1"),
+		Sources:         map[string]string{"allowed_models": "user", "residency": "none", "default_model": "none"},
+		ReachableModels: []string{"m1"},
+	})
+	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	r := newPolicyTestRouter(ph, rh, adminID)
+
+	resp := doJSON(t, r, http.MethodPut, "/api/v1/users/"+targetID+"/routing-policy", policyObject{AllowedModels: strs("m1")})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("put: status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+
+	reqs := gw.all()
+	if len(reqs) != 1 {
+		t.Fatalf("expected exactly 1 gateway call for the lock-out check, got %d", len(reqs))
+	}
+	got := reqs[0]
+	if got.Method != http.MethodPost {
+		t.Fatalf("expected the lock-out check to call POST, got %s", got.Method)
+	}
+	if got.Body.UserID != targetID {
+		t.Errorf("user_id = %q, want %q", got.Body.UserID, targetID)
+	}
+	if got.Body.APIKeyID != "" {
+		t.Errorf("api_key_id = %q, want empty (user-level write)", got.Body.APIKeyID)
+	}
+	if got.Body.Override == nil || got.Body.Override.Level != principalTypeUser {
+		t.Fatalf("override = %+v, want level=user", got.Body.Override)
+	}
+	if got.Body.Override.Policy == nil || got.Body.Override.Policy.AllowedModels == nil || len(*got.Body.Override.Policy.AllowedModels) != 1 || (*got.Body.Override.Policy.AllowedModels)[0] != "m1" {
+		t.Errorf("override.policy = %+v, want allowed_models=[m1]", got.Body.Override.Policy)
+	}
+}
+
+func TestPutAPIKeyPolicy_SendsOverrideWithAPIKeyLevelAndOwnerUserID(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	adminID := newPolicyTestUser(t, ctx, pool)
+	targetID := newPolicyTestUser(t, ctx, pool)
+	insertModel(t, ctx, pool, "m1", backendClassSelfHosted, true)
+	keyID := newTestAPIKey(t, ctx, pool, targetID, "ci-key")
+
+	gw := newFakeCapturingGateway(t, gatewayEffectivePolicy{
+		Residency: residencyAny, AllowedModels: strs("m1"),
+		Sources:         map[string]string{"allowed_models": "api_key", "residency": "none", "default_model": "none"},
+		ReachableModels: []string{"m1"},
+	})
+	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	r := newPolicyTestRouter(ph, rh, adminID)
+
+	resp := doJSON(t, r, http.MethodPut, "/api/v1/api-keys/"+keyID+"/routing-policy", policyObject{AllowedModels: strs("m1")})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("put: status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+
+	reqs := gw.all()
+	if len(reqs) != 1 {
+		t.Fatalf("expected exactly 1 gateway call, got %d", len(reqs))
+	}
+	got := reqs[0]
+	if got.Body.UserID != targetID {
+		t.Errorf("user_id = %q, want owner %q", got.Body.UserID, targetID)
+	}
+	if got.Body.APIKeyID != keyID {
+		t.Errorf("api_key_id = %q, want %q", got.Body.APIKeyID, keyID)
+	}
+	if got.Body.Override == nil || got.Body.Override.Level != principalTypeAPIKey {
+		t.Fatalf("override = %+v, want level=api_key", got.Body.Override)
+	}
+}
+
+// TestPreviewUserPolicy_SendsBeforeWithoutOverrideAndAfterWithOverride is the
+// core regression test for this bug: the preview endpoint must make two
+// gateway calls (before with no override, after with the proposed policy as
+// an override.level=user), and the response's "effective" must be the real
+// gateway shape -- with "sources" and "reachable_models" present, exactly
+// what the web drawer's `effective.sources.residency` access needs.
+func TestPreviewUserPolicy_SendsBeforeWithoutOverrideAndAfterWithOverride(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	adminID := newPolicyTestUser(t, ctx, pool)
+	targetID := newPolicyTestUser(t, ctx, pool)
+	insertModel(t, ctx, pool, "m1", backendClassSelfHosted, true)
+
+	gw := newFakeCapturingGateway(t, gatewayEffectivePolicy{
+		Residency: residencySelfHostedOnly, AllowedModels: strs("m1"),
+		Sources:         map[string]string{"allowed_models": "user", "residency": "user", "default_model": "none"},
+		ReachableModels: []string{"m1"},
+	})
+	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	r := newPolicyTestRouter(ph, rh, adminID)
+
+	resp := doJSON(t, r, http.MethodPost, "/api/v1/users/"+targetID+"/routing-policy/preview", policyObject{AllowedModels: strs("m1")})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("preview: status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+
+	reqs := gw.all()
+	if len(reqs) != 2 {
+		t.Fatalf("expected exactly 2 gateway calls (before, after), got %d: %+v", len(reqs), reqs)
+	}
+	before, after := reqs[0], reqs[1]
+	if before.Method != http.MethodPost {
+		t.Fatalf("expected the 'before' call to be POST (so it can also return the keys list), got %s", before.Method)
+	}
+	if before.Body.Override != nil {
+		t.Errorf("expected the 'before' call to send no override, got %+v", before.Body.Override)
+	}
+	if before.Body.UserID != targetID || before.Body.APIKeyID != "" {
+		t.Errorf("before call user_id/api_key_id = %q/%q, want %q/\"\"", before.Body.UserID, before.Body.APIKeyID, targetID)
+	}
+	if after.Body.Override == nil || after.Body.Override.Level != principalTypeUser {
+		t.Fatalf("after call override = %+v, want level=user", after.Body.Override)
+	}
+	if after.Body.Override.Policy == nil || after.Body.Override.Policy.AllowedModels == nil || len(*after.Body.Override.Policy.AllowedModels) != 1 || (*after.Body.Override.Policy.AllowedModels)[0] != "m1" {
+		t.Errorf("after call override.policy = %+v, want allowed_models=[m1]", after.Body.Override.Policy)
+	}
+
+	// The exact bug: assert the wire shape has sources + reachable_models on
+	// "effective", not a local {residency, allowed_models, default_model}-only
+	// approximation.
+	var raw map[string]any
+	if err := json.Unmarshal(resp.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	eff, ok := raw["effective"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected an effective object, got %+v", raw["effective"])
+	}
+	sources, ok := eff["sources"].(map[string]any)
+	if !ok {
+		t.Fatalf("effective.sources missing or not an object -- this is the exact TypeError the web drawer hit on effective.sources.residency; got %+v", eff)
+	}
+	if sources["residency"] != "user" {
+		t.Errorf("effective.sources.residency = %v, want %q", sources["residency"], "user")
+	}
+	if _, ok := eff["reachable_models"]; !ok {
+		t.Fatalf("effective.reachable_models missing, got %+v", eff)
+	}
+}
+
+func TestPreviewAPIKeyPolicy_SendsOverrideWithAPIKeyLevelAndOwnerUserID(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	adminID := newPolicyTestUser(t, ctx, pool)
+	targetID := newPolicyTestUser(t, ctx, pool)
+	insertModel(t, ctx, pool, "m1", backendClassSelfHosted, true)
+	keyID := newTestAPIKey(t, ctx, pool, targetID, "ci-key")
+
+	gw := newFakeCapturingGateway(t, gatewayEffectivePolicy{
+		Residency: residencyAny, AllowedModels: strs("m1"),
+		Sources:         map[string]string{"allowed_models": "api_key", "residency": "none", "default_model": "none"},
+		ReachableModels: []string{"m1"},
+	})
+	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	r := newPolicyTestRouter(ph, rh, adminID)
+
+	resp := doJSON(t, r, http.MethodPost, "/api/v1/api-keys/"+keyID+"/routing-policy/preview", policyObject{AllowedModels: strs("m1")})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("preview: status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+
+	reqs := gw.all()
+	if len(reqs) != 2 {
+		t.Fatalf("expected exactly 2 gateway calls (before, after), got %d", len(reqs))
+	}
+	before, after := reqs[0], reqs[1]
+	if before.Body.UserID != targetID || before.Body.APIKeyID != keyID {
+		t.Errorf("before call user_id/api_key_id = %q/%q, want %q/%q", before.Body.UserID, before.Body.APIKeyID, targetID, keyID)
+	}
+	if after.Body.Override == nil || after.Body.Override.Level != principalTypeAPIKey {
+		t.Fatalf("after call override = %+v, want level=api_key", after.Body.Override)
+	}
+	if after.Body.UserID != targetID || after.Body.APIKeyID != keyID {
+		t.Errorf("after call user_id/api_key_id = %q/%q, want %q/%q", after.Body.UserID, after.Body.APIKeyID, targetID, keyID)
+	}
+}
+
+// TestPutAndPreview_AgreeOnLockOut is the design's explicit requirement --
+// "switch [the 409 lock-out check] to the gateway override call too so PUT
+// and preview agree" -- using the real DB-backed fakePolicyGateway (not the
+// capturing one above) so both endpoints are evaluated against the same
+// merge decision.
+func TestPutAndPreview_AgreeOnLockOut(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	adminID := newPolicyTestUser(t, ctx, pool)
+	targetID := newPolicyTestUser(t, ctx, pool)
+	insertModel(t, ctx, pool, "m1", backendClassSelfHosted, true)
+	insertModel(t, ctx, pool, "m2", backendClassSelfHosted, true)
+	keyID := newTestAPIKey(t, ctx, pool, targetID, "ci-key")
+
+	gw := newFakePolicyGateway(t, pool)
+	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	r := newPolicyTestRouter(ph, rh, adminID)
+
+	if resp := doJSON(t, r, http.MethodPut, "/api/v1/api-keys/"+keyID+"/routing-policy", policyObject{AllowedModels: strs("m2")}); resp.Code != http.StatusOK {
+		t.Fatalf("put key policy: status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+
+	// Preview says this would lock the key out (m1 ∩ m2 = ∅).
+	previewResp := doJSON(t, r, http.MethodPost, "/api/v1/users/"+targetID+"/routing-policy/preview", policyObject{AllowedModels: strs("m1")})
+	if previewResp.Code != http.StatusOK {
+		t.Fatalf("preview: status = %d, body = %s", previewResp.Code, previewResp.Body.String())
+	}
+	preview := decodeJSON[previewResponse](t, previewResp.Body.Bytes())
+	if len(preview.WouldLockOut) == 0 {
+		t.Fatalf("expected preview to report a lock-out, got %+v", preview)
+	}
+
+	// The actual PUT must 409 for the exact same reason.
+	putResp := doJSON(t, r, http.MethodPut, "/api/v1/users/"+targetID+"/routing-policy", policyObject{AllowedModels: strs("m1")})
+	if putResp.Code != http.StatusConflict {
+		t.Fatalf("expected PUT to 409 in agreement with the preview, got %d; body = %s", putResp.Code, putResp.Body.String())
 	}
 }

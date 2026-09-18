@@ -90,7 +90,9 @@ export function ModelAccessNotice({ models }: Props) {
                   ))}
                 </span>
               )}
-              <span className={styles.source}>{sourceLabel(policy.sources.allowed_models)}</span>
+              {policy.sources?.allowed_models && (
+                <span className={styles.source}>{sourceLabel(policy.sources.allowed_models)}</span>
+              )}
             </dd>
 
             <dt>Where they run</dt>
@@ -98,13 +100,17 @@ export function ModelAccessNotice({ models }: Props) {
               {policy.residency === 'self_hosted_only'
                 ? 'Self-hosted only — nothing leaves your infrastructure'
                 : residencyLabel(policy.residency)}
-              <span className={styles.source}>{sourceLabel(policy.sources.residency)}</span>
+              {policy.sources?.residency && (
+                <span className={styles.source}>{sourceLabel(policy.sources.residency)}</span>
+              )}
             </dd>
 
             <dt>Starts on</dt>
             <dd>
               {policy.default_model ? label(policy.default_model, models) : 'Nothing in particular'}
-              <span className={styles.source}>{sourceLabel(policy.sources.default_model)}</span>
+              {policy.sources?.default_model && (
+                <span className={styles.source}>{sourceLabel(policy.sources.default_model)}</span>
+              )}
             </dd>
           </dl>
 

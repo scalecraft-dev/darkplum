@@ -13,14 +13,20 @@
 //
 // "Effective" (the merged, enforced view) has exactly ONE implementation, in
 // the gateway (internal/policy) -- see gatewayEffectiveClient. Every "GET
-// .../effective" and preview endpoint here proxies that endpoint (or, for
-// PUT-time validation where the change is not yet persisted and can't be
-// asked of the gateway, reimplements the same intersection/lock-out logic
-// locally in Go -- see mergeAllowedModels -- purely so writes do not depend
-// on the gateway being reachable).
+// .../effective" view proxies GET {gateway}/v1/policy/effective; every write
+// (PUT's lock-out check) and preview (POST .../preview) proxies POST
+// {gateway}/v1/policy/effective with a hypothetical override instead --
+// there is deliberately no second, locally-reimplemented merge/intersection
+// anywhere in this file (an earlier version of this file had one --
+// mergeAllowedModels -- specifically so writes did not depend on the gateway
+// being reachable; that traded a second source of truth for a marginal
+// availability win, which DESIGN4's "gateway is the only place policy is
+// merged" rule forbids. A PUT or preview now 502s if the gateway is down,
+// same as the "effective" reads always have).
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -28,7 +34,6 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"sort"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -89,52 +94,6 @@ type principalPolicyResponse struct {
 // stricter ancestor.
 func validPrincipalResidency(r *string) bool {
 	return r == nil || *r == residencySelfHostedOnly
-}
-
-// mergeAllowedModels reproduces the gateway's allowed_models merge
-// (internal/policy, DESIGN4's Effective(chain)) locally: the intersection of
-// every non-nil allowlist in the chain, in org->user->key order. A chain
-// with no non-nil entries returns nil ("no restriction" = every model). A
-// chain whose non-nil entries intersect to nothing returns a non-nil, empty
-// slice -- the caller uses that to refuse a PUT that would lock the
-// principal out (see validatePrincipalPolicyWrite) rather than to filter
-// anything itself.
-//
-// Pure and order-independent (intersection commutes) so it is unit-testable
-// without a database.
-func mergeAllowedModels(chain ...*[]string) *[]string {
-	var sets []map[string]bool
-	for _, c := range chain {
-		if c == nil {
-			continue
-		}
-		set := make(map[string]bool, len(*c))
-		for _, id := range *c {
-			set[id] = true
-		}
-		sets = append(sets, set)
-	}
-	if len(sets) == 0 {
-		return nil
-	}
-
-	inter := sets[0]
-	for _, s := range sets[1:] {
-		next := make(map[string]bool, len(inter))
-		for id := range inter {
-			if s[id] {
-				next[id] = true
-			}
-		}
-		inter = next
-	}
-
-	ids := make([]string, 0, len(inter))
-	for id := range inter {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	return &ids
 }
 
 // modelAllowed reports whether id is permitted by an (already-merged)
@@ -253,15 +212,46 @@ func validateDefaultModel(ctx context.Context, db *pgxpool.Pool, id string, effe
 	return fmt.Errorf("default_model %q (alias) has no target in the effective allowlist", id)
 }
 
-// gatewayEffectivePolicy is the wire shape of the gateway's
-// GET /v1/policy/effective (service-key only) -- see DESIGN4's Gateway
-// section. AllowedModels is nil for "every model" (no restriction).
+// gatewayEffectivePolicy is the wire shape of the gateway's GET/POST
+// /v1/policy/effective (service-key only) -- see DESIGN4's Gateway section.
+// AllowedModels is nil for "every model" (no restriction). Keys is only ever
+// populated on a POST response (see effectiveWithOverride) -- GET never sets
+// it.
 type gatewayEffectivePolicy struct {
-	AllowedModels   *[]string         `json:"allowed_models"`
-	Residency       string            `json:"residency"`
-	DefaultModel    *string           `json:"default_model"`
-	Sources         map[string]string `json:"sources"`
-	ReachableModels []string          `json:"reachable_models"`
+	AllowedModels   *[]string             `json:"allowed_models"`
+	Residency       string                `json:"residency"`
+	DefaultModel    *string               `json:"default_model"`
+	Sources         map[string]string     `json:"sources"`
+	ReachableModels []string              `json:"reachable_models"`
+	Keys            []gatewayKeyEffective `json:"keys,omitempty"`
+}
+
+// gatewayKeyEffective is one entry of gatewayEffectivePolicy.Keys -- an
+// api_key owned by the user_id under preview/write, and what ITS effective
+// policy would be under the same hypothetical override. The gateway names it
+// by id only (it has no api_keys.name column to read); callers that need a
+// name (409 messages, keys_affected) look it up locally via keyNamesByID.
+type gatewayKeyEffective struct {
+	APIKeyID  string                 `json:"api_key_id"`
+	Effective gatewayEffectivePolicy `json:"effective"`
+}
+
+// gatewayPolicyOverride is the wire shape of one POST /v1/policy/effective
+// override: the chain level to substitute, and what to substitute it with.
+// Policy nil means "inherit" -- remove whatever row this level currently has,
+// exactly like DELETE .../routing-policy. policyObject already has the exact
+// field shape the gateway expects for Policy, so it is reused directly rather
+// than duplicated.
+type gatewayPolicyOverride struct {
+	Level  string        `json:"level"`
+	Policy *policyObject `json:"policy"`
+}
+
+// gatewayEffectiveOverrideRequest is the body of POST /v1/policy/effective.
+type gatewayEffectiveOverrideRequest struct {
+	UserID   string                 `json:"user_id"`
+	APIKeyID string                 `json:"api_key_id,omitempty"`
+	Override *gatewayPolicyOverride `json:"override,omitempty"`
 }
 
 // gatewayEffectiveClient calls the gateway's GET /v1/policy/effective, the
@@ -321,6 +311,49 @@ func (g *gatewayEffectiveClient) effective(ctx context.Context, userID string, a
 	return &out, nil
 }
 
+// effectiveWithOverride calls POST {gatewayURL}/v1/policy/effective -- the
+// gateway's impact-preview surface (DESIGN4's Gateway "POST
+// /v1/policy/effective"). override nil reproduces the current, un-overridden
+// effective policy (identical to effective/GET, except Keys IS populated
+// when apiKeyID is empty -- see the gateway's HandleEffectivePolicyOverride
+// doc comment); non-nil hypothetically substitutes one chain level without
+// writing anything. This is the ONLY way PUT's lock-out check and the
+// preview endpoints ask "what would this look like" -- see this file's
+// package doc comment for why there is no local reimplementation of the
+// merge to fall back on.
+func (g *gatewayEffectiveClient) effectiveWithOverride(ctx context.Context, userID, apiKeyID string, override *gatewayPolicyOverride) (*gatewayEffectivePolicy, error) {
+	ctx, cancel := context.WithTimeout(ctx, gatewayEffectiveTimeout)
+	defer cancel()
+
+	body, err := json.Marshal(gatewayEffectiveOverrideRequest{UserID: userID, APIKeyID: apiKeyID, Override: override})
+	if err != nil {
+		return nil, fmt.Errorf("encode override policy request: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, g.gatewayURL+"/v1/policy/effective", bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("build override policy request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+g.serviceKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := g.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("call gateway override policy: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("gateway override policy returned %d", resp.StatusCode)
+	}
+
+	var out gatewayEffectivePolicy
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 256*1024)).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode gateway override policy: %w", err)
+	}
+	return &out, nil
+}
+
 // PolicyHandler serves the per-principal routing-policy endpoints: GET/PUT/
 // DELETE on a user's or api key's own policy row, the admin/self "effective"
 // proxies, the principals overview list, and impact previews. Org-level GET/
@@ -340,18 +373,6 @@ func NewPolicyHandler(db *pgxpool.Pool, rec *activity.Recorder, gatewayURL, serv
 		activity: rec,
 		gateway:  newGatewayEffectiveClient(gatewayURL, serviceKey),
 	}
-}
-
-// orgAllowedModels reads the org row's allowed_models column, used as the
-// top of every merge chain below. The org row is guaranteed to exist by
-// migration 015's seed insert.
-func orgAllowedModels(ctx context.Context, db *pgxpool.Pool) (*[]string, error) {
-	var allowed *[]string
-	err := db.QueryRow(ctx, `SELECT allowed_models FROM principal_routing_policies WHERE principal_type = 'org'`).Scan(&allowed)
-	if err != nil {
-		return nil, fmt.Errorf("read org allowed_models: %w", err)
-	}
-	return allowed, nil
 }
 
 // getPrincipalPolicy reads one user or api_key's own stored policy row (nil
@@ -407,37 +428,6 @@ func lookupAPIKey(ctx context.Context, db *pgxpool.Pool, id string) (*apiKeyInfo
 	return &info, nil
 }
 
-// activeUserKeys lists a user's non-revoked api_keys (id, name, and their
-// own explicit allowed_models override, if any) — used to check every key a
-// user owns for a lock-out when the user's own policy is tightened.
-type ownedKey struct {
-	ID            string
-	Name          string
-	AllowedModels *[]string
-}
-
-func activeUserKeys(ctx context.Context, db *pgxpool.Pool, userID string) ([]ownedKey, error) {
-	rows, err := db.Query(ctx, `
-		SELECT k.id, k.name, p.allowed_models
-		FROM api_keys k
-		LEFT JOIN principal_routing_policies p ON p.principal_type = 'api_key' AND p.api_key_id = k.id
-		WHERE k.user_id = $1 AND k.revoked_at IS NULL
-	`, userID)
-	if err != nil {
-		return nil, fmt.Errorf("list user api keys: %w", err)
-	}
-	defer rows.Close()
-	var keys []ownedKey
-	for rows.Next() {
-		var k ownedKey
-		if err := rows.Scan(&k.ID, &k.Name, &k.AllowedModels); err != nil {
-			return nil, fmt.Errorf("scan user api key: %w", err)
-		}
-		keys = append(keys, k)
-	}
-	return keys, rows.Err()
-}
-
 // lockedOutKey names one api_key that would have (or has) an empty effective
 // allowlist, for the 409 message and the preview response's would_lock_out.
 type lockedOutKey struct {
@@ -445,38 +435,111 @@ type lockedOutKey struct {
 	Name string
 }
 
-// validatePrincipalPolicyWrite runs every format/existence/lock-out check
-// shared by PUT and preview for a user or api_key policy. It never touches
-// the database for writes -- callers do that afterward once this returns no
-// error. orgAM is the org's own allowed_models (top of every chain).
-// ownerUserAM is nil for a user-principal write (there is no owner above a
-// user other than org) and the owning user's CURRENT stored allowed_models
-// for an api_key-principal write.
-func validatePrincipalPolicyWrite(ctx context.Context, db *pgxpool.Pool, principalType string, req policyObject, orgAM *[]string, ownerUserAM *[]string) (effective *[]string, err error) {
+// errGatewayUnavailable wraps a gateway call failure inside
+// validateAndPreviewWrite so callers (PUT/preview handlers) can tell it apart
+// from a genuine validation error: the former is a 502 (the write/preview
+// simply cannot be evaluated right now), the latter is a 400 (the request
+// itself is invalid regardless of gateway reachability).
+var errGatewayUnavailable = errors.New("gateway unavailable")
+
+// keyNamesByID batches api_keys.name lookups for a set of ids -- used to
+// attach a human name to the gateway's Keys list (ids only; the gateway has
+// no api_keys.name column to read -- see gatewayKeyEffective) for 409
+// messages and keys_affected.
+func keyNamesByID(ctx context.Context, db *pgxpool.Pool, ids []string) (map[string]string, error) {
+	names := make(map[string]string, len(ids))
+	if len(ids) == 0 {
+		return names, nil
+	}
+	rows, err := db.Query(ctx, `SELECT id::text, name FROM api_keys WHERE id = ANY($1)`, ids)
+	if err != nil {
+		return nil, fmt.Errorf("lookup key names: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, name string
+		if err := rows.Scan(&id, &name); err != nil {
+			return nil, fmt.Errorf("scan key name: %w", err)
+		}
+		names[id] = name
+	}
+	return names, rows.Err()
+}
+
+// validateAndPreviewWrite runs every format/existence check shared by PUT and
+// preview for a user or api_key policy, then asks the gateway (the ONE merge
+// implementation -- see this file's package doc comment) what req's effective
+// policy would be, as a POST /v1/policy/effective override. It never touches
+// principal_routing_policies for writes -- callers do that afterward (PUT
+// only, once this returns no error and no lock-out).
+//
+// principalType/targetID/ownerUserID identify the override: for a user
+// write, targetID is the user id and ownerUserID is ignored; for an api_key
+// write, targetID is the key id and ownerUserID is its owner (from
+// lookupAPIKey). The returned gatewayEffectivePolicy's Keys field is
+// populated for a user-principal write (every non-revoked key that user
+// owns, under the same override) and empty for an api_key-principal write
+// (only the key itself is affected) -- exactly DESIGN4's "keys" contract.
+func (h *PolicyHandler) validateAndPreviewWrite(ctx context.Context, principalType, targetID, ownerUserID string, req policyObject) (*gatewayEffectivePolicy, error) {
 	if !validPrincipalResidency(req.Residency) {
 		return nil, errors.New("residency must be null or 'self_hosted_only'")
 	}
 	if req.AllowedModels != nil {
-		if err := validateAllowedModelIDs(ctx, db, *req.AllowedModels); err != nil {
+		if err := validateAllowedModelIDs(ctx, h.db, *req.AllowedModels); err != nil {
 			return nil, err
 		}
 	}
 
-	var chain []*[]string
-	chain = append(chain, orgAM)
+	userID, apiKeyID := ownerUserID, ""
 	if principalType == principalTypeAPIKey {
-		chain = append(chain, ownerUserAM)
+		apiKeyID = targetID
+	} else {
+		userID = targetID
 	}
-	chain = append(chain, req.AllowedModels)
-	effective = mergeAllowedModels(chain...)
+	eff, err := h.gateway.effectiveWithOverride(ctx, userID, apiKeyID, &gatewayPolicyOverride{Level: principalType, Policy: &req})
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", errGatewayUnavailable, err)
+	}
 
 	if req.DefaultModel != nil {
-		if err := validateDefaultModel(ctx, db, *req.DefaultModel, effective); err != nil {
+		if err := validateDefaultModel(ctx, h.db, *req.DefaultModel, eff.AllowedModels); err != nil {
 			return nil, err
 		}
 	}
 
-	return effective, nil
+	return eff, nil
+}
+
+// lockedOutFromEffective collects every locked-out principal from a
+// validateAndPreviewWrite result: the target itself (named selfName -- "
+// (user)" for a user write, the key's own name for an api_key write) if its
+// own allowed_models is a non-nil empty slice, plus every entry in eff.Keys
+// (only ever non-empty for a user-principal write) that is likewise empty.
+func lockedOutFromEffective(ctx context.Context, db *pgxpool.Pool, eff *gatewayEffectivePolicy, selfID, selfName string) ([]lockedOutKey, error) {
+	var out []lockedOutKey
+	if eff.AllowedModels != nil && len(*eff.AllowedModels) == 0 {
+		out = append(out, lockedOutKey{ID: selfID, Name: selfName})
+	}
+	if len(eff.Keys) == 0 {
+		return out, nil
+	}
+	ids := make([]string, 0, len(eff.Keys))
+	for _, k := range eff.Keys {
+		if k.Effective.AllowedModels != nil && len(*k.Effective.AllowedModels) == 0 {
+			ids = append(ids, k.APIKeyID)
+		}
+	}
+	if len(ids) == 0 {
+		return out, nil
+	}
+	names, err := keyNamesByID(ctx, db, ids)
+	if err != nil {
+		return nil, err
+	}
+	for _, id := range ids {
+		out = append(out, lockedOutKey{ID: id, Name: names[id]})
+	}
+	return out, nil
 }
 
 // GetUserPolicy handles GET /api/v1/users/:id/routing-policy.
@@ -556,32 +619,20 @@ func (h *PolicyHandler) PutUserPolicy(c *gin.Context) {
 		return
 	}
 
-	orgAM, err := orgAllowedModels(ctx, h.db)
+	eff, err := h.validateAndPreviewWrite(ctx, principalTypeUser, id, "", req)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "read org policy failed"})
-		return
-	}
-
-	effective, err := validatePrincipalPolicyWrite(ctx, h.db, principalTypeUser, req, orgAM, nil)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	var lockedOut []lockedOutKey
-	if effective != nil && len(*effective) == 0 {
-		lockedOut = append(lockedOut, lockedOutKey{ID: id, Name: "(user)"})
-	}
-	keys, err := activeUserKeys(ctx, h.db, id)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "list user api keys failed"})
-		return
-	}
-	for _, k := range keys {
-		keyEff := mergeAllowedModels(orgAM, req.AllowedModels, k.AllowedModels)
-		if keyEff != nil && len(*keyEff) == 0 {
-			lockedOut = append(lockedOut, lockedOutKey{ID: k.ID, Name: k.Name})
+		if errors.Is(err, errGatewayUnavailable) {
+			c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		} else {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		}
+		return
+	}
+
+	lockedOut, err := lockedOutFromEffective(ctx, h.db, eff, id, "(user)")
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "check owned keys failed"})
+		return
 	}
 	if len(lockedOut) > 0 {
 		c.JSON(http.StatusConflict, gin.H{
@@ -631,27 +682,16 @@ func (h *PolicyHandler) PutAPIKeyPolicy(c *gin.Context) {
 		return
 	}
 
-	orgAM, err := orgAllowedModels(ctx, h.db)
+	eff, err := h.validateAndPreviewWrite(ctx, principalTypeAPIKey, id, info.UserID, req)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "read org policy failed"})
+		if errors.Is(err, errGatewayUnavailable) {
+			c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+		} else {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		}
 		return
 	}
-	ownerPolicy, _, err := getPrincipalPolicy(ctx, h.db, principalTypeUser, info.UserID)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "read owner policy failed"})
-		return
-	}
-	var ownerAM *[]string
-	if ownerPolicy != nil {
-		ownerAM = ownerPolicy.AllowedModels
-	}
-
-	effective, err := validatePrincipalPolicyWrite(ctx, h.db, principalTypeAPIKey, req, orgAM, ownerAM)
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-	if effective != nil && len(*effective) == 0 {
+	if eff.AllowedModels != nil && len(*eff.AllowedModels) == 0 {
 		c.JSON(http.StatusConflict, gin.H{
 			"error":      "this policy would lock this key out of every model",
 			"locked_out": []string{info.Name},
@@ -851,22 +891,37 @@ func (h *PolicyHandler) respondEffective(c *gin.Context, principalType, id, user
 }
 
 // previewResponse is POST .../routing-policy/preview's response shape.
-// Effective is a LOCAL approximation ({residency, allowed_models,
-// default_model} merged the same way the gateway would, per
-// mergeAllowedModels) rather than a live gateway call: the change being
-// previewed is never written, so there is no committed state the gateway
-// could compute against. See DESIGN4's API section and this file's package
-// doc comment.
+// Effective is the REAL gateway shape (sources, reachable_models included) --
+// a live POST /v1/policy/effective override call, not a local approximation.
+// See this file's package doc comment: there is exactly one merge
+// implementation, and it is the gateway's, for a write preview exactly as
+// much as for a write or a read.
 type previewResponse struct {
 	Effective    previewEffective   `json:"effective"`
 	KeysAffected []previewKeyImpact `json:"keys_affected"`
 	WouldLockOut []string           `json:"would_lock_out"`
 }
 
+// previewEffective mirrors gatewayEffectivePolicy but omits Keys: the
+// gateway's raw per-key entries feed KeysAffected (with names attached
+// locally) instead of round-tripping onto the wire a second time under
+// "effective".
 type previewEffective struct {
-	Residency     *string   `json:"residency"`
-	AllowedModels *[]string `json:"allowed_models"`
-	DefaultModel  *string   `json:"default_model"`
+	AllowedModels   *[]string         `json:"allowed_models"`
+	Residency       string            `json:"residency"`
+	DefaultModel    *string           `json:"default_model"`
+	Sources         map[string]string `json:"sources"`
+	ReachableModels []string          `json:"reachable_models"`
+}
+
+func newPreviewEffective(eff *gatewayEffectivePolicy) previewEffective {
+	return previewEffective{
+		AllowedModels:   eff.AllowedModels,
+		Residency:       eff.Residency,
+		DefaultModel:    eff.DefaultModel,
+		Sources:         eff.Sources,
+		ReachableModels: eff.ReachableModels,
+	}
 }
 
 type previewKeyImpact struct {
@@ -878,7 +933,10 @@ type previewKeyImpact struct {
 
 // PreviewUserPolicy handles POST /api/v1/users/:id/routing-policy/preview --
 // same body and validation as PutUserPolicy, but never writes; lock-outs are
-// reported in would_lock_out instead of a 409.
+// reported in would_lock_out instead of a 409. "before" comes from a second
+// gateway call with no override (still returns the user's keys, since
+// api_key_id is empty -- see the gateway's HandleEffectivePolicyOverride doc
+// comment), "after" from the proposed policy as an override, per DESIGN4.
 func (h *PolicyHandler) PreviewUserPolicy(c *gin.Context) {
 	id := c.Param("id")
 	if !isValidUUID(id) {
@@ -901,12 +959,6 @@ func (h *PolicyHandler) PreviewUserPolicy(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-
-	orgAM, err := orgAllowedModels(ctx, h.db)
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "read org policy failed"})
-		return
-	}
 	if req.AllowedModels != nil {
 		if err := validateAllowedModelIDs(ctx, h.db, *req.AllowedModels); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -918,32 +970,52 @@ func (h *PolicyHandler) PreviewUserPolicy(c *gin.Context) {
 		return
 	}
 
-	effective := mergeAllowedModels(orgAM, req.AllowedModels)
-	resp := previewResponse{
-		Effective:    previewEffective{Residency: req.Residency, AllowedModels: effective, DefaultModel: req.DefaultModel},
-		KeysAffected: []previewKeyImpact{},
-		WouldLockOut: []string{},
-	}
-	if effective != nil && len(*effective) == 0 {
-		resp.WouldLockOut = append(resp.WouldLockOut, "(user)")
-	}
-
-	keys, err := activeUserKeys(ctx, h.db, id)
+	before, err := h.gateway.effectiveWithOverride(ctx, id, "", nil)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "list user api keys failed"})
+		c.JSON(http.StatusBadGateway, gin.H{"error": "gateway effective policy unavailable: " + err.Error()})
 		return
 	}
-	currentPolicy, _, err := getPrincipalPolicy(ctx, h.db, principalTypeUser, id)
-	var currentUserAM *[]string
-	if currentPolicy != nil {
-		currentUserAM = currentPolicy.AllowedModels
+	after, err := h.gateway.effectiveWithOverride(ctx, id, "", &gatewayPolicyOverride{Level: principalTypeUser, Policy: &req})
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "gateway effective policy unavailable: " + err.Error()})
+		return
 	}
-	for _, k := range keys {
-		before := mergeAllowedModels(orgAM, currentUserAM, k.AllowedModels)
-		after := mergeAllowedModels(orgAM, req.AllowedModels, k.AllowedModels)
-		resp.KeysAffected = append(resp.KeysAffected, previewKeyImpact{ID: k.ID, Name: k.Name, Before: before, After: after})
-		if after != nil && len(*after) == 0 {
-			resp.WouldLockOut = append(resp.WouldLockOut, k.Name)
+	if req.DefaultModel != nil {
+		if err := validateDefaultModel(ctx, h.db, *req.DefaultModel, after.AllowedModels); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+
+	beforeByKey := make(map[string]*[]string, len(before.Keys))
+	for _, k := range before.Keys {
+		beforeByKey[k.APIKeyID] = k.Effective.AllowedModels
+	}
+	ids := make([]string, 0, len(after.Keys))
+	for _, k := range after.Keys {
+		ids = append(ids, k.APIKeyID)
+	}
+	names, err := keyNamesByID(ctx, h.db, ids)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "lookup key names failed"})
+		return
+	}
+
+	resp := previewResponse{
+		Effective:    newPreviewEffective(after),
+		KeysAffected: make([]previewKeyImpact, 0, len(after.Keys)),
+		WouldLockOut: []string{},
+	}
+	if after.AllowedModels != nil && len(*after.AllowedModels) == 0 {
+		resp.WouldLockOut = append(resp.WouldLockOut, "(user)")
+	}
+	for _, k := range after.Keys {
+		name := names[k.APIKeyID]
+		resp.KeysAffected = append(resp.KeysAffected, previewKeyImpact{
+			ID: k.APIKeyID, Name: name, Before: beforeByKey[k.APIKeyID], After: k.Effective.AllowedModels,
+		})
+		if k.Effective.AllowedModels != nil && len(*k.Effective.AllowedModels) == 0 {
+			resp.WouldLockOut = append(resp.WouldLockOut, name)
 		}
 	}
 
@@ -984,35 +1056,29 @@ func (h *PolicyHandler) PreviewAPIKeyPolicy(c *gin.Context) {
 		return
 	}
 
-	orgAM, err := orgAllowedModels(ctx, h.db)
+	before, err := h.gateway.effectiveWithOverride(ctx, info.UserID, id, nil)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "read org policy failed"})
+		c.JSON(http.StatusBadGateway, gin.H{"error": "gateway effective policy unavailable: " + err.Error()})
 		return
 	}
-	ownerPolicy, _, err := getPrincipalPolicy(ctx, h.db, principalTypeUser, info.UserID)
+	after, err := h.gateway.effectiveWithOverride(ctx, info.UserID, id, &gatewayPolicyOverride{Level: principalTypeAPIKey, Policy: &req})
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "read owner policy failed"})
+		c.JSON(http.StatusBadGateway, gin.H{"error": "gateway effective policy unavailable: " + err.Error()})
 		return
 	}
-	var ownerAM *[]string
-	if ownerPolicy != nil {
-		ownerAM = ownerPolicy.AllowedModels
+	if req.DefaultModel != nil {
+		if err := validateDefaultModel(ctx, h.db, *req.DefaultModel, after.AllowedModels); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
 	}
-	currentPolicy, _, err := getPrincipalPolicy(ctx, h.db, principalTypeAPIKey, id)
-	var currentKeyAM *[]string
-	if currentPolicy != nil {
-		currentKeyAM = currentPolicy.AllowedModels
-	}
-
-	before := mergeAllowedModels(orgAM, ownerAM, currentKeyAM)
-	after := mergeAllowedModels(orgAM, ownerAM, req.AllowedModels)
 
 	resp := previewResponse{
-		Effective:    previewEffective{Residency: req.Residency, AllowedModels: after, DefaultModel: req.DefaultModel},
-		KeysAffected: []previewKeyImpact{{ID: id, Name: info.Name, Before: before, After: after}},
+		Effective:    newPreviewEffective(after),
+		KeysAffected: []previewKeyImpact{{ID: id, Name: info.Name, Before: before.AllowedModels, After: after.AllowedModels}},
 		WouldLockOut: []string{},
 	}
-	if after != nil && len(*after) == 0 {
+	if after.AllowedModels != nil && len(*after.AllowedModels) == 0 {
 		resp.WouldLockOut = append(resp.WouldLockOut, info.Name)
 	}
 	c.JSON(http.StatusOK, resp)

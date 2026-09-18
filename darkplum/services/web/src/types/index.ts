@@ -278,9 +278,22 @@ export interface PolicyKeyImpact {
   after: string[]
 }
 
+/**
+ * The `effective` block of a preview response. The API returns the same shape
+ * as the effective endpoint, but a preview is computed against a policy that
+ * was never written and the parts drawn from live backend state can be absent
+ * from an older or degraded API. They are optional here, and only here, so a
+ * partial answer renders instead of throwing on the page that opened it.
+ */
+export interface PreviewEffectivePolicy
+  extends Omit<EffectivePolicy, 'sources' | 'reachable_models'> {
+  sources?: Partial<EffectivePolicy['sources']>
+  reachable_models?: string[]
+}
+
 /** What a policy would do, computed without writing it. */
 export interface PolicyPreview {
-  effective: EffectivePolicy
+  effective: PreviewEffectivePolicy
   keys_affected: PolicyKeyImpact[]
   /** Principals left with nothing they can reach. Non-empty means the save is
    *  refused by the API (409), so the UI refuses it first. */

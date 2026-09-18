@@ -125,6 +125,68 @@ type Snapshot struct {
 	// PrincipalCounts is len(UserPolicies)/len(KeyPolicies), reported as-is
 	// on /health.
 	PrincipalCounts PrincipalCounts
+
+	// OrgRow is the org level's own raw (unmerged) policy row. Together with
+	// UserRows and KeyRows, this is the input POST /v1/policy/effective's
+	// override path needs to reconstruct a principal's chain and substitute
+	// exactly one level -- OrgPolicy/UserPolicies/KeyPolicies only ever store
+	// the ALREADY-MERGED Effective() result, which cannot be un-merged. See
+	// ChainFor.
+	OrgRow PolicyRow
+	// UserRows maps user_id -> that user's own raw policy row, one entry per
+	// EXPLICIT row of principal_routing_policies with principal_type='user' --
+	// the same domain as UserPolicies' keys, but unmerged.
+	UserRows map[string]PolicyRow
+	// KeyRows maps api_key_id -> that key's own raw policy row, one entry per
+	// EXPLICIT row of principal_routing_policies with principal_type='api_key'
+	// -- the same domain as KeyPolicies' keys, but unmerged.
+	KeyRows map[string]PolicyRow
+	// KeyOwner maps api_key_id -> owning user_id for every NON-REVOKED api_key
+	// in the customer's database, independent of whether that key has ever had
+	// an explicit policy row of its own (unlike KeyRows, whose domain is only
+	// keys with a row). Used by the POST /v1/policy/effective override path to
+	// answer "every key owned by this user" for its "keys" list -- see
+	// UserKeys, the inverse mapping precomputed alongside it.
+	KeyOwner map[string]string
+	// UserKeys maps user_id -> the ids of every non-revoked api_key it owns,
+	// the inverse of KeyOwner precomputed once per snapshot load rather than
+	// scanned from KeyOwner per request.
+	UserKeys map[string][]string
+}
+
+// ChainFor returns the raw, unmerged policy chain for a principal in the
+// canonical org -> user[-> api_key] order Effective expects: org and user
+// rows are always present; the api_key row is appended only when keyID is
+// non-empty. A level with no explicit row in the snapshot is represented as
+// a bare PolicyRow{Level: ...} (every field nil = inherit) rather than
+// omitted, so PolicyOverride.Apply always has a row at every requested level
+// to substitute into, regardless of whether an admin has ever touched it.
+//
+// Unlike EffectiveFor (the request-time enforcement path, which looks up
+// precomputed EffectivePolicy values and never touches raw rows), ChainFor
+// exists solely for POST /v1/policy/effective's override preview -- the one
+// place the gateway needs to re-run Effective() with one level's row swapped
+// out rather than read an already-merged result.
+func (s Snapshot) ChainFor(userID, keyID string) []PolicyRow {
+	org := s.OrgRow
+	org.Level = PrincipalTypeOrg
+
+	user, ok := s.UserRows[userID]
+	if !ok {
+		user = PolicyRow{}
+	}
+	user.Level = PrincipalTypeUser
+
+	chain := []PolicyRow{org, user}
+	if keyID != "" {
+		key, ok := s.KeyRows[keyID]
+		if !ok {
+			key = PolicyRow{}
+		}
+		key.Level = PrincipalTypeAPIKey
+		chain = append(chain, key)
+	}
+	return chain
 }
 
 // StaticTarget returns the target of a static alias, mirroring the

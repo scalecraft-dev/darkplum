@@ -580,10 +580,28 @@ func isUUID(s string) bool {
 	return uuidPattern.MatchString(s)
 }
 
-// effectivePolicyResponse is the body of GET /v1/policy/effective.
+// effectivePolicyResponse is the body of GET /v1/policy/effective, and (with
+// Keys additionally populated in some cases — see HandleEffectivePolicyOverride)
+// the body of POST /v1/policy/effective. Keys is omitted from the wire
+// response entirely when empty/unset (both for GET, which never sets it, and
+// for a POST call where it wasn't applicable), so GET's response shape is
+// byte-for-byte unchanged by POST's existence.
 type effectivePolicyResponse struct {
 	policy.EffectivePolicy
-	ReachableModels []string `json:"reachable_models"`
+	ReachableModels []string                  `json:"reachable_models"`
+	Keys            []effectivePolicyKeyEntry `json:"keys,omitempty"`
+}
+
+// effectivePolicyKeyEntry is one entry of effectivePolicyResponse.Keys — a
+// key owned by the user_id under preview, and what ITS effective policy
+// would be under the same hypothetical override. Name is deliberately absent
+// (see HandleEffectivePolicyOverride's doc comment): the gateway has no
+// api_keys.name column to read, only ownership (Snapshot.KeyOwner/UserKeys)
+// and policy rows — the api fills in the name from its own database when it
+// builds keys_affected.
+type effectivePolicyKeyEntry struct {
+	APIKeyID  string                  `json:"api_key_id"`
+	Effective effectivePolicyResponse `json:"effective"`
 }
 
 // HandleEffectivePolicy handles GET /v1/policy/effective?user_id=<uuid>[&api_key_id=<uuid>],
@@ -651,6 +669,186 @@ func (h *ChatHandler) HandleEffectivePolicy(c *gin.Context) {
 		EffectivePolicy: eff,
 		ReachableModels: reachableModels(eff, snap, h.routes.Snapshot()),
 	})
+}
+
+// effectivePolicyOverrideRequest is the body of POST /v1/policy/effective.
+type effectivePolicyOverrideRequest struct {
+	UserID   string                   `json:"user_id"`
+	APIKeyID string                   `json:"api_key_id"`
+	Override *effectivePolicyOverride `json:"override"`
+}
+
+// effectivePolicyOverride names the one chain level (policy.PrincipalType*)
+// to hypothetically substitute, and what to substitute it with. Policy nil
+// means "inherit": remove whatever row this level currently has, exactly
+// like DELETE .../routing-policy does today.
+type effectivePolicyOverride struct {
+	Level  string                `json:"level"`
+	Policy *effectivePolicyRowIn `json:"policy"`
+}
+
+// effectivePolicyRowIn is the wire shape of one level's policy — the same
+// shape the api's PUT .../routing-policy accepts, so the api can pass the
+// proposed body straight through as the override with no translation.
+type effectivePolicyRowIn struct {
+	Residency     *string   `json:"residency"`
+	AllowedModels *[]string `json:"allowed_models"`
+	DefaultModel  *string   `json:"default_model"`
+}
+
+// HandleEffectivePolicyOverride handles POST /v1/policy/effective, the
+// preview counterpart of GET /v1/policy/effective: it builds the same
+// principal chain (Snapshot.ChainFor) and runs the SAME Effective() merge as
+// every other consumer of this package, but with one chain level
+// hypothetically substituted (or removed, when override.policy is null =
+// "inherit") — this is what lets the api's impact-preview endpoints (POST
+// .../users/:id/routing-policy/preview and .../api-keys/:id/routing-policy/preview)
+// answer "what would this look like" before writing anything, without a
+// second, divergent merge implementation living on the api side. See
+// DESIGN4.md's "Effective(chain) — ONE implementation, in the gateway".
+//
+// Service-key only, identical rule to GET (see its doc comment) — a user or
+// service caller impersonating another principal's policy preview is exactly
+// the cross-tenant read the api must never be able to trigger from a
+// session-scoped credential.
+func (h *ChatHandler) HandleEffectivePolicyOverride(c *gin.Context) {
+	if c.GetString(middleware.ContextKeyType) != middleware.KeyTypeService {
+		c.JSON(http.StatusForbidden, openAIError{
+			Error: openAIErrorBody{
+				Message: "POST /v1/policy/effective is only available to the service key",
+				Type:    "permission_error",
+				Code:    "service_key_required",
+			},
+		})
+		return
+	}
+
+	var req effectivePolicyOverrideRequest
+	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
+		c.JSON(http.StatusBadRequest, openAIError{
+			Error: openAIErrorBody{
+				Message: fmt.Sprintf("invalid request body: %s", err.Error()),
+				Type:    "invalid_request_error",
+				Code:    "invalid_request",
+			},
+		})
+		return
+	}
+
+	if !isUUID(req.UserID) {
+		c.JSON(http.StatusBadRequest, openAIError{
+			Error: openAIErrorBody{
+				Message: "user_id is required and must be a UUID",
+				Type:    "invalid_request_error",
+				Code:    "invalid_request",
+			},
+		})
+		return
+	}
+	if req.APIKeyID != "" && !isUUID(req.APIKeyID) {
+		c.JSON(http.StatusBadRequest, openAIError{
+			Error: openAIErrorBody{
+				Message: "api_key_id must be a UUID",
+				Type:    "invalid_request_error",
+				Code:    "invalid_request",
+			},
+		})
+		return
+	}
+
+	var override *policy.PolicyOverride
+	if req.Override != nil {
+		switch req.Override.Level {
+		case policy.PrincipalTypeOrg, policy.PrincipalTypeUser:
+			// Always applicable: ChainFor's chain always has an org row and a
+			// user row.
+		case policy.PrincipalTypeAPIKey:
+			if req.APIKeyID == "" {
+				c.JSON(http.StatusBadRequest, openAIError{
+					Error: openAIErrorBody{
+						Message: `override.level "api_key" requires a non-null api_key_id`,
+						Type:    "invalid_request_error",
+						Code:    "invalid_request",
+					},
+				})
+				return
+			}
+		default:
+			c.JSON(http.StatusBadRequest, openAIError{
+				Error: openAIErrorBody{
+					Message: fmt.Sprintf("override.level must be one of org, user, api_key, got %q", req.Override.Level),
+					Type:    "invalid_request_error",
+					Code:    "invalid_request",
+				},
+			})
+			return
+		}
+
+		var row *policy.PolicyRow
+		if req.Override.Policy != nil {
+			if req.Override.Policy.Residency != nil && *req.Override.Policy.Residency != policy.ResidencySelfHostedOnly {
+				c.JSON(http.StatusBadRequest, openAIError{
+					Error: openAIErrorBody{
+						Message: `override.policy.residency must be null or "self_hosted_only"`,
+						Type:    "invalid_request_error",
+						Code:    "invalid_request",
+					},
+				})
+				return
+			}
+			row = &policy.PolicyRow{
+				Residency:     req.Override.Policy.Residency,
+				AllowedModels: req.Override.Policy.AllowedModels,
+				DefaultModel:  req.Override.Policy.DefaultModel,
+			}
+		}
+		override = &policy.PolicyOverride{Level: req.Override.Level, Policy: row}
+	}
+
+	snap, loaded := h.policy.Current()
+	if !loaded {
+		respondPolicyUnavailable(c)
+		return
+	}
+
+	table := h.routes.Snapshot()
+	resp := previewEffective(snap, table, req.UserID, req.APIKeyID, override)
+
+	// Keys (every non-revoked key owned by req.UserID, each re-evaluated
+	// under the same override) is populated whenever the caller is looking at
+	// a user-scoped view: either no specific key was named at all (the plain
+	// GET-equivalent case, which doubles as the "before" half of the api's
+	// preview diff — see DESIGN4.md's Impact preview section), or the
+	// override itself targets "user"/"org" (the "after" half, previewing a
+	// change that can ripple to every key this user owns). An "api_key"-level
+	// override with an api_key_id only ever affects that one key, already
+	// covered by the top-level response, so no list is needed there.
+	if req.APIKeyID == "" || (override != nil && (override.Level == policy.PrincipalTypeUser || override.Level == policy.PrincipalTypeOrg)) {
+		for _, keyID := range snap.UserKeys[req.UserID] {
+			resp.Keys = append(resp.Keys, effectivePolicyKeyEntry{
+				APIKeyID:  keyID,
+				Effective: previewEffective(snap, table, req.UserID, keyID, override),
+			})
+		}
+	}
+
+	c.JSON(http.StatusOK, resp)
+}
+
+// previewEffective builds userID/keyID's raw chain (Snapshot.ChainFor),
+// applies override when non-nil, and runs policy.Effective() — the shared
+// core of HandleEffectivePolicyOverride's top-level response and its
+// per-key Keys entries. keyID == "" builds the 2-row (org, user) chain.
+func previewEffective(snap policy.Snapshot, table *routing.Table, userID, keyID string, override *policy.PolicyOverride) effectivePolicyResponse {
+	chain := snap.ChainFor(userID, keyID)
+	if override != nil {
+		chain = override.Apply(chain)
+	}
+	eff := policy.Effective(chain)
+	return effectivePolicyResponse{
+		EffectivePolicy: eff,
+		ReachableModels: reachableModels(eff, snap, table),
+	}
 }
 
 // reachableModels computes the models that are allowed by eff AND currently
