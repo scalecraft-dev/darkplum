@@ -39,7 +39,7 @@
 
 import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import { join, relative } from 'node:path'
+import { dirname, join, relative } from 'node:path'
 import ts from 'typescript'
 import { ALL_ROUTES, ROUTES } from '../src/lib/routes.ts'
 
@@ -368,28 +368,67 @@ function valueRefs(root: ts.Node, into: Set<string>): void {
 }
 
 /** Exported functions of a lib module: name -> the value references in its
- *  body. A re-export (`export { a as b } from './x'`) is an export named b
- *  that references a, so reachability flows through it like a wrapper. */
-function exportedFunctions(sf: ts.SourceFile): Map<string, Set<string>> {
+ *  body. Handles every way a module can export: `export function f`,
+ *  `export const f`, `export default f` / `export default function`, a
+ *  later `export { f, g as h }` of local declarations (resolved to their
+ *  bodies), `export { a as b } from './x'` (an export named b that
+ *  references a) and `export * from './x'` (every export of x, resolved
+ *  recursively within src/lib). */
+function exportedFunctions(sf: ts.SourceFile, seen = new Set<string>()): Map<string, Set<string>> {
   const out = new Map<string, Set<string>>()
-  const isExported = (n: ts.Node) =>
+  if (seen.has(sf.fileName)) return out
+  seen.add(sf.fileName)
+
+  const hasExport = (n: ts.Node) =>
     ts.canHaveModifiers(n) && (ts.getModifiers(n) ?? []).some((m) => m.kind === ts.SyntaxKind.ExportKeyword)
+  const hasDefault = (n: ts.Node) =>
+    ts.canHaveModifiers(n) && (ts.getModifiers(n) ?? []).some((m) => m.kind === ts.SyntaxKind.DefaultKeyword)
+  const refsOf = (n: ts.Node) => { const r = new Set<string>(); valueRefs(n, r); return r }
+
+  // Every top-level declaration, exported or not, so a later `export { f }`
+  // or `export default f` can be resolved to a real body.
+  const locals = new Map<string, Set<string>>()
   for (const stmt of sf.statements) {
-    if (ts.isFunctionDeclaration(stmt) && stmt.name && isExported(stmt)) {
-      const refs = new Set<string>()
-      valueRefs(stmt, refs)
-      out.set(stmt.name.text, refs)
-    } else if (ts.isVariableStatement(stmt) && isExported(stmt)) {
+    if (ts.isFunctionDeclaration(stmt) && stmt.name) locals.set(stmt.name.text, refsOf(stmt))
+    else if (ts.isVariableStatement(stmt)) {
       for (const decl of stmt.declarationList.declarations) {
-        if (!ts.isIdentifier(decl.name)) continue
-        const refs = new Set<string>()
-        valueRefs(decl, refs)
-        out.set(decl.name.text, refs)
+        if (ts.isIdentifier(decl.name)) locals.set(decl.name.text, refsOf(decl))
       }
-    } else if (ts.isExportDeclaration(stmt) && stmt.exportClause && ts.isNamedExports(stmt.exportClause)) {
-      for (const el of stmt.exportClause.elements) {
-        if (el.isTypeOnly || stmt.isTypeOnly) continue
-        out.set(el.name.text, new Set([(el.propertyName ?? el.name).text]))
+    }
+  }
+
+  const resolveModule = (spec: ts.Expression | undefined): ts.SourceFile | null => {
+    if (!spec || !ts.isStringLiteral(spec) || !spec.text.startsWith('.')) return null
+    const base = join(dirname(sf.fileName), spec.text)
+    for (const cand of [base, `${base}.ts`, `${base}.tsx`, join(base, 'index.ts')]) {
+      try { if (statSync(cand).isFile()) return parse(cand) } catch { /* next */ }
+    }
+    return null
+  }
+
+  for (const stmt of sf.statements) {
+    if (ts.isFunctionDeclaration(stmt) && hasExport(stmt)) {
+      out.set(hasDefault(stmt) ? 'default' : stmt.name!.text, refsOf(stmt))
+    } else if (ts.isVariableStatement(stmt) && hasExport(stmt)) {
+      for (const decl of stmt.declarationList.declarations) {
+        if (ts.isIdentifier(decl.name)) out.set(decl.name.text, refsOf(decl))
+      }
+    } else if (ts.isExportAssignment(stmt) && !stmt.isExportEquals) {
+      // `export default f` resolves to f's body; `export default <expr>` is
+      // the expression's own references.
+      const expr = stmt.expression
+      out.set('default', ts.isIdentifier(expr) ? (locals.get(expr.text) ?? new Set([expr.text])) : refsOf(expr))
+    } else if (ts.isExportDeclaration(stmt) && !stmt.isTypeOnly) {
+      if (stmt.exportClause && ts.isNamedExports(stmt.exportClause)) {
+        for (const el of stmt.exportClause.elements) {
+          if (el.isTypeOnly) continue
+          const local = (el.propertyName ?? el.name).text
+          if (stmt.moduleSpecifier) out.set(el.name.text, new Set([local]))
+          else out.set(el.name.text, locals.get(local) ?? new Set([local]))
+        }
+      } else if (!stmt.exportClause && stmt.moduleSpecifier) {
+        const target = resolveModule(stmt.moduleSpecifier)
+        if (target) for (const [name, refs] of exportedFunctions(target, seen)) if (name !== 'default') out.set(name, refs)
       }
     }
   }
@@ -452,7 +491,7 @@ for (const routeKey of Object.keys(ROUTES).sort()) {
   if (screenRefs.has(`ROUTES.${routeKey}`)) continue
   const via = [...libExports].filter(([, e]) => e.refs.has(`ROUTES.${routeKey}`)).map(([k]) => k)
   if (via.some((k) => reachable.has(k))) continue
-  const names = via.map((k) => k.split('#')[1])
+  const names = [...new Set(via.map((k) => k.split('#')[1]))]
   unreferenced.push(
     via.length === 0
       ? `ROUTES.${routeKey} — no src/lib function uses it and nothing outside src/lib references it`
