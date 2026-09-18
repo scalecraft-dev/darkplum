@@ -1043,6 +1043,41 @@ func TestUserPolicy_AllNullPutIsInherit(t *testing.T) {
 	if strings.Contains(list.Body.String(), targetID) {
 		t.Fatalf("principals list still shows the user after an all-null put: %s", list.Body.String())
 	}
+
+	// The audit trail reads as the removal it was: before = the old row,
+	// after = null -- the same shape DELETE writes.
+	var detailJSON []byte
+	if err := pool.QueryRow(ctx,
+		`SELECT detail FROM activity_events WHERE event_type = $1 ORDER BY created_at DESC LIMIT 1`,
+		string(activity.RoutingPolicyPrincipalChanged),
+	).Scan(&detailJSON); err != nil {
+		t.Fatalf("fetch principal_changed event: %v", err)
+	}
+	var detail map[string]any
+	if err := json.Unmarshal(detailJSON, &detail); err != nil {
+		t.Fatalf("decode event detail: %v", err)
+	}
+	if detail["before"] == nil || detail["after"] != nil {
+		t.Fatalf("all-null put must be audited as a delete (before set, after null), got %+v", detail)
+	}
+	var events int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM activity_events WHERE event_type = $1 AND target_id = $2`,
+		string(activity.RoutingPolicyPrincipalChanged), targetID).Scan(&events); err != nil {
+		t.Fatal(err)
+	}
+	// An all-null put against a principal with no row is a no-op and must
+	// not be recorded.
+	if resp := doJSON(t, r, http.MethodPut, "/api/v1/users/"+targetID+"/routing-policy", policyObject{}); resp.Code != http.StatusOK {
+		t.Fatalf("second all-null put: %d %s", resp.Code, resp.Body.String())
+	}
+	var after int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM activity_events WHERE event_type = $1 AND target_id = $2`,
+		string(activity.RoutingPolicyPrincipalChanged), targetID).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if after != events {
+		t.Fatalf("an all-null put with no row must record nothing; events went %d -> %d", events, after)
+	}
 }
 
 // --- Org policy: affected_principals on tighten -----------------------------

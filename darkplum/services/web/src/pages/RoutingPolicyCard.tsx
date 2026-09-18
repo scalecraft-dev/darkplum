@@ -390,7 +390,10 @@ export function RoutingPolicyCard({
             <p className={styles.affectedQuiet} role="status">
               {unresolved.length === 1
                 ? `1 enabled model has not been seen by a backend yet (${modelLabel(unresolved[0], models)}); if it turns out to be cloud-managed it will also be refused.`
-                : `${unresolved.length} enabled models have not been seen by a backend yet (${unresolved.map((id) => modelLabel(id, models)).join(', ')}); any that turn out to be cloud-managed will also be refused.`}
+                : `${unresolved.length} enabled models have not been seen by a backend yet (${unresolved
+                    .slice(0, 4)
+                    .map((id) => modelLabel(id, models))
+                    .join(', ')}${unresolved.length > 4 ? ` and ${unresolved.length - 4} more` : ''}); any that turn out to be cloud-managed will also be refused.`}
             </p>
           )}
 

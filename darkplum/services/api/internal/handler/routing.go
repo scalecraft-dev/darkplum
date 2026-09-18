@@ -1210,6 +1210,7 @@ func (h *RoutingHandler) PutRoutingPolicy(c *gin.Context) {
 		"default_model":       resp.DefaultModel,
 		"affected_principals": resp.AffectedPrincipals,
 		"org_narrowed":        resp.OrgNarrowed,
+		"unresolved_models":   resp.UnresolvedModels,
 	}
 	h.activity.Record(ctx, evt)
 
