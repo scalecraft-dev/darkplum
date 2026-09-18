@@ -1,4 +1,4 @@
-import type { User, ApiKey, ChatMessage, ActivityEvent, InferenceEvent, UsageBucket, UsageSummary, UserUsageSummary, KeyUsageSummary, Model, AdminModel, ModelAlias, Residency, RoutingPolicy } from '../types'
+import type { User, ApiKey, ChatMessage, ActivityEvent, InferenceEvent, UsageBucket, UsageSummary, UserUsageSummary, KeyUsageSummary, Model, AdminModel, ModelAlias, Residency, RoutingPolicy, ConversationSummary, ConversationFull, ConversationMessage, ConversationMessageInput } from '../types'
 
 const BASE = '/api/v1'
 
@@ -246,6 +246,86 @@ export function updateRoutingPolicy(residency: Residency): Promise<RoutingPolicy
   })
 }
 
+// Conversations
+//
+// Session-scoped: every one of these reads and writes the signed-in user's own
+// conversations. Another user's id comes back as a 404, never a 403.
+
+export function listConversations(limit?: number): Promise<ConversationSummary[]> {
+  const query = limit ? `?limit=${limit}` : ''
+  return fetchJSON<ConversationSummary[]>(`/conversations${query}`)
+}
+
+export function createConversation(body: {
+  title?: string
+  model?: string
+  import_key?: string
+  messages?: ConversationMessageInput[]
+}): Promise<ConversationFull> {
+  return fetchJSON<ConversationFull>('/conversations', {
+    method: 'POST',
+    body: JSON.stringify(body),
+  })
+}
+
+export function getConversation(id: string): Promise<ConversationFull> {
+  return fetchJSON<ConversationFull>(`/conversations/${id}`)
+}
+
+export function updateConversation(
+  id: string,
+  patch: { title?: string; model?: string },
+): Promise<ConversationSummary> {
+  return fetchJSON<ConversationSummary>(`/conversations/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify(patch),
+  })
+}
+
+/** Appends a user turn, or a user turn and the assistant turn that answered it.
+ *  The server assigns seq; the response is the authority on where they landed. */
+export function appendConversationMessages(
+  id: string,
+  messages: ConversationMessageInput[],
+): Promise<{ messages: ConversationMessage[] }> {
+  return fetchJSON<{ messages: ConversationMessage[] }>(`/conversations/${id}/messages`, {
+    method: 'POST',
+    body: JSON.stringify({ messages }),
+  })
+}
+
+export function deleteConversation(id: string): Promise<void> {
+  return fetchJSON<void>(`/conversations/${id}`, { method: 'DELETE' })
+}
+
+/** Removes the turn at fromSeq and everything after it. */
+export function truncateConversationMessages(id: string, fromSeq: number): Promise<void> {
+  return fetchJSON<void>(`/conversations/${id}/messages?from_seq=${fromSeq}`, {
+    method: 'DELETE',
+  })
+}
+
+/** The person's own copy of one conversation, as a JSON attachment. Read as a
+ *  blob rather than linked to directly so a failure lands in the UI instead of
+ *  replacing the page with an error body. */
+export async function exportConversation(id: string): Promise<{ blob: Blob; filename: string }> {
+  const res = await fetch(`${BASE}/conversations/${id}?format=export`, {
+    headers: { 'X-Requested-With': 'XMLHttpRequest' },
+    credentials: 'same-origin',
+  })
+  if (res.status === 401) {
+    window.location.href = '/login'
+    return { blob: new Blob(), filename: '' }
+  }
+  if (!res.ok) {
+    const body = await res.text().catch(() => '')
+    throw new ApiError(extractErrorMessage(body) || res.statusText || `HTTP ${res.status}`, res.status)
+  }
+  const disposition = res.headers.get('Content-Disposition') ?? ''
+  const match = /filename="?([^";]+)"?/.exec(disposition)
+  return { blob: await res.blob(), filename: match?.[1] || `conversation-${id}.json` }
+}
+
 // Chat streaming
 
 /**
@@ -268,6 +348,13 @@ export class ChatError extends Error {
   }
 }
 
+/** What the gateway said about the request itself, as soon as the response
+ *  headers land. The request id ties a stored assistant turn to the audit
+ *  record of the call that produced it. */
+export interface ChatResponseMeta {
+  requestId: string | null
+}
+
 export async function streamChat(
   messages: ChatMessage[],
   model: string,
@@ -275,6 +362,7 @@ export async function streamChat(
   onDone: () => void,
   onError: (err: Error) => void,
   signal: AbortSignal,
+  onMeta?: (meta: ChatResponseMeta) => void,
 ): Promise<void> {
   let res: Response
   try {
@@ -295,6 +383,8 @@ export async function streamChat(
     window.location.href = '/login'
     return
   }
+
+  onMeta?.({ requestId: res.headers.get('X-Request-Id') })
 
   if (!res.ok) {
     // Routing refusals (403/404/503) arrive as a JSON body even when the

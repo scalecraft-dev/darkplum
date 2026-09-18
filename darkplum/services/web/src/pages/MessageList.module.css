@@ -179,6 +179,40 @@
   border-top: 1px solid var(--border-muted);
 }
 
+/* Which model answered. Sits with the other footnotes on a reply, in the same
+   monospace the rest of the product uses for identifiers. */
+.messageModel {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* A turn plus the note that it never reached the server. */
+.turn {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.unsaved {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding-left: var(--space-2);
+  border-left: 2px solid var(--warning-fg);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-normal);
+  color: var(--fg-muted);
+}
+
+.unsaved svg {
+  flex-shrink: 0;
+  color: var(--warning-fg);
+}
+
 .regenerate {
   display: inline-flex;
   align-items: center;

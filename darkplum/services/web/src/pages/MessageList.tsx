@@ -4,6 +4,7 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
 import type { ChatMessage } from '../types'
+import { formatModelName } from '../lib/formatModelName'
 import { CodeBlock } from '../components/ui/CodeBlock'
 import { CopyButton } from '../components/ui/CopyButton'
 import styles from './MessageList.module.css'
@@ -29,7 +30,23 @@ interface Props {
   failure?: ChatFailure | null
   isAdmin?: boolean
   onRetry?: () => void
+  /** Index of the first turn the server did not take, or null while the whole
+   *  conversation is stored. */
+  unsavedFrom?: number | null
 }
+
+/** History is kept on the server; a turn that never got there would otherwise
+ *  look identical to one that did. Said once, next to the turn it concerns. */
+const UnsavedNotice = () => (
+  <p className={styles.unsaved} role="status">
+    <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+      <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+      <line x1="12" y1="9" x2="12" y2="13" />
+      <line x1="12" y1="17" x2="12.01" y2="17" />
+    </svg>
+    <span>Not saved to your history — send it again to store it.</span>
+  </p>
+)
 
 /** Headline and next step for each routing refusal the gateway can return.
  *  When a re-read of the list has confirmed the model is gone, the next step is
@@ -184,11 +201,15 @@ const ThinkingIndicator = () => (
 
 const AssistantBubble = memo(({
   content,
+  model,
   isStreaming,
   isLast,
   onRegenerate,
 }: {
   content: string
+  /** The model the server recorded as having produced this reply. A thread can
+   *  span several, so the answer says which one it came from. */
+  model?: string | null
   isStreaming: boolean
   isLast: boolean
   onRegenerate?: () => void
@@ -210,6 +231,11 @@ const AssistantBubble = memo(({
           {!isStreaming && content && (
             <div className={styles.actions}>
               <CopyButton value={content} label="Copy" />
+              {model && (
+                <span className={styles.messageModel} title={model}>
+                  {formatModelName(model)}
+                </span>
+              )}
               {isLast && onRegenerate && (
                 <button className={styles.regenerate} onClick={onRegenerate} type="button">
                   <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -228,7 +254,15 @@ const AssistantBubble = memo(({
 ))
 AssistantBubble.displayName = 'AssistantBubble'
 
-export function MessageList({ messages, streaming, onRegenerate, failure, isAdmin, onRetry }: Props) {
+export function MessageList({
+  messages,
+  streaming,
+  onRegenerate,
+  failure,
+  isAdmin,
+  onRetry,
+  unsavedFrom,
+}: Props) {
   const bottomRef = useRef<HTMLDivElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
   const [userScrolled, setUserScrolled] = useState(false)
@@ -261,17 +295,26 @@ export function MessageList({ messages, streaming, onRegenerate, failure, isAdmi
       <div className={styles.inner}>
         {messages.map((msg, i) => {
           const isLast = i === messages.length - 1
-          if (msg.role === 'user') {
-            return <UserBubble key={i} content={msg.content} />
-          }
+          const unsaved = unsavedFrom !== null && unsavedFrom !== undefined && i === unsavedFrom
+          const bubble =
+            msg.role === 'user' ? (
+              <UserBubble key={i} content={msg.content} />
+            ) : (
+              <AssistantBubble
+                key={i}
+                content={msg.content}
+                model={msg.model}
+                isStreaming={isLast && streaming}
+                isLast={isLast}
+                onRegenerate={onRegenerate}
+              />
+            )
+          if (!unsaved) return bubble
           return (
-            <AssistantBubble
-              key={i}
-              content={msg.content}
-              isStreaming={isLast && streaming}
-              isLast={isLast}
-              onRegenerate={onRegenerate}
-            />
+            <div key={i} className={styles.turn}>
+              {bubble}
+              <UnsavedNotice />
+            </div>
           )
         })}
         {failure && (

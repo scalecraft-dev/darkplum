@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useState } from 'react'
 import type { User } from '../types'
 import { useToast } from '../components/Toast'
 import { Avatar, Badge, Button, Input, Modal, Table, TableEmpty } from '../components/ui'
@@ -16,53 +16,63 @@ interface Props {
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
 
-function DeleteButton({ id, onDelete }: { id: string; onDelete: (id: string) => Promise<void> }) {
+/** Deleting a user takes their chat history with it — the database cascades
+ *  conversations off the user row. That is not something a two-click inline
+ *  confirm can say, so it is said in full before anything happens. */
+function DeleteButton({ user, onDelete }: { user: User; onDelete: (id: string) => Promise<void> }) {
   const { toast } = useToast()
-  const [confirming, setConfirming] = useState(false)
+  const [open, setOpen] = useState(false)
   const [loading, setLoading] = useState(false)
-  const timer = useRef<ReturnType<typeof setTimeout> | null>(null)
 
-  const handleClick = async () => {
-    if (!confirming) {
-      setConfirming(true)
-      timer.current = setTimeout(() => setConfirming(false), 3000)
-      return
-    }
-    if (timer.current) clearTimeout(timer.current)
+  const handleDelete = async () => {
     setLoading(true)
     try {
-      await onDelete(id)
+      await onDelete(user.id)
       toast('User deleted', 'success')
+      setOpen(false)
     } catch (err) {
       toast((err as Error).message, 'error')
     } finally {
       setLoading(false)
-      setConfirming(false)
     }
   }
 
-  useEffect(() => () => { if (timer.current) clearTimeout(timer.current) }, [])
-
   return (
-    <button
-      className={`${styles.actionBtn} ${confirming ? styles.actionConfirm : ''}`}
-      onClick={handleClick}
-      disabled={loading}
-      title="Delete user"
-    >
-      {loading ? (
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={styles.spinner}>
-          <path d="M21 12a9 9 0 1 1-6.219-8.56" />
-        </svg>
-      ) : confirming ? (
-        'Confirm?'
-      ) : (
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-          <polyline points="3 6 5 6 21 6" />
-          <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
-        </svg>
-      )}
-    </button>
+    <>
+      <button
+        className={styles.actionBtn}
+        onClick={() => setOpen(true)}
+        disabled={loading}
+        title="Delete user"
+      >
+        {loading ? (
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={styles.spinner}>
+            <path d="M21 12a9 9 0 1 1-6.219-8.56" />
+          </svg>
+        ) : (
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <polyline points="3 6 5 6 21 6" />
+            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+          </svg>
+        )}
+      </button>
+
+      <Modal
+        open={open}
+        onClose={() => setOpen(false)}
+        title="Delete this user?"
+        description={`${user.name} (${user.email}) loses access immediately, and every conversation they have had is permanently deleted with the account. There is no undo.`}
+      >
+        <div className={styles.formFooter}>
+          <Button variant="ghost" onClick={() => setOpen(false)} disabled={loading}>
+            Cancel
+          </Button>
+          <Button variant="danger" onClick={() => void handleDelete()} disabled={loading}>
+            {loading ? 'Deleting...' : 'Delete user and conversations'}
+          </Button>
+        </div>
+      </Modal>
+    </>
   )
 }
 
@@ -259,7 +269,7 @@ export function UsersTab({ users, isAdmin, currentUserId, onCreate, onDelete, on
                     {isAdmin && onResetPassword && (
                       <ResetPasswordButton userId={u.id} onReset={onResetPassword} />
                     )}
-                    {isAdmin && <DeleteButton id={u.id} onDelete={onDelete} />}
+                    {isAdmin && <DeleteButton user={u} onDelete={onDelete} />}
                   </td>
                 </tr>
               ))

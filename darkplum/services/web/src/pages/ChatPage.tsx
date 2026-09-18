@@ -1,21 +1,35 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { ChatError, streamChat } from '../lib/api'
+import { ChatError, exportConversation, streamChat } from '../lib/api'
 import {
-  createConversation,
+  DRAFT_ID,
+  NEW_CONVERSATION_TITLE,
+  appendTurns,
+  assistantTurn,
+  cacheConversation,
+  createDraft,
   deleteConversation,
-  flushConversations,
+  deriveTitle,
+  forgetConversation,
+  hasLocalConversations,
+  importLocalConversations,
   loadConversations,
-  saveConversation,
-  updateTitle,
+  openConversation,
+  renameConversation,
+  setConversationModel,
+  startConversation,
+  toWireMessages,
+  truncateFrom,
+  userTurn,
   type Conversation,
 } from '../lib/conversations'
 import type { ChatMessage } from '../types'
 import { useAuth } from '../context/AuthContext'
+import { useToast } from '../components/Toast'
 import { useModels } from '../hooks/useModels'
 import { Button } from '../components/ui'
 import { Skeleton } from '../components/ui/Skeleton'
-import { ConversationList } from './ConversationList'
+import { ConversationList, type ListState } from './ConversationList'
 import { MessageList, type ChatFailure } from './MessageList'
 import { ChatComposer, type ComposerNotice } from './ChatComposer'
 import { ModelSelector } from './ModelSelector'
@@ -39,9 +53,14 @@ const STALE_MODEL_CODES = new Set([
   'model_residency_violation',
 ])
 
+function errorText(err: unknown, fallback: string): string {
+  return err instanceof Error && err.message ? err.message : fallback
+}
+
 export function ChatPage() {
   const navigate = useNavigate()
   const { user } = useAuth()
+  const { toast } = useToast()
   const isAdmin = user?.role === 'admin'
   const {
     models,
@@ -50,12 +69,21 @@ export function ChatPage() {
     error: modelsError,
     refetch: refetchModels,
   } = useModels()
-  const [conversations, setConversations] = useState<Conversation[]>(() => loadConversations())
-  const [activeId, setActiveId] = useState<string | null>(
-    () => conversations[0]?.id ?? null,
-  )
+  const [conversations, setConversations] = useState<Conversation[]>([])
+  const [activeId, setActiveId] = useState<string | null>(null)
+  const [listState, setListState] = useState<ListState>('loading')
+  const [listError, setListError] = useState<string | null>(null)
+  const [importFailed, setImportFailed] = useState(false)
+  const [importing, setImporting] = useState(false)
+  /** The conversation whose bodies are being fetched, if any. */
+  const [loadingId, setLoadingId] = useState<string | null>(null)
+  const [threadError, setThreadError] = useState<string | null>(null)
+  const [exporting, setExporting] = useState(false)
   const [streaming, setStreaming] = useState(false)
   const [model, setModel] = useState('')
+  /** A stored model waiting for the picker's list to arrive before it can be
+   *  honoured. Restoring it against an empty list would read as "gone". */
+  const [pendingModel, setPendingModel] = useState<string | null>(null)
   const [failure, setFailure] = useState<ChatFailure | null>(null)
   const abortRef = useRef<AbortController | null>(null)
   const modelIds = useMemo(() => models.map((m) => m.id), [models])
@@ -75,31 +103,112 @@ export function ChatPage() {
         : 'empty'
 
   useEffect(() => {
-    if (modelsReady && !model && !autoPickedRef.current) {
+    if (modelsReady && !model && !autoPickedRef.current && pendingModel === null) {
       autoPickedRef.current = true
       setModel(models[0].id)
     }
-  }, [modelsReady, model, models])
+  }, [modelsReady, model, models, pendingModel])
+
+  /** A conversation reopens on the model it was last used with — but only if
+   *  that model is still on offer. When it is gone the picker is left empty for
+   *  the person to choose: nobody is moved onto a different model silently. */
+  useEffect(() => {
+    if (pendingModel === null || !modelsReady) return
+    autoPickedRef.current = true
+    setModel(modelIds.includes(pendingModel) ? pendingModel : '')
+    setPendingModel(null)
+  }, [pendingModel, modelsReady, modelIds])
 
   const active = conversations.find((c) => c.id === activeId) ?? null
   const messages = active?.messages ?? []
+  const threadLoading = Boolean(active && loadingId === active.id)
 
-  const updateConv = useCallback((conv: Conversation) => {
-    setConversations((prev) => {
-      const idx = prev.findIndex((c) => c.id === conv.id)
-      if (idx >= 0) {
-        const next = [...prev]
-        next[idx] = conv
-        return next
-      }
-      return [conv, ...prev]
-    })
+  /** The page is the live copy; the store keeps it so coming back to /chat does
+   *  not refetch threads that were read a moment ago. Not while tokens are
+   *  arriving: that is a write per token, for a half-finished answer. */
+  useEffect(() => {
+    if (streaming) return
+    for (const conv of conversations) cacheConversation(conv)
+  }, [conversations, streaming])
+
+  const patchConv = useCallback((id: string, patch: (conv: Conversation) => Conversation) => {
+    setConversations((prev) => prev.map((c) => (c.id === id ? patch(c) : c)))
   }, [])
 
-  const persistConv = useCallback((conv: Conversation) => {
-    saveConversation(conv)
-    updateConv(conv)
-  }, [updateConv])
+  const readList = useCallback(async () => {
+    setListState('loading')
+    setListError(null)
+    try {
+      const list = await loadConversations()
+      setConversations((prev) => {
+        const draft = prev.find((c) => c.draft)
+        return draft ? [draft, ...list] : list
+      })
+      setListState('ready')
+      return list
+    } catch (err) {
+      setListState('error')
+      setListError(errorText(err, 'Your conversations could not be loaded'))
+      return null
+    }
+  }, [])
+
+  const openThread = useCallback(async (id: string) => {
+    setLoadingId(id)
+    setThreadError(null)
+    try {
+      const full = await openConversation(id)
+      setConversations((prev) => prev.map((c) => (c.id === id ? full : c)))
+    } catch (err) {
+      setThreadError(errorText(err, 'This conversation could not be loaded'))
+    } finally {
+      setLoadingId((prev) => (prev === id ? null : prev))
+    }
+  }, [])
+
+  // First load: move anything still held in this browser to the server, then
+  // read the list and open the most recent conversation.
+  useEffect(() => {
+    let cancelled = false
+    void (async () => {
+      if (hasLocalConversations()) {
+        setImporting(true)
+        const result = await importLocalConversations()
+        if (cancelled) return
+        setImporting(false)
+        setImportFailed(result.failed > 0)
+      }
+      let list: Conversation[] = []
+      try {
+        list = await loadConversations()
+        if (cancelled) return
+        setConversations(list)
+        setListState('ready')
+      } catch (err) {
+        if (cancelled) return
+        setListState('error')
+        setListError(errorText(err, 'Your conversations could not be loaded'))
+        return
+      }
+      const first = list[0]
+      if (!first) return
+      setActiveId(first.id)
+      if (first.model) setPendingModel(first.model)
+      setLoadingId(first.id)
+      try {
+        const full = await openConversation(first.id)
+        if (cancelled) return
+        setConversations((prev) => prev.map((c) => (c.id === full.id ? full : c)))
+      } catch (err) {
+        if (!cancelled) setThreadError(errorText(err, 'This conversation could not be loaded'))
+      } finally {
+        if (!cancelled) setLoadingId((prev) => (prev === first.id ? null : prev))
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   /** The picker states which model may see this conversation, so the choice is
    *  written to the conversation as well. Without that, a send would still go
@@ -107,41 +216,93 @@ export function ChatPage() {
    *  card stays put: it is the only remaining way back to the refused message. */
   const handleModelChange = useCallback((id: string) => {
     setModel(id)
-    if (id && active && active.model !== id) {
-      persistConv({ ...active, model: id })
-    }
-  }, [active, persistConv])
+    autoPickedRef.current = true
+    if (!id || !active || active.model === id) return
+    patchConv(active.id, (c) => ({ ...c, model: id }))
+    // A preference, not content: a conversation that has not been created yet
+    // carries it along on the first send, and a failed write is not worth
+    // interrupting anyone over.
+    if (!active.draft) void setConversationModel(active.id, id).catch(() => {})
+  }, [active, patchConv])
 
   const handleNewChat = useCallback(() => {
-    const conv = createConversation(model)
-    persistConv(conv)
-    setActiveId(conv.id)
     setFailure(null)
-  }, [model, persistConv])
+    setThreadError(null)
+    setConversations((prev) => (prev.some((c) => c.draft) ? prev : [createDraft(model), ...prev]))
+    setActiveId(DRAFT_ID)
+  }, [model])
 
   const handleSelectConversation = useCallback((id: string) => {
+    const conv = conversations.find((c) => c.id === id)
+    if (!conv) return
     setActiveId(id)
     setFailure(null)
-    const conv = conversations.find((c) => c.id === id)
-    // A conversation whose model has gone opens with nothing selected: moving it
-    // onto a different model is the person's call, not ours. One that never had
-    // a model of its own keeps whatever is already chosen.
-    if (conv?.model) {
-      setModel(modelIds.includes(conv.model) ? conv.model : '')
-    }
-  }, [conversations, modelIds])
+    setThreadError(null)
+    // An untouched new chat is not worth keeping once the person moves on.
+    setConversations((prev) =>
+      prev.filter((c) => !(c.draft && c.id !== id && c.messages.length === 0)),
+    )
+    if (conv.model) setPendingModel(conv.model)
+    if (!conv.loaded) void openThread(id)
+  }, [conversations, openThread])
 
-  const handleDeleteConversation = useCallback((id: string) => {
-    deleteConversation(id)
-    setFailure(null)
-    setConversations((prev) => {
-      const next = prev.filter((c) => c.id !== id)
-      if (activeId === id) {
-        setActiveId(next[0]?.id ?? null)
-      }
-      return next
-    })
-  }, [activeId])
+  const handleDeleteConversation = useCallback(async (id: string) => {
+    const conv = conversations.find((c) => c.id === id)
+    if (!conv) return
+    setConversations((prev) => prev.filter((c) => c.id !== id))
+    if (activeId === id) {
+      setActiveId(null)
+      setFailure(null)
+      setThreadError(null)
+    }
+    if (conv.draft) {
+      forgetConversation(id)
+      return
+    }
+    try {
+      await deleteConversation(id)
+    } catch (err) {
+      // Nothing was removed, so the conversation goes back where it was.
+      setConversations((prev) =>
+        [conv, ...prev].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)),
+      )
+      toast(errorText(err, 'The conversation could not be deleted'), 'error')
+    }
+  }, [conversations, activeId, toast])
+
+  const handleRenameConversation = useCallback(async (id: string, title: string) => {
+    const conv = conversations.find((c) => c.id === id)
+    const next = title.trim().slice(0, 200)
+    if (!conv || !next || next === conv.title) return
+    patchConv(id, (c) => ({ ...c, title: next }))
+    if (conv.draft) return
+    try {
+      await renameConversation(id, next)
+    } catch (err) {
+      patchConv(id, (c) => ({ ...c, title: conv.title }))
+      toast(errorText(err, 'The conversation could not be renamed'), 'error')
+    }
+  }, [conversations, patchConv, toast])
+
+  const handleExport = useCallback(async () => {
+    if (!active || active.draft) return
+    setExporting(true)
+    try {
+      const { blob, filename } = await exportConversation(active.id)
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = filename
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      URL.revokeObjectURL(url)
+    } catch (err) {
+      toast(errorText(err, 'The conversation could not be downloaded'), 'error')
+    } finally {
+      setExporting(false)
+    }
+  }, [active, toast])
 
   /** A routing refusal is the freshest evidence there is that the picker is
    *  showing a model the gateway no longer serves. Re-read the list, and if the
@@ -165,76 +326,277 @@ export function ChatPage() {
       // conversation's current choice and outranks the model it was last sent
       // on: what is on screen is what the data goes to.
       const sendModel = model || conv.model
-      const updatedMessages: ChatMessage[] = [...messagesToSend, { role: 'assistant', content: '' }]
-      let updated = { ...conv, messages: updatedMessages, model: sendModel, updatedAt: new Date().toISOString() }
+      if (!sendModel) return
 
-      if (messagesToSend.filter((m) => m.role === 'user').length === 1) {
-        updated = updateTitle(updated)
-      }
+      const isDraft = conv.draft === true
+      const title =
+        isDraft || conv.title === NEW_CONVERSATION_TITLE ? deriveTitle(messagesToSend) : conv.title
+      // The id changes under us the moment the server creates the conversation,
+      // so every later write looks it up again rather than holding a stale one.
+      let liveId = conv.id
 
-      updateConv(updated)
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id === liveId
+            ? {
+                ...c,
+                title,
+                model: sendModel,
+                updatedAt: new Date().toISOString(),
+                messages: [...messagesToSend, { role: 'assistant' as const, content: '' }],
+              }
+            : c,
+        ),
+      )
       setFailure(null)
       setStreaming(true)
+
+      // Turns the server has not taken yet. Normally one — the message just
+      // typed. More than one means an earlier save failed: the API takes a turn
+      // at a time, so the newest goes and the older one stays flagged.
+      const unsent = messagesToSend.slice(conv.syncedCount)
+      const gapFrom = unsent.length > 1 ? conv.syncedCount : null
+
+      // Saving runs alongside the request: a reply must never wait on our own
+      // database, and a database that is down must not cost anyone their answer.
+      const saveUserTurn = (async (): Promise<{
+        id: string
+        stored: boolean
+        diverged: boolean
+      }> => {
+        try {
+          if (isDraft) {
+            const created = await startConversation({ title, model: sendModel, messages: unsent })
+            liveId = created.id
+            setConversations((prev) =>
+              prev.map((c) =>
+                c.id === DRAFT_ID
+                  ? { ...created, messages: c.messages, unsavedFrom: null }
+                  : c,
+              ),
+            )
+            setActiveId((prev) => (prev === DRAFT_ID ? created.id : prev))
+            return { id: created.id, stored: true, diverged: false }
+          }
+          if (unsent.length === 0) return { id: liveId, stored: true, diverged: false }
+          const result = await appendTurns(liveId, [userTurn(unsent[unsent.length - 1].content)])
+          const last = result.messages[result.messages.length - 1]
+          setConversations((prev) =>
+            prev.map((c) =>
+              c.id === liveId
+                ? {
+                    ...c,
+                    syncedCount: messagesToSend.length,
+                    serverSeq: last ? last.seq : c.serverSeq,
+                    unsavedFrom: c.unsavedFrom ?? gapFrom,
+                  }
+                : c,
+            ),
+          )
+          return { id: liveId, stored: true, diverged: result.diverged }
+        } catch {
+          setConversations((prev) =>
+            prev.map((c) =>
+              c.id === liveId ? { ...c, unsavedFrom: c.unsavedFrom ?? conv.syncedCount } : c,
+            ),
+          )
+          return { id: liveId, stored: false, diverged: false }
+        }
+      })()
 
       const ctrl = new AbortController()
       abortRef.current = ctrl
 
       let accum = ''
+      let requestId: string | null = null
+      // Held on an object rather than in locals: the stream reports through
+      // callbacks, and these are read after it has finished.
+      const result: { outcome: 'done' | 'error' | 'aborted'; error: Error | null } = {
+        outcome: 'aborted',
+        error: null,
+      }
+
       await streamChat(
-        messagesToSend,
+        toWireMessages(messagesToSend),
         sendModel,
         (token) => {
           accum += token
-          const withToken = { ...updated, messages: [...messagesToSend, { role: 'assistant' as const, content: accum }] }
-          updateConv(withToken)
+          setConversations((prev) =>
+            prev.map((c) =>
+              c.id === liveId
+                ? { ...c, messages: [...messagesToSend, { role: 'assistant' as const, content: accum }] }
+                : c,
+            ),
+          )
         },
         () => {
-          const final = { ...updated, messages: [...messagesToSend, { role: 'assistant' as const, content: accum }] }
-          persistConv(final)
-          setStreaming(false)
-          abortRef.current = null
+          result.outcome = 'done'
         },
         (err) => {
-          // The gateway refuses routing failures with a code; keep it so the
-          // conversation can explain the refusal instead of "request failed".
-          // The failure lives in component state only — it is never part of the
-          // conversation, so it is never persisted or replayed to a model.
-          const code = err instanceof ChatError ? err.code : undefined
-          setFailure({ message: err.message, code, model: sendModel })
-          const rolled = { ...updated, messages: messagesToSend }
-          persistConv(rolled)
-          setStreaming(false)
-          abortRef.current = null
-          if (code && STALE_MODEL_CODES.has(code)) {
-            void reconcileModels(sendModel)
-          }
+          result.outcome = 'error'
+          result.error = err
         },
         ctrl.signal,
+        (meta) => {
+          requestId = meta.requestId
+        },
       )
+
+      setStreaming(false)
+      abortRef.current = null
+
+      const target = await saveUserTurn
+
+      if (result.outcome === 'error') {
+        // The gateway refuses routing failures with a code; keep it so the
+        // conversation can explain the refusal instead of "request failed".
+        // The failure lives in component state only — it is never part of the
+        // conversation, so it is never stored or replayed to a model.
+        const err = result.error
+        const code = err instanceof ChatError ? err.code : undefined
+        setFailure({
+          message: err ? err.message : 'The message was not sent',
+          code,
+          model: sendModel,
+        })
+        setConversations((prev) =>
+          prev.map((c) => (c.id === target.id ? { ...c, messages: messagesToSend } : c)),
+        )
+        if (code && STALE_MODEL_CODES.has(code)) void reconcileModels(sendModel)
+        return
+      }
+
+      const reply = accum
+      if (!reply.trim()) {
+        // Stopped before a word arrived: there is no turn worth keeping.
+        setConversations((prev) =>
+          prev.map((c) => (c.id === target.id ? { ...c, messages: messagesToSend } : c)),
+        )
+        return
+      }
+
+      let stored = false
+      let servedBy: string | null = sendModel
+      let storedSeq: number | null = null
+      let diverged = target.diverged
+      if (target.stored) {
+        try {
+          const appended = await appendTurns(target.id, [
+            assistantTurn(reply, sendModel, requestId),
+          ])
+          const saved = appended.messages[appended.messages.length - 1]
+          // The server names the model that actually served the request; it
+          // knows, and the picker only ever held an intention.
+          if (saved) {
+            servedBy = saved.model ?? sendModel
+            storedSeq = saved.seq
+          }
+          diverged = diverged || appended.diverged
+          stored = true
+        } catch {
+          stored = false
+        }
+      }
+
+      const finalMessages: ChatMessage[] = [
+        ...messagesToSend,
+        { role: 'assistant', content: reply, model: servedBy },
+      ]
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id === target.id
+            ? {
+                ...c,
+                messages: finalMessages,
+                messageCount: storedSeq ?? finalMessages.length,
+                // Where the server actually put this turn. Guessing it from the
+                // local count would read the next append as another tab's work.
+                serverSeq: storedSeq ?? c.serverSeq,
+                syncedCount: stored ? finalMessages.length : c.syncedCount,
+                unsavedFrom: stored
+                  ? c.unsavedFrom
+                  : (c.unsavedFrom ?? finalMessages.length - 1),
+                updatedAt: new Date().toISOString(),
+              }
+            : c,
+        ),
+      )
+
+      // The server put this turn somewhere we did not expect: the same
+      // conversation is open elsewhere. Its copy is the real one.
+      if (diverged) {
+        try {
+          const fresh = await openConversation(target.id, { force: true })
+          setConversations((prev) => prev.map((c) => (c.id === fresh.id ? fresh : c)))
+        } catch {
+          // The thread on screen stays as it is until the next read.
+        }
+      }
     },
-    [streaming, model, updateConv, persistConv, reconcileModels],
+    [streaming, model, reconcileModels],
   )
 
   const handleSend = useCallback(
     async (text: string) => {
       let conv = active
       if (!conv) {
-        conv = createConversation(model)
-        persistConv(conv)
-        setActiveId(conv.id)
+        conv = createDraft(model)
+        const draft = conv
+        setConversations((prev) => [draft, ...prev.filter((c) => !c.draft)])
+        setActiveId(DRAFT_ID)
       }
-      const userMsg: ChatMessage = { role: 'user', content: text }
-      const messagesToSend = [...conv.messages, userMsg]
+      const messagesToSend: ChatMessage[] = [...conv.messages, { role: 'user', content: text }]
       await sendMessages(conv, messagesToSend)
     },
-    [active, model, sendMessages, persistConv],
+    [active, model, sendMessages],
   )
 
+  /** A second answer to the same question replaces the first, on the server as
+   *  well as on screen. The stored reply goes first: if it cannot be removed,
+   *  regenerating would leave two answers in the history, so nothing is sent. */
   const handleRegenerate = useCallback(async () => {
     if (!active || streaming) return
+    const last = active.messages[active.messages.length - 1]
+    if (!last || last.role !== 'assistant') return
+
     const withoutLast = active.messages.slice(0, -1)
-    await sendMessages(active, withoutLast)
-  }, [active, streaming, sendMessages])
+    // seq is 1-based and contiguous, so the last turn's seq is the count.
+    const fromSeq = active.messages.length
+    const kept = fromSeq - 1
+    let base = active
+
+    if (active.syncedCount >= fromSeq) {
+      try {
+        await truncateFrom(active.id, fromSeq)
+      } catch (err) {
+        patchConv(active.id, (c) => ({
+          ...c,
+          unsavedFrom: c.unsavedFrom ?? c.messages.length - 1,
+        }))
+        toast(
+          errorText(err, 'The stored reply could not be removed, so nothing was regenerated'),
+          'error',
+        )
+        return
+      }
+      base = {
+        ...active,
+        serverSeq: kept,
+        messageCount: kept,
+        syncedCount: Math.min(active.syncedCount, kept),
+      }
+      patchConv(active.id, (c) => ({
+        ...c,
+        serverSeq: kept,
+        messageCount: kept,
+        syncedCount: Math.min(c.syncedCount, kept),
+        // The turn that was flagged as unsaved is gone with the rest.
+        unsavedFrom: c.unsavedFrom !== null && c.unsavedFrom >= kept ? null : c.unsavedFrom,
+      }))
+    }
+
+    await sendMessages(base, withoutLast)
+  }, [active, streaming, sendMessages, patchConv, toast])
 
   // After a failure the last message is the user's own, so resend as-is
   // rather than slicing it off the way regenerate does.
@@ -244,12 +606,10 @@ export function ChatPage() {
   }, [active, streaming, sendMessages])
 
   const handleStop = useCallback(() => {
+    // Whatever arrived before the stop is a real answer and is kept, so the
+    // send finishes its own bookkeeping rather than being cut short here.
     abortRef.current?.abort()
-    if (active) {
-      persistConv({ ...active, updatedAt: new Date().toISOString() })
-    }
-    setStreaming(false)
-  }, [active, persistConv])
+  }, [])
 
   const handleStarterPrompt = useCallback((prompt: string) => {
     void handleSend(prompt)
@@ -257,17 +617,29 @@ export function ChatPage() {
 
   useEffect(() => () => {
     abortRef.current?.abort()
-    flushConversations()
   }, [])
+
+  // A conversation whose earlier turns are not on screen must not take a new
+  // one: the reply would be missing what came before, and the turn would land
+  // after messages nobody can see.
+  const threadNotReady = Boolean(active && !active.loaded)
+  const composerDisabled = modelsState !== 'ready' || threadNotReady
+  const canExport = Boolean(active && !active.draft && active.messageCount > 0)
 
   return (
     <div className={styles.page}>
       <ConversationList
         conversations={conversations}
         activeId={activeId}
+        state={listState}
+        error={listError}
+        importing={importing}
+        importFailed={importFailed}
         onSelect={handleSelectConversation}
         onNew={handleNewChat}
-        onDelete={handleDeleteConversation}
+        onDelete={(id) => void handleDeleteConversation(id)}
+        onRename={(id, title) => void handleRenameConversation(id, title)}
+        onRetry={() => void readList()}
       />
       <div className={styles.main}>
         <div className={styles.header}>
@@ -278,9 +650,57 @@ export function ChatPage() {
             value={model}
             onChange={handleModelChange}
           />
+          {canExport && (
+            <div className={styles.headerActions}>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => void handleExport()}
+                disabled={exporting}
+                title="Download this conversation as a JSON file"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+                  <polyline points="7 10 12 15 17 10" />
+                  <line x1="12" y1="15" x2="12" y2="3" />
+                </svg>
+                {exporting ? 'Downloading…' : 'Download'}
+              </Button>
+            </div>
+          )}
         </div>
 
-        {messages.length === 0 ? (
+        {threadLoading ? (
+          <div className={styles.threadLoading} role="status" aria-live="polite">
+            <span className={styles.srOnly}>Loading this conversation</span>
+            <div className={styles.threadSkeleton} aria-hidden="true">
+              <Skeleton width="45%" height="44px" borderRadius="var(--radius-lg)" />
+              <Skeleton width="72%" height="96px" borderRadius="var(--radius-lg)" />
+              <Skeleton width="38%" height="44px" borderRadius="var(--radius-lg)" />
+              <Skeleton width="64%" height="72px" borderRadius="var(--radius-lg)" />
+            </div>
+          </div>
+        ) : threadError ? (
+          <div className={styles.emptyState}>
+            <div className={`${styles.notice} ${styles.noticeError}`} role="alert">
+              <h3 className={styles.noticeTitle}>This conversation could not be opened</h3>
+              <p className={styles.noticeBody}>
+                Its messages are stored on the server and could not be read just now. Nothing
+                has been lost.
+              </p>
+              <p className={styles.noticeDetail}>{threadError}</p>
+              <div className={styles.noticeActions}>
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => activeId && void openThread(activeId)}
+                >
+                  Try again
+                </Button>
+              </div>
+            </div>
+          </div>
+        ) : messages.length === 0 ? (
           <div className={styles.emptyState}>
             <h2 className={styles.emptyTitle}>darkplum</h2>
             {modelsState !== 'error' && modelsState !== 'empty' && (
@@ -360,6 +780,7 @@ export function ChatPage() {
             onRegenerate={handleRegenerate}
             failure={failure}
             isAdmin={isAdmin}
+            unsavedFrom={active?.unsavedFrom ?? null}
             /* Retrying with nothing selected would repeat the same refused
                request, so the card offers it only once a model is chosen. */
             onRetry={modelsState === 'ready' ? handleRetry : undefined}
@@ -370,15 +791,21 @@ export function ChatPage() {
           onSend={handleSend}
           onStop={handleStop}
           streaming={streaming}
-          disabled={modelsState !== 'ready'}
+          disabled={composerDisabled}
           /* The empty-state card has its own Try again; offer one here only
              when that card is not on screen. */
-          notice={composerNotice(
-            modelsState,
-            isAdmin,
-            messages.length > 0 ? () => void refetchModels() : undefined,
-            modelsRefetching,
-          )}
+          notice={
+            threadLoading
+              ? { text: 'Opening this conversation…' }
+              : threadNotReady
+              ? { text: 'This conversation has not loaded, so a reply would be missing what came before it.' }
+              : composerNotice(
+                  modelsState,
+                  isAdmin,
+                  messages.length > 0 ? () => void refetchModels() : undefined,
+                  modelsRefetching,
+                )
+          }
         />
       </div>
     </div>

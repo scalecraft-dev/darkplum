@@ -28,6 +28,14 @@ const (
 	ModelAliasUpdated    EventType = "model_alias.updated"
 	ModelAliasDeleted    EventType = "model_alias.deleted"
 	RoutingPolicyChanged EventType = "routing_policy.changed"
+
+	// ConversationDeleted is recorded on DELETE /api/v1/conversations/:id.
+	// Detail carries only {"message_count": n} -- never conversation content
+	// or title, which is exactly what a compliance reviewer needs (a
+	// deletion happened, how big it was) without leaking chat content into
+	// the admin-visible activity log. No other conversation endpoint writes
+	// an activity event.
+	ConversationDeleted EventType = "conversation.deleted"
 )
 
 // Event is the input to Recorder.Record.

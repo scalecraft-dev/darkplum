@@ -21,6 +21,46 @@ export interface ApiKey {
 export interface ChatMessage {
   role: 'user' | 'assistant'
   content: string
+  /** Assistant turns read back from history: the model the server recorded as
+   *  having produced the reply. Display only — stripped before the turn is sent
+   *  back to the gateway. */
+  model?: string | null
+}
+
+/** A conversation as the list endpoint returns it: no message bodies. */
+export interface ConversationSummary {
+  id: string
+  title: string
+  /** The model the conversation was last used with. '' when none was chosen. */
+  model: string
+  message_count: number
+  created_at: string
+  updated_at: string
+}
+
+export interface ConversationMessage {
+  /** 1-based position in the conversation, assigned by the server. */
+  seq: number
+  role: 'user' | 'assistant'
+  content: string
+  /** Assistant turns: the model that produced the reply, as the server recorded it. */
+  model: string | null
+  /** Assistant turns: the gateway request this reply came from. */
+  request_id: string | null
+  created_at: string
+}
+
+export interface ConversationFull extends ConversationSummary {
+  messages: ConversationMessage[]
+}
+
+/** A turn on its way to the server. The server fills in model and request_id
+ *  from its own audit trail; these are sent for older servers that do not. */
+export interface ConversationMessageInput {
+  role: 'user' | 'assistant'
+  content: string
+  model?: string
+  request_id?: string
 }
 
 /** Where a model actually runs. Mirrors models.backend_class in the API. */

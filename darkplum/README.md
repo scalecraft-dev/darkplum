@@ -191,6 +191,22 @@ upgrade path when you need more than a TLS-terminating NLB.
 The gateway itself is never exposed: its `/health` endpoint reports routing and
 policy state and is meant for in-cluster probes and operators only.
 
+## Conversation history
+
+Chat history is stored in the platform's Postgres database, in your account.
+Conversation content is readable only by its owner: there is no administrator
+endpoint that reads another user's conversations, and the usage log holds
+metadata only (who, when, which model, tokens) — never text. Each stored reply
+records the model that actually produced it, taken from the usage log rather
+than from the browser. Users can download their own history as JSON and delete
+conversations permanently (hard delete, no undo); deleting a user deletes all of
+their conversations. Existing browser-local history is moved to the server the
+first time a user signs in after this upgrade.
+
+Not yet built: an organisation retention policy and supervised eDiscovery
+access (dual control, audited). Both are planned as explicit features rather
+than by weakening the owner-only rule.
+
 ## Models and Routing
 
 Every model sits behind one OpenAI-compatible endpoint. The gateway resolves each

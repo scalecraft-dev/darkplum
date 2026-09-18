@@ -243,6 +243,7 @@ func run() error {
 	activityH := handler.NewActivityHandler(pool)
 	routing := handler.NewRoutingHandler(pool, activityRecorder)
 	routing.SetAvailabilityWindow(modelAvailabilityWindowFromEnv())
+	conversations := handler.NewConversationHandler(pool, activityRecorder)
 
 	r.GET("/health", func(c *gin.Context) { c.Status(http.StatusOK) })
 
@@ -288,6 +289,18 @@ func run() error {
 	{
 		v1.GET("/users", users.ListUsers)
 		v1.GET("/api-keys", keys.ListAPIKeys)
+
+		// Conversation history: session-authenticated but explicitly NOT
+		// admin-only -- see the privacy comment atop
+		// internal/handler/conversations.go. Every handler scopes by the
+		// session user_id itself.
+		v1.GET("/conversations", conversations.ListConversations)
+		v1.POST("/conversations", conversations.CreateConversation)
+		v1.GET("/conversations/:id", conversations.GetConversation)
+		v1.PATCH("/conversations/:id", conversations.PatchConversation)
+		v1.POST("/conversations/:id/messages", conversations.AppendMessages)
+		v1.DELETE("/conversations/:id", conversations.DeleteConversation)
+		v1.DELETE("/conversations/:id/messages", conversations.TruncateMessages)
 
 		adminOnly := v1.Group("")
 		adminOnly.Use(auth.AdminRequired())
