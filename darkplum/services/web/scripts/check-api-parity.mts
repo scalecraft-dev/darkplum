@@ -319,7 +319,9 @@ fail(
 // Without this, a wrapper nobody calls keeps a "ui" route green forever.
 // ---------------------------------------------------------------------------
 
-/** Exported functions of a lib module: name -> the source of its body. */
+/** Exported functions of a lib module: name -> the source of its body. A
+ *  re-export (`export { a as b } from './api'`) is an export named b whose
+ *  "body" is the name a, so reachability flows through it like a wrapper. */
 function exportedFunctions(source: string): Map<string, string> {
   const fnRe = /export\s+(?:async\s+)?function\s+(\w+)\s*\(|export\s+const\s+(\w+)\s*=/g
   const starts: Array<{ name: string; at: number }> = []
@@ -328,13 +330,32 @@ function exportedFunctions(source: string): Map<string, string> {
   starts.forEach(({ name, at }, idx) => {
     out.set(name, source.slice(at, starts[idx + 1]?.at ?? source.length))
   })
+  for (const m of source.matchAll(/export\s*\{([^}]*)\}\s*from\s*['"][^'"]+['"]/g)) {
+    for (const spec of m[1].split(',')) {
+      const [orig, alias] = spec.trim().split(/\s+as\s+/).map((x) => x?.trim())
+      if (orig) out.set(alias ?? orig, orig)
+    }
+  }
   return out
+}
+
+/**
+ * Drops the places a name can appear without being called: import
+ * declarations (an import nobody calls is tsc's business — noUnusedLocals)
+ * and type positions (`typeof f`, `import type`). Without this, keeping an
+ * import alive with `ReturnType<typeof f>` would count as reaching f's route.
+ */
+function valueUsesOnly(source: string): string {
+  return source
+    .replace(/import\s+type\s+[^;]*?from\s*['"][^'"]+['"];?/g, '')
+    .replace(/import\s*(?:[\w*\s{},]*?)\s*from\s*['"][^'"]+['"];?/g, '')
+    .replace(/\btypeof\s+\w+/g, '')
 }
 
 const libFiles = walk(join(SRC_DIR, 'lib'))
 const nonLibSource = walk(SRC_DIR)
   .filter((f) => !libFiles.includes(f))
-  .map((f) => stripComments(readFileSync(f, 'utf8')))
+  .map((f) => valueUsesOnly(stripComments(readFileSync(f, 'utf8'))))
   .join('\n')
 
 /** Rewrites `import { a as b }` aliases back to `a` in a lib module's source,
@@ -358,7 +379,9 @@ const libExports = new Map<string, { name: string; body: string }>()
 for (const f of libFiles) {
   const src = unalias(stripComments(readFileSync(f, 'utf8')))
   for (const [name, body] of exportedFunctions(src)) {
-    libExports.set(`${relative(WEB_ROOT, f)}#${name}`, { name, body })
+    // Bodies too: a lib helper that only names a wrapper in a type keeps
+    // nothing alive.
+    libExports.set(`${relative(WEB_ROOT, f)}#${name}`, { name, body: valueUsesOnly(body) })
   }
 }
 const mentions = (haystack: string, name: string) => new RegExp(`\\b${name}\\b`).test(haystack)

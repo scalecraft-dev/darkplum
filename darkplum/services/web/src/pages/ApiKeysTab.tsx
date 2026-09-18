@@ -144,9 +144,15 @@ export function ApiKeysTab({ users, apiKeys, models, isAdmin, onCreate, onRevoke
     <div>
       <div className={styles.toolbar}>
         <div className={styles.toolbarInfo}>
-          <span className={styles.count}>{activeCount} active</span>
-          {revokedCount > 0 && (
-            <span className={styles.countMuted}>{revokedCount} revoked</span>
+          {query.trim() ? (
+            <span className={styles.count}>{filteredKeys.length} of {apiKeys.length} keys</span>
+          ) : (
+            <>
+              <span className={styles.count}>{activeCount} active</span>
+              {revokedCount > 0 && (
+                <span className={styles.countMuted}>{revokedCount} revoked</span>
+              )}
+            </>
           )}
         </div>
         <div className={styles.searchWrap}>

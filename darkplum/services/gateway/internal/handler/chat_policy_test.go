@@ -1154,3 +1154,22 @@ func TestHandleEffectivePolicyImpact_ResidencyTighteningNarrowsViaReachability(t
 		t.Errorf("residency never locks anyone out; only the pre-existing empty key expected, got %+v", got.LockedOut)
 	}
 }
+
+func TestHandleEffectivePolicyImpact_ResidencyTighteningWithoutCloudModelsNarrowsNobody(t *testing.T) {
+	// Every enabled model is self-hosted, so self_hosted_only takes nothing
+	// away from anyone: no org_narrowed, no narrowed, no lock-outs beyond the
+	// pre-existing empty key.
+	h := newTestHandler(fakeProviders{}, baseOverrideRoutes(), impactSnapshot(), true)
+	w, c := newPolicyImpactRequest(t, middleware.KeyTypeService, `{"override":{"level":"org","policy":{"residency":"self_hosted_only"}}}`)
+	h.HandleEffectivePolicyImpact(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body=%s", w.Code, w.Body.String())
+	}
+	got := decodePolicyImpact(t, w.Body.Bytes())
+	if got.OrgNarrowed || len(got.Narrowed) != 0 {
+		t.Errorf("no cloud models enabled: org_narrowed=%v narrowed=%+v, want false/[]", got.OrgNarrowed, got.Narrowed)
+	}
+	if len(got.LockedOut) != 1 || got.LockedOut[0].APIKeyID != previewKeyID2 {
+		t.Errorf("only the pre-existing empty key may be locked out, got %+v", got.LockedOut)
+	}
+}

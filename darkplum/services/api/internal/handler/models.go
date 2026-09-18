@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -218,7 +219,10 @@ func (h *ModelHandler) ListModels(c *gin.Context) {
 			defaultModel = dm
 			policyFiltered = true
 		}
-	} else if bearer := c.GetHeader("Authorization"); bearer != "" {
+	} else if bearer := c.GetHeader("Authorization"); strings.HasPrefix(bearer, "Bearer ") {
+		// Only a Bearer credential is forwarded (apiOrSession already gates
+		// the route on that prefix; checked again here so the handler is
+		// safe if it is ever mounted elsewhere).
 		ids, dm, gwErr := h.bearerModels(ctx, bearer)
 		if gwErr != nil {
 			slog.WarnContext(ctx, "list models: gateway model list unavailable for api-key caller, falling back to unfiltered list", "err", gwErr)

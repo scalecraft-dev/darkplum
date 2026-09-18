@@ -252,7 +252,11 @@ export function UsersTab({ users, models, isAdmin, currentUserId, onCreate, onDe
     <div>
       <div className={styles.toolbar}>
         <div className={styles.toolbarInfo}>
-          <span className={styles.count}>{users.length} {users.length === 1 ? 'user' : 'users'}</span>
+          <span className={styles.count}>
+            {query.trim()
+              ? `${filteredUsers.length} of ${users.length} ${users.length === 1 ? 'user' : 'users'}`
+              : `${users.length} ${users.length === 1 ? 'user' : 'users'}`}
+          </span>
         </div>
         <div className={styles.searchWrap}>
           <svg
