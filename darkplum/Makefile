@@ -125,15 +125,26 @@ deploy: deploy-infra deploy-k8s deploy-platform ## Full deploy: infrastructure +
 	@echo "  Darkplum deployment complete."
 	@echo "========================================="
 	@echo ""
-	@echo "Wait for vLLM to finish loading, then run:"
-	@echo "  make test"
+	@GPUS=$$($(_GPU_COUNT)); \
+	if [ "$$GPUS" = "0" ]; then \
+		echo "Bedrock-only install (gpu_desired_size = 0). Next:"; \
+		echo "  make verify-bedrock-iam    prove the gateway role reaches only the configured Bedrock models"; \
+		echo "  make expose-web            publish the web UI (add CERT_ARN=<ACM cert> for HTTPS)"; \
+		echo "  then open the printed address, create the first admin, and enable a model under Admin > Models."; \
+		echo ""; \
+		echo "Add self-hosted open-source models later: set gpu_desired_size = 1 and run 'make deploy' again."; \
+	else \
+		echo "Wait for vLLM to finish loading (15-25 minutes), then:"; \
+		echo "  make test                  chat once through the self-hosted model"; \
+		echo "  make verify-bedrock-iam    prove the gateway role reaches only the configured Bedrock models"; \
+		echo "  make expose-web            publish the web UI (add CERT_ARN=<ACM cert> for HTTPS)"; \
+		echo ""; \
+		echo "Monitor model loading:"; \
+		echo "  kubectl logs -f -n $(NAMESPACE) deploy/vllm-inference -c model-download"; \
+		echo "  kubectl logs -f -n $(NAMESPACE) deploy/vllm-inference -c vllm"; \
+	fi
 	@echo ""
-	@echo "Monitor model loading:"
-	@echo "  kubectl logs -f -n $(NAMESPACE) deploy/vllm-inference -c model-download"
-	@echo "  kubectl logs -f -n $(NAMESPACE) deploy/vllm-inference -c vllm"
-	@echo ""
-	@echo "Check readiness:"
-	@echo "  make status"
+	@echo "Check readiness:  make status"
 
 cli: ## Build the darkplum operator CLI (bin/darkplum)
 	@echo "Building darkplum CLI..."
@@ -285,7 +296,12 @@ configure-sso: ## Configure OIDC/SSO authentication (interactive)
 	echo "IMPORTANT: Add this redirect URL to your identity provider:"; \
 	echo "  $$OIDC_REDIRECT_URL"
 
-test: ## Send a test chat completion request to vLLM
+test: ## Send a test chat completion request to the self-hosted vLLM model
+	@GPUS=$$($(_GPU_COUNT)); [ "$$GPUS" != "0" ] || { \
+		echo "This is a Bedrock-only install (gpu_desired_size = 0): there is no self-hosted vLLM to test."; \
+		echo "Chat through the web UI instead (make expose-web), or check the gateway's view of Bedrock:"; \
+		echo "  kubectl port-forward -n darkplum-system svc/darkplum-gateway 8082:8080 &  curl -s localhost:8082/health | jq .routing"; \
+		exit 0; }
 	@echo "Port-forwarding to vLLM service..."
 	@kubectl port-forward -n $(NAMESPACE) svc/vllm-inference 8000:8000 &>/dev/null &
 	@PF_PID=$$!; \
@@ -319,23 +335,38 @@ test: ## Send a test chat completion request to vLLM
 
 status: ## Show cluster and workload status
 	@echo "=== Cluster ==="
-	@kubectl cluster-info 2>/dev/null || echo "kubeconfig not set. Run: make deploy-infra"
+	@kubectl cluster-info 2>/dev/null | head -1 || echo "kubeconfig not set. Run: make deploy-infra"
 	@echo ""
-	@echo "=== Nodes ==="
-	@kubectl get nodes -L darkplum.ai/node-type 2>/dev/null || true
+	@echo "=== Platform (darkplum-system) ==="
+	@kubectl get pods -n darkplum-system -o wide 2>/dev/null || echo "Platform not deployed. Run: make deploy"
 	@echo ""
-	@echo "=== GPU Allocatable ==="
-	@kubectl get nodes -l darkplum.ai/node-type=gpu-inference \
-		-o custom-columns="NAME:.metadata.name,GPU:.status.allocatable.nvidia\.com/gpu,STATUS:.status.conditions[-1].type" \
-		2>/dev/null || echo "No GPU nodes found."
+	@echo "=== Web UI ==="
+	@HOST=$$(kubectl get svc darkplum-web -n darkplum-system -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null); \
+	PORT=$$(kubectl get svc darkplum-web -n darkplum-system -o jsonpath='{.spec.ports[0].port}' 2>/dev/null); \
+	if [ -n "$$HOST" ]; then echo "$$([ "$$PORT" = "443" ] && echo https || echo http)://$$HOST"; \
+	else echo "cluster-internal (make expose-web to publish; or kubectl port-forward -n darkplum-system svc/darkplum-web 8081:80)"; fi
 	@echo ""
-	@echo "=== Pods ==="
-	@kubectl get pods -n $(NAMESPACE) -o wide 2>/dev/null || true
-	@echo ""
-	@echo "=== vLLM Logs (last 5 lines) ==="
-	@kubectl logs -n $(NAMESPACE) deploy/vllm-inference -c vllm --tail=5 2>/dev/null || \
-		kubectl logs -n $(NAMESPACE) deploy/vllm-inference -c model-download --tail=5 2>/dev/null || \
-		echo "No vLLM pods running."
+	@GPUS=$$($(_GPU_COUNT)); \
+	if [ "$$GPUS" = "0" ]; then \
+		echo "=== Self-hosted models ==="; \
+		echo "none — Bedrock-only install (gpu_desired_size = 0)"; \
+	else \
+		echo "=== Nodes ==="; \
+		kubectl get nodes -L darkplum.ai/node-type 2>/dev/null || true; \
+		echo ""; \
+		echo "=== GPU Allocatable ==="; \
+		kubectl get nodes -l darkplum.ai/node-type=gpu-inference \
+			-o custom-columns="NAME:.metadata.name,GPU:.status.allocatable.nvidia\.com/gpu,STATUS:.status.conditions[-1].type" \
+			2>/dev/null || echo "No GPU nodes found."; \
+		echo ""; \
+		echo "=== Self-hosted model pods ==="; \
+		kubectl get pods -n $(NAMESPACE) -o wide 2>/dev/null || true; \
+		echo ""; \
+		echo "=== vLLM Logs (last 5 lines) ==="; \
+		kubectl logs -n $(NAMESPACE) deploy/vllm-inference -c vllm --tail=5 2>/dev/null || \
+			kubectl logs -n $(NAMESPACE) deploy/vllm-inference -c model-download --tail=5 2>/dev/null || \
+			echo "No vLLM pods running yet."; \
+	fi
 
 destroy: ## Tear down all resources
 	@echo "Deleting Kubernetes resources..."
@@ -442,6 +473,8 @@ unexpose-web: ## Revert the web UI to cluster-internal (port-forward only)
 # =============================================================================
 
 MAX_LEN ?= 8192
+# Number of GPU nodes the current Terraform state asked for ("" before apply).
+_GPU_COUNT = cd $(TF_DIR) && terraform output -json 2>/dev/null | jq -r '.gpu_desired_size.value // empty'
 # Hugging Face revision for deploy-model. Pin a commit SHA for anything that matters.
 REVISION ?= main
 _GW_UPSTREAMS = kubectl get deploy darkplum-gateway -n darkplum-system \

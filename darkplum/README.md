@@ -1,31 +1,40 @@
 # Darkplum — Private AI Cloud
 
-Deploy a private LLM inference stack in your own AWS account. One command, your infrastructure, your data.
+Deploy a private LLM platform in your own AWS account. Your prompts never reach
+Darkplum: self-hosted open-source models never leave your cluster, and Bedrock
+models run under your own account, your own keys and your own audit trail.
 
 ## What This Deploys
 
 ```
-┌─────────────────────────────────────────────────┐
-│  Your AWS Account                               │
-│                                                 │
-│  ┌──────────────────────────────────────────┐   │
-│  │  EKS Cluster                             │   │
-│  │                                          │   │
-│  │  CPU Nodes (m5.large x2)                 │   │
-│  │  ├── CoreDNS                             │   │
-│  │  └── kube-proxy                          │   │
-│  │                                          │   │
-│  │  GPU Node (g5.xlarge x1)                 │   │
-│  │  ├── NVIDIA Device Plugin                │   │
-│  │  └── vLLM (Mistral 7B Instruct)         │   │
-│  │      └── OpenAI-compatible API           │   │
-│  │          /v1/chat/completions            │   │
-│  └──────────────────────────────────────────┘   │
-│                                                 │
-│  VPC (3 AZs, private + public subnets, NAT)     │
-│  IRSA roles (per-service IAM isolation)          │
-└─────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│  Your AWS Account                                                    │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────┐      │
+│  │  EKS Cluster (private subnets)                             │      │
+│  │                                                            │      │
+│  │  darkplum-system (CPU nodes, m5.large x2)                  │      │
+│  │  ├── web      — chat + admin UI          ─┐ make expose-web│      │
+│  │  ├── api      — auth, catalog, aliases,   │ NLB (+ your ACM│      │
+│  │  │             routing policy, audit      │ certificate)   │      │
+│  │  └── gateway  — one OpenAI-compatible    ─┘                │      │
+│  │                 endpoint; enforces model,                  │      │
+│  │                 enabled flag, residency  ──► Bedrock via   │      │
+│  │                 on every request             PrivateLink   │      │
+│  │                       │                      (IAM allowlist│      │
+│  │                       ▼                       geo-scoped)  │      │
+│  │  darkplum-inference (GPU nodes, g5.xlarge, optional)       │      │
+│  │  └── vLLM per open-source model (make deploy-model)        │      │
+│  └────────────────────────────────────────────────────────────┘      │
+│                                                                      │
+│  RDS Postgres (private, encrypted)  ·  VPC (3 AZs, NAT)  ·  ECR      │
+│  IAM: one Pod Identity role for the gateway, limited to the          │
+│  configured Bedrock model families in one geography                  │
+└──────────────────────────────────────────────────────────────────────┘
 ```
+
+Set `gpu_desired_size = 0` for a Bedrock-only install (no GPU node, no vLLM);
+raise it later to add self-hosted open-source models.
 
 ## Prerequisites
 
@@ -68,14 +77,25 @@ make destroy
 
 ## Cost
 
-| Resource | Hourly | Monthly (24/7) |
-|----------|--------|----------------|
-| g5.xlarge (1x A10G GPU) | $1.01 | $730 |
-| m5.large x2 (CPU nodes) | $0.19 | $137 |
-| NAT Gateway | $0.05 | $33 |
-| **Total** | **~$1.25** | **~$900** |
+On-demand us-east-2 list prices, 24/7 (730 h/month). Region and usage change these.
 
-The GPU node group supports scaling to zero (`gpu_desired_size = 0`). With zero GPUs, `make deploy` skips self-hosted vLLM entirely and installs a Bedrock-only platform with no GPU cost (the $1.01/hr line above) — the cheapest way to get to first chat; raise `gpu_desired_size` and re-run `make deploy` to add self-hosted models later. **Remember to run `make destroy` when done testing.**
+| Resource | Hourly | Monthly |
+|----------|--------|---------|
+| EKS control plane | $0.10 | $73 |
+| m5.large x2 (CPU nodes for web, api, gateway) | $0.19 | $140 |
+| NAT gateway (plus $0.045/GB processed) | $0.05 | $33 |
+| RDS db.t4g.micro + 20 GB storage | $0.02 | $14 |
+| Bedrock interface endpoints, 2 x 3 AZs (plus $0.01/GB) | $0.06 | $44 |
+| **Bedrock-only floor (`gpu_desired_size = 0`)** | **~$0.42** | **~$305** + Bedrock tokens |
+| g5.xlarge (1x A10G GPU) per self-hosted model | $1.01 | $730 |
+| **With one self-hosted model** | **~$1.43** | **~$1,035** |
+
+Bedrock tokens are billed by AWS per model on top of this. The GPU node group
+scales to zero (`gpu_desired_size = 0`): `make deploy` then skips self-hosted
+vLLM and installs a Bedrock-only platform, the cheapest path to first chat;
+raise `gpu_desired_size` and run `make deploy` again to add self-hosted models.
+**Run `make destroy` when you are done testing** (`make unexpose-web` first if
+you published the UI, so the load balancer is removed cleanly).
 
 ## Cloud selection
 
