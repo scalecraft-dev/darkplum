@@ -11,6 +11,10 @@ interface Props {
   isAdmin: boolean
   onCreate: (name: string, userId: string) => Promise<void>
   onRevoke: (id: string) => Promise<void>
+  /** Opens the routing-policy drawer for one key. */
+  onEditPolicy?: (key: ApiKey) => void
+  /** Ids of keys with a routing-policy row of their own. */
+  policyOwners?: ReadonlySet<string>
 }
 
 function RevokeButton({ id, onRevoke }: { id: string; onRevoke: (id: string) => Promise<void> }) {
@@ -63,7 +67,19 @@ function RevokeButton({ id, onRevoke }: { id: string; onRevoke: (id: string) => 
   )
 }
 
-export function ApiKeysTab({ users, apiKeys, isAdmin, onCreate, onRevoke }: Props) {
+/** A key's way into its own routing policy. A key never reaches more than its
+ *  owner, so this narrows; it cannot widen. */
+function PolicyButton({ label, onClick }: { label: string; onClick: () => void }) {
+  return (
+    <button className={styles.actionBtn} onClick={onClick} title={label} aria-label={label}>
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+      </svg>
+    </button>
+  )
+}
+
+export function ApiKeysTab({ users, apiKeys, isAdmin, onCreate, onRevoke, onEditPolicy, policyOwners }: Props) {
   const { toast } = useToast()
   const [modalOpen, setModalOpen] = useState(false)
   const [keyName, setKeyName] = useState('')
@@ -122,13 +138,14 @@ export function ApiKeysTab({ users, apiKeys, isAdmin, onCreate, onRevoke }: Prop
               <th>Owner</th>
               <th>Key Prefix</th>
               <th>Created</th>
+              <th>Model access</th>
               <th>Status</th>
               <th className={styles.actionsCol}></th>
             </tr>
           </thead>
           <tbody>
             {apiKeys.length === 0 ? (
-              <TableEmpty colSpan={6}>
+              <TableEmpty colSpan={7}>
                 <div className={styles.empty}>
                   <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
                     <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4" />
@@ -157,11 +174,24 @@ export function ApiKeysTab({ users, apiKeys, isAdmin, onCreate, onRevoke }: Prop
                   </td>
                   <td className={styles.date}>{new Date(k.created_at).toLocaleDateString()}</td>
                   <td>
+                    {policyOwners?.has(k.id) ? (
+                      <Badge variant="warning" bordered>Own policy</Badge>
+                    ) : (
+                      <span className={styles.muted}>Inherits owner</span>
+                    )}
+                  </td>
+                  <td>
                     <Badge variant={k.revoked_at ? 'danger' : 'success'}>
                       {k.revoked_at ? 'Revoked' : 'Active'}
                     </Badge>
                   </td>
                   <td className={styles.actionsCol}>
+                    {isAdmin && !k.revoked_at && onEditPolicy && (
+                      <PolicyButton
+                        label={`Routing policy for ${k.name}`}
+                        onClick={() => onEditPolicy(k)}
+                      />
+                    )}
                     {isAdmin && !k.revoked_at && <RevokeButton id={k.id} onRevoke={onRevoke} />}
                   </td>
                 </tr>
@@ -193,6 +223,10 @@ export function ApiKeysTab({ users, apiKeys, isAdmin, onCreate, onRevoke }: Prop
               <option key={u.id} value={u.id}>{u.name}</option>
             ))}
           </Select>
+          <p className={styles.ownerNote}>
+            The key starts with exactly what its owner can reach. Narrow it further from the shield
+            button on its row — a key can never reach more than its owner.
+          </p>
           <div className={styles.formFooter}>
             <Button type="button" variant="ghost" onClick={handleClose}>Cancel</Button>
             <Button type="submit" disabled={loading || !keyName.trim() || !userId}>

@@ -211,10 +211,98 @@ export type Residency = 'any' | 'self_hosted_only'
 
 export interface RoutingPolicy {
   residency: Residency
+  /** null means every enabled model. A list means only those model ids.
+   *  Absent on older APIs — treat as null. */
+  allowed_models?: string[] | null
+  /** Used when a request names no model, and preselected in the chat picker.
+   *  May be an alias. Absent on older APIs — treat as null. */
+  default_model?: string | null
   updated_at: string
   /** Returned by PUT: routed aliases whose routes will now be refused. One
    *  readable sentence each, written by the API. */
   warnings?: string[]
+  /** Returned by PUT when the new policy is tighter: how many users and keys
+   *  have a smaller reachable set because of it. */
+  affected_principals?: number
+}
+
+// ---------------------------------------------------------------------------
+// Per-principal routing policy
+//
+// The same three fields exist at the organisation, user and API-key level. A
+// null field inherits from the level above; a set field only ever narrows.
+// A key can never reach more than its owner. A user never more than the
+// organisation.
+// ---------------------------------------------------------------------------
+
+export type PrincipalType = 'org' | 'user' | 'api_key'
+
+/** One principal's own row, exactly as stored. null everywhere = inherits all. */
+export interface PrincipalPolicy {
+  /** null inherits. The only value that can be set is the tighter one. */
+  residency: 'self_hosted_only' | null
+  /** null inherits. Concrete model ids only — never aliases. */
+  allowed_models: string[] | null
+  /** null inherits. May be an alias. */
+  default_model: string | null
+  updated_at?: string
+  updated_by?: string | null
+}
+
+/** Which level decided a field. 'none' means nothing anywhere set it. */
+export type PolicySource = PrincipalType | 'none'
+
+/** What the merge of the whole chain comes to, as the gateway computes it —
+ *  the one implementation everything reads from. */
+export interface EffectivePolicy {
+  /** null means every model; a list means exactly those ids. */
+  allowed_models: string[] | null
+  residency: Residency
+  default_model: string | null
+  sources: {
+    allowed_models: PolicySource
+    residency: PolicySource
+    default_model: PolicySource
+  }
+  /** Allowed ∧ routable ∧ enabled ∧ residency-ok, as things stand right now. */
+  reachable_models: string[]
+  /** Admin views only: the principal's own row, or null when it inherits. */
+  stored?: PrincipalPolicy | null
+}
+
+/** One of the edited user's keys, and what this change does to its reach. */
+export interface PolicyKeyImpact {
+  id: string
+  name: string
+  before: string[]
+  after: string[]
+}
+
+/** What a policy would do, computed without writing it. */
+export interface PolicyPreview {
+  effective: EffectivePolicy
+  keys_affected: PolicyKeyImpact[]
+  /** Principals left with nothing they can reach. Non-empty means the save is
+   *  refused by the API (409), so the UI refuses it first. */
+  would_lock_out: string[]
+}
+
+/** A row of the "Access overview" table: one explicit user or key policy. */
+export interface PolicyPrincipal {
+  principal_type: 'user' | 'api_key'
+  user_id?: string | null
+  api_key_id?: string | null
+  /** Email for a user; key name for a key. Written by the API. */
+  display: string
+  /** Key rows: who owns the key. */
+  owner?: string | null
+  policy: PrincipalPolicy
+  reachable_models: string[]
+}
+
+export interface PolicyPrincipalsPage {
+  principals: PolicyPrincipal[]
+  total: number
 }
 
 export interface AuthConfig {

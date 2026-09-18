@@ -24,10 +24,24 @@ const (
 	APIKeyCreated       EventType = "apikey.created"
 	APIKeyRevoked       EventType = "apikey.revoked"
 
-	ModelAliasCreated    EventType = "model_alias.created"
-	ModelAliasUpdated    EventType = "model_alias.updated"
-	ModelAliasDeleted    EventType = "model_alias.deleted"
+	ModelAliasCreated EventType = "model_alias.created"
+	ModelAliasUpdated EventType = "model_alias.updated"
+	ModelAliasDeleted EventType = "model_alias.deleted"
+	// RoutingPolicyChanged is no longer emitted (superseded by
+	// RoutingPolicyOrgChanged) but the constant stays defined so the web's
+	// event-type-to-label humaniser keeps rendering historical rows recorded
+	// with it before this cutover.
 	RoutingPolicyChanged EventType = "routing_policy.changed"
+	// RoutingPolicyOrgChanged is recorded on PUT /api/v1/routing-policy
+	// (the org-level policy). Detail carries the new residency/
+	// allowed_models/default_model and, when the change tightens the
+	// policy, affected_principals -- see routing.go's orgPolicyTightened.
+	RoutingPolicyOrgChanged EventType = "routing_policy.org_changed"
+	// RoutingPolicyPrincipalChanged is recorded on PUT/DELETE
+	// .../routing-policy for a user or api_key principal. Detail carries
+	// principal_type plus the before/after policy objects (policy shape
+	// only, never content).
+	RoutingPolicyPrincipalChanged EventType = "routing_policy.principal_changed"
 
 	// ConversationDeleted is recorded on DELETE /api/v1/conversations/:id.
 	// Detail carries only {"message_count": n} -- never conversation content

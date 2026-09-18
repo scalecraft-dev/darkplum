@@ -4,19 +4,22 @@ import {
   getRoutingPolicy,
   listAdminModels,
   listModelAliases,
+  listPolicyPrincipals,
   putModelAlias,
+  setModelDisplayName,
   toggleModel,
   updateRoutingPolicy,
 } from '../lib/api'
 import { formatModelName } from '../lib/formatModelName'
 import { UNREACHABLE_HINT, backendClassLabel, backendClassOf, isReachable } from '../lib/modelRouting'
-import type { AdminModel, ModelAlias, ModelAliasInput, Residency, RoutingPolicy } from '../types'
+import type { AdminModel, ModelAlias, ModelAliasInput, PolicyPrincipal, Residency, RoutingPolicy } from '../types'
 import { useToast } from '../components/Toast'
 import { Badge, Table, TableEmpty } from '../components/ui'
 import { CopyButton } from '../components/ui/CopyButton'
 import { Skeleton } from '../components/ui/Skeleton'
+import { AccessOverviewSection } from './AccessOverviewSection'
 import { AliasesSection } from './AliasesSection'
-import { RoutingPolicyCard } from './RoutingPolicyCard'
+import { RoutingPolicyCard, type OrgPolicyDraft } from './RoutingPolicyCard'
 import pageStyles from './PageLayout.module.css'
 import styles from './ModelsPage.module.css'
 
@@ -118,6 +121,83 @@ function ToggleSwitch({
 }
 
 // ---------------------------------------------------------------------------
+// Display name
+//
+// The name everyone else picks this model by. A discovered id formatted for
+// reading is the default; an administrator can replace it, and clearing the
+// field goes back to the default rather than leaving a model with no name.
+// ---------------------------------------------------------------------------
+
+function DisplayNameCell({
+  model,
+  onRename,
+}: {
+  model: AdminModel
+  onRename: (model: AdminModel, displayName: string | null) => Promise<void>
+}) {
+  const [editing, setEditing] = useState(false)
+  const [value, setValue] = useState(model.display_name ?? '')
+  const [saving, setSaving] = useState(false)
+  const shown = model.display_name ?? formatModelName(model.model_id)
+
+  const commit = async () => {
+    const next = value.trim()
+    setEditing(false)
+    if (next === (model.display_name ?? '')) return
+    setSaving(true)
+    try {
+      await onRename(model, next === '' ? null : next.slice(0, 100))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  if (editing) {
+    return (
+      <input
+        className={styles.nameInput}
+        value={value}
+        autoFocus
+        maxLength={100}
+        aria-label={`Display name for ${model.model_id}`}
+        placeholder={formatModelName(model.model_id)}
+        onChange={(e) => setValue(e.target.value)}
+        onBlur={() => void commit()}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') {
+            e.preventDefault()
+            void commit()
+          } else if (e.key === 'Escape') {
+            e.preventDefault()
+            setValue(model.display_name ?? '')
+            setEditing(false)
+          }
+        }}
+      />
+    )
+  }
+
+  return (
+    <button
+      type="button"
+      className={styles.nameBtn}
+      disabled={saving}
+      onClick={() => {
+        setValue(model.display_name ?? '')
+        setEditing(true)
+      }}
+      title={model.display_name ? 'Rename — clear the field to use the discovered name' : 'Give this model a name'}
+      aria-label={`Rename ${shown}`}
+    >
+      <span className={styles.modelName}>{saving ? 'Saving…' : shown}</span>
+      <svg className={styles.nameIcon} width="11" height="11" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        <path d="M11.2 2.3a1.5 1.5 0 0 1 2.1 2.1L5.6 12.1l-2.8.7.7-2.8z" />
+      </svg>
+    </button>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Provider section (collapsible card with table)
 // ---------------------------------------------------------------------------
 
@@ -127,9 +207,10 @@ interface ProviderSectionProps {
   togglingIds: Set<string>
   residency: Residency
   onToggle: (model: AdminModel) => void
+  onRename: (model: AdminModel, displayName: string | null) => Promise<void>
 }
 
-function ProviderSection({ provider, models, togglingIds, residency, onToggle }: ProviderSectionProps) {
+function ProviderSection({ provider, models, togglingIds, residency, onToggle, onRename }: ProviderSectionProps) {
   const [collapsed, setCollapsed] = useState(false)
 
   const enabledCount = models.filter((m) => m.enabled).length
@@ -168,7 +249,7 @@ function ProviderSection({ provider, models, togglingIds, residency, onToggle }:
       <tr key={m.id} className={blocked || unreachable ? styles.rowFlagged : ''}>
         <td>
           <div className={styles.modelCell}>
-            <span className={styles.modelName}>{displayName}</span>
+            <DisplayNameCell model={m} onRename={onRename} />
           </div>
         </td>
         <td>
@@ -355,6 +436,11 @@ export function ModelsPage() {
   const [aliasesLoading, setAliasesLoading] = useState(true)
   const [aliasesError, setAliasesError] = useState<string | null>(null)
 
+  const [principals, setPrincipals] = useState<PolicyPrincipal[]>([])
+  const [principalsTotal, setPrincipalsTotal] = useState(0)
+  const [principalsLoading, setPrincipalsLoading] = useState(true)
+  const [principalsError, setPrincipalsError] = useState<string | null>(null)
+
   const residency: Residency = policy?.residency ?? 'any'
 
   const loadModels = useCallback(async () => {
@@ -382,6 +468,20 @@ export function ModelsPage() {
     }
   }, [])
 
+  const loadPrincipals = useCallback(async () => {
+    setPrincipalsLoading(true)
+    try {
+      const page = await listPolicyPrincipals({ limit: 200 })
+      setPrincipals(page.principals)
+      setPrincipalsTotal(page.total)
+      setPrincipalsError(null)
+    } catch (err) {
+      setPrincipalsError((err as Error).message)
+    } finally {
+      setPrincipalsLoading(false)
+    }
+  }, [])
+
   const loadAliases = useCallback(async () => {
     setAliasesLoading(true)
     try {
@@ -398,29 +498,54 @@ export function ModelsPage() {
     void loadModels()
     void loadPolicy()
     void loadAliases()
-  }, [loadModels, loadPolicy, loadAliases])
+    void loadPrincipals()
+  }, [loadModels, loadPolicy, loadAliases, loadPrincipals])
 
-  /** Resolves with the API's own warnings — the routed aliases whose routes
-   *  will now be refused. The card shows them; an empty list means none. */
-  const handlePolicyChange = async (next: Residency): Promise<string[]> => {
+  /** Resolves with what the API said the change does: the routed-alias routes
+   *  that will now be refused, and how many principals reach less than before.
+   *  Both are the API's own counts — nothing here is inferred. */
+  const handlePolicyChange = async (
+    draft: OrgPolicyDraft,
+  ): Promise<{ warnings: string[]; affectedPrincipals: number }> => {
     setPolicySaving(true)
     try {
-      const updated = await updateRoutingPolicy(next)
+      const updated = await updateRoutingPolicy({
+        residency: draft.residency,
+        allowed_models: draft.allowed_models,
+        default_model: draft.default_model,
+      })
       setPolicy(updated)
-      toast(
-        next === 'self_hosted_only'
-          ? 'Switched to self-hosted only. Cloud-managed models are refused.'
-          : 'Any model allowed. Cloud-managed models can answer again.',
-        'success',
-      )
-      // The aliases carry per-route health, which this may have just changed.
+      toast('Routing policy saved', 'success')
+      // The aliases carry per-route health, and the principals carry reachable
+      // sets; this may have just changed both.
       void loadAliases()
-      return updated.warnings ?? []
+      void loadPrincipals()
+      return {
+        warnings: updated.warnings ?? [],
+        affectedPrincipals: updated.affected_principals ?? 0,
+      }
     } catch (err) {
       toast((err as Error).message, 'error')
-      return []
+      return { warnings: [], affectedPrincipals: 0 }
     } finally {
       setPolicySaving(false)
+    }
+  }
+
+  /** Renames a model for everyone who picks one. The API is the authority on
+   *  what was stored, so the row takes the response rather than the input. */
+  const handleRename = async (model: AdminModel, displayName: string | null) => {
+    try {
+      const updated = await setModelDisplayName(model.id, displayName)
+      setModels((prev) => prev.map((m) => (m.id === updated.id ? updated : m)))
+      toast(
+        displayName === null
+          ? `Name cleared — ${model.model_id} uses its discovered name again`
+          : `Renamed to ${displayName}`,
+        'success',
+      )
+    } catch (err) {
+      toast((err as Error).message, 'error')
     }
   }
 
@@ -525,8 +650,18 @@ export function ModelsPage() {
         error={policyError}
         saving={policySaving}
         models={models}
+        aliases={aliases}
         onRetry={() => void loadPolicy()}
         onChange={handlePolicyChange}
+      />
+
+      <AccessOverviewSection
+        principals={principals}
+        total={principalsTotal}
+        models={models}
+        loading={principalsLoading}
+        error={principalsError}
+        onRetry={() => void loadPrincipals()}
       />
 
       <AliasesSection
@@ -672,6 +807,7 @@ export function ModelsPage() {
             togglingIds={togglingIds}
             residency={residency}
             onToggle={handleToggle}
+            onRename={handleRename}
           />
         ))
       )}

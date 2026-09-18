@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useNavigate, useLocation } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
+import { ROUTES, buildPath } from '../lib/routes'
 import { Button, Input, PlumMark } from '../components/ui'
 import styles from './LoginPage.module.css'
 
@@ -86,7 +87,11 @@ export function LoginPage() {
               variant="secondary"
               size="lg"
               style={{ width: '100%' }}
-              onClick={() => { window.location.href = '/auth/login?return_to=' + encodeURIComponent(returnTo) }}
+              onClick={() => {
+                window.location.href = buildPath(ROUTES.authLoginRedirect, undefined, {
+                  return_to: returnTo,
+                })
+              }}
             >
               Sign in with SSO
             </Button>

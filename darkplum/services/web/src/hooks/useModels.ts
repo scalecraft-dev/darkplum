@@ -7,6 +7,10 @@ const SLOW_POLL_MS = 60_000
 
 interface UseModelsResult {
   models: Model[]
+  /** What the picker should start on: the first non-null default walking the
+   *  key → user → organisation chain, as the API resolved it. Empty when
+   *  nothing anywhere sets one, or on an older API that does not send it. */
+  defaultModel: string
   /** True only until the first fetch settles. Later fetches keep the list on
    *  screen, so a poll or a retry never replaces a usable page with skeletons. */
   isLoading: boolean
@@ -24,6 +28,7 @@ interface UseModelsResult {
 
 export function useModels(): UseModelsResult {
   const [models, setModels] = useState<Model[]>([])
+  const [defaultModel, setDefaultModel] = useState('')
   const [isLoading, setIsLoading] = useState(true)
   const [isRefetching, setIsRefetching] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -41,6 +46,7 @@ export function useModels(): UseModelsResult {
       const result = await listModels()
       if (seq !== fetchSeqRef.current) return result.data // superseded; do not touch state
       setModels(result.data)
+      setDefaultModel(result.default_model ?? '')
       setError(null)
       const hadModels = hasModelsRef.current
       const nowHasModels = result.data.length > 0
@@ -97,5 +103,5 @@ export function useModels(): UseModelsResult {
     }
   }, [fetchModels])
 
-  return { models, isLoading, isRefetching, error, refetch }
+  return { models, defaultModel, isLoading, isRefetching, error, refetch }
 }

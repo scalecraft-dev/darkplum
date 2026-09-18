@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useTheme } from '../context/ThemeContext'
 import {
   Area,
@@ -10,24 +10,34 @@ import {
   YAxis,
 } from 'recharts'
 import {
+  exportActivity,
+  exportUsage,
   getKeySummary,
   getUserSummary,
   getUsageStats,
   getUsageSummary,
   listActivity,
+  listAdminModels,
+  listApiKeys,
   listUsage,
+  listUsers,
 } from '../lib/api'
+import { saveBlob } from '../lib/download'
 import type {
   ActivityEvent,
+  AdminModel,
+  ApiKey,
   InferenceEvent,
   InferencePurpose,
   KeyUsageSummary,
   TimeRange,
   UsageBucket,
   UsageSummary,
+  User,
   UserUsageSummary,
 } from '../types'
 import {
+  EVENT_LABELS,
   eventLabel,
   eventVariant,
   formatEventDetail,
@@ -43,7 +53,15 @@ import styles from './ActivityTab.module.css'
 // Constants
 // ---------------------------------------------------------------------------
 
-const PAGE_SIZE = 50
+/** How many rows a page holds. Someone reading an audit trail for a specific
+ *  request wants a longer page than someone glancing at today. */
+const PAGE_SIZES = [50, 100, 200] as const
+const DEFAULT_PAGE_SIZE = 50
+
+/** Event types the API can send, as one sorted list for the filter. Anything
+ *  not listed still renders through the humaniser; it just cannot be picked
+ *  from the menu, which is why the filter also accepts a typed value. */
+const EVENT_TYPES = Object.keys(EVENT_LABELS).sort()
 
 const TIME_RANGES: { label: string; value: TimeRange }[] = [
   { label: '24h', value: '24h' },
@@ -258,6 +276,22 @@ export function ActivityTab() {
    *  records, but they are not what anyone means by "who used what". */
   const [purpose, setPurpose]     = useState<PurposeFilter>('inference')
   const [page, setPage]           = useState(0)
+  const [pageSize, setPageSize]   = useState<number>(DEFAULT_PAGE_SIZE)
+
+  /** The filters the API accepts, all of them. An empty string means "no
+   *  filter" and is dropped before the request goes out. */
+  const [eventType, setEventType] = useState('')
+  /** One human, applied as the actor on admin events and as the user on
+   *  requests — the same person either way. */
+  const [personId, setPersonId]   = useState('')
+  const [apiKeyId, setApiKeyId]   = useState('')
+  const [modelId, setModelId]     = useState('')
+
+  // Filter menus. Read once; a failure costs a menu, not the page.
+  const [allUsers, setAllUsers]   = useState<User[]>([])
+  const [allKeys, setAllKeys]     = useState<ApiKey[]>([])
+  const [allModels, setAllModels] = useState<AdminModel[]>([])
+  const [exporting, setExporting] = useState(false)
 
   const [summary, setSummary]         = useState<UsageSummary | null>(null)
   const [buckets, setBuckets]         = useState<UsageBucket[]>([])
@@ -279,6 +313,32 @@ export function ActivityTab() {
 
   // Derived interval for chart labels
   const interval = timeRange === '24h' ? 'hour' : 'day'
+
+  useEffect(() => {
+    listUsers().then(setAllUsers).catch(() => setAllUsers([]))
+    listApiKeys().then(setAllKeys).catch(() => setAllKeys([]))
+    listAdminModels().then(setAllModels).catch(() => setAllModels([]))
+  }, [])
+
+  /** Exactly what the visible log is filtered by. The export sends the same
+   *  object, so a downloaded CSV can never disagree with the table above it. */
+  const activityFilters = useMemo(
+    () => ({ actor_id: personId || undefined, event_type: eventType || undefined }),
+    [personId, eventType],
+  )
+
+  const usageFilters = useMemo(
+    () => ({
+      user_id: personId || undefined,
+      api_key_id: apiKeyId || undefined,
+      model: modelId || undefined,
+      purpose,
+    }),
+    [personId, apiKeyId, modelId, purpose],
+  )
+
+  const filtersActive =
+    eventType !== '' || personId !== '' || apiKeyId !== '' || modelId !== ''
 
   // ---------------------------------------------------------------------------
   // Data fetching
@@ -317,27 +377,24 @@ export function ActivityTab() {
   const fetchEvents = useCallback(async () => {
     setLoadingEvents(true)
     const { since, until } = getTimeRange(timeRange)
-    const offset = page * PAGE_SIZE
-    // The server filters to answers unless told otherwise, so the choice is
-    // always sent — including 'all', which is how it is asked to stop filtering.
-    const purposeParam = { purpose }
+    const offset = page * pageSize
 
     try {
       if (logView === 'admin') {
-        const res = await listActivity({ since, until, limit: PAGE_SIZE, offset })
+        const res = await listActivity({ since, until, limit: pageSize, offset, ...activityFilters })
         setUnifiedEvents(res.events.map(adminEventToUnified))
         setTotal(res.total)
       } else if (logView === 'api') {
-        const res = await listUsage({ since, until, limit: PAGE_SIZE, offset, ...purposeParam })
+        const res = await listUsage({ since, until, limit: pageSize, offset, ...usageFilters })
         setUnifiedEvents(res.events.map(inferenceEventToUnified))
         setTotal(res.total)
       } else {
         // 'all': fetch both full result sets and merge client-side
         // We fetch enough to fill two full pages worth so pagination is stable
-        const fetchLimit = PAGE_SIZE * 2
+        const fetchLimit = pageSize * 2
         const [adminRes, apiRes] = await Promise.all([
-          listActivity({ since, until, limit: fetchLimit, offset: 0 }),
-          listUsage({ since, until, limit: fetchLimit, offset: 0, ...purposeParam }),
+          listActivity({ since, until, limit: fetchLimit, offset: 0, ...activityFilters }),
+          listUsage({ since, until, limit: fetchLimit, offset: 0, ...usageFilters }),
         ])
         const merged = [
           ...adminRes.events.map(adminEventToUnified),
@@ -346,7 +403,7 @@ export function ActivityTab() {
 
         const totalMerged = adminRes.total + apiRes.total
         setTotal(totalMerged)
-        setUnifiedEvents(merged.slice(offset, offset + PAGE_SIZE))
+        setUnifiedEvents(merged.slice(offset, offset + pageSize))
       }
     } catch (err) {
       toast((err as Error).message, 'error')
@@ -355,32 +412,27 @@ export function ActivityTab() {
     } finally {
       setLoadingEvents(false)
     }
-  }, [timeRange, logView, purpose, page, toast])
+  }, [timeRange, logView, page, pageSize, activityFilters, usageFilters, toast])
 
   // ---------------------------------------------------------------------------
   // Export
   // ---------------------------------------------------------------------------
 
+  /** The CSV carries the filters that are on screen — the same objects the
+   *  table was built from, not a second set assembled here. */
   async function handleExport() {
     const { since, until } = getTimeRange(timeRange)
-    const params = new URLSearchParams({ since, until })
-    const path = logView === 'api' ? 'usage' : 'activity'
-    if (path === 'usage') params.set('purpose', purpose)
+    setExporting(true)
     try {
-      const res = await fetch(`/api/v1/${path}/export?${params}`, {
-        headers: { 'X-Requested-With': 'XMLHttpRequest' },
-        credentials: 'same-origin',
-      })
-      if (!res.ok) throw new Error(`Export failed: HTTP ${res.status}`)
-      const blob = await res.blob()
-      const url  = URL.createObjectURL(blob)
-      const a    = document.createElement('a')
-      a.href     = url
-      a.download = `${path}_events.csv`
-      a.click()
-      URL.revokeObjectURL(url)
+      const { blob, filename } =
+        logView === 'api'
+          ? await exportUsage({ since, until, ...usageFilters })
+          : await exportActivity({ since, until, ...activityFilters })
+      saveBlob(blob, filename)
     } catch (err) {
       toast((err as Error).message, 'error')
+    } finally {
+      setExporting(false)
     }
   }
 
@@ -388,10 +440,11 @@ export function ActivityTab() {
   // Effects
   // ---------------------------------------------------------------------------
 
-  // Reset page when time range, log view or purpose changes
+  // Any change to what is being asked for starts at the first page again:
+  // page 4 of the old filter is not page 4 of the new one.
   useEffect(() => {
     setPage(0)
-  }, [timeRange, logView, purpose])
+  }, [timeRange, logView, purpose, pageSize, eventType, personId, apiKeyId, modelId])
 
   useEffect(() => {
     void fetchSummaryAndChart()
@@ -410,10 +463,10 @@ export function ActivityTab() {
     requests: b.request_count,
   }))
 
-  const firstItem = page * PAGE_SIZE + 1
-  const lastItem  = Math.min((page + 1) * PAGE_SIZE, total)
+  const firstItem = page * pageSize + 1
+  const lastItem  = Math.min((page + 1) * pageSize, total)
   const hasPrev   = page > 0
-  const hasNext   = (page + 1) * PAGE_SIZE < total
+  const hasNext   = (page + 1) * pageSize < total
 
   const requestChange = summary ? pctChange(summary.total_requests, summary.total_requests_previous) : null
 
@@ -430,13 +483,13 @@ export function ActivityTab() {
     <div>
       {/* Toolbar */}
       <div className={styles.toolbar}>
-        <Button variant="secondary" size="sm" onClick={() => void handleExport()}>
+        <Button variant="secondary" size="sm" onClick={() => void handleExport()} disabled={exporting}>
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ marginRight: '6px' }}>
             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
             <polyline points="7 10 12 15 17 10" />
             <line x1="12" y1="15" x2="12" y2="3" />
           </svg>
-          Export CSV
+          {exporting ? 'Preparing…' : 'Export CSV'}
         </Button>
         <div className={styles.timeRange}>
           {TIME_RANGES.map((r) => (
@@ -652,6 +705,101 @@ export function ActivityTab() {
         )}
       </div>
 
+      {/* Every filter the API accepts, and only the ones that apply to what is
+          on screen: a model filter over admin events would silently do nothing. */}
+      <div className={styles.filterBar}>
+        {logView !== 'api' && (
+          <label className={styles.filter}>
+            <span className={styles.filterLabel}>Event type</span>
+            <select
+              className={styles.filterSelect}
+              value={eventType}
+              onChange={(e) => setEventType(e.target.value)}
+            >
+              <option value="">Any event</option>
+              {EVENT_TYPES.map((t) => (
+                <option key={t} value={t}>{eventLabel(t)}</option>
+              ))}
+            </select>
+          </label>
+        )}
+
+        <label className={styles.filter}>
+          <span className={styles.filterLabel}>
+            {logView === 'admin' ? 'Actor' : logView === 'api' ? 'User' : 'Person'}
+          </span>
+          <select
+            className={styles.filterSelect}
+            value={personId}
+            onChange={(e) => setPersonId(e.target.value)}
+          >
+            <option value="">Anyone</option>
+            {allUsers.map((u) => (
+              <option key={u.id} value={u.id}>{u.name || u.email}</option>
+            ))}
+          </select>
+        </label>
+
+        {logView !== 'admin' && (
+          <label className={styles.filter}>
+            <span className={styles.filterLabel}>API key</span>
+            <select
+              className={styles.filterSelect}
+              value={apiKeyId}
+              onChange={(e) => setApiKeyId(e.target.value)}
+            >
+              <option value="">Any key</option>
+              {allKeys.map((k) => (
+                <option key={k.id} value={k.id}>
+                  {k.name}{k.revoked_at ? ' (revoked)' : ''}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
+
+        {logView !== 'admin' && (
+          <label className={styles.filter}>
+            <span className={styles.filterLabel}>Model</span>
+            <select
+              className={styles.filterSelect}
+              value={modelId}
+              onChange={(e) => setModelId(e.target.value)}
+            >
+              <option value="">Any model</option>
+              {allModels.map((m) => (
+                <option key={m.id} value={m.model_id}>
+                  {m.display_name ?? m.model_id}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
+
+        <label className={`${styles.filter} ${styles.filterRows}`}>
+          <span className={styles.filterLabel}>Rows</span>
+          <select
+            className={styles.filterSelect}
+            value={pageSize}
+            onChange={(e) => setPageSize(Number(e.target.value))}
+          >
+            {PAGE_SIZES.map((n) => (
+              <option key={n} value={n}>{n}</option>
+            ))}
+          </select>
+        </label>
+
+        {filtersActive && (
+          <button
+            type="button"
+            className={styles.clearFilters}
+            onClick={() => { setEventType(''); setPersonId(''); setApiKeyId(''); setModelId('') }}
+          >
+            Clear filters
+          </button>
+        )}
+      </div>
+
       <div className={styles.tableCard}>
         <Table>
           <thead>
@@ -667,7 +815,7 @@ export function ActivityTab() {
           </thead>
           <tbody>
             {loadingEvents ? (
-              Array.from({ length: 8 }).map((_, i) => <SkeletonRow key={i} cols={columnCount} />)
+              Array.from({ length: Math.min(pageSize, 8) }).map((_, i) => <SkeletonRow key={i} cols={columnCount} />)
             ) : unifiedEvents.length === 0 ? (
               <TableEmpty colSpan={columnCount}>
                 <div className={styles.empty}>
@@ -676,8 +824,14 @@ export function ActivityTab() {
                     <line x1="12" y1="20" x2="12" y2="4" />
                     <line x1="6" y1="20" x2="6" y2="14" />
                   </svg>
-                  <span className={styles.emptyTitle}>No activity yet</span>
-                  <span className={styles.emptyHint}>Events will appear here once users start interacting with the system</span>
+                  <span className={styles.emptyTitle}>
+                    {filtersActive ? 'Nothing matches these filters' : 'No activity yet'}
+                  </span>
+                  <span className={styles.emptyHint}>
+                    {filtersActive
+                      ? 'Widen the time range, or clear a filter above.'
+                      : 'Events will appear here once users start interacting with the system'}
+                  </span>
                 </div>
               </TableEmpty>
             ) : (

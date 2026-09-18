@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { ChatError, exportConversation, streamChat } from '../lib/api'
 import {
+  CONVERSATION_PAGE,
   DRAFT_ID,
   NEW_CONVERSATION_TITLE,
   appendTurns,
@@ -24,6 +25,7 @@ import {
   userTurn,
   type Conversation,
 } from '../lib/conversations'
+import { saveBlob } from '../lib/download'
 import type { ChatMessage } from '../types'
 import { useAuth } from '../context/AuthContext'
 import { useToast } from '../components/Toast'
@@ -34,6 +36,7 @@ import { ConversationList, type ListState } from './ConversationList'
 import { MessageList, type ChatFailure } from './MessageList'
 import { ChatComposer, type ComposerNotice } from './ChatComposer'
 import { ModelSelector } from './ModelSelector'
+import { ModelAccessNotice } from './ModelAccessNotice'
 import styles from './ChatPage.module.css'
 
 const STARTER_PROMPTS = [
@@ -52,6 +55,10 @@ const STALE_MODEL_CODES = new Set([
   'model_not_found',
   'model_not_enabled',
   'model_residency_violation',
+  // The list is already filtered by policy when it is read, so this refusal
+  // means the policy was narrowed after the picker was filled. Re-reading is
+  // the point: the entry should not be on offer any more.
+  'model_not_allowed',
 ])
 
 /** Refusals that say the model this conversation was pinned to has gone. The
@@ -82,6 +89,7 @@ export function ChatPage() {
   const isAdmin = user?.role === 'admin'
   const {
     models,
+    defaultModel,
     isLoading: modelsLoading,
     isRefetching: modelsRefetching,
     error: modelsError,
@@ -91,6 +99,11 @@ export function ChatPage() {
   const [activeId, setActiveId] = useState<string | null>(null)
   const [listState, setListState] = useState<ListState>('loading')
   const [listError, setListError] = useState<string | null>(null)
+  /** How many conversations the rail has asked for. A full page back means
+   *  there may be more, so "Load more" asks for one page further. */
+  const [listLimit, setListLimit] = useState(CONVERSATION_PAGE)
+  const [listComplete, setListComplete] = useState(false)
+  const [loadingMore, setLoadingMore] = useState(false)
   const [importFailed, setImportFailed] = useState(false)
   const [importing, setImporting] = useState(false)
   /** The conversation whose bodies are being fetched, if any. */
@@ -127,12 +140,17 @@ export function ChatPage() {
         ? 'error'
         : 'empty'
 
+  /** The first visit starts on the model the policy nominates — the first
+   *  non-null default walking key → user → organisation. Without one, the first
+   *  entry on offer. Once this has fired, an empty selection is a deliberate
+   *  one and stays empty. */
   useEffect(() => {
     if (modelsReady && !model && !autoPickedRef.current && pendingModel === null) {
       autoPickedRef.current = true
-      setModel(models[0].id)
+      const preferred = defaultModel && modelIds.includes(defaultModel) ? defaultModel : models[0].id
+      setModel(preferred)
     }
-  }, [modelsReady, model, models, pendingModel])
+  }, [modelsReady, model, models, modelIds, defaultModel, pendingModel])
 
   /** A conversation reopens on the model it was last used with — but only if
    *  that model is still on offer. When it is gone the picker is left empty for
@@ -160,15 +178,16 @@ export function ChatPage() {
     setConversations((prev) => prev.map((c) => (c.id === id ? patch(c) : c)))
   }, [])
 
-  const readList = useCallback(async () => {
+  const readList = useCallback(async (limit = listLimit) => {
     setListState('loading')
     setListError(null)
     try {
-      const list = await loadConversations()
+      const list = await loadConversations(limit)
       setConversations((prev) => {
         const draft = prev.find((c) => c.draft)
         return draft ? [draft, ...list] : list
       })
+      setListComplete(list.length < limit)
       setListState('ready')
       return list
     } catch (err) {
@@ -176,7 +195,27 @@ export function ChatPage() {
       setListError(errorText(err, 'Your conversations could not be loaded'))
       return null
     }
-  }, [])
+  }, [listLimit])
+
+  /** One page further back. The whole list is re-read at the larger limit, so
+   *  the rail and the in-memory copy stay one thing rather than two halves. */
+  const handleLoadMore = useCallback(async () => {
+    const next = listLimit + CONVERSATION_PAGE
+    setLoadingMore(true)
+    try {
+      const list = await loadConversations(next)
+      setConversations((prev) => {
+        const draft = prev.find((c) => c.draft)
+        return draft ? [draft, ...list] : list
+      })
+      setListLimit(next)
+      setListComplete(list.length < next)
+    } catch (err) {
+      toast(errorText(err, 'More conversations could not be loaded'), 'error')
+    } finally {
+      setLoadingMore(false)
+    }
+  }, [listLimit, toast])
 
   const openThread = useCallback(async (id: string) => {
     setLoadingId(id)
@@ -205,9 +244,10 @@ export function ChatPage() {
       }
       let list: Conversation[] = []
       try {
-        list = await loadConversations()
+        list = await loadConversations(CONVERSATION_PAGE)
         if (cancelled) return
         setConversations(list)
+        setListComplete(list.length < CONVERSATION_PAGE)
         setListState('ready')
       } catch (err) {
         if (cancelled) return
@@ -320,14 +360,7 @@ export function ChatPage() {
     setExporting(true)
     try {
       const { blob, filename } = await exportConversation(active.id)
-      const url = URL.createObjectURL(blob)
-      const link = document.createElement('a')
-      link.href = url
-      link.download = filename
-      document.body.appendChild(link)
-      link.click()
-      link.remove()
-      URL.revokeObjectURL(url)
+      saveBlob(blob, filename)
     } catch (err) {
       toast(errorText(err, 'The conversation could not be downloaded'), 'error')
     } finally {
@@ -742,6 +775,9 @@ export function ChatPage() {
         onDelete={(id) => void handleDeleteConversation(id)}
         onRename={(id, title) => void handleRenameConversation(id, title)}
         onRetry={() => void readList()}
+        hasMore={!listComplete}
+        loadingMore={loadingMore}
+        onLoadMore={() => void handleLoadMore()}
       />
       <div className={styles.main}>
         <div className={styles.header}>
@@ -752,6 +788,7 @@ export function ChatPage() {
             value={model}
             onChange={handleModelChange}
           />
+          <ModelAccessNotice models={models} />
           {canExport && (
             <div className={styles.headerActions}>
               <Button

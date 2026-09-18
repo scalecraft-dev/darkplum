@@ -407,9 +407,17 @@ func TestRoutingPolicy_GetPutAndInvalidValue(t *testing.T) {
 		t.Fatalf("expected residency %q after update, got %q", residencySelfHostedOnly, policy.Residency)
 	}
 
+	// routing_policy.residency (migration 010) must stay mirrored from the
+	// new org row (migration 015's prp_mirror_org trigger) so a gateway
+	// still reading the legacy table during a rolling deploy sees the same
+	// value.
+	var mirroredResidency string
 	var updatedBy *string
-	if err := pool.QueryRow(ctx, `SELECT updated_by FROM routing_policy WHERE id = true`).Scan(&updatedBy); err != nil {
-		t.Fatalf("fetch updated_by: %v", err)
+	if err := pool.QueryRow(ctx, `SELECT residency, updated_by FROM routing_policy WHERE id = true`).Scan(&mirroredResidency, &updatedBy); err != nil {
+		t.Fatalf("fetch mirrored routing_policy row: %v", err)
+	}
+	if mirroredResidency != residencySelfHostedOnly {
+		t.Fatalf("expected routing_policy.residency mirrored to %q, got %q", residencySelfHostedOnly, mirroredResidency)
 	}
 	if updatedBy == nil || *updatedBy != userID {
 		t.Fatalf("expected updated_by = %q, got %v", userID, updatedBy)
@@ -417,12 +425,12 @@ func TestRoutingPolicy_GetPutAndInvalidValue(t *testing.T) {
 
 	var eventCount int
 	if err := pool.QueryRow(ctx,
-		`SELECT COUNT(*) FROM activity_events WHERE event_type = $1`, string(activity.RoutingPolicyChanged),
+		`SELECT COUNT(*) FROM activity_events WHERE event_type = $1`, string(activity.RoutingPolicyOrgChanged),
 	).Scan(&eventCount); err != nil {
 		t.Fatalf("count policy-changed events: %v", err)
 	}
 	if eventCount != 1 {
-		t.Fatalf("expected 1 routing_policy.changed event, got %d", eventCount)
+		t.Fatalf("expected 1 routing_policy.org_changed event, got %d", eventCount)
 	}
 }
 

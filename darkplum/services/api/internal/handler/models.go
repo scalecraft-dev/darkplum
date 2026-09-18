@@ -6,10 +6,12 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -21,17 +23,32 @@ type ModelHandler struct {
 	serviceKey string
 	pool       *pgxpool.Pool
 	client     *http.Client
+	gateway    *gatewayEffectiveClient
 
 	// availabilityWindow defaults to modelAvailabilityWindow and can be
 	// overridden via SetAvailabilityWindow, which cmd/main.go does from
 	// MODEL_AVAILABILITY_WINDOW_SECONDS so an operator can tune it without a
 	// rebuild.
 	availabilityWindow time.Duration
+
+	// effCacheMu/effCache back getSessionEffective's 5s-per-user cache of
+	// the gateway's effective policy — see that method's doc comment.
+	effCacheMu sync.Mutex
+	effCache   map[string]effectiveCacheEntry
+}
+
+// effectiveCacheEntry is one session user's cached effective policy, used
+// only to filter the chat-facing /v1/models list (never for enforcement).
+type effectiveCacheEntry struct {
+	expiresAt     time.Time
+	allowedModels *[]string
+	defaultModel  *string
 }
 
 // NewModelHandler constructs a ModelHandler. gatewayURL and serviceKey are used
 // by SyncModels to call the gateway's /v1/models endpoint at startup and on the
-// periodic sync ticker.
+// periodic sync ticker, and by ListModels (via the shared effective-policy
+// client) to filter the list for a session user.
 func NewModelHandler(gatewayURL, serviceKey string, pool *pgxpool.Pool) *ModelHandler {
 	return &ModelHandler{
 		gatewayURL: gatewayURL,
@@ -40,7 +57,9 @@ func NewModelHandler(gatewayURL, serviceKey string, pool *pgxpool.Pool) *ModelHa
 		client: &http.Client{
 			Timeout: 10 * time.Second,
 		},
+		gateway:            newGatewayEffectiveClient(gatewayURL, serviceKey),
 		availabilityWindow: modelAvailabilityWindow,
+		effCache:           make(map[string]effectiveCacheEntry),
 	}
 }
 
@@ -96,9 +115,57 @@ type openAIModelEntry struct {
 }
 
 // openAIModelsResponse is the OpenAI-compatible envelope for the models list.
+// DefaultModel is additive (top-level, not part of the OpenAI spec) so the
+// webchat picker can preselect without a second round trip: it is the
+// session user's effective default_model when one could be resolved, else
+// the org's own default_model, else nil.
 type openAIModelsResponse struct {
-	Object string             `json:"object"`
-	Data   []openAIModelEntry `json:"data"`
+	Object       string             `json:"object"`
+	Data         []openAIModelEntry `json:"data"`
+	DefaultModel *string            `json:"default_model"`
+}
+
+// getSessionEffective returns the session user's effective allowed_models
+// and default_model for filtering the chat-facing /v1/models list, backed by
+// a cache of modelsEffectiveCacheTTL (5s) per user so a busy chat UI
+// re-fetching the model list doesn't hammer the gateway on every keystroke/
+// tab focus. A cache miss/expiry calls the gateway's
+// GET /v1/policy/effective; any failure (timeout, non-200, gateway down) is
+// returned to the caller, which must fall back to the unfiltered list rather
+// than fail the request — see ListModels. This is a UX filter only, never
+// the enforcement point.
+func (h *ModelHandler) getSessionEffective(ctx context.Context, userID string) (*[]string, *string, error) {
+	h.effCacheMu.Lock()
+	if e, ok := h.effCache[userID]; ok && time.Now().Before(e.expiresAt) {
+		h.effCacheMu.Unlock()
+		return e.allowedModels, e.defaultModel, nil
+	}
+	h.effCacheMu.Unlock()
+
+	eff, err := h.gateway.effective(ctx, userID, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	h.effCacheMu.Lock()
+	h.effCache[userID] = effectiveCacheEntry{
+		expiresAt:     time.Now().Add(modelsEffectiveCacheTTL),
+		allowedModels: eff.AllowedModels,
+		defaultModel:  eff.DefaultModel,
+	}
+	h.effCacheMu.Unlock()
+
+	return eff.AllowedModels, eff.DefaultModel, nil
+}
+
+// orgDefaultModel reads the org policy row's default_model, used as the
+// /v1/models envelope's default_model fallback when there is no session
+// user (a Bearer/API-key caller) or the gateway's effective policy couldn't
+// be fetched.
+func (h *ModelHandler) orgDefaultModel(ctx context.Context) (*string, error) {
+	var d *string
+	err := h.pool.QueryRow(ctx, `SELECT default_model FROM principal_routing_policies WHERE principal_type = 'org'`).Scan(&d)
+	return d, err
 }
 
 // ListModels handles GET /v1/models — chat-facing, returns enabled models plus
@@ -106,6 +173,16 @@ type openAIModelsResponse struct {
 // self_hosted_only residency policy, cloud_managed models (and aliases
 // pointing at them) are omitted entirely — this is a UX convenience for the
 // picker, not the enforcement point (that's the gateway; see policy.Snapshot).
+//
+// For a session (browser) caller -- identified by "user_id" being set in the
+// gin context, which only happens via SessionRequired, never the Bearer/
+// API-key path -- the list is additionally filtered to that user's effective
+// allowed_models (see getSessionEffective) and routed/static alias entries
+// whose every target is disallowed are omitted. A Bearer/API-key caller
+// (no "user_id" in context) gets the unfiltered, residency-only list exactly
+// as before: that caller's own gateway-side enforcement already applies its
+// key's policy per request, and this endpoint's job for that caller is model
+// discovery, not a second, possibly-inconsistent filter.
 func (h *ModelHandler) ListModels(c *gin.Context) {
 	ctx := c.Request.Context()
 
@@ -114,6 +191,25 @@ func (h *ModelHandler) ListModels(c *gin.Context) {
 		slog.ErrorContext(ctx, "list models: read routing policy failed", "err", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "list models failed"})
 		return
+	}
+
+	var allowedModels *[]string
+	var defaultModel *string
+	if userID := c.GetString("user_id"); userID != "" {
+		am, dm, effErr := h.getSessionEffective(ctx, userID)
+		if effErr != nil {
+			slog.WarnContext(ctx, "list models: gateway effective policy unavailable, falling back to unfiltered list", "user_id", userID, "err", effErr)
+		} else {
+			allowedModels = am
+			defaultModel = dm
+		}
+	}
+	if defaultModel == nil {
+		if d, dErr := h.orgDefaultModel(ctx); dErr == nil {
+			defaultModel = d
+		} else {
+			slog.WarnContext(ctx, "list models: read org default_model failed", "err", dErr)
+		}
 	}
 
 	modelRows, err := h.pool.Query(ctx, `
@@ -230,8 +326,8 @@ func (h *ModelHandler) ListModels(c *gin.Context) {
 		return
 	}
 
-	data := buildModelsList(models, aliases, routedAliases, residency, time.Now(), h.availabilityWindow)
-	c.JSON(http.StatusOK, openAIModelsResponse{Object: "list", Data: data})
+	data := buildModelsList(models, aliases, routedAliases, residency, time.Now(), h.availabilityWindow, allowedModels)
+	c.JSON(http.StatusOK, openAIModelsResponse{Object: "list", Data: data, DefaultModel: defaultModel})
 }
 
 // getResidency reads the routing_policy singleton's current residency value.
@@ -278,12 +374,57 @@ func (h *ModelHandler) ListAdminModels(c *gin.Context) {
 }
 
 // toggleModelRequest is the request body for PATCH /api/v1/models/:id.
+// DisplayName is a tri-state field: absent/omitted leaves the stored
+// display_name untouched; explicit null clears it (reverts to showing the
+// raw model_id); a non-empty string (1-100 chars) sets it. SyncModels never
+// writes display_name (see models.go's upsert), so an admin-set name always
+// survives a resync -- this endpoint is the only writer.
+//
+// DisplayName is deliberately json.RawMessage, NOT *json.RawMessage: a
+// *json.RawMessage field collapses "absent" and "null" to the same nil
+// pointer (encoding/json sets the pointer itself to nil for a JSON null,
+// same as when the key is missing entirely, before RawMessage's own
+// UnmarshalJSON ever runs) -- there is no way to tell them apart afterward.
+// A plain (non-pointer) json.RawMessage does NOT get that early-nil
+// treatment: it stays nil (len 0) when the key is absent, but is
+// unmarshaled to the literal bytes "null" when the key is explicitly null,
+// so parseDisplayName can distinguish the two by inspecting the bytes.
 type toggleModelRequest struct {
-	Enabled bool `json:"enabled"`
+	Enabled     bool            `json:"enabled"`
+	DisplayName json.RawMessage `json:"display_name"`
+}
+
+// displayNameMaxLen mirrors the 1-100 character bound from DESIGN4's parity
+// section.
+const displayNameMaxLen = 100
+
+// parseDisplayName decodes toggleModelRequest.DisplayName's tri-state raw
+// JSON into (value, changed): changed is false when the field was absent
+// from the request body (nothing to update); when changed is true, a nil
+// value means "clear it" (JSON null) and a non-nil value is the new name,
+// already length-validated. Pure so the tri-state parsing and the 1-100
+// bound are unit-testable without a database. See toggleModelRequest's doc
+// comment for why raw must be a plain json.RawMessage, not a pointer to one.
+func parseDisplayName(raw json.RawMessage) (value *string, changed bool, err error) {
+	if raw == nil {
+		return nil, false, nil
+	}
+	if string(raw) == "null" {
+		return nil, true, nil
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return nil, false, fmt.Errorf("display_name must be a string or null")
+	}
+	if len(s) < 1 || len(s) > displayNameMaxLen {
+		return nil, false, fmt.Errorf("display_name must be 1-%d characters", displayNameMaxLen)
+	}
+	return &s, true, nil
 }
 
 // ToggleModel handles PATCH /api/v1/models/:id — admin only.
-// Accepts {"enabled": true|false} and returns the updated model row.
+// Accepts {"enabled": true|false, "display_name"?: string|null} and returns
+// the updated model row.
 func (h *ModelHandler) ToggleModel(c *gin.Context) {
 	id := c.Param("id")
 	if !isValidUUID(id) {
@@ -297,10 +438,23 @@ func (h *ModelHandler) ToggleModel(c *gin.Context) {
 		return
 	}
 
-	// UPDATE first — matching the pattern in users.go (Exec + RowsAffected).
-	tag, err := h.pool.Exec(c.Request.Context(), `
-		UPDATE models SET enabled = $1, updated_at = now() WHERE id = $2
-	`, req.Enabled, id)
+	displayName, changeDisplayName, err := parseDisplayName(req.DisplayName)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	var tag pgconn.CommandTag
+	if changeDisplayName {
+		tag, err = h.pool.Exec(c.Request.Context(), `
+			UPDATE models SET enabled = $1, display_name = $2, updated_at = now() WHERE id = $3
+		`, req.Enabled, displayName, id)
+	} else {
+		// UPDATE first — matching the pattern in users.go (Exec + RowsAffected).
+		tag, err = h.pool.Exec(c.Request.Context(), `
+			UPDATE models SET enabled = $1, updated_at = now() WHERE id = $2
+		`, req.Enabled, id)
+	}
 	if err != nil {
 		slog.ErrorContext(c.Request.Context(), "toggle model update failed", "id", id, "err", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "toggle model failed"})

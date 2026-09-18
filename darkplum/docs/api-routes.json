@@ -1,0 +1,422 @@
+[
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/health",
+    "auth": "public",
+    "surface": "machine",
+    "reason": "Kubernetes liveness/readiness probe and load-balancer health check; no browser surface"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/auth/config",
+    "auth": "public",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "POST",
+    "path": "/auth/login",
+    "auth": "public",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "POST",
+    "path": "/auth/change-password",
+    "auth": "session",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "POST",
+    "path": "/auth/setup",
+    "auth": "public",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/auth/me",
+    "auth": "session",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/auth/login",
+    "auth": "public",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/auth/callback",
+    "auth": "public",
+    "surface": "machine",
+    "reason": "OIDC provider redirect target reached by browser navigation, never by an API call"
+  },
+  {
+    "service": "api",
+    "method": "POST",
+    "path": "/auth/logout",
+    "auth": "session",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/api/v1/users",
+    "auth": "session",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/api/v1/api-keys",
+    "auth": "session",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/api/v1/conversations",
+    "auth": "session",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "POST",
+    "path": "/api/v1/conversations",
+    "auth": "session",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/api/v1/conversations/:id",
+    "auth": "session",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "PATCH",
+    "path": "/api/v1/conversations/:id",
+    "auth": "session",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "POST",
+    "path": "/api/v1/conversations/:id/messages",
+    "auth": "session",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "DELETE",
+    "path": "/api/v1/conversations/:id",
+    "auth": "session",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "DELETE",
+    "path": "/api/v1/conversations/:id/messages",
+    "auth": "session",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/api/v1/me/routing-policy/effective",
+    "auth": "session",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "POST",
+    "path": "/api/v1/users",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "DELETE",
+    "path": "/api/v1/users/:id",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "PATCH",
+    "path": "/api/v1/users/:id/role",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "PATCH",
+    "path": "/api/v1/users/:id/password",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/api/v1/users/:id/routing-policy",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "PUT",
+    "path": "/api/v1/users/:id/routing-policy",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "DELETE",
+    "path": "/api/v1/users/:id/routing-policy",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/api/v1/users/:id/routing-policy/effective",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "POST",
+    "path": "/api/v1/users/:id/routing-policy/preview",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "POST",
+    "path": "/api/v1/api-keys",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "DELETE",
+    "path": "/api/v1/api-keys/:id",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/api/v1/api-keys/:id/routing-policy",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "PUT",
+    "path": "/api/v1/api-keys/:id/routing-policy",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "DELETE",
+    "path": "/api/v1/api-keys/:id/routing-policy",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/api/v1/api-keys/:id/routing-policy/effective",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "POST",
+    "path": "/api/v1/api-keys/:id/routing-policy/preview",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/api/v1/models",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "PATCH",
+    "path": "/api/v1/models/:id",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/api/v1/model-aliases",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "PUT",
+    "path": "/api/v1/model-aliases/:alias",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "DELETE",
+    "path": "/api/v1/model-aliases/:alias",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "POST",
+    "path": "/api/v1/model-aliases/:alias/test",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/api/v1/routing-policy",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "PUT",
+    "path": "/api/v1/routing-policy",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/api/v1/routing-policy/principals",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/api/v1/activity",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/api/v1/activity/export",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/api/v1/usage",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/api/v1/usage/export",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/api/v1/usage/stats",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/api/v1/usage/summary",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/api/v1/usage/user-summary",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/api/v1/usage/key-summary",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/v1/models",
+    "auth": "session",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "auth": "session",
+    "surface": "ui"
+  },
+  {
+    "service": "gateway",
+    "method": "GET",
+    "path": "/health",
+    "auth": "public",
+    "surface": "machine",
+    "reason": "Kubernetes probe and operator diagnostics (routing, policy, classifier state); the api's /health is what the browser reaches"
+  },
+  {
+    "service": "gateway",
+    "method": "GET",
+    "path": "/v1/models",
+    "auth": "api_key",
+    "surface": "machine",
+    "reason": "Discovered-model list for the api's catalog sync (service key) and for SDK callers with a user key; the browser uses the api's /v1/models"
+  },
+  {
+    "service": "gateway",
+    "method": "POST",
+    "path": "/v1/chat/completions",
+    "auth": "api_key",
+    "surface": "machine",
+    "reason": "Inference endpoint; the browser reaches it through the api proxy (/v1/chat/completions on the api), SDKs call it with a user key"
+  },
+  {
+    "service": "gateway",
+    "method": "POST",
+    "path": "/v1/routing/dryrun",
+    "auth": "api_key",
+    "surface": "machine",
+    "reason": "Called by the api on behalf of the admin Test-a-prompt panel (POST /api/v1/model-aliases/:alias/test) with the service key"
+  },
+  {
+    "service": "gateway",
+    "method": "GET",
+    "path": "/v1/policy/effective",
+    "auth": "service",
+    "surface": "machine",
+    "reason": "Single effective-policy implementation, consulted by the api for every effective/preview/me view with the service key"
+  }
+]

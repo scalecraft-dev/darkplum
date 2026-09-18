@@ -1,0 +1,124 @@
+import { useCallback, useEffect, useState } from 'react'
+import { getMyPolicyEffective } from '../lib/api'
+import { POLICY_RULE, policyLimits, residencyLabel, sourceLabel } from '../lib/policy'
+import { formatModelName } from '../lib/formatModelName'
+import type { EffectivePolicy, Model } from '../types'
+import { Button, Modal } from '../components/ui'
+import styles from './ModelAccessNotice.module.css'
+
+interface Props {
+  /** The entries the picker is offering — used to name allowed ids the way the
+   *  picker names them, rather than showing a raw id twice. */
+  models: Model[]
+}
+
+function label(id: string, models: Model[]): string {
+  const match = models.find((m) => m.id === id)
+  if (match?.alias_of) return `${match.id} — ${formatModelName(match.alias_of)}`
+  return formatModelName(id)
+}
+
+/**
+ * A quiet way for someone in chat to find out why their model list is shorter
+ * than a colleague's. It reads the merged policy for the signed-in person from
+ * the one endpoint that computes it, so what is explained here is exactly what
+ * the gateway enforces — never a second guess at the same rule.
+ *
+ * The affordance only appears once the answer is worth reading: when nothing is
+ * narrowed, there is nothing to explain and the header stays clean.
+ */
+export function ModelAccessNotice({ models }: Props) {
+  const [open, setOpen] = useState(false)
+  const [policy, setPolicy] = useState<EffectivePolicy | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    try {
+      setPolicy(await getMyPolicyEffective())
+      setError(null)
+    } catch (err) {
+      // An older API has no such endpoint. That is not worth telling anyone
+      // about in chat: the affordance simply does not appear.
+      setError(err instanceof Error ? err.message : 'Your model access could not be read')
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => { void load() }, [load])
+
+  if (loading || error || !policyLimits(policy) || !policy) return null
+
+  return (
+    <>
+      <button
+        type="button"
+        className={styles.trigger}
+        onClick={() => setOpen(true)}
+        aria-label="Model access is limited by policy — why?"
+      >
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+          <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+        </svg>
+        {/* The sentence is the affordance. On a narrow header the shield keeps
+            its place and the accessible name carries the rest. */}
+        <span className={styles.triggerText} aria-hidden="true">
+          Model access is limited by policy — why?
+        </span>
+      </button>
+
+      <Modal
+        open={open}
+        onClose={() => setOpen(false)}
+        title="Why your model list is what it is"
+        description="Your organisation decides which models can answer. This is the policy as it applies to you right now."
+      >
+        <div className={styles.body}>
+          <dl className={styles.grid}>
+            <dt>Models you can use</dt>
+            <dd>
+              {policy.allowed_models === null ? (
+                'Every model the organisation has enabled'
+              ) : policy.allowed_models.length === 0 ? (
+                <span className={styles.none}>None — ask an administrator</span>
+              ) : (
+                <span className={styles.chips}>
+                  {policy.allowed_models.map((id) => (
+                    <span key={id} className={styles.chip}>{label(id, models)}</span>
+                  ))}
+                </span>
+              )}
+              <span className={styles.source}>{sourceLabel(policy.sources.allowed_models)}</span>
+            </dd>
+
+            <dt>Where they run</dt>
+            <dd>
+              {policy.residency === 'self_hosted_only'
+                ? 'Self-hosted only — nothing leaves your infrastructure'
+                : residencyLabel(policy.residency)}
+              <span className={styles.source}>{sourceLabel(policy.sources.residency)}</span>
+            </dd>
+
+            <dt>Starts on</dt>
+            <dd>
+              {policy.default_model ? label(policy.default_model, models) : 'Nothing in particular'}
+              <span className={styles.source}>{sourceLabel(policy.sources.default_model)}</span>
+            </dd>
+          </dl>
+
+          <p className={styles.rule}>{POLICY_RULE}</p>
+          <p className={styles.hint}>
+            Nothing here is something you can change yourself. An administrator can widen it from
+            the Models page.
+          </p>
+
+          <div className={styles.footer}>
+            <Button type="button" onClick={() => setOpen(false)}>Close</Button>
+          </div>
+        </div>
+      </Modal>
+    </>
+  )
+}

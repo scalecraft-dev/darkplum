@@ -1,12 +1,26 @@
-import { useCallback, useEffect, useState } from 'react'
-import { createApiKey, createUser, deleteUser, listApiKeys, listUsers, resetUserPassword, revokeApiKey, updateUserRole } from '../lib/api'
-import type { ApiKey, User } from '../types'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
+import {
+  createApiKey,
+  createUser,
+  deleteUser,
+  listApiKeys,
+  listAdminModels,
+  listModelAliases,
+  listPolicyPrincipals,
+  listUsers,
+  resetUserPassword,
+  revokeApiKey,
+  updateUserRole,
+} from '../lib/api'
+import type { AdminModel, ApiKey, ModelAlias, PolicyPrincipal, User } from '../types'
 import { useAuth } from '../context/AuthContext'
 import { useToast } from '../components/Toast'
 import { Tab, TabList } from '../components/ui'
 import { KeyRevealModal } from './KeyRevealModal'
 import { UsersTab } from './UsersTab'
 import { ApiKeysTab } from './ApiKeysTab'
+import { PrincipalPolicyDrawer, type PolicyPrincipalRef } from './PrincipalPolicyDrawer'
 import pageStyles from './PageLayout.module.css'
 import styles from './AdminPage.module.css'
 
@@ -16,10 +30,21 @@ export function AdminPage() {
   const { user: currentUser } = useAuth()
   const isAdmin = currentUser?.role === 'admin'
   const { toast } = useToast()
-  const [tab, setTab] = useState<Tab>('users')
+  const [searchParams, setSearchParams] = useSearchParams()
+  const [tab, setTab] = useState<Tab>(() =>
+    searchParams.get('tab') === 'api-keys' ? 'api-keys' : 'users',
+  )
   const [users, setUsers] = useState<User[]>([])
   const [keys, setKeys] = useState<ApiKey[]>([])
   const [revealKey, setRevealKey] = useState<string | null>(null)
+
+  // The policy drawer needs the model catalogue and the aliases; the lists need
+  // to know which principals have a row of their own. All three are read once
+  // here rather than by each tab.
+  const [models, setModels] = useState<AdminModel[]>([])
+  const [aliases, setAliases] = useState<ModelAlias[]>([])
+  const [principals, setPrincipals] = useState<PolicyPrincipal[]>([])
+  const [policyTarget, setPolicyTarget] = useState<PolicyPrincipalRef | null>(null)
 
   const loadUsers = useCallback(async () => {
     try {
@@ -37,13 +62,81 @@ export function AdminPage() {
     }
   }, [toast])
 
+  /** Which users and keys carry their own policy. A failure here costs a badge,
+   *  not the page, so it is not worth a toast. */
+  const loadPrincipals = useCallback(async () => {
+    try {
+      setPrincipals((await listPolicyPrincipals({ limit: 200 })).principals)
+    } catch {
+      setPrincipals([])
+    }
+  }, [])
+
   useEffect(() => {
     void loadUsers()
     void loadKeys()
-  }, [loadUsers, loadKeys])
+    void loadPrincipals()
+    // The catalogue only matters once the drawer opens, and a failure there is
+    // reported inside the drawer.
+    listAdminModels().then(setModels).catch(() => setModels([]))
+    listModelAliases().then(setAliases).catch(() => setAliases([]))
+  }, [loadUsers, loadKeys, loadPrincipals])
 
-  const handleCreateUser = async (name: string, email: string, password?: string) => {
-    const user = await createUser({ name, email, password })
+  const policyOwners = useMemo(() => {
+    const ids = new Set<string>()
+    for (const p of principals) {
+      const id = p.principal_type === 'user' ? p.user_id : p.api_key_id
+      if (id) ids.add(id)
+    }
+    return ids
+  }, [principals])
+
+  const openUserPolicy = useCallback((user: User) => {
+    setPolicyTarget({
+      type: 'user',
+      id: user.id,
+      title: user.name || user.email,
+      subtitle: user.email,
+    })
+  }, [])
+
+  const openKeyPolicy = useCallback((key: ApiKey) => {
+    setPolicyTarget({
+      type: 'api_key',
+      id: key.id,
+      title: key.name,
+      subtitle: `${key.prefix}… · owned by ${key.user_name ?? 'unknown user'}`,
+    })
+  }, [])
+
+  // Deep link from the access overview on the Models page: ?tab=…&policy=<id>.
+  // The drawer opens as soon as the row it names has been read, and the query
+  // is cleared so a reload does not reopen it unasked.
+  useEffect(() => {
+    const target = searchParams.get('policy')
+    if (!target) return
+    const key = keys.find((k) => k.id === target)
+    const user = users.find((u) => u.id === target)
+    if (!key && !user) return
+    if (key) {
+      setTab('api-keys')
+      openKeyPolicy(key)
+    } else if (user) {
+      setTab('users')
+      openUserPolicy(user)
+    }
+    const next = new URLSearchParams(searchParams)
+    next.delete('policy')
+    setSearchParams(next, { replace: true })
+  }, [searchParams, setSearchParams, users, keys, openUserPolicy, openKeyPolicy])
+
+  const handleCreateUser = async (
+    name: string,
+    email: string,
+    password: string,
+    role: 'admin' | 'reader',
+  ) => {
+    const user = await createUser({ name, email, password, role })
     setUsers((prev) => [user, ...prev])
   }
 
@@ -81,7 +174,7 @@ export function AdminPage() {
     <div className={pageStyles.page}>
       <div className={pageStyles.header}>
         <h1 className={pageStyles.title}>Users & Keys</h1>
-        <p className={pageStyles.subtitle}>Manage users and API keys</p>
+        <p className={pageStyles.subtitle}>Manage users, API keys and what each one can reach</p>
       </div>
 
       <TabList>
@@ -112,16 +205,42 @@ export function AdminPage() {
 
       <div className={styles.tabContent}>
         {tab === 'users' && (
-          <UsersTab users={users} isAdmin={isAdmin} currentUserId={currentUser?.id} onCreate={handleCreateUser} onDelete={handleDeleteUser} onRoleChange={handleRoleChange} onResetPassword={handleResetPassword} />
+          <UsersTab
+            users={users}
+            isAdmin={isAdmin}
+            currentUserId={currentUser?.id}
+            onCreate={handleCreateUser}
+            onDelete={handleDeleteUser}
+            onRoleChange={handleRoleChange}
+            onResetPassword={handleResetPassword}
+            onEditPolicy={openUserPolicy}
+            policyOwners={policyOwners}
+          />
         )}
         {tab === 'api-keys' && (
-          <ApiKeysTab users={users} apiKeys={keys} isAdmin={isAdmin} onCreate={handleCreateKey} onRevoke={handleRevoke} />
+          <ApiKeysTab
+            users={users}
+            apiKeys={keys}
+            isAdmin={isAdmin}
+            onCreate={handleCreateKey}
+            onRevoke={handleRevoke}
+            onEditPolicy={openKeyPolicy}
+            policyOwners={policyOwners}
+          />
         )}
       </div>
 
       {revealKey && (
         <KeyRevealModal keyValue={revealKey} onClose={() => setRevealKey(null)} />
       )}
+
+      <PrincipalPolicyDrawer
+        principal={policyTarget}
+        models={models}
+        aliases={aliases}
+        onClose={() => setPolicyTarget(null)}
+        onSaved={() => void loadPrincipals()}
+      />
     </div>
   )
 }

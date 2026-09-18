@@ -404,3 +404,101 @@
     transition-duration: 0.01ms !important;
   }
 }
+
+/* --- Filter bar ---
+   Sits under the view toggles: the toggles decide which log is being read, the
+   filters narrow it. Wraps rather than scrolls, so nothing hides off-screen on
+   a laptop with the sidebar open. */
+
+.filterBar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+  padding: var(--space-3);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+}
+
+.filter {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.filterLabel {
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--fg-muted);
+}
+
+.filterSelect {
+  max-width: 15rem;
+  padding: var(--space-1) var(--space-2);
+  background: var(--bg-base);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  color: var(--fg-default);
+  font-family: var(--font-sans);
+  font-size: var(--fs-sm);
+}
+
+.filterSelect:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 1px;
+  border-color: var(--border-focus);
+}
+
+/* Page size is a display preference, not a filter on the data, so it sits at
+   the far end away from the things that change what is being counted. */
+.filterRows {
+  margin-left: auto;
+}
+
+.filterRows .filterSelect {
+  max-width: 5.5rem;
+}
+
+.clearFilters {
+  padding: var(--space-1) var(--space-2);
+  background: none;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  color: var(--fg-muted);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+  transition: color var(--transition-fast), border-color var(--transition-fast);
+}
+
+.clearFilters:hover {
+  color: var(--fg-default);
+  border-color: var(--fg-subtle);
+}
+
+.clearFilters:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
+@media (max-width: 767px) {
+  .filterRows {
+    margin-left: 0;
+  }
+
+  .filter {
+    flex: 1 1 10rem;
+  }
+
+  .filterSelect {
+    max-width: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .clearFilters {
+    transition-duration: 0.01ms !important;
+  }
+}

@@ -239,3 +239,124 @@
     transition-duration: 0.01ms !important;
   }
 }
+
+/* --- Fields (added with per-principal policy) --- */
+
+.field {
+  border: 0;
+  padding: 0;
+  margin: 0 0 var(--space-4);
+}
+
+.field:last-of-type {
+  margin-bottom: 0;
+}
+
+.legend {
+  padding: 0;
+  margin-bottom: var(--space-2);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+  color: var(--fg-default);
+}
+
+.fieldNote {
+  margin-bottom: var(--space-2);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-muted);
+  max-width: 68ch;
+}
+
+.pickerWrap {
+  margin-top: var(--space-3);
+}
+
+.fieldError {
+  margin-top: var(--space-2);
+  padding-left: var(--space-2);
+  border-left: 2px solid var(--danger-fg);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-default);
+  max-width: 68ch;
+}
+
+.fieldError code {
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+.select {
+  width: 100%;
+  max-width: 34rem;
+  padding: var(--space-2) var(--space-3);
+  background: var(--bg-base);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  color: var(--fg-default);
+  font-family: var(--font-sans);
+  font-size: var(--fs-sm);
+}
+
+.select:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 1px;
+  border-color: var(--border-focus);
+}
+
+/* What the change did to people who already had their own policy. Counted by
+   the API, not guessed here. */
+.affected {
+  margin-top: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  background: var(--warning-bg);
+  border-left: 2px solid var(--warning-fg);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-default);
+  max-width: 68ch;
+}
+
+.footer {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--space-4);
+  margin-top: var(--space-5);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--border-muted);
+}
+
+.rule {
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-muted);
+  max-width: 52ch;
+}
+
+.footerActions {
+  display: flex;
+  flex-shrink: 0;
+  gap: var(--space-2);
+}
+
+.timing {
+  margin-top: var(--space-2);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-subtle);
+  max-width: 68ch;
+}
+
+@media (max-width: 767px) {
+  .footer {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .footerActions {
+    justify-content: flex-end;
+  }
+}

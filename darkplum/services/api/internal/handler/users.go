@@ -35,6 +35,11 @@ type createUserRequest struct {
 	Email    string `json:"email" binding:"required,email"`
 	Name     string `json:"name"  binding:"required"`
 	Password string `json:"password,omitempty"`
+	// Role is optional; empty defaults to 'reader' (the users.role column's
+	// own DEFAULT, migration 003_user_roles.sql). Present so an admin can
+	// create a fellow admin directly instead of a two-step create-then-
+	// PATCH-role dance.
+	Role string `json:"role,omitempty"`
 }
 
 // CreateUser handles POST /api/v1/users.
@@ -42,6 +47,10 @@ func (h *UserHandler) CreateUser(c *gin.Context) {
 	var req createUserRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.Role != "" && req.Role != "admin" && req.Role != "reader" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "role must be 'admin' or 'reader'"})
 		return
 	}
 
@@ -60,12 +69,25 @@ func (h *UserHandler) CreateUser(c *gin.Context) {
 		passwordHash = &hashStr
 	}
 
+	role := req.Role
+	if role == "" {
+		role = "reader"
+	}
+
+	// $3 is cast to ::text explicitly: with no password (the SSO-invited-user
+	// case, req.Password == "" so passwordHash is a nil *string), $3 is used
+	// both as a plain value and inside "CASE WHEN $3 IS NOT NULL" -- neither
+	// occurrence gives Postgres enough context to infer a type for an
+	// untyped NULL, and it fails closed with "could not determine data type
+	// of parameter $3" (42P08) rather than silently guessing. This was never
+	// exercised by a test before the routing-policy work added
+	// TestCreateUser_OptionalRole, which creates a passwordless user.
 	var u User
 	err := h.db.QueryRow(c.Request.Context(), `
-		INSERT INTO users (email, name, password_hash, auth_provider)
-		VALUES ($1, $2, $3, CASE WHEN $3 IS NOT NULL THEN 'local' ELSE NULL END)
+		INSERT INTO users (email, name, password_hash, auth_provider, role)
+		VALUES ($1, $2, $3::text, CASE WHEN $3::text IS NOT NULL THEN 'local' ELSE NULL END, $4)
 		RETURNING id, email, name, role, created_at
-	`, req.Email, req.Name, passwordHash).Scan(&u.ID, &u.Email, &u.Name, &u.Role, &u.CreatedAt)
+	`, req.Email, req.Name, passwordHash, role).Scan(&u.ID, &u.Email, &u.Name, &u.Role, &u.CreatedAt)
 	if err != nil {
 		if isUniqueViolation(err) {
 			c.JSON(http.StatusConflict, gin.H{"error": "email already exists"})

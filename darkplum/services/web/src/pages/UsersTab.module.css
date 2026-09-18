@@ -189,6 +189,16 @@
   padding-top: var(--space-2);
 }
 
+/* Said at the moment a user is created, so nobody goes looking for a model
+   allowlist that is not on this form. */
+.roleNote {
+  margin-top: calc(var(--space-2) * -1);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-subtle);
+  max-width: 56ch;
+}
+
 /* --- Reset password inline form --- */
 
 .resetPasswordForm {

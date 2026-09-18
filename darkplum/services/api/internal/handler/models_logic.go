@@ -134,12 +134,32 @@ type routedAliasDBRow struct {
 // availabilityWindow is caller-supplied (rather than the modelAvailabilityWindow
 // default baked in) so ModelHandler can apply an operator-configured
 // MODEL_AVAILABILITY_WINDOW_SECONDS override; see cmd/main.go.
-func buildModelsList(models []modelDBRow, aliases []aliasDBRow, routedAliases []routedAliasDBRow, residency string, now time.Time, availabilityWindow time.Duration) []openAIModelEntry {
+//
+// allowed is the caller's effective per-principal allowlist (see policy.go's
+// gatewayEffectiveClient and ListModels): nil means unrestricted (every
+// model that survives the residency/availability checks below is kept); a
+// non-nil (possibly empty) slice restricts entries to that concrete set of
+// model ids, mirroring the gateway's own allowed_models intersection so the
+// picker's list agrees with what the gateway would actually accept. Applied
+// against the model/alias TARGET id, never the alias name itself, matching
+// the contract that allowlists are concrete model ids only.
+func buildModelsList(models []modelDBRow, aliases []aliasDBRow, routedAliases []routedAliasDBRow, residency string, now time.Time, availabilityWindow time.Duration, allowed *[]string) []openAIModelEntry {
+	var allowedSet map[string]bool
+	if allowed != nil {
+		allowedSet = make(map[string]bool, len(*allowed))
+		for _, id := range *allowed {
+			allowedSet[id] = true
+		}
+	}
+
 	created := now.Unix()
 	entries := make([]openAIModelEntry, 0, len(models)+len(aliases)+len(routedAliases))
 
 	for _, m := range models {
 		if residency == residencySelfHostedOnly && m.BackendClass == backendClassCloudManaged {
+			continue
+		}
+		if allowedSet != nil && !allowedSet[m.ModelID] {
 			continue
 		}
 		if !modelIsAvailableWithin(m.DiscoveredAt, now, availabilityWindow) {
@@ -156,6 +176,9 @@ func buildModelsList(models []modelDBRow, aliases []aliasDBRow, routedAliases []
 
 	for _, a := range aliases {
 		if residency == residencySelfHostedOnly && a.BackendClass == backendClassCloudManaged {
+			continue
+		}
+		if allowedSet != nil && !allowedSet[a.TargetModelID] {
 			continue
 		}
 		if !modelIsAvailableWithin(a.TargetDiscoveredAt, now, availabilityWindow) {
@@ -188,6 +211,9 @@ func buildModelsList(models []modelDBRow, aliases []aliasDBRow, routedAliases []
 				continue
 			}
 			if residency == residencySelfHostedOnly && rt.TargetBackendClass == backendClassCloudManaged {
+				continue
+			}
+			if allowedSet != nil && !allowedSet[rt.TargetModelID] {
 				continue
 			}
 			if !modelIsAvailableWithin(rt.TargetDiscoveredAt, now, availabilityWindow) {

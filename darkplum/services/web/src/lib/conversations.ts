@@ -138,9 +138,14 @@ export function cachedConversations(): Conversation[] {
   return order.map((id) => cache.get(id)).filter((c): c is Conversation => Boolean(c))
 }
 
+/** How many conversations the rail asks for at a time. "Load more" asks for
+ *  one page more, rather than a second page: the endpoint takes a limit, and a
+ *  growing limit keeps the in-memory copy in one piece. */
+export const CONVERSATION_PAGE = 30
+
 /** Reads the list of conversations. Summaries only — bodies arrive on open. */
-export async function loadConversations(): Promise<Conversation[]> {
-  const summaries = await listConversations()
+export async function loadConversations(limit = CONVERSATION_PAGE): Promise<Conversation[]> {
+  const summaries = await listConversations({ limit })
   const next = summaries.map(fromSummary)
   cache.clear()
   order = []

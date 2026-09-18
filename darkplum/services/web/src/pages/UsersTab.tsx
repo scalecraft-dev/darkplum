@@ -1,17 +1,22 @@
 import { useState } from 'react'
 import type { User } from '../types'
 import { useToast } from '../components/Toast'
-import { Avatar, Badge, Button, Input, Modal, Table, TableEmpty } from '../components/ui'
+import { Avatar, Badge, Button, Input, Modal, Select, Table, TableEmpty } from '../components/ui'
 import styles from './UsersTab.module.css'
 
 interface Props {
   users: User[]
   isAdmin: boolean
   currentUserId: string | undefined
-  onCreate: (name: string, email: string, password?: string) => Promise<void>
+  onCreate: (name: string, email: string, password: string, role: 'admin' | 'reader') => Promise<void>
   onDelete: (id: string) => Promise<void>
   onRoleChange: (id: string, role: 'admin' | 'reader') => Promise<void>
   onResetPassword?: (id: string, password: string) => Promise<void>
+  /** Opens the routing-policy drawer for one user. */
+  onEditPolicy?: (user: User) => void
+  /** Ids of users with a routing-policy row of their own. Everyone else
+   *  inherits the organisation's, which is not worth a badge. */
+  policyOwners?: ReadonlySet<string>
 }
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
@@ -161,12 +166,25 @@ function ResetPasswordButton({ userId, onReset }: { userId: string; onReset: (id
   )
 }
 
-export function UsersTab({ users, isAdmin, currentUserId, onCreate, onDelete, onRoleChange, onResetPassword }: Props) {
+/** One row's way into its routing policy. Kept as an icon action beside the
+ *  others so the row does not grow a column for something most users inherit. */
+function PolicyButton({ label, onClick }: { label: string; onClick: () => void }) {
+  return (
+    <button className={styles.actionBtn} onClick={onClick} title={label} aria-label={label}>
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+      </svg>
+    </button>
+  )
+}
+
+export function UsersTab({ users, isAdmin, currentUserId, onCreate, onDelete, onRoleChange, onResetPassword, onEditPolicy, policyOwners }: Props) {
   const { toast } = useToast()
   const [modalOpen, setModalOpen] = useState(false)
   const [name, setName] = useState('')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
+  const [role, setRole] = useState<'admin' | 'reader'>('reader')
   const [emailError, setEmailError] = useState('')
   const [loading, setLoading] = useState(false)
 
@@ -179,11 +197,12 @@ export function UsersTab({ users, isAdmin, currentUserId, onCreate, onDelete, on
     setEmailError('')
     setLoading(true)
     try {
-      await onCreate(name.trim(), email.trim(), password)
+      await onCreate(name.trim(), email.trim(), password, role)
       toast('User created', 'success')
       setName('')
       setEmail('')
       setPassword('')
+      setRole('reader')
       setModalOpen(false)
     } catch (err) {
       toast((err as Error).message, 'error')
@@ -197,6 +216,7 @@ export function UsersTab({ users, isAdmin, currentUserId, onCreate, onDelete, on
     setName('')
     setEmail('')
     setPassword('')
+    setRole('reader')
     setEmailError('')
   }
 
@@ -224,13 +244,14 @@ export function UsersTab({ users, isAdmin, currentUserId, onCreate, onDelete, on
               <th>Name</th>
               <th>Email</th>
               <th>Role</th>
+              <th>Model access</th>
               <th>Created</th>
               <th className={styles.actionsCol}></th>
             </tr>
           </thead>
           <tbody>
             {users.length === 0 ? (
-              <TableEmpty colSpan={5}>
+              <TableEmpty colSpan={6}>
                 <div className={styles.empty}>
                   <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
                     <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" />
@@ -264,8 +285,21 @@ export function UsersTab({ users, isAdmin, currentUserId, onCreate, onDelete, on
                       </Badge>
                     )}
                   </td>
+                  <td>
+                    {policyOwners?.has(u.id) ? (
+                      <Badge variant="warning" bordered>Own policy</Badge>
+                    ) : (
+                      <span className={styles.muted}>Inherits org</span>
+                    )}
+                  </td>
                   <td className={styles.date}>{new Date(u.created_at).toLocaleDateString()}</td>
                   <td className={styles.actionsCol}>
+                    {isAdmin && onEditPolicy && (
+                      <PolicyButton
+                        label={`Routing policy for ${u.name}`}
+                        onClick={() => onEditPolicy(u)}
+                      />
+                    )}
                     {isAdmin && onResetPassword && (
                       <ResetPasswordButton userId={u.id} onReset={onResetPassword} />
                     )}
@@ -307,6 +341,18 @@ export function UsersTab({ users, isAdmin, currentUserId, onCreate, onDelete, on
             minLength={8}
             required
           />
+          <Select
+            label="Role"
+            value={role}
+            onChange={(e) => setRole(e.target.value as 'admin' | 'reader')}
+          >
+            <option value="reader">Reader — chat, and their own conversations</option>
+            <option value="admin">Admin — everything, including users, models and policy</option>
+          </Select>
+          <p className={styles.roleNote}>
+            A new user inherits the organisation's routing policy. Narrow it for them from the
+            shield button on their row.
+          </p>
           <div className={styles.formFooter}>
             <Button type="button" variant="ghost" onClick={handleClose}>Cancel</Button>
             <Button type="submit" disabled={loading || !name.trim()}>

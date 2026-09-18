@@ -12,6 +12,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -70,10 +71,14 @@ type routeSnapshotter interface {
 }
 
 // ChatHandler is the model-routing enforcement point for
-// POST /v1/chat/completions, GET /v1/models, and POST /v1/routing/dryrun.
+// POST /v1/chat/completions, GET /v1/models, POST /v1/routing/dryrun, and
+// GET /v1/policy/effective.
 //
 // Request order for HandleChatCompletions:
-//  1. parse body; model required (400)
+//  1. parse body; if `model` is omitted and the caller used a user API key,
+//     try the caller's effective default_model first (see the
+//     default-model-resolution block below) — otherwise, and if that lookup
+//     found nothing, model is required (400)
 //  2. policy snapshot must be loaded, else fail closed (503 policy_unavailable)
 //  3. alias resolve (admin intent wins over a same-named discovered model; no
 //     chains). A routed alias additionally classifies the request here (step
@@ -81,15 +86,18 @@ type routeSnapshotter interface {
 //     alias resolves straight to its target exactly as before.
 //  4. route lookup on the resolved id (404 model_not_found — no default fall-through, ever)
 //  5. enabled check (403 model_not_enabled)
-//  6. residency check (403 model_residency_violation)
-//  7. dispatch
+//  6. residency check (403 model_residency_violation) — against the
+//     PRINCIPAL'S effective (strictest) residency, not just the org's
+//  7. model_not_allowed check (403) — the resolved id must be in the
+//     principal's effective allowlist
+//  8. dispatch
 //
-// Steps 4-6 run unchanged regardless of how the target was resolved: a route
+// Steps 4-7 run unchanged regardless of how the target was resolved: a route
 // a routed alias's classifier picked goes through exactly the same
 // enforcement as a plain model id or a static alias's target. A forbidden
 // pick is refused (see respondModelNotFound/respondModelNotEnabled/
-// respondResidencyViolation's routeContext parameter) — never silently
-// swapped for default_route or any other route.
+// respondResidencyViolation/respondModelNotAllowed's routeContext parameter)
+// — never silently swapped for default_route or any other route.
 type ChatHandler struct {
 	providers providerLookup
 	routes    routeSnapshotter
@@ -200,6 +208,25 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 			},
 		})
 		return
+	}
+
+	// A user-key caller that omits `model` gets its effective default_model,
+	// if one is set anywhere in its org -> user -> api_key chain. This is a
+	// best-effort lookup against whatever policy snapshot happens to be
+	// available right now (never blocking, never itself a source of 503): if
+	// no snapshot has loaded yet, or the caller isn't a user key, or no
+	// default is set, req.Model stays "" and the existing 400 below fires
+	// exactly as before. If a default IS found, req.Model is filled in and
+	// the ENTIRE normal chain below still runs against it — including
+	// model_not_allowed, in case a later policy tightening orphaned the
+	// stored default (see DESIGN4.md's "Omitted model" note).
+	if req.Model == "" && c.GetString(middleware.ContextKeyType) == middleware.KeyTypeUser {
+		if snap, loaded := h.policy.Current(); loaded {
+			eff := snap.EffectiveFor(attributedUserID(c), c.GetString(middleware.ContextKeyID), middleware.KeyTypeUser)
+			if eff.DefaultModel != nil && *eff.DefaultModel != "" {
+				req.Model = *eff.DefaultModel
+			}
+		}
 	}
 
 	if req.Model == "" {
@@ -324,10 +351,31 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 		return
 	}
 
-	if snap.Residency == policy.ResidencySelfHostedOnly && route.Class == routing.ClassCloudManaged {
+	// eff is the calling principal's effective policy: for a user key, its
+	// own key row folded through its owner's user row and the org row; for a
+	// service key, the X-Darkplum-User-Id it presents (attributedUserID),
+	// with no key-level row ever consulted (see policy.Snapshot.EffectiveFor
+	// and its KeyTypeService branch). The residency check below uses this
+	// STRICTEST effective value rather than snap.Residency directly, so a
+	// tighter user/key residency setting is enforced even when the org
+	// itself allows cloud-managed models.
+	eff := snap.EffectiveFor(attributedUserID(c), c.GetString(middleware.ContextKeyID), c.GetString(middleware.ContextKeyType))
+
+	if eff.Residency == policy.ResidencySelfHostedOnly && route.Class == routing.ClassCloudManaged {
 		c.Set("denial_code", "model_residency_violation")
 		logDenial(c, "model_residency_violation", req.Model, resolvedModel, route.Class)
 		respondResidencyViolation(c, resolvedModel, routeCtx)
+		return
+	}
+
+	// model_not_allowed: the check is always on resolvedModel — the SELECTED
+	// target, including a routed alias's classifier pick. A route to a
+	// disallowed model is refused here, never silently swapped for
+	// default_route or any other route.
+	if !eff.Allows(resolvedModel) {
+		c.Set("denial_code", "model_not_allowed")
+		logDenial(c, "model_not_allowed", req.Model, resolvedModel, route.Class)
+		respondModelNotAllowed(c, resolvedModel, routeCtx)
 		return
 	}
 
@@ -459,6 +507,15 @@ func (h *ChatHandler) handleComplete(c *gin.Context, prov provider.Provider, cha
 // discovered set, not just what's currently enabled. Each entry reports
 // owned_by (the backend kind) and backend_class (self_hosted/cloud_managed)
 // straight from the route, so this handler never needs a provider lookup.
+//
+// Filtering by effective routing policy applies ONLY to a user API key
+// (ContextKeyType == middleware.KeyTypeUser): the caller's own allowlist
+// hides models it could never successfully call anyway. A SERVICE key's
+// response is always the full, unfiltered list — the api's SyncModels is the
+// one caller of this endpoint using a service key, and it needs the
+// complete discovered set (including models no principal is currently
+// allowed to use) to keep its own models table in sync; filtering that away
+// would silently stop syncing models the moment an admin tightened policy.
 func (h *ChatHandler) HandleListModels(c *gin.Context) {
 	type modelEntry struct {
 		ID           string `json:"id"`
@@ -476,11 +533,27 @@ func (h *ChatHandler) HandleListModels(c *gin.Context) {
 	table := h.routes.Snapshot()
 	ids := table.IDs() // already sorted
 
+	var eff policy.EffectivePolicy
+	filterByPolicy := false
+	if c.GetString(middleware.ContextKeyType) == middleware.KeyTypeUser {
+		if snap, loaded := h.policy.Current(); loaded {
+			eff = snap.EffectiveFor(attributedUserID(c), c.GetString(middleware.ContextKeyID), middleware.KeyTypeUser)
+			filterByPolicy = true
+		}
+		// If policy hasn't loaded yet, fall through unfiltered rather than
+		// 503 — this endpoint is metadata, not an enforcement point; a
+		// request that actually tries to USE a filtered-out model still goes
+		// through HandleChatCompletions, which fails closed on its own.
+	}
+
 	models := make([]modelEntry, 0, len(ids))
 	for _, id := range ids {
 		route, ok := table.Lookup(id)
 		if !ok {
 			// Defensive: IDs() is always derived from the same table snapshot.
+			continue
+		}
+		if filterByPolicy && !eff.Allows(id) {
 			continue
 		}
 		models = append(models, modelEntry{
@@ -496,6 +569,115 @@ func (h *ChatHandler) HandleListModels(c *gin.Context) {
 		Object: "list",
 		Data:   models,
 	})
+}
+
+// uuidPattern matches a canonical 8-4-4-4-12 hex UUID (any version/variant —
+// the gateway only needs to reject obviously malformed input before using
+// the value as a map key, not validate RFC 4122 conformance).
+var uuidPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+func isUUID(s string) bool {
+	return uuidPattern.MatchString(s)
+}
+
+// effectivePolicyResponse is the body of GET /v1/policy/effective.
+type effectivePolicyResponse struct {
+	policy.EffectivePolicy
+	ReachableModels []string `json:"reachable_models"`
+}
+
+// HandleEffectivePolicy handles GET /v1/policy/effective?user_id=<uuid>[&api_key_id=<uuid>],
+// the single merge implementation's read surface for the api: every
+// "effective policy" view the api renders (org card, per-user/per-key
+// drawers, /me) proxies this endpoint with the service key rather than
+// re-implementing Effective() on the api side.
+//
+// Service-key only: a user or service caller impersonating another
+// principal's policy view is exactly the kind of cross-tenant read the api
+// must never be able to trigger from a session-scoped credential, so this
+// refuses (403) for anything but the shared service key — the api always
+// holds one, every session-authenticated request already proxies through it.
+func (h *ChatHandler) HandleEffectivePolicy(c *gin.Context) {
+	if c.GetString(middleware.ContextKeyType) != middleware.KeyTypeService {
+		c.JSON(http.StatusForbidden, openAIError{
+			Error: openAIErrorBody{
+				Message: "GET /v1/policy/effective is only available to the service key",
+				Type:    "permission_error",
+				Code:    "service_key_required",
+			},
+		})
+		return
+	}
+
+	userID := c.Query("user_id")
+	if !isUUID(userID) {
+		c.JSON(http.StatusBadRequest, openAIError{
+			Error: openAIErrorBody{
+				Message: "user_id is required and must be a UUID",
+				Type:    "invalid_request_error",
+				Code:    "invalid_request",
+			},
+		})
+		return
+	}
+
+	keyID := c.Query("api_key_id")
+	if keyID != "" && !isUUID(keyID) {
+		c.JSON(http.StatusBadRequest, openAIError{
+			Error: openAIErrorBody{
+				Message: "api_key_id must be a UUID",
+				Type:    "invalid_request_error",
+				Code:    "invalid_request",
+			},
+		})
+		return
+	}
+
+	snap, loaded := h.policy.Current()
+	if !loaded {
+		respondPolicyUnavailable(c)
+		return
+	}
+
+	// keyType is deliberately middleware.KeyTypeUser here regardless of the
+	// CALLING credential's own type (always the service key, checked above):
+	// this parameter tells EffectiveFor whether to consult KeyPolicies for
+	// keyID, which is exactly what we want to evaluate for the user/key pair
+	// under inspection — never KeyTypeService, which would (correctly, for a
+	// REAL service-key request) skip key-level rows entirely.
+	eff := snap.EffectiveFor(userID, keyID, middleware.KeyTypeUser)
+
+	c.JSON(http.StatusOK, effectivePolicyResponse{
+		EffectivePolicy: eff,
+		ReachableModels: reachableModels(eff, snap, h.routes.Snapshot()),
+	})
+}
+
+// reachableModels computes the models that are allowed by eff AND currently
+// routable AND enabled AND residency-ok — the "right now" view GET
+// /v1/policy/effective reports separately from the raw allowed_models
+// allowlist (which may name models that don't exist yet, aren't enabled, or
+// are cloud_managed under a self_hosted_only residency).
+func reachableModels(eff policy.EffectivePolicy, snap policy.Snapshot, table *routing.Table) []string {
+	ids := table.IDs() // already sorted
+	reachable := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if !eff.Allows(id) {
+			continue
+		}
+		if !snap.Enabled[id] {
+			continue
+		}
+		route, ok := table.Lookup(id)
+		if !ok {
+			continue
+		}
+		if eff.Residency == policy.ResidencySelfHostedOnly && route.Class == routing.ClassCloudManaged {
+			continue
+		}
+		reachable = append(reachable, id)
+	}
+	return reachable
 }
 
 // routingDryrunRequest is the body of POST /v1/routing/dryrun.
@@ -673,6 +855,25 @@ func respondResidencyViolation(c *gin.Context, model string, rc *routeContext) {
 	})
 }
 
+// respondModelNotAllowed writes the 403 for a model that is available,
+// enabled, and residency-compliant but outside the calling principal's
+// effective allowlist (policy.EffectivePolicy.Allows). See respondModelNotFound
+// for rc. Message text for the non-routed case matches DESIGN4.md's contract
+// exactly: `model %q is not allowed for this user/API key`.
+func respondModelNotAllowed(c *gin.Context, model string, rc *routeContext) {
+	msg := fmt.Sprintf("model %q is not allowed for this user/API key", model)
+	if rc != nil {
+		msg = fmt.Sprintf("route %q of alias %q selects model %q, which is not allowed for this user/API key", rc.Route, rc.Alias, model)
+	}
+	c.JSON(http.StatusForbidden, openAIError{
+		Error: openAIErrorBody{
+			Message: msg,
+			Type:    "permission_error",
+			Code:    "model_not_allowed",
+		},
+	})
+}
+
 // respondRequestCanceled writes the response for a routed alias's classifier
 // aborting because the request's context was canceled (router.ErrAborted) —
 // the one case where the handler must not dispatch anywhere at all, not even
@@ -696,8 +897,8 @@ func respondRequestCanceled(c *gin.Context) {
 // inference_events, which today has no column to carry the denial reason
 // (model=<alias> with requested_model NULL would otherwise be the only trace
 // of an alias-routed 404/403). code is one of model_not_found,
-// model_not_enabled, model_residency_violation, policy_unavailable,
-// invalid_request, request_canceled. requestedModel is always the raw value
+// model_not_enabled, model_residency_violation, model_not_allowed,
+// policy_unavailable, invalid_request, request_canceled. requestedModel is always the raw value
 // the caller sent in the request body (regardless of whether it was an
 // alias), except for invalid_request where no reliable value exists —
 // noModelRecorded ("(none)") is passed instead so the log and the audit

@@ -264,3 +264,38 @@
     transition-duration: 0.01ms !important;
   }
 }
+
+/* Sits under the list, not in it: it is a way to see more, not a conversation. */
+.loadMoreBtn {
+  flex-shrink: 0;
+  margin: var(--space-2) var(--space-2) var(--space-3);
+  padding: var(--space-2);
+  background: none;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  color: var(--fg-muted);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+  transition: color var(--transition-fast), border-color var(--transition-fast);
+}
+
+.loadMoreBtn:hover:not(:disabled) {
+  color: var(--fg-default);
+  border-color: var(--fg-subtle);
+}
+
+.loadMoreBtn:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
+.loadMoreBtn:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .loadMoreBtn {
+    transition-duration: 0.01ms !important;
+  }
+}

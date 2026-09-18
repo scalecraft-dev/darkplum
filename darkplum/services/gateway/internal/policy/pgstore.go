@@ -2,18 +2,21 @@ package policy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // PgStore loads Snapshots from Postgres and caches the last-good result.
-// Refresh performs exactly 4 SELECTs (models, model_aliases,
-// model_alias_routes, routing_policy).
+// Refresh performs exactly 5 SELECTs (models, model_aliases,
+// model_alias_routes, routing_policy, principal_routing_policies joined to
+// api_keys).
 //
 // A freshly onboarded customer database may not have run the api's migration
 // 010 yet when the gateway starts — model_aliases/routing_policy simply don't
@@ -253,7 +256,195 @@ func (s *PgStore) loadFromDB(ctx context.Context) (Snapshot, error) {
 		return Snapshot{}, fmt.Errorf("policy: query routing_policy: %w", err)
 	}
 
-	return Snapshot{Enabled: enabled, Aliases: buildAliases(aliasRows, routeRows), Residency: residency}, nil
+	// principal_routing_policies (migration 015) may not exist yet on a
+	// customer database mid-rollout, exactly like model_aliases/routing_policy
+	// before migration 010 landed — see loadPrincipalPolicyRows.
+	principalRows, err := s.loadPrincipalPolicyRows(ctx)
+	if err != nil {
+		if !isUndefinedTableError(err) {
+			return Snapshot{}, fmt.Errorf("policy: query principal_routing_policies: %w", err)
+		}
+		log.Printf("policy: WARNING principal_routing_policies does not exist yet (migration 015 not applied) — treating as zero explicit principal policies for this snapshot")
+		principalRows = nil
+	}
+	orgPolicy, userPolicies, keyPolicies, counts := buildPrincipalPolicies(principalRows, residency)
+
+	return Snapshot{
+		Enabled:         enabled,
+		Aliases:         buildAliases(aliasRows, routeRows),
+		Residency:       residency,
+		OrgPolicy:       orgPolicy,
+		UserPolicies:    userPolicies,
+		KeyPolicies:     keyPolicies,
+		PrincipalCounts: counts,
+	}, nil
+}
+
+// undefinedTableErrorCode is the Postgres SQLSTATE for "undefined_table". See
+// https://www.postgresql.org/docs/current/errcodes-appendix.html.
+const undefinedTableErrorCode = "42P01"
+
+// isUndefinedTableError reports whether err is a Postgres "undefined_table"
+// error (SQLSTATE 42P01) — the signature of principal_routing_policies not
+// existing yet on a customer database that hasn't run migration 015.
+func isUndefinedTableError(err error) bool {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == undefinedTableErrorCode
+	}
+	return false
+}
+
+// rawPrincipalPolicyRow is one scanned row of the principal_routing_policies
+// / api_keys join in loadPrincipalPolicyRows. KeyOwnerUserID is api_keys.user_id
+// for an api_key-type row (nil for org/user rows, where the LEFT JOIN finds
+// nothing to match); buildPrincipalPolicies uses it to locate that key's
+// owning user's OWN row (if any) so a key's chain is org -> user -> api_key
+// even though principal_routing_policies itself never stores a key's owning
+// user_id (an api_key row's user_id column is NULL, enforced by the
+// principal_type CHECK constraint — the owner is looked up via api_keys
+// instead).
+type rawPrincipalPolicyRow struct {
+	PrincipalType  string
+	UserID         *string
+	APIKeyID       *string
+	Residency      *string
+	AllowedModels  *[]string
+	DefaultModel   *string
+	KeyOwnerUserID *string
+}
+
+// loadPrincipalPolicyRows runs the principal_routing_policies / api_keys join
+// and scans every row. It performs I/O only — see buildPrincipalPolicies for
+// the pure assembly logic this feeds.
+func (s *PgStore) loadPrincipalPolicyRows(ctx context.Context) ([]rawPrincipalPolicyRow, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT prp.principal_type,
+		       prp.user_id::text,
+		       prp.api_key_id::text,
+		       prp.residency,
+		       prp.allowed_models,
+		       prp.default_model,
+		       ak.user_id::text
+		  FROM principal_routing_policies prp
+		  LEFT JOIN api_keys ak ON ak.id = prp.api_key_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []rawPrincipalPolicyRow
+	for rows.Next() {
+		var r rawPrincipalPolicyRow
+		var allowedModels []string
+		if err := rows.Scan(&r.PrincipalType, &r.UserID, &r.APIKeyID, &r.Residency, &allowedModels, &r.DefaultModel, &r.KeyOwnerUserID); err != nil {
+			return nil, fmt.Errorf("scan principal_routing_policies row: %w", err)
+		}
+		r.AllowedModels = nullableSlicePtr(allowedModels)
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read principal_routing_policies rows: %w", err)
+	}
+	return out, nil
+}
+
+// nullableSlicePtr returns nil for a nil slice (SQL NULL) and a pointer to s
+// otherwise, preserving the NULL vs empty-array distinction pgx's array
+// codec already gives a plain []string scan target: NULL leaves it nil, '{}'
+// produces a non-nil zero-length slice.
+func nullableSlicePtr(s []string) *[]string {
+	if s == nil {
+		return nil
+	}
+	return &s
+}
+
+// buildPrincipalPolicies assembles a Snapshot's OrgPolicy/UserPolicies/
+// KeyPolicies/PrincipalCounts from the raw scanned rows of
+// loadPrincipalPolicyRows. Pure (no I/O) so it is unit-testable with fakes,
+// exactly like buildAliases.
+//
+// orgResidencyFallback is the org residency already read from
+// routing_policy.residency (loadFromDB's separate, always-present query) —
+// used as the org row's residency whenever no principal_type='org' row is
+// found, which covers both the 42P01-tolerance case (rows is nil/empty
+// because the table doesn't exist yet) and the — should be unreachable given
+// prp_org_singleton plus migration 015's seed INSERT, but not trusted to hold
+// forever — case where the table exists yet somehow has no org row.
+func buildPrincipalPolicies(rows []rawPrincipalPolicyRow, orgResidencyFallback string) (orgPolicy *EffectivePolicy, userPolicies, keyPolicies map[string]*EffectivePolicy, counts PrincipalCounts) {
+	orgRow := PolicyRow{Level: PrincipalTypeOrg}
+	foundOrgRow := false
+
+	userRows := make(map[string]PolicyRow)
+
+	type keyRowWithOwner struct {
+		row   PolicyRow
+		owner string
+	}
+	keyRows := make(map[string]keyRowWithOwner)
+
+	for _, r := range rows {
+		switch r.PrincipalType {
+		case PrincipalTypeOrg:
+			orgRow = PolicyRow{Level: PrincipalTypeOrg, Residency: r.Residency, AllowedModels: r.AllowedModels, DefaultModel: r.DefaultModel}
+			foundOrgRow = true
+		case PrincipalTypeUser:
+			if r.UserID == nil {
+				// Violates the principal_type CHECK constraint; should be
+				// unreachable, but a user-type row with no user_id is
+				// unusable — drop it rather than key a map entry on "".
+				log.Printf("policy: WARNING principal_routing_policies row has principal_type='user' but a NULL user_id, dropping")
+				continue
+			}
+			userRows[*r.UserID] = PolicyRow{Level: PrincipalTypeUser, Residency: r.Residency, AllowedModels: r.AllowedModels, DefaultModel: r.DefaultModel}
+		case PrincipalTypeAPIKey:
+			if r.APIKeyID == nil {
+				log.Printf("policy: WARNING principal_routing_policies row has principal_type='api_key' but a NULL api_key_id, dropping")
+				continue
+			}
+			owner := ""
+			if r.KeyOwnerUserID != nil {
+				owner = *r.KeyOwnerUserID
+			}
+			keyRows[*r.APIKeyID] = keyRowWithOwner{
+				row:   PolicyRow{Level: PrincipalTypeAPIKey, Residency: r.Residency, AllowedModels: r.AllowedModels, DefaultModel: r.DefaultModel},
+				owner: owner,
+			}
+		default:
+			log.Printf("policy: WARNING principal_routing_policies row has unrecognised principal_type %q, ignoring", r.PrincipalType)
+		}
+	}
+
+	if !foundOrgRow && orgResidencyFallback == ResidencySelfHostedOnly {
+		v := ResidencySelfHostedOnly
+		orgRow.Residency = &v
+	}
+
+	orgEff := Effective([]PolicyRow{orgRow})
+	orgPolicy = &orgEff
+
+	userPolicies = make(map[string]*EffectivePolicy, len(userRows))
+	for id, row := range userRows {
+		eff := Effective([]PolicyRow{orgRow, row})
+		userPolicies[id] = &eff
+	}
+
+	keyPolicies = make(map[string]*EffectivePolicy, len(keyRows))
+	for id, kr := range keyRows {
+		chain := []PolicyRow{orgRow}
+		if kr.owner != "" {
+			if ur, ok := userRows[kr.owner]; ok {
+				chain = append(chain, ur)
+			}
+		}
+		chain = append(chain, kr.row)
+		eff := Effective(chain)
+		keyPolicies[id] = &eff
+	}
+
+	counts = PrincipalCounts{Users: len(userRows), APIKeys: len(keyRows)}
+	return orgPolicy, userPolicies, keyPolicies, counts
 }
 
 // rawRouteRow is one scanned model_alias_routes row (migration 013), in

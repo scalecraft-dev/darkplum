@@ -20,6 +20,10 @@ interface Props {
   onDelete: (id: string) => void
   onRename: (id: string, title: string) => void
   onRetry: () => void
+  /** A full page came back, so there may be older conversations still unread. */
+  hasMore?: boolean
+  loadingMore?: boolean
+  onLoadMore?: () => void
 }
 
 const SKELETON_WIDTHS = ['82%', '64%', '73%', '56%', '69%']
@@ -36,6 +40,9 @@ export function ConversationList({
   onDelete,
   onRename,
   onRetry,
+  hasMore = false,
+  loadingMore = false,
+  onLoadMore,
 }: Props) {
   const [renamingId, setRenamingId] = useState<string | null>(null)
   const [draftTitle, setDraftTitle] = useState('')
@@ -191,6 +198,19 @@ export function ConversationList({
             )
           })}
         </ul>
+      )}
+
+      {/* Older conversations are read on request rather than all at once: a
+          long history should not make opening chat slower. */}
+      {state === 'ready' && hasMore && onLoadMore && (
+        <button
+          type="button"
+          className={styles.loadMoreBtn}
+          onClick={onLoadMore}
+          disabled={loadingMore}
+        >
+          {loadingMore ? 'Loading…' : 'Load older conversations'}
+        </button>
       )}
 
       <Modal

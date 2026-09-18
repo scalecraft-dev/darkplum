@@ -1,0 +1,168 @@
+/* The allowlist control, shared by the organisation policy card and the
+   per-principal drawer. */
+
+.picker {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.search {
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  color: var(--fg-default);
+  font-family: var(--font-sans);
+  font-size: var(--fs-sm);
+}
+
+.search::placeholder {
+  color: var(--fg-subtle);
+}
+
+.search:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 1px;
+  border-color: var(--border-focus);
+}
+
+/* Aliases fill the list; they are never stored in it. The count is how many
+   concrete model ids one click adds. */
+.aliasRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.aliasRowLabel {
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+}
+
+.aliasBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 2px var(--space-2);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-full);
+  color: var(--fg-default);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+  transition: border-color var(--transition-fast), background var(--transition-fast);
+}
+
+.aliasBtn code {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+}
+
+.aliasBtn:hover {
+  border-color: var(--brand-default);
+  background: var(--brand-subtle);
+}
+
+.aliasBtn:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
+.aliasCount {
+  padding: 0 6px;
+  background: var(--bg-surface-raised);
+  border-radius: var(--radius-full);
+  color: var(--fg-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.modelList {
+  max-height: 260px;
+  overflow-y: auto;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+}
+
+.modelItem + .modelItem {
+  border-top: 1px solid var(--border-muted);
+}
+
+.modelLabel {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  cursor: pointer;
+}
+
+.modelLabel:hover {
+  background: var(--bg-surface-hover);
+}
+
+.modelLabel:focus-within {
+  outline: 2px solid var(--border-focus);
+  outline-offset: -2px;
+}
+
+.checkbox {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--brand-default);
+  flex-shrink: 0;
+}
+
+.modelText {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  flex: 1;
+}
+
+.modelName {
+  font-size: var(--fs-sm);
+  color: var(--fg-default);
+}
+
+.modelId {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+  overflow-wrap: anywhere;
+}
+
+.modelFlags {
+  display: flex;
+  flex-shrink: 0;
+  gap: var(--space-1);
+}
+
+.modelEmpty {
+  padding: var(--space-4) var(--space-3);
+  font-size: var(--fs-xs);
+  color: var(--fg-muted);
+  text-align: center;
+}
+
+.count {
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+  font-variant-numeric: tabular-nums;
+}
+
+@media (max-width: 767px) {
+  .modelFlags {
+    display: none;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .aliasBtn {
+    transition-duration: 0.01ms !important;
+  }
+}

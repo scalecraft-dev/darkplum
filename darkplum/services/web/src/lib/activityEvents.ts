@@ -25,6 +25,11 @@ export const EVENT_LABELS: Record<string, { label: string; variant: EventVariant
   'model_alias.updated':    { label: 'Alias Retargeted',       variant: 'info'    },
   'model_alias.deleted':    { label: 'Alias Deleted',          variant: 'info'    },
   'routing_policy.changed': { label: 'Routing Policy Changed', variant: 'warning' },
+
+  // Per-principal policy. The organisation event and the per-principal one are
+  // named apart: one moves everybody, the other moves one user or one key.
+  'routing_policy.org_changed':       { label: 'Org Policy Changed',       variant: 'warning' },
+  'routing_policy.principal_changed': { label: 'Principal Policy Changed', variant: 'warning' },
 }
 
 /** Plain-language rendering for detail values that are internal enums. */
@@ -39,7 +44,17 @@ const DETAIL_VALUE_LABELS: Record<string, Record<string, string>> = {
 const DETAIL_KEY_LABELS: Record<string, string> = {
   target_model_id: 'target',
   residency: 'routing',
+  allowed_models: 'allowed',
+  allowed_models_before: 'allowed before',
+  allowed_models_after: 'allowed after',
+  default_model: 'default',
+  principal_type: 'principal',
+  affected_principals: 'principals affected',
 }
+
+/** Beyond this, a list of model ids is noise in a table cell. The drawer and
+ *  the policy screens carry the full set. */
+const MAX_LISTED = 3
 
 /** "model_alias.retargeted" -> "Model Alias Retargeted". */
 export function humanizeEventType(eventType: string): string {
@@ -62,6 +77,13 @@ export function eventVariant(eventType: string): EventVariant {
  */
 export function formatDetailValue(value: unknown): string {
   if (value === null || value === undefined) return '—'
+  // Policy events carry allowlists. A JSON array in a table cell is unreadable;
+  // the first few ids and a count is not.
+  if (Array.isArray(value)) {
+    if (value.length === 0) return 'none'
+    const head = value.slice(0, MAX_LISTED).map(String).join(', ')
+    return value.length > MAX_LISTED ? `${head} +${value.length - MAX_LISTED} more` : head
+  }
   if (typeof value === 'object') {
     try {
       return JSON.stringify(value)

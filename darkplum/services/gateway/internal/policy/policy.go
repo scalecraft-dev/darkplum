@@ -78,6 +78,15 @@ func (a AliasDef) Route(name string) (RouteDef, bool) {
 	return RouteDef{}, false
 }
 
+// PrincipalCounts is the number of principals with an EXPLICIT policy row in
+// principal_routing_policies at snapshot-load time — i.e. len(UserPolicies)
+// and len(KeyPolicies), not every user/key that exists. Reported on /health
+// as policy.principals.
+type PrincipalCounts struct {
+	Users   int
+	APIKeys int
+}
+
 // Snapshot is the routing-enforcement policy in effect at a point in time.
 type Snapshot struct {
 	// Enabled maps model_id -> models.enabled. A model absent from this map
@@ -88,8 +97,34 @@ type Snapshot struct {
 	// re-resolved through Aliases again (model_aliases guarantees a target is
 	// never itself an alias).
 	Aliases map[string]AliasDef
-	// Residency is ResidencyAny or ResidencySelfHostedOnly.
+	// Residency is ResidencyAny or ResidencySelfHostedOnly. This is the
+	// org-level value only (routing_policy.residency, or the org row of
+	// principal_routing_policies once migration 015 lands) — per-principal
+	// enforcement must use EffectiveFor's strictest value instead, not this
+	// field directly.
 	Residency string
+
+	// OrgPolicy is the org level's own precomputed EffectivePolicy (chain of
+	// exactly the org row). Every principal with no row of its own shares
+	// this exact pointer via EffectiveFor — see buildPrincipalPolicies. Never
+	// nil for a Snapshot loaded by PgStore; nil only for a Snapshot built by
+	// hand (tests, or a field literal that only sets Enabled/Aliases/Residency).
+	OrgPolicy *EffectivePolicy
+	// UserPolicies maps user_id -> precomputed EffectivePolicy, one entry per
+	// EXPLICIT row of principal_routing_policies with principal_type='user'
+	// (chain: org row, then that user's row). A user with no row has no entry
+	// here — EffectiveFor falls back to OrgPolicy for it.
+	UserPolicies map[string]*EffectivePolicy
+	// KeyPolicies maps api_key_id -> precomputed EffectivePolicy, one entry
+	// per EXPLICIT row of principal_routing_policies with
+	// principal_type='api_key' (chain: org row, then the key's owning user's
+	// row if one exists, then the key's own row). A key with no row has no
+	// entry here — EffectiveFor falls back to UserPolicies (or OrgPolicy) for
+	// it. Never consulted for a service key (see EffectiveFor).
+	KeyPolicies map[string]*EffectivePolicy
+	// PrincipalCounts is len(UserPolicies)/len(KeyPolicies), reported as-is
+	// on /health.
+	PrincipalCounts PrincipalCounts
 }
 
 // StaticTarget returns the target of a static alias, mirroring the

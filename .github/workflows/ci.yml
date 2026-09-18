@@ -69,6 +69,11 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm exec tsc --noEmit
       - run: pnpm run build
+      # API <-> UI parity: every route the UI calls is in docs/api-routes.json as
+      # "ui", every "ui" route is called, machine-only routes carry a reason, and
+      # no fetch() lives outside the API client. The Go services run the same
+      # golden against their live route tables.
+      - run: pnpm run check:parity
 
   terraform:
     name: Terraform
@@ -92,13 +97,17 @@ jobs:
           terraform test
 
   manifests:
-    name: Kubernetes manifests
+    name: Kubernetes manifests and docs
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: darkplum
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: darkplum/services/api/go.mod
+          cache-dependency-path: darkplum/services/api/go.sum
       - uses: azure/setup-kubectl@v4
       - name: kustomize builds
         run: |
@@ -113,3 +122,8 @@ jobs:
             | python3 -c 'import sys, yaml; docs = list(yaml.safe_load_all(sys.stdin)); assert {d["kind"] for d in docs} == {"Deployment", "Service"}, docs'
       - name: Makefile parses
         run: make -n help > /dev/null
+      - name: API reference is generated from the golden
+        working-directory: darkplum/services/api
+        run: |
+          go run ./cmd/apidoc
+          git diff --exit-code -- ../../docs/API.md || { echo "docs/API.md is stale: run 'go run ./cmd/apidoc' in services/api and commit the result"; exit 1; }

@@ -247,23 +247,26 @@ func buildRouter(chatHandler *handler.ChatHandler, apiKeyMW, recordingMW, health
 	v1 := engine.Group("/v1")
 	v1.Use(apiKeyMW)
 
-	// GET /v1/models and POST /v1/routing/dryrun are authenticated but not
-	// wrapped in recordingMW: recordingMW builds and records exactly one
-	// purpose="inference" InferenceEvent per POST, which is right for
-	// /chat/completions but wrong for a dryrun (it never dispatches to any
-	// model, and records nothing itself — see HandleRoutingDryrun). GET
-	// /v1/models is unaffected either way (Recording is a POST-only
-	// middleware) but is kept out of the recorded group for the same reason:
-	// it never produces an inference_events row.
+	// GET /v1/models, POST /v1/routing/dryrun, and GET /v1/policy/effective
+	// are authenticated but not wrapped in recordingMW: recordingMW builds
+	// and records exactly one purpose="inference" InferenceEvent per POST,
+	// which is right for /chat/completions but wrong for a dryrun (it never
+	// dispatches to any model, and records nothing itself — see
+	// HandleRoutingDryrun) or an effective-policy lookup (a metadata read,
+	// not an inference). GET /v1/models and GET /v1/policy/effective are
+	// unaffected either way (Recording is a POST-only middleware) but are
+	// kept out of the recorded group for the same reason: neither ever
+	// produces an inference_events row.
 	v1.GET("/models", chatHandler.HandleListModels)
 	v1.POST("/routing/dryrun", chatHandler.HandleRoutingDryrun)
+	v1.GET("/policy/effective", chatHandler.HandleEffectivePolicy)
 
-	// Only three endpoints are served under /v1. There is no reverse-proxy
+	// Only four endpoints are served under /v1. There is no reverse-proxy
 	// passthrough: the previous behaviour forwarded every other
 	// GET/DELETE/PUT/PATCH /v1/* request straight to the default vLLM
 	// upstream with no policy check — an open allowlist onto a third party's
 	// route table that also leaked GET /v1/models/{id} metadata for arbitrary
-	// ids. Every other /v1/* path, and every other method on these three
+	// ids. Every other /v1/* path, and every other method on these four
 	// paths, falls through to the NoRoute handler below.
 	recorded := v1.Group("")
 	recorded.Use(recordingMW)
@@ -305,6 +308,17 @@ type semanticRouterHealthStatus interface {
 	Status() (breakerOpen bool, consecutiveFailures int)
 }
 
+// policyHealthStatus is the subset of *policy.PgStore that newHealthHandler
+// needs. Defined as an interface (mirroring semanticRouterHealthStatus above)
+// so tests can substitute a fake Snapshot/Status directly — including one
+// carrying PrincipalCounts — without going through PgStore's real load
+// machinery, which requires a live pool or the policy package's own
+// unexported test seams.
+type policyHealthStatus interface {
+	Status() policy.Status
+	Current() (policy.Snapshot, bool)
+}
+
 // newHealthHandler builds the /health handler. /health is the liveness AND
 // readiness probe endpoint: it always returns 200 as long as the process is
 // healthy — upstream reachability, routing source state, policy staleness,
@@ -323,7 +337,7 @@ type semanticRouterHealthStatus interface {
 // log by routing.Manager.Refresh. Similarly, semanticClassifier.HealthStatus
 // is a cached, rate-limited probe (see SemanticRouterClassifier) — this
 // handler never triggers a network call itself.
-func newHealthHandler(upstreamChecker *health.Checker, routeMgr *routing.Manager, polStore *policy.PgStore, semanticClassifier semanticRouterHealthStatus) gin.HandlerFunc {
+func newHealthHandler(upstreamChecker *health.Checker, routeMgr *routing.Manager, polStore policyHealthStatus, semanticClassifier semanticRouterHealthStatus) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		upstreams := upstreamChecker.Check(c.Request.Context())
 		upstreamBody := make(map[string]string, len(upstreams))
@@ -342,6 +356,16 @@ func newHealthHandler(upstreamChecker *health.Checker, routeMgr *routing.Manager
 		}
 
 		policyStatus := polStore.Status()
+
+		// principals reports how many explicit user/api_key policy rows are
+		// currently loaded (policy.Snapshot.PrincipalCounts) — zero for both
+		// when no snapshot has ever loaded, or before migration 015 exists on
+		// the customer database (the 42P01-tolerance path still produces a
+		// loaded Snapshot with zero explicit principal rows).
+		principals := gin.H{"users": 0, "api_keys": 0}
+		if snap, ok := polStore.Current(); ok {
+			principals = gin.H{"users": snap.PrincipalCounts.Users, "api_keys": snap.PrincipalCounts.APIKeys}
+		}
 
 		srBreakerOpen, srConsecutiveFailures := semanticClassifier.Status()
 		srHealthStatus := semanticClassifier.HealthStatus(c.Request.Context())
@@ -364,6 +388,7 @@ func newHealthHandler(upstreamChecker *health.Checker, routeMgr *routing.Manager
 				"loaded":      policyStatus.Loaded,
 				"age_seconds": policyStatus.AgeSeconds,
 				"stale":       policyStatus.Stale,
+				"principals":  principals,
 			},
 		})
 	}

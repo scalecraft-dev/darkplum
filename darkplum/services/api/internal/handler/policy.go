@@ -1,0 +1,1151 @@
+// Per-principal routing policy: org -> user -> api_key (migration
+// 015_principal_policies.sql). Same JSON shape at every level:
+//
+//	{"residency": null|"self_hosted_only", "allowed_models": null|[...], "default_model": null|string}
+//
+// null always means "inherit the level above"; org's null residency means
+// "any" (there is nothing above org). allowed_models is a tri-state via
+// *[]string: nil (absent or JSON null) = inherit, a non-nil (possibly empty)
+// slice = an explicit allowlist. An explicit empty allowlist is only ever
+// meaningful as an intermediate value on the way to a 409 lock-out check
+// below -- it is never silently accepted as "deny everything" without that
+// check running first.
+//
+// "Effective" (the merged, enforced view) has exactly ONE implementation, in
+// the gateway (internal/policy) -- see gatewayEffectiveClient. Every "GET
+// .../effective" and preview endpoint here proxies that endpoint (or, for
+// PUT-time validation where the change is not yet persisted and can't be
+// asked of the gateway, reimplements the same intersection/lock-out logic
+// locally in Go -- see mergeAllowedModels -- purely so writes do not depend
+// on the gateway being reachable).
+package handler
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"sort"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/scalecraft/darkplum/api/internal/activity"
+)
+
+const (
+	principalTypeOrg    = "org"
+	principalTypeUser   = "user"
+	principalTypeAPIKey = "api_key"
+
+	// principalsListMaxLimit caps GET /api/v1/routing-policy/principals'
+	// page size (and hence the number of per-principal gateway calls it
+	// makes -- see PolicyHandler.ListPrincipalPolicies) at 200, per contract.
+	principalsListMaxLimit     = 200
+	principalsListDefaultLimit = 50
+
+	// gatewayEffectiveTimeout bounds one call to the gateway's
+	// GET /v1/policy/effective. Kept short (well under the 10s
+	// RoutingHandler/ModelHandler client timeouts used elsewhere) because
+	// this endpoint backs interactive admin views and the chat model
+	// picker -- a slow gateway must fail fast, not hang the request.
+	gatewayEffectiveTimeout = 2 * time.Second
+
+	// modelsEffectiveCacheTTL bounds how often ListModels re-fetches a given
+	// session user's effective policy from the gateway; see
+	// ModelHandler.getSessionEffective.
+	modelsEffectiveCacheTTL = 5 * time.Second
+)
+
+// policyObject is the wire shape for a principal's own stored policy row
+// (user/api_key), used by GET/PUT .../routing-policy. Residency and
+// AllowedModels are tri-state pointers: nil means "inherit"; AllowedModels
+// additionally distinguishes an explicit empty list ([]              , not
+// nil) from "inherit" (nil).
+type policyObject struct {
+	Residency     *string   `json:"residency"`
+	AllowedModels *[]string `json:"allowed_models"`
+	DefaultModel  *string   `json:"default_model"`
+}
+
+// principalPolicyResponse is GET/PUT .../routing-policy's response shape for
+// a user or api_key principal.
+type principalPolicyResponse struct {
+	Residency     *string    `json:"residency"`
+	AllowedModels *[]string  `json:"allowed_models"`
+	DefaultModel  *string    `json:"default_model"`
+	UpdatedAt     *time.Time `json:"updated_at,omitempty"`
+}
+
+// validPrincipalResidency mirrors principal_routing_policies.residency's
+// CHECK constraint: nil (inherit) or exactly "self_hosted_only". Unlike the
+// org level, a principal can never explicitly set "any" -- there is nothing
+// to override "any" with, since inheriting IS "any" in the absence of a
+// stricter ancestor.
+func validPrincipalResidency(r *string) bool {
+	return r == nil || *r == residencySelfHostedOnly
+}
+
+// mergeAllowedModels reproduces the gateway's allowed_models merge
+// (internal/policy, DESIGN4's Effective(chain)) locally: the intersection of
+// every non-nil allowlist in the chain, in org->user->key order. A chain
+// with no non-nil entries returns nil ("no restriction" = every model). A
+// chain whose non-nil entries intersect to nothing returns a non-nil, empty
+// slice -- the caller uses that to refuse a PUT that would lock the
+// principal out (see validatePrincipalPolicyWrite) rather than to filter
+// anything itself.
+//
+// Pure and order-independent (intersection commutes) so it is unit-testable
+// without a database.
+func mergeAllowedModels(chain ...*[]string) *[]string {
+	var sets []map[string]bool
+	for _, c := range chain {
+		if c == nil {
+			continue
+		}
+		set := make(map[string]bool, len(*c))
+		for _, id := range *c {
+			set[id] = true
+		}
+		sets = append(sets, set)
+	}
+	if len(sets) == 0 {
+		return nil
+	}
+
+	inter := sets[0]
+	for _, s := range sets[1:] {
+		next := make(map[string]bool, len(inter))
+		for id := range inter {
+			if s[id] {
+				next[id] = true
+			}
+		}
+		inter = next
+	}
+
+	ids := make([]string, 0, len(inter))
+	for id := range inter {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return &ids
+}
+
+// modelAllowed reports whether id is permitted by an (already-merged)
+// effective allowlist: nil means unrestricted (always true); otherwise id
+// must be a member.
+func modelAllowed(effective *[]string, id string) bool {
+	if effective == nil {
+		return true
+	}
+	for _, m := range *effective {
+		if m == id {
+			return true
+		}
+	}
+	return false
+}
+
+// aliasLookup is the result of resolving a candidate default_model id
+// against models/model_aliases.
+type aliasLookup struct {
+	isModel      bool
+	isAlias      bool
+	aliasTargets []string // for an alias: its target (static) or every route's target (routed)
+}
+
+// lookupModelOrAlias classifies id as a concrete model, an alias, or
+// unknown, and for an alias resolves its target(s) -- used by both allowlist
+// validation (aliases are rejected there) and default_model validation
+// (aliases are allowed there, checked against their targets).
+func lookupModelOrAlias(ctx context.Context, db *pgxpool.Pool, id string) (aliasLookup, error) {
+	var lk aliasLookup
+	if err := db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM models WHERE model_id = $1)`, id).Scan(&lk.isModel); err != nil {
+		return lk, fmt.Errorf("check model existence: %w", err)
+	}
+
+	var kind *string
+	var target *string
+	err := db.QueryRow(ctx, `SELECT kind, target_model_id FROM model_aliases WHERE alias = $1`, id).Scan(&kind, &target)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return lk, fmt.Errorf("check alias existence: %w", err)
+	}
+	if err == nil {
+		lk.isAlias = true
+		if kind != nil && *kind == aliasKindStatic && target != nil {
+			lk.aliasTargets = []string{*target}
+		} else {
+			rows, rErr := db.Query(ctx, `SELECT target_model_id FROM model_alias_routes WHERE alias = $1`, id)
+			if rErr != nil {
+				return lk, fmt.Errorf("load alias routes: %w", rErr)
+			}
+			defer rows.Close()
+			for rows.Next() {
+				var t string
+				if sErr := rows.Scan(&t); sErr != nil {
+					return lk, fmt.Errorf("scan alias route target: %w", sErr)
+				}
+				lk.aliasTargets = append(lk.aliasTargets, t)
+			}
+			if rErr := rows.Err(); rErr != nil {
+				return lk, fmt.Errorf("alias route rows: %w", rErr)
+			}
+		}
+	}
+	return lk, nil
+}
+
+// validateAllowedModelIDs enforces the allowlist contract: every id must be
+// a real, currently-known model id -- never an alias (aliases resolve to
+// zero, one, or many models depending on routing/classification, so an
+// allowlist entry naming one would be ambiguous policy). Returns a single
+// error describing the first problem found; used for the 400 response body.
+func validateAllowedModelIDs(ctx context.Context, db *pgxpool.Pool, ids []string) error {
+	for _, id := range ids {
+		lk, err := lookupModelOrAlias(ctx, db, id)
+		if err != nil {
+			return err
+		}
+		if lk.isAlias {
+			return fmt.Errorf("allowlists take model ids; add the alias's targets instead: %s", id)
+		}
+		if !lk.isModel {
+			return fmt.Errorf("unknown model id: %s", id)
+		}
+	}
+	return nil
+}
+
+// validateDefaultModel checks that a candidate default_model is a real
+// model or alias id, and — when effective is a restricted (non-nil)
+// allowlist — that it is actually reachable under it: a concrete model id
+// must be a member; an alias must have at least one target that is (its
+// other targets are simply never selectable, exactly as a route to a
+// disallowed target is refused per-request rather than silently swapped).
+func validateDefaultModel(ctx context.Context, db *pgxpool.Pool, id string, effective *[]string) error {
+	lk, err := lookupModelOrAlias(ctx, db, id)
+	if err != nil {
+		return err
+	}
+	if !lk.isModel && !lk.isAlias {
+		return fmt.Errorf("unknown model or alias id: %s", id)
+	}
+	if effective == nil {
+		return nil
+	}
+	if lk.isModel && !lk.isAlias {
+		if !modelAllowed(effective, id) {
+			return fmt.Errorf("default_model %q is not in the effective allowlist", id)
+		}
+		return nil
+	}
+	for _, t := range lk.aliasTargets {
+		if modelAllowed(effective, t) {
+			return nil
+		}
+	}
+	return fmt.Errorf("default_model %q (alias) has no target in the effective allowlist", id)
+}
+
+// gatewayEffectivePolicy is the wire shape of the gateway's
+// GET /v1/policy/effective (service-key only) -- see DESIGN4's Gateway
+// section. AllowedModels is nil for "every model" (no restriction).
+type gatewayEffectivePolicy struct {
+	AllowedModels   *[]string         `json:"allowed_models"`
+	Residency       string            `json:"residency"`
+	DefaultModel    *string           `json:"default_model"`
+	Sources         map[string]string `json:"sources"`
+	ReachableModels []string          `json:"reachable_models"`
+}
+
+// gatewayEffectiveClient calls the gateway's GET /v1/policy/effective, the
+// single implementation of the org->user->key merge. Every "effective" view
+// in the api (admin, /me, previews' shown-to-user fields, /v1/models
+// filtering) proxies through this rather than re-deriving the merge, so
+// those views can never disagree with what the gateway will actually
+// enforce on the next request.
+type gatewayEffectiveClient struct {
+	gatewayURL string
+	serviceKey string
+	client     *http.Client
+}
+
+func newGatewayEffectiveClient(gatewayURL, serviceKey string) *gatewayEffectiveClient {
+	return &gatewayEffectiveClient{
+		gatewayURL: gatewayURL,
+		serviceKey: serviceKey,
+		client:     &http.Client{Timeout: gatewayEffectiveTimeout},
+	}
+}
+
+// effective calls GET {gatewayURL}/v1/policy/effective?user_id=...[&api_key_id=...].
+// A non-nil error means the caller should treat the gateway as unreachable
+// or misbehaving -- callers decide per endpoint whether that becomes a 502
+// (admin effective/preview endpoints) or a warned-and-degraded fallback
+// (ListModels).
+func (g *gatewayEffectiveClient) effective(ctx context.Context, userID string, apiKeyID *string) (*gatewayEffectivePolicy, error) {
+	ctx, cancel := context.WithTimeout(ctx, gatewayEffectiveTimeout)
+	defer cancel()
+
+	target := fmt.Sprintf("%s/v1/policy/effective?user_id=%s", g.gatewayURL, url.QueryEscape(userID))
+	if apiKeyID != nil {
+		target += "&api_key_id=" + url.QueryEscape(*apiKeyID)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
+	if err != nil {
+		return nil, fmt.Errorf("build effective policy request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+g.serviceKey)
+
+	resp, err := g.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("call gateway effective policy: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("gateway effective policy returned %d", resp.StatusCode)
+	}
+
+	var out gatewayEffectivePolicy
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 256*1024)).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode gateway effective policy: %w", err)
+	}
+	return &out, nil
+}
+
+// PolicyHandler serves the per-principal routing-policy endpoints: GET/PUT/
+// DELETE on a user's or api key's own policy row, the admin/self "effective"
+// proxies, the principals overview list, and impact previews. Org-level GET/
+// PUT stay on RoutingHandler (routing.go) alongside the alias/residency logic
+// they already share.
+type PolicyHandler struct {
+	db       *pgxpool.Pool
+	activity *activity.Recorder
+	gateway  *gatewayEffectiveClient
+}
+
+// NewPolicyHandler returns a PolicyHandler backed by db, calling the
+// gateway's effective-policy endpoint with the service credential.
+func NewPolicyHandler(db *pgxpool.Pool, rec *activity.Recorder, gatewayURL, serviceKey string) *PolicyHandler {
+	return &PolicyHandler{
+		db:       db,
+		activity: rec,
+		gateway:  newGatewayEffectiveClient(gatewayURL, serviceKey),
+	}
+}
+
+// orgAllowedModels reads the org row's allowed_models column, used as the
+// top of every merge chain below. The org row is guaranteed to exist by
+// migration 015's seed insert.
+func orgAllowedModels(ctx context.Context, db *pgxpool.Pool) (*[]string, error) {
+	var allowed *[]string
+	err := db.QueryRow(ctx, `SELECT allowed_models FROM principal_routing_policies WHERE principal_type = 'org'`).Scan(&allowed)
+	if err != nil {
+		return nil, fmt.Errorf("read org allowed_models: %w", err)
+	}
+	return allowed, nil
+}
+
+// getPrincipalPolicy reads one user or api_key's own stored policy row (nil
+// fields if no row exists — "inherit everything").
+func getPrincipalPolicy(ctx context.Context, db *pgxpool.Pool, principalType, id string) (*policyObject, *time.Time, error) {
+	col := "user_id"
+	if principalType == principalTypeAPIKey {
+		col = "api_key_id"
+	}
+	var p policyObject
+	var updatedAt time.Time
+	err := db.QueryRow(ctx, fmt.Sprintf(`
+		SELECT residency, allowed_models, default_model, updated_at
+		FROM principal_routing_policies WHERE principal_type = $1 AND %s = $2
+	`, col), principalType, id).Scan(&p.Residency, &p.AllowedModels, &p.DefaultModel, &updatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil, nil
+	}
+	if err != nil {
+		return nil, nil, fmt.Errorf("read principal policy: %w", err)
+	}
+	return &p, &updatedAt, nil
+}
+
+// userExists/apiKeyOwner are small existence/ownership lookups shared by the
+// principal-policy handlers below.
+func userExists(ctx context.Context, db *pgxpool.Pool, id string) (bool, error) {
+	var ok bool
+	err := db.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM users WHERE id = $1)`, id).Scan(&ok)
+	return ok, err
+}
+
+// apiKeyInfo is what the policy handlers need about an api_keys row: its
+// owner, name (for lock-out messages), and whether it is revoked (revoked
+// keys keep their policy row for audit but never count toward a lock-out —
+// they can't make requests either way).
+type apiKeyInfo struct {
+	UserID    string
+	Name      string
+	RevokedAt *time.Time
+}
+
+func lookupAPIKey(ctx context.Context, db *pgxpool.Pool, id string) (*apiKeyInfo, error) {
+	var info apiKeyInfo
+	err := db.QueryRow(ctx, `SELECT user_id, name, revoked_at FROM api_keys WHERE id = $1`, id).
+		Scan(&info.UserID, &info.Name, &info.RevokedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &info, nil
+}
+
+// activeUserKeys lists a user's non-revoked api_keys (id, name, and their
+// own explicit allowed_models override, if any) — used to check every key a
+// user owns for a lock-out when the user's own policy is tightened.
+type ownedKey struct {
+	ID            string
+	Name          string
+	AllowedModels *[]string
+}
+
+func activeUserKeys(ctx context.Context, db *pgxpool.Pool, userID string) ([]ownedKey, error) {
+	rows, err := db.Query(ctx, `
+		SELECT k.id, k.name, p.allowed_models
+		FROM api_keys k
+		LEFT JOIN principal_routing_policies p ON p.principal_type = 'api_key' AND p.api_key_id = k.id
+		WHERE k.user_id = $1 AND k.revoked_at IS NULL
+	`, userID)
+	if err != nil {
+		return nil, fmt.Errorf("list user api keys: %w", err)
+	}
+	defer rows.Close()
+	var keys []ownedKey
+	for rows.Next() {
+		var k ownedKey
+		if err := rows.Scan(&k.ID, &k.Name, &k.AllowedModels); err != nil {
+			return nil, fmt.Errorf("scan user api key: %w", err)
+		}
+		keys = append(keys, k)
+	}
+	return keys, rows.Err()
+}
+
+// lockedOutKey names one api_key that would have (or has) an empty effective
+// allowlist, for the 409 message and the preview response's would_lock_out.
+type lockedOutKey struct {
+	ID   string
+	Name string
+}
+
+// validatePrincipalPolicyWrite runs every format/existence/lock-out check
+// shared by PUT and preview for a user or api_key policy. It never touches
+// the database for writes -- callers do that afterward once this returns no
+// error. orgAM is the org's own allowed_models (top of every chain).
+// ownerUserAM is nil for a user-principal write (there is no owner above a
+// user other than org) and the owning user's CURRENT stored allowed_models
+// for an api_key-principal write.
+func validatePrincipalPolicyWrite(ctx context.Context, db *pgxpool.Pool, principalType string, req policyObject, orgAM *[]string, ownerUserAM *[]string) (effective *[]string, err error) {
+	if !validPrincipalResidency(req.Residency) {
+		return nil, errors.New("residency must be null or 'self_hosted_only'")
+	}
+	if req.AllowedModels != nil {
+		if err := validateAllowedModelIDs(ctx, db, *req.AllowedModels); err != nil {
+			return nil, err
+		}
+	}
+
+	var chain []*[]string
+	chain = append(chain, orgAM)
+	if principalType == principalTypeAPIKey {
+		chain = append(chain, ownerUserAM)
+	}
+	chain = append(chain, req.AllowedModels)
+	effective = mergeAllowedModels(chain...)
+
+	if req.DefaultModel != nil {
+		if err := validateDefaultModel(ctx, db, *req.DefaultModel, effective); err != nil {
+			return nil, err
+		}
+	}
+
+	return effective, nil
+}
+
+// GetUserPolicy handles GET /api/v1/users/:id/routing-policy.
+func (h *PolicyHandler) GetUserPolicy(c *gin.Context) {
+	id := c.Param("id")
+	if !isValidUUID(id) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid user id"})
+		return
+	}
+	ok, err := userExists(c.Request.Context(), h.db, id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "check user failed"})
+		return
+	}
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+		return
+	}
+	h.respondPolicy(c, principalTypeUser, id)
+}
+
+// GetAPIKeyPolicy handles GET /api/v1/api-keys/:id/routing-policy.
+func (h *PolicyHandler) GetAPIKeyPolicy(c *gin.Context) {
+	id := c.Param("id")
+	if !isValidUUID(id) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid api key id"})
+		return
+	}
+	info, err := lookupAPIKey(c.Request.Context(), h.db, id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "check api key failed"})
+		return
+	}
+	if info == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "api key not found"})
+		return
+	}
+	h.respondPolicy(c, principalTypeAPIKey, id)
+}
+
+func (h *PolicyHandler) respondPolicy(c *gin.Context, principalType, id string) {
+	p, updatedAt, err := getPrincipalPolicy(c.Request.Context(), h.db, principalType, id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "get policy failed"})
+		return
+	}
+	resp := principalPolicyResponse{UpdatedAt: updatedAt}
+	if p != nil {
+		resp.Residency = p.Residency
+		resp.AllowedModels = p.AllowedModels
+		resp.DefaultModel = p.DefaultModel
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+// PutUserPolicy handles PUT /api/v1/users/:id/routing-policy.
+func (h *PolicyHandler) PutUserPolicy(c *gin.Context) {
+	id := c.Param("id")
+	if !isValidUUID(id) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid user id"})
+		return
+	}
+	ctx := c.Request.Context()
+	ok, err := userExists(ctx, h.db, id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "check user failed"})
+		return
+	}
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+		return
+	}
+
+	var req policyObject
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	orgAM, err := orgAllowedModels(ctx, h.db)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "read org policy failed"})
+		return
+	}
+
+	effective, err := validatePrincipalPolicyWrite(ctx, h.db, principalTypeUser, req, orgAM, nil)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	var lockedOut []lockedOutKey
+	if effective != nil && len(*effective) == 0 {
+		lockedOut = append(lockedOut, lockedOutKey{ID: id, Name: "(user)"})
+	}
+	keys, err := activeUserKeys(ctx, h.db, id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "list user api keys failed"})
+		return
+	}
+	for _, k := range keys {
+		keyEff := mergeAllowedModels(orgAM, req.AllowedModels, k.AllowedModels)
+		if keyEff != nil && len(*keyEff) == 0 {
+			lockedOut = append(lockedOut, lockedOutKey{ID: k.ID, Name: k.Name})
+		}
+	}
+	if len(lockedOut) > 0 {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":      "this policy would leave the user (or a key it owns) with no reachable models",
+			"locked_out": lockedOutNames(lockedOut),
+		})
+		return
+	}
+
+	before, _, err := getPrincipalPolicy(ctx, h.db, principalTypeUser, id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "read current policy failed"})
+		return
+	}
+
+	resp, err := h.upsertPolicy(ctx, c, principalTypeUser, id, req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "update policy failed"})
+		return
+	}
+
+	h.recordPrincipalChanged(c, principalTypeUser, id, before, &req)
+	c.JSON(http.StatusOK, resp)
+}
+
+// PutAPIKeyPolicy handles PUT /api/v1/api-keys/:id/routing-policy.
+func (h *PolicyHandler) PutAPIKeyPolicy(c *gin.Context) {
+	id := c.Param("id")
+	if !isValidUUID(id) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid api key id"})
+		return
+	}
+	ctx := c.Request.Context()
+	info, err := lookupAPIKey(ctx, h.db, id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "check api key failed"})
+		return
+	}
+	if info == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "api key not found"})
+		return
+	}
+
+	var req policyObject
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	orgAM, err := orgAllowedModels(ctx, h.db)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "read org policy failed"})
+		return
+	}
+	ownerPolicy, _, err := getPrincipalPolicy(ctx, h.db, principalTypeUser, info.UserID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "read owner policy failed"})
+		return
+	}
+	var ownerAM *[]string
+	if ownerPolicy != nil {
+		ownerAM = ownerPolicy.AllowedModels
+	}
+
+	effective, err := validatePrincipalPolicyWrite(ctx, h.db, principalTypeAPIKey, req, orgAM, ownerAM)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if effective != nil && len(*effective) == 0 {
+		c.JSON(http.StatusConflict, gin.H{
+			"error":      "this policy would lock this key out of every model",
+			"locked_out": []string{info.Name},
+		})
+		return
+	}
+
+	before, _, err := getPrincipalPolicy(ctx, h.db, principalTypeAPIKey, id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "read current policy failed"})
+		return
+	}
+
+	resp, err := h.upsertPolicy(ctx, c, principalTypeAPIKey, id, req)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "update policy failed"})
+		return
+	}
+
+	h.recordPrincipalChanged(c, principalTypeAPIKey, id, before, &req)
+	c.JSON(http.StatusOK, resp)
+}
+
+func lockedOutNames(keys []lockedOutKey) []string {
+	names := make([]string, len(keys))
+	for i, k := range keys {
+		names[i] = k.Name
+	}
+	return names
+}
+
+// upsertPolicy writes req as principalType/id's stored policy row via the
+// partial-unique-index upsert matching migration 015, and returns the
+// resulting principalPolicyResponse.
+func (h *PolicyHandler) upsertPolicy(ctx context.Context, c *gin.Context, principalType, id string, req policyObject) (principalPolicyResponse, error) {
+	var updatedBy *string
+	if uid := c.GetString("user_id"); uid != "" {
+		updatedBy = &uid
+	}
+
+	col := "user_id"
+	if principalType == principalTypeAPIKey {
+		col = "api_key_id"
+	}
+
+	var resp principalPolicyResponse
+	err := h.db.QueryRow(ctx, fmt.Sprintf(`
+		INSERT INTO principal_routing_policies (principal_type, %s, residency, allowed_models, default_model, updated_at, updated_by)
+		VALUES ($1, $2, $3, $4, $5, now(), $6)
+		ON CONFLICT (%s) WHERE %s IS NOT NULL DO UPDATE
+			SET residency = EXCLUDED.residency, allowed_models = EXCLUDED.allowed_models,
+				default_model = EXCLUDED.default_model, updated_at = now(), updated_by = EXCLUDED.updated_by
+		RETURNING residency, allowed_models, default_model, updated_at
+	`, col, col, col), principalType, id, req.Residency, req.AllowedModels, req.DefaultModel, updatedBy).
+		Scan(&resp.Residency, &resp.AllowedModels, &resp.DefaultModel, &resp.UpdatedAt)
+	return resp, err
+}
+
+func (h *PolicyHandler) recordPrincipalChanged(c *gin.Context, principalType, id string, before *policyObject, after *policyObject) {
+	evt := activity.FromContext(c, activity.RoutingPolicyPrincipalChanged)
+	evt.TargetType = activity.StrPtr(principalType)
+	evt.TargetID = activity.StrPtr(id)
+	evt.Detail = map[string]any{
+		"principal_type": principalType,
+		"before":         before,
+		"after":          after,
+	}
+	h.activity.Record(c.Request.Context(), evt)
+}
+
+// DeleteUserPolicy handles DELETE /api/v1/users/:id/routing-policy -- reset
+// to fully inherit (removes the stored row; 204 whether or not one existed).
+func (h *PolicyHandler) DeleteUserPolicy(c *gin.Context) {
+	h.deletePolicy(c, principalTypeUser, "user_id", func(ctx context.Context, id string) (bool, error) {
+		return userExists(ctx, h.db, id)
+	})
+}
+
+// DeleteAPIKeyPolicy handles DELETE /api/v1/api-keys/:id/routing-policy.
+func (h *PolicyHandler) DeleteAPIKeyPolicy(c *gin.Context) {
+	h.deletePolicy(c, principalTypeAPIKey, "api_key_id", func(ctx context.Context, id string) (bool, error) {
+		info, err := lookupAPIKey(ctx, h.db, id)
+		return info != nil, err
+	})
+}
+
+func (h *PolicyHandler) deletePolicy(c *gin.Context, principalType, col string, exists func(context.Context, string) (bool, error)) {
+	id := c.Param("id")
+	if !isValidUUID(id) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid id"})
+		return
+	}
+	ctx := c.Request.Context()
+	ok, err := exists(ctx, id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "check principal failed"})
+		return
+	}
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "principal not found"})
+		return
+	}
+
+	before, _, err := getPrincipalPolicy(ctx, h.db, principalType, id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "read current policy failed"})
+		return
+	}
+
+	if _, err := h.db.Exec(ctx, fmt.Sprintf(
+		`DELETE FROM principal_routing_policies WHERE principal_type = $1 AND %s = $2`, col,
+	), principalType, id); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "delete policy failed"})
+		return
+	}
+
+	if before != nil {
+		h.recordPrincipalChanged(c, principalType, id, before, nil)
+	}
+	c.Status(http.StatusNoContent)
+}
+
+// GetUserPolicyEffective handles GET /api/v1/users/:id/routing-policy/effective (admin).
+func (h *PolicyHandler) GetUserPolicyEffective(c *gin.Context) {
+	id := c.Param("id")
+	if !isValidUUID(id) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid user id"})
+		return
+	}
+	ok, err := userExists(c.Request.Context(), h.db, id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "check user failed"})
+		return
+	}
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+		return
+	}
+	h.respondEffective(c, principalTypeUser, id, id, nil)
+}
+
+// GetAPIKeyPolicyEffective handles GET /api/v1/api-keys/:id/routing-policy/effective (admin).
+func (h *PolicyHandler) GetAPIKeyPolicyEffective(c *gin.Context) {
+	id := c.Param("id")
+	if !isValidUUID(id) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid api key id"})
+		return
+	}
+	info, err := lookupAPIKey(c.Request.Context(), h.db, id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "check api key failed"})
+		return
+	}
+	if info == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "api key not found"})
+		return
+	}
+	h.respondEffective(c, principalTypeAPIKey, id, info.UserID, &id)
+}
+
+// GetMyPolicyEffective handles GET /api/v1/me/routing-policy/effective (any
+// session user, for themselves only -- no "stored" field, since a
+// non-admin has no reason to see the raw row versus the merged view).
+func (h *PolicyHandler) GetMyPolicyEffective(c *gin.Context) {
+	userID := c.GetString("user_id")
+	if userID == "" {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "not authenticated"})
+		return
+	}
+	eff, err := h.gateway.effective(c.Request.Context(), userID, nil)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "gateway effective policy unavailable: " + err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, eff)
+}
+
+func (h *PolicyHandler) respondEffective(c *gin.Context, principalType, id, userID string, apiKeyID *string) {
+	eff, err := h.gateway.effective(c.Request.Context(), userID, apiKeyID)
+	if err != nil {
+		c.JSON(http.StatusBadGateway, gin.H{"error": "gateway effective policy unavailable: " + err.Error()})
+		return
+	}
+	stored, _, err := getPrincipalPolicy(c.Request.Context(), h.db, principalType, id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "read stored policy failed"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"allowed_models":   eff.AllowedModels,
+		"residency":        eff.Residency,
+		"default_model":    eff.DefaultModel,
+		"sources":          eff.Sources,
+		"reachable_models": eff.ReachableModels,
+		"stored":           stored,
+	})
+}
+
+// previewResponse is POST .../routing-policy/preview's response shape.
+// Effective is a LOCAL approximation ({residency, allowed_models,
+// default_model} merged the same way the gateway would, per
+// mergeAllowedModels) rather than a live gateway call: the change being
+// previewed is never written, so there is no committed state the gateway
+// could compute against. See DESIGN4's API section and this file's package
+// doc comment.
+type previewResponse struct {
+	Effective    previewEffective   `json:"effective"`
+	KeysAffected []previewKeyImpact `json:"keys_affected"`
+	WouldLockOut []string           `json:"would_lock_out"`
+}
+
+type previewEffective struct {
+	Residency     *string   `json:"residency"`
+	AllowedModels *[]string `json:"allowed_models"`
+	DefaultModel  *string   `json:"default_model"`
+}
+
+type previewKeyImpact struct {
+	ID     string    `json:"id"`
+	Name   string    `json:"name"`
+	Before *[]string `json:"before"`
+	After  *[]string `json:"after"`
+}
+
+// PreviewUserPolicy handles POST /api/v1/users/:id/routing-policy/preview --
+// same body and validation as PutUserPolicy, but never writes; lock-outs are
+// reported in would_lock_out instead of a 409.
+func (h *PolicyHandler) PreviewUserPolicy(c *gin.Context) {
+	id := c.Param("id")
+	if !isValidUUID(id) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid user id"})
+		return
+	}
+	ctx := c.Request.Context()
+	ok, err := userExists(ctx, h.db, id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "check user failed"})
+		return
+	}
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
+		return
+	}
+
+	var req policyObject
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	orgAM, err := orgAllowedModels(ctx, h.db)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "read org policy failed"})
+		return
+	}
+	if req.AllowedModels != nil {
+		if err := validateAllowedModelIDs(ctx, h.db, *req.AllowedModels); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	if !validPrincipalResidency(req.Residency) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "residency must be null or 'self_hosted_only'"})
+		return
+	}
+
+	effective := mergeAllowedModels(orgAM, req.AllowedModels)
+	resp := previewResponse{
+		Effective:    previewEffective{Residency: req.Residency, AllowedModels: effective, DefaultModel: req.DefaultModel},
+		KeysAffected: []previewKeyImpact{},
+		WouldLockOut: []string{},
+	}
+	if effective != nil && len(*effective) == 0 {
+		resp.WouldLockOut = append(resp.WouldLockOut, "(user)")
+	}
+
+	keys, err := activeUserKeys(ctx, h.db, id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "list user api keys failed"})
+		return
+	}
+	currentPolicy, _, err := getPrincipalPolicy(ctx, h.db, principalTypeUser, id)
+	var currentUserAM *[]string
+	if currentPolicy != nil {
+		currentUserAM = currentPolicy.AllowedModels
+	}
+	for _, k := range keys {
+		before := mergeAllowedModels(orgAM, currentUserAM, k.AllowedModels)
+		after := mergeAllowedModels(orgAM, req.AllowedModels, k.AllowedModels)
+		resp.KeysAffected = append(resp.KeysAffected, previewKeyImpact{ID: k.ID, Name: k.Name, Before: before, After: after})
+		if after != nil && len(*after) == 0 {
+			resp.WouldLockOut = append(resp.WouldLockOut, k.Name)
+		}
+	}
+
+	c.JSON(http.StatusOK, resp)
+}
+
+// PreviewAPIKeyPolicy handles POST /api/v1/api-keys/:id/routing-policy/preview.
+func (h *PolicyHandler) PreviewAPIKeyPolicy(c *gin.Context) {
+	id := c.Param("id")
+	if !isValidUUID(id) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid api key id"})
+		return
+	}
+	ctx := c.Request.Context()
+	info, err := lookupAPIKey(ctx, h.db, id)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "check api key failed"})
+		return
+	}
+	if info == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "api key not found"})
+		return
+	}
+
+	var req policyObject
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if req.AllowedModels != nil {
+		if err := validateAllowedModelIDs(ctx, h.db, *req.AllowedModels); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	if !validPrincipalResidency(req.Residency) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "residency must be null or 'self_hosted_only'"})
+		return
+	}
+
+	orgAM, err := orgAllowedModels(ctx, h.db)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "read org policy failed"})
+		return
+	}
+	ownerPolicy, _, err := getPrincipalPolicy(ctx, h.db, principalTypeUser, info.UserID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "read owner policy failed"})
+		return
+	}
+	var ownerAM *[]string
+	if ownerPolicy != nil {
+		ownerAM = ownerPolicy.AllowedModels
+	}
+	currentPolicy, _, err := getPrincipalPolicy(ctx, h.db, principalTypeAPIKey, id)
+	var currentKeyAM *[]string
+	if currentPolicy != nil {
+		currentKeyAM = currentPolicy.AllowedModels
+	}
+
+	before := mergeAllowedModels(orgAM, ownerAM, currentKeyAM)
+	after := mergeAllowedModels(orgAM, ownerAM, req.AllowedModels)
+
+	resp := previewResponse{
+		Effective:    previewEffective{Residency: req.Residency, AllowedModels: after, DefaultModel: req.DefaultModel},
+		KeysAffected: []previewKeyImpact{{ID: id, Name: info.Name, Before: before, After: after}},
+		WouldLockOut: []string{},
+	}
+	if after != nil && len(*after) == 0 {
+		resp.WouldLockOut = append(resp.WouldLockOut, info.Name)
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+// principalListEntry is one row in GET /api/v1/routing-policy/principals.
+type principalListEntry struct {
+	PrincipalType   string       `json:"principal_type"`
+	PrincipalID     string       `json:"principal_id"`
+	Display         string       `json:"display"`
+	Policy          policyObject `json:"policy"`
+	UpdatedAt       time.Time    `json:"updated_at"`
+	ReachableModels []string     `json:"reachable_models,omitempty"`
+	EffectiveError  string       `json:"effective_error,omitempty"`
+}
+
+// ListPrincipalPolicies handles GET /api/v1/routing-policy/principals
+// (admin): every explicit user/key policy row, paginated (default 50, max
+// 200 per page). For each row on the page it calls the gateway's effective
+// endpoint to attach reachable_models -- a per-principal call, capped at 200
+// per page by construction, per DESIGN4's contract. A single principal's
+// gateway call failing degrades that row (effective_error set,
+// reachable_models omitted) rather than failing the whole page, since an
+// admin overview listing up to 200 rows should not 502 entirely over one
+// slow/unreachable lookup.
+func (h *PolicyHandler) ListPrincipalPolicies(c *gin.Context) {
+	limit := principalsListDefaultLimit
+	if v := c.Query("limit"); v != "" {
+		if n, err := parsePositiveInt(v); err == nil {
+			limit = n
+		}
+	}
+	if limit > principalsListMaxLimit {
+		limit = principalsListMaxLimit
+	}
+	if limit <= 0 {
+		limit = principalsListDefaultLimit
+	}
+	offset := 0
+	if v := c.Query("offset"); v != "" {
+		if n, err := parsePositiveInt(v); err == nil {
+			offset = n
+		}
+	}
+
+	ctx := c.Request.Context()
+
+	var total int
+	if err := h.db.QueryRow(ctx, `SELECT COUNT(*) FROM principal_routing_policies WHERE principal_type IN ('user','api_key')`).Scan(&total); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "count principals failed"})
+		return
+	}
+
+	rows, err := h.db.Query(ctx, `
+		SELECT p.principal_type, COALESCE(p.user_id::text, p.api_key_id::text),
+			COALESCE(u.email, k.name || ' (' || ku.email || ')'),
+			p.residency, p.allowed_models, p.default_model, p.updated_at,
+			p.user_id, p.api_key_id
+		FROM principal_routing_policies p
+		LEFT JOIN users u ON u.id = p.user_id
+		LEFT JOIN api_keys k ON k.id = p.api_key_id
+		LEFT JOIN users ku ON ku.id = k.user_id
+		WHERE p.principal_type IN ('user','api_key')
+		ORDER BY p.updated_at DESC
+		LIMIT $1 OFFSET $2
+	`, limit, offset)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "list principals failed"})
+		return
+	}
+
+	type rawRow struct {
+		entry    principalListEntry
+		userID   *string
+		apiKeyID *string
+	}
+	var raw []rawRow
+	for rows.Next() {
+		var r rawRow
+		if err := rows.Scan(&r.entry.PrincipalType, &r.entry.PrincipalID, &r.entry.Display,
+			&r.entry.Policy.Residency, &r.entry.Policy.AllowedModels, &r.entry.Policy.DefaultModel, &r.entry.UpdatedAt,
+			&r.userID, &r.apiKeyID); err != nil {
+			rows.Close()
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "scan principal failed"})
+			return
+		}
+		raw = append(raw, r)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "principal rows error"})
+		return
+	}
+	rows.Close()
+
+	entries := make([]principalListEntry, 0, len(raw))
+	for _, r := range raw {
+		var userID string
+		var apiKeyID *string
+		if r.userID != nil {
+			userID = *r.userID
+		} else if r.apiKeyID != nil {
+			apiKeyID = r.apiKeyID
+			// Look up the owning user id for the gateway call — the
+			// effective endpoint always keys off user_id, with api_key_id
+			// narrowing further.
+			info, err := lookupAPIKey(ctx, h.db, *r.apiKeyID)
+			if err != nil || info == nil {
+				r.entry.EffectiveError = "owner lookup failed"
+				entries = append(entries, r.entry)
+				continue
+			}
+			userID = info.UserID
+		}
+		eff, err := h.gateway.effective(ctx, userID, apiKeyID)
+		if err != nil {
+			r.entry.EffectiveError = err.Error()
+		} else {
+			r.entry.ReachableModels = eff.ReachableModels
+		}
+		entries = append(entries, r.entry)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"principals": entries,
+		"total":      total,
+		"limit":      limit,
+		"offset":     offset,
+	})
+}
+
+func parsePositiveInt(s string) (int, error) {
+	var n int
+	_, err := fmt.Sscanf(s, "%d", &n)
+	return n, err
+}

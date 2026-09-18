@@ -1,0 +1,531 @@
+/* The routing-policy drawer. Same shell as the activity drawer — one drawer
+   pattern in the admin, not two — with a form body that scrolls under a footer
+   that never does: the impact of the change must stay in view while the change
+   is being made. */
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  z-index: var(--z-drawer);
+  animation: fadeIn 0.15s ease;
+}
+
+.overlay[data-state='closed'] {
+  animation: fadeOut 0.15s ease;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@keyframes fadeOut {
+  from { opacity: 1; }
+  to   { opacity: 0; }
+}
+
+.drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  display: flex;
+  flex-direction: column;
+  width: 560px;
+  max-width: 96vw;
+  height: 100%;
+  background: var(--bg-surface);
+  border-left: 1px solid var(--border-default);
+  box-shadow: var(--shadow-lg);
+  z-index: var(--z-overlay);
+  animation: slideIn 0.15s ease;
+}
+
+.drawer[data-state='closed'] {
+  animation: slideOut 0.15s ease;
+}
+
+@keyframes slideIn {
+  from { transform: translateX(100%); }
+  to   { transform: translateX(0); }
+}
+
+@keyframes slideOut {
+  from { transform: translateX(0); }
+  to   { transform: translateX(100%); }
+}
+
+.closeBtn {
+  position: absolute;
+  top: var(--space-4);
+  right: var(--space-4);
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  color: var(--fg-muted);
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+
+.closeBtn:hover {
+  color: var(--fg-default);
+  background: var(--bg-surface-raised);
+}
+
+.closeBtn:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
+/* --- Header --- */
+
+.header {
+  flex-shrink: 0;
+  padding: var(--space-5) var(--space-6) var(--space-4);
+  padding-right: var(--space-10);
+  border-bottom: 1px solid var(--border-default);
+}
+
+.eyebrow {
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--fg-subtle);
+}
+
+.name {
+  margin-top: 2px;
+  font-size: var(--fs-lg);
+  font-weight: var(--fw-semibold);
+  color: var(--fg-default);
+  letter-spacing: -0.01em;
+  word-break: break-word;
+}
+
+.subtitle {
+  margin-top: 2px;
+  font-size: var(--fs-sm);
+  color: var(--fg-muted);
+  word-break: break-word;
+}
+
+/* The rule the whole screen obeys, stated once where a policy is written. */
+.rule {
+  margin-top: var(--space-3);
+  padding-left: var(--space-3);
+  border-left: 2px solid var(--brand-default);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-muted);
+  max-width: 62ch;
+}
+
+/* --- Scrolling body --- */
+
+.body {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  padding: var(--space-5) var(--space-6);
+}
+
+.field {
+  border: 0;
+  padding: 0;
+  margin: 0;
+}
+
+.legend {
+  padding: 0;
+  margin-bottom: var(--space-2);
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+  color: var(--fg-default);
+}
+
+.fieldNote {
+  margin-bottom: var(--space-2);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-muted);
+  max-width: 62ch;
+}
+
+.choices {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.choice {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-3);
+  background: var(--bg-base);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: border-color var(--transition-fast), background var(--transition-fast);
+}
+
+.choice:hover {
+  border-color: var(--fg-subtle);
+}
+
+.choice:focus-within {
+  border-color: var(--border-focus);
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
+.choiceChecked {
+  background: var(--brand-subtle);
+  border-color: var(--brand-default);
+}
+
+.choiceTop {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.radio {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--brand-default);
+  flex-shrink: 0;
+}
+
+.choiceLabel {
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  color: var(--fg-default);
+}
+
+.choiceHint {
+  padding-left: calc(14px + var(--space-2));
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-muted);
+  max-width: 60ch;
+}
+
+/* --- Model picker ---
+   The control itself lives in ModelAllowlistPicker; this only places it. It is
+   a sibling of the "Choose models" option, not a child: nesting a checkbox list
+   inside that option's label would make every tick also hit the radio. */
+
+.picker {
+  margin-top: var(--space-3);
+  padding-left: calc(14px + var(--space-2));
+}
+
+.fieldError {
+  display: flex;
+  gap: var(--space-1);
+  margin-top: var(--space-2);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-default);
+  border-left: 2px solid var(--danger-fg);
+  padding-left: var(--space-2);
+  max-width: 60ch;
+}
+
+.fieldError code {
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+.select {
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  background: var(--bg-base);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  color: var(--fg-default);
+  font-family: var(--font-sans);
+  font-size: var(--fs-sm);
+}
+
+.select:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 1px;
+  border-color: var(--border-focus);
+}
+
+/* --- What this comes to --- */
+
+.effect {
+  padding: var(--space-4);
+  background: var(--bg-base);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+}
+
+.effectHead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-bottom: var(--space-3);
+}
+
+.effectTitle {
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+  color: var(--fg-default);
+}
+
+/* Reserves its own line so a "Checking…" that comes and goes never nudges the
+   values underneath it. */
+.effectState {
+  min-width: 11ch;
+  text-align: right;
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+  white-space: nowrap;
+}
+
+.effectGrid {
+  display: grid;
+  grid-template-columns: 11rem 1fr;
+  gap: var(--space-2) var(--space-3);
+  align-items: baseline;
+}
+
+.effectGrid dt {
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--fg-muted);
+}
+
+.effectGrid dd {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--fs-sm);
+  color: var(--fg-default);
+  min-width: 0;
+}
+
+/* Stored value, then where it came from. The chip is quiet on purpose: the
+   value is the answer, the level is the footnote. */
+.source {
+  padding: 1px 6px;
+  background: var(--bg-surface-raised);
+  border-radius: var(--radius-full);
+  font-size: var(--fs-xs);
+  color: var(--fg-muted);
+  white-space: nowrap;
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.chip {
+  padding: 1px 6px;
+  background: var(--bg-surface-raised);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--fg-default);
+  overflow-wrap: anywhere;
+}
+
+.chipMore {
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+}
+
+.none {
+  color: var(--danger-fg);
+  font-weight: var(--fw-medium);
+}
+
+.effectNote {
+  margin-top: var(--space-3);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-subtle);
+  max-width: 62ch;
+}
+
+.previewError {
+  margin-bottom: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  background: var(--danger-bg);
+  border: 1px solid var(--danger-border);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-xs);
+  color: var(--fg-default);
+}
+
+/* --- Load failure --- */
+
+.loadError {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-4);
+  background: var(--danger-bg);
+  border: 1px solid var(--danger-border);
+  border-radius: var(--radius-md);
+}
+
+.loadErrorTitle {
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  color: var(--fg-default);
+}
+
+.loadErrorDetail {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--fg-muted);
+  word-break: break-word;
+}
+
+/* --- Footer --- */
+
+.footer {
+  flex-shrink: 0;
+  padding: var(--space-4) var(--space-6) var(--space-5);
+  background: var(--bg-surface);
+  border-top: 1px solid var(--border-default);
+}
+
+.impact {
+  margin-bottom: var(--space-3);
+}
+
+.impactQuiet {
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+}
+
+/* A save that cannot happen says so where the save button is, not in a toast
+   after the fact. */
+.impactBlock {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  background: var(--danger-bg);
+  border-left: 2px solid var(--danger-fg);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-default);
+}
+
+.impactBlock svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+  color: var(--danger-fg);
+}
+
+.impactWarn {
+  padding: var(--space-2) var(--space-3);
+  background: var(--warning-bg);
+  border-left: 2px solid var(--warning-fg);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-default);
+}
+
+.impactList {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: var(--space-2);
+}
+
+.impactList li {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.impactKey {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.impactCounts {
+  flex-shrink: 0;
+  color: var(--fg-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.impactMore {
+  margin-top: var(--space-1);
+  color: var(--fg-muted);
+}
+
+.timing {
+  margin-bottom: var(--space-3);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-subtle);
+  max-width: 62ch;
+}
+
+.actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+/* Going back to inherited is not the same kind of move as saving a change, so
+   it sits apart from the pair on the right. */
+.resetBtn {
+  margin-right: auto;
+}
+
+@media (max-width: 767px) {
+  .drawer {
+    width: 100vw;
+    max-width: 100vw;
+  }
+
+  .effectGrid {
+    grid-template-columns: 1fr;
+    gap: var(--space-1) 0;
+  }
+
+  .effectGrid dd {
+    margin-bottom: var(--space-2);
+  }
+
+  .actions {
+    flex-wrap: wrap;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .drawer,
+  .overlay {
+    animation: none !important;
+  }
+
+  .choice,
+  .closeBtn {
+    transition-duration: 0.01ms !important;
+  }
+}

@@ -19,6 +19,7 @@ import (
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/scalecraft/darkplum/api/internal/activity"
 	"github.com/scalecraft/darkplum/api/internal/auth"
@@ -227,15 +228,6 @@ func run() error {
 		}
 	}()
 
-	// Router.
-	gin.SetMode(gin.ReleaseMode)
-	r := gin.New()
-	r.Use(gin.Recovery())
-	r.Use(requestID())
-	r.Use(requestLogger())
-	r.Use(corsMiddleware())
-	r.Use(csrfProtection())
-
 	// Handlers.
 	users := handler.NewUserHandler(pool, activityRecorder, authCfg.Pepper)
 	keys := handler.NewAPIKeyHandler(pool, activityRecorder)
@@ -243,117 +235,24 @@ func run() error {
 	activityH := handler.NewActivityHandler(pool)
 	routing := handler.NewRoutingHandler(pool, activityRecorder, gatewayURL, serviceKey)
 	routing.SetAvailabilityWindow(modelAvailabilityWindowFromEnv())
+	policy := handler.NewPolicyHandler(pool, activityRecorder, gatewayURL, serviceKey)
 	conversations := handler.NewConversationHandler(pool, activityRecorder)
 
-	r.GET("/health", func(c *gin.Context) { c.Status(http.StatusOK) })
-
-	// Auth config — always available so the frontend can detect auth mode.
-	r.GET("/auth/config", func(c *gin.Context) {
-		resp := gin.H{
-			"local": true,
-			"oidc":  gin.H{"enabled": authCfg.OIDC != nil},
-		}
-		var count int
-		if err := pool.QueryRow(c.Request.Context(),
-			`SELECT COUNT(*) FROM users WHERE password_hash IS NOT NULL`).Scan(&count); err == nil {
-			resp["setup_required"] = count == 0
-		}
-		c.JSON(http.StatusOK, resp)
+	r := buildRouter(routerDeps{
+		pool:          pool,
+		authCfg:       authCfg,
+		sessionMW:     sessionMW,
+		localProvider: localProvider,
+		oidcProvider:  oidcProvider,
+		users:         users,
+		keys:          keys,
+		chat:          chat,
+		activityH:     activityH,
+		routing:       routing,
+		policy:        policy,
+		modelHandler:  modelHandler,
+		conversations: conversations,
 	})
-
-	// Auth routes. Local password auth (POST /login) is always registered; OIDC
-	// (GET /login redirect + callback) is additive. /me and /logout are
-	// provider-agnostic via the shared session layer.
-	loginRL := auth.LoginRateLimit(0.2, 5) // 1 attempt / 5s sustained, burst 5
-	authGroup := r.Group("/auth")
-	authGroup.POST("/login", loginRL, localProvider.Login)
-	authGroup.POST("/change-password", localProvider.ChangePassword)
-	// First-run admin creation is only reachable before OIDC is configured; an
-	// OIDC deployment provisions its first admin via SSO + a role grant, so the
-	// unauthenticated setup endpoint is never exposed alongside OIDC.
-	if oidcProvider == nil {
-		authGroup.POST("/setup", loginRL, localProvider.Setup)
-	}
-	authGroup.GET("/me", localProvider.HandleMe)
-	if oidcProvider != nil {
-		authGroup.GET("/login", loginRL, oidcProvider.Login)
-		authGroup.GET("/callback", loginRL, oidcProvider.Callback)
-		authGroup.POST("/logout", oidcProvider.Logout)
-	} else {
-		authGroup.POST("/logout", localProvider.Logout)
-	}
-
-	// API routes.
-	v1 := r.Group("/api/v1")
-	v1.Use(sessionMW)
-	{
-		v1.GET("/users", users.ListUsers)
-		v1.GET("/api-keys", keys.ListAPIKeys)
-
-		// Conversation history: session-authenticated but explicitly NOT
-		// admin-only -- see the privacy comment atop
-		// internal/handler/conversations.go. Every handler scopes by the
-		// session user_id itself.
-		v1.GET("/conversations", conversations.ListConversations)
-		v1.POST("/conversations", conversations.CreateConversation)
-		v1.GET("/conversations/:id", conversations.GetConversation)
-		v1.PATCH("/conversations/:id", conversations.PatchConversation)
-		v1.POST("/conversations/:id/messages", conversations.AppendMessages)
-		v1.DELETE("/conversations/:id", conversations.DeleteConversation)
-		v1.DELETE("/conversations/:id/messages", conversations.TruncateMessages)
-
-		adminOnly := v1.Group("")
-		adminOnly.Use(auth.AdminRequired())
-		{
-			adminOnly.POST("/users", users.CreateUser)
-			adminOnly.DELETE("/users/:id", users.DeleteUser)
-			adminOnly.PATCH("/users/:id/role", users.UpdateRole)
-			adminOnly.PATCH("/users/:id/password", users.ResetPassword)
-
-			adminOnly.POST("/api-keys", keys.CreateAPIKey)
-			adminOnly.DELETE("/api-keys/:id", keys.RevokeAPIKey)
-
-			adminOnly.GET("/models", modelHandler.ListAdminModels)
-			adminOnly.PATCH("/models/:id", modelHandler.ToggleModel)
-
-			adminOnly.GET("/model-aliases", routing.ListAliases)
-			adminOnly.PUT("/model-aliases/:alias", routing.PutAlias)
-			adminOnly.DELETE("/model-aliases/:alias", routing.DeleteAlias)
-			adminOnly.POST("/model-aliases/:alias/test", routing.TestAlias)
-
-			adminOnly.GET("/routing-policy", routing.GetRoutingPolicy)
-			adminOnly.PUT("/routing-policy", routing.PutRoutingPolicy)
-
-			adminOnly.GET("/activity", activityH.ListActivity)
-			adminOnly.GET("/activity/export", activityH.ExportActivity)
-			adminOnly.GET("/usage", activityH.ListUsage)
-			adminOnly.GET("/usage/export", activityH.ExportUsage)
-			adminOnly.GET("/usage/stats", activityH.UsageStats)
-			adminOnly.GET("/usage/summary", activityH.UsageSummary)
-			adminOnly.GET("/usage/user-summary", activityH.UserSummary)
-			adminOnly.GET("/usage/key-summary", activityH.KeySummary)
-		}
-	}
-
-	// Chat and model routes accept either session auth (browser) or Bearer
-	// API key (curl, Cursor, SDK clients). When a Bearer token is present the
-	// request is forwarded to the gateway which validates the key — we skip
-	// session auth so API-key callers don't need a cookie.
-	apiOrSession := func(sessionMW gin.HandlerFunc) gin.HandlerFunc {
-		return func(c *gin.Context) {
-			if strings.HasPrefix(c.GetHeader("Authorization"), "Bearer ") {
-				// Bearer (API key) requests are forwarded to the gateway, which
-				// validates the key. The API layer does not re-validate it here.
-				c.Next()
-				return
-			}
-			// No Bearer token — a valid browser session is required. There is no
-			// unauthenticated fallback for session callers.
-			sessionMW(c)
-		}
-	}
-	r.GET("/v1/models", apiOrSession(sessionMW), modelHandler.ListModels)
-	r.POST("/v1/chat/completions", apiOrSession(sessionMW), chat.ProxyChat)
 
 	srv := &http.Server{
 		Addr:         ":" + port,
@@ -386,6 +285,167 @@ func run() error {
 	}
 
 	return <-errCh
+}
+
+// routerDeps is every handler/config buildRouter needs to register routes.
+// Pulled out of run() so cmd's route-inventory test (main_test.go) can build
+// the exact same route table run() serves, against a throwaway test
+// database, and diff it against docs/api-routes.json without booting a full
+// server or a real gateway.
+type routerDeps struct {
+	pool          *pgxpool.Pool
+	authCfg       *auth.Config
+	sessionMW     gin.HandlerFunc
+	localProvider *auth.LocalProvider
+	oidcProvider  *auth.OIDCProvider
+	users         *handler.UserHandler
+	keys          *handler.APIKeyHandler
+	chat          *handler.ChatHandler
+	activityH     *handler.ActivityHandler
+	routing       *handler.RoutingHandler
+	policy        *handler.PolicyHandler
+	modelHandler  *handler.ModelHandler
+	conversations *handler.ConversationHandler
+}
+
+// buildRouter registers every route the api serves. See routerDeps' doc
+// comment for why this is a standalone function rather than inlined in run().
+func buildRouter(d routerDeps) *gin.Engine {
+	gin.SetMode(gin.ReleaseMode)
+	r := gin.New()
+	r.Use(gin.Recovery())
+	r.Use(requestID())
+	r.Use(requestLogger())
+	r.Use(corsMiddleware())
+	r.Use(csrfProtection())
+
+	r.GET("/health", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	// Auth config — always available so the frontend can detect auth mode.
+	r.GET("/auth/config", func(c *gin.Context) {
+		resp := gin.H{
+			"local": true,
+			"oidc":  gin.H{"enabled": d.authCfg.OIDC != nil},
+		}
+		var count int
+		if err := d.pool.QueryRow(c.Request.Context(),
+			`SELECT COUNT(*) FROM users WHERE password_hash IS NOT NULL`).Scan(&count); err == nil {
+			resp["setup_required"] = count == 0
+		}
+		c.JSON(http.StatusOK, resp)
+	})
+
+	// Auth routes. Local password auth (POST /login) is always registered; OIDC
+	// (GET /login redirect + callback) is additive. /me and /logout are
+	// provider-agnostic via the shared session layer.
+	loginRL := auth.LoginRateLimit(0.2, 5) // 1 attempt / 5s sustained, burst 5
+	authGroup := r.Group("/auth")
+	authGroup.POST("/login", loginRL, d.localProvider.Login)
+	authGroup.POST("/change-password", d.localProvider.ChangePassword)
+	// First-run admin creation is only reachable before OIDC is configured; an
+	// OIDC deployment provisions its first admin via SSO + a role grant, so the
+	// unauthenticated setup endpoint is never exposed alongside OIDC.
+	if d.oidcProvider == nil {
+		authGroup.POST("/setup", loginRL, d.localProvider.Setup)
+	}
+	authGroup.GET("/me", d.localProvider.HandleMe)
+	if d.oidcProvider != nil {
+		authGroup.GET("/login", loginRL, d.oidcProvider.Login)
+		authGroup.GET("/callback", loginRL, d.oidcProvider.Callback)
+		authGroup.POST("/logout", d.oidcProvider.Logout)
+	} else {
+		authGroup.POST("/logout", d.localProvider.Logout)
+	}
+
+	// API routes.
+	v1 := r.Group("/api/v1")
+	v1.Use(d.sessionMW)
+	{
+		v1.GET("/users", d.users.ListUsers)
+		v1.GET("/api-keys", d.keys.ListAPIKeys)
+
+		// Conversation history: session-authenticated but explicitly NOT
+		// admin-only -- see the privacy comment atop
+		// internal/handler/conversations.go. Every handler scopes by the
+		// session user_id itself.
+		v1.GET("/conversations", d.conversations.ListConversations)
+		v1.POST("/conversations", d.conversations.CreateConversation)
+		v1.GET("/conversations/:id", d.conversations.GetConversation)
+		v1.PATCH("/conversations/:id", d.conversations.PatchConversation)
+		v1.POST("/conversations/:id/messages", d.conversations.AppendMessages)
+		v1.DELETE("/conversations/:id", d.conversations.DeleteConversation)
+		v1.DELETE("/conversations/:id/messages", d.conversations.TruncateMessages)
+
+		// Any session user's own effective routing policy — no "stored" field
+		// (that's admin-only, via the equivalent .../routing-policy/effective
+		// endpoints below), just what they can actually reach right now.
+		v1.GET("/me/routing-policy/effective", d.policy.GetMyPolicyEffective)
+
+		adminOnly := v1.Group("")
+		adminOnly.Use(auth.AdminRequired())
+		{
+			adminOnly.POST("/users", d.users.CreateUser)
+			adminOnly.DELETE("/users/:id", d.users.DeleteUser)
+			adminOnly.PATCH("/users/:id/role", d.users.UpdateRole)
+			adminOnly.PATCH("/users/:id/password", d.users.ResetPassword)
+			adminOnly.GET("/users/:id/routing-policy", d.policy.GetUserPolicy)
+			adminOnly.PUT("/users/:id/routing-policy", d.policy.PutUserPolicy)
+			adminOnly.DELETE("/users/:id/routing-policy", d.policy.DeleteUserPolicy)
+			adminOnly.GET("/users/:id/routing-policy/effective", d.policy.GetUserPolicyEffective)
+			adminOnly.POST("/users/:id/routing-policy/preview", d.policy.PreviewUserPolicy)
+
+			adminOnly.POST("/api-keys", d.keys.CreateAPIKey)
+			adminOnly.DELETE("/api-keys/:id", d.keys.RevokeAPIKey)
+			adminOnly.GET("/api-keys/:id/routing-policy", d.policy.GetAPIKeyPolicy)
+			adminOnly.PUT("/api-keys/:id/routing-policy", d.policy.PutAPIKeyPolicy)
+			adminOnly.DELETE("/api-keys/:id/routing-policy", d.policy.DeleteAPIKeyPolicy)
+			adminOnly.GET("/api-keys/:id/routing-policy/effective", d.policy.GetAPIKeyPolicyEffective)
+			adminOnly.POST("/api-keys/:id/routing-policy/preview", d.policy.PreviewAPIKeyPolicy)
+
+			adminOnly.GET("/models", d.modelHandler.ListAdminModels)
+			adminOnly.PATCH("/models/:id", d.modelHandler.ToggleModel)
+
+			adminOnly.GET("/model-aliases", d.routing.ListAliases)
+			adminOnly.PUT("/model-aliases/:alias", d.routing.PutAlias)
+			adminOnly.DELETE("/model-aliases/:alias", d.routing.DeleteAlias)
+			adminOnly.POST("/model-aliases/:alias/test", d.routing.TestAlias)
+
+			adminOnly.GET("/routing-policy", d.routing.GetRoutingPolicy)
+			adminOnly.PUT("/routing-policy", d.routing.PutRoutingPolicy)
+			adminOnly.GET("/routing-policy/principals", d.policy.ListPrincipalPolicies)
+
+			adminOnly.GET("/activity", d.activityH.ListActivity)
+			adminOnly.GET("/activity/export", d.activityH.ExportActivity)
+			adminOnly.GET("/usage", d.activityH.ListUsage)
+			adminOnly.GET("/usage/export", d.activityH.ExportUsage)
+			adminOnly.GET("/usage/stats", d.activityH.UsageStats)
+			adminOnly.GET("/usage/summary", d.activityH.UsageSummary)
+			adminOnly.GET("/usage/user-summary", d.activityH.UserSummary)
+			adminOnly.GET("/usage/key-summary", d.activityH.KeySummary)
+		}
+	}
+
+	// Chat and model routes accept either session auth (browser) or Bearer
+	// API key (curl, Cursor, SDK clients). When a Bearer token is present the
+	// request is forwarded to the gateway which validates the key — we skip
+	// session auth so API-key callers don't need a cookie.
+	apiOrSession := func(sessionMW gin.HandlerFunc) gin.HandlerFunc {
+		return func(c *gin.Context) {
+			if strings.HasPrefix(c.GetHeader("Authorization"), "Bearer ") {
+				// Bearer (API key) requests are forwarded to the gateway, which
+				// validates the key. The API layer does not re-validate it here.
+				c.Next()
+				return
+			}
+			// No Bearer token — a valid browser session is required. There is no
+			// unauthenticated fallback for session callers.
+			sessionMW(c)
+		}
+	}
+	r.GET("/v1/models", apiOrSession(d.sessionMW), d.modelHandler.ListModels)
+	r.POST("/v1/chat/completions", apiOrSession(d.sessionMW), d.chat.ProxyChat)
+
+	return r
 }
 
 func envOr(key, fallback string) string {

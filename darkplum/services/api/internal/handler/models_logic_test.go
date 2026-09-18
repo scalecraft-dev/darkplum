@@ -55,7 +55,7 @@ func TestBuildModelsList_NoPolicyIncludesEverything(t *testing.T) {
 		{Alias: "smart", TargetModelID: "claude-3-sonnet", OwnedBy: "bedrock", BackendClass: backendClassCloudManaged, TargetDiscoveredAt: now},
 	}
 
-	got := buildModelsList(models, aliases, nil, residencyAny, now, modelAvailabilityWindow)
+	got := buildModelsList(models, aliases, nil, residencyAny, now, modelAvailabilityWindow, nil)
 	if len(got) != 4 {
 		t.Fatalf("len(got) = %d, want 4: %+v", len(got), got)
 	}
@@ -91,7 +91,7 @@ func TestBuildModelsList_SelfHostedOnlyOmitsCloudManaged(t *testing.T) {
 		{Alias: "smart", TargetModelID: "claude-3-sonnet", OwnedBy: "bedrock", BackendClass: backendClassCloudManaged, TargetDiscoveredAt: now},
 	}
 
-	got := buildModelsList(models, aliases, nil, residencySelfHostedOnly, now, modelAvailabilityWindow)
+	got := buildModelsList(models, aliases, nil, residencySelfHostedOnly, now, modelAvailabilityWindow, nil)
 
 	for _, e := range got {
 		if e.BackendClass == backendClassCloudManaged {
@@ -107,7 +107,7 @@ func TestBuildModelsList_SelfHostedOnlyOmitsCloudManaged(t *testing.T) {
 }
 
 func TestBuildModelsList_EmptyInputsProduceEmptySlice(t *testing.T) {
-	got := buildModelsList(nil, nil, nil, residencyAny, time.Now(), modelAvailabilityWindow)
+	got := buildModelsList(nil, nil, nil, residencyAny, time.Now(), modelAvailabilityWindow, nil)
 	if got == nil {
 		t.Fatal("buildModelsList returned nil, want a non-nil empty slice so JSON encodes []")
 	}
@@ -135,7 +135,7 @@ func TestBuildModelsList_UnavailableModelAndAliasOmitted(t *testing.T) {
 		{Alias: "cold", TargetModelID: "stale", OwnedBy: "vllm", BackendClass: backendClassSelfHosted, TargetDiscoveredAt: stale},
 	}
 
-	got := buildModelsList(models, aliases, nil, residencyAny, now, modelAvailabilityWindow)
+	got := buildModelsList(models, aliases, nil, residencyAny, now, modelAvailabilityWindow, nil)
 
 	ids := map[string]bool{}
 	for _, e := range got {
@@ -212,7 +212,7 @@ func TestBuildModelsList_RoutedAlias_ViableEntryShape(t *testing.T) {
 		},
 	}
 
-	got := buildModelsList(nil, nil, routed, residencyAny, now, modelAvailabilityWindow)
+	got := buildModelsList(nil, nil, routed, residencyAny, now, modelAvailabilityWindow, nil)
 	if len(got) != 1 {
 		t.Fatalf("len(got) = %d, want 1: %+v", len(got), got)
 	}
@@ -266,7 +266,7 @@ func TestBuildModelsList_RoutedAlias_OmittedWhenNoViableRoute(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := buildModelsList(nil, nil, tc.routed, residencyAny, now, modelAvailabilityWindow)
+			got := buildModelsList(nil, nil, tc.routed, residencyAny, now, modelAvailabilityWindow, nil)
 			if len(got) != 0 {
 				t.Fatalf("expected the routed alias to be omitted, got %+v", got)
 			}
@@ -291,7 +291,7 @@ func TestBuildModelsList_RoutedAlias_ResidencyPartialViability(t *testing.T) {
 		},
 	}
 
-	got := buildModelsList(nil, nil, routed, residencySelfHostedOnly, now, modelAvailabilityWindow)
+	got := buildModelsList(nil, nil, routed, residencySelfHostedOnly, now, modelAvailabilityWindow, nil)
 	if len(got) != 1 {
 		t.Fatalf("expected the alias to survive on its self_hosted route, got %+v", got)
 	}
@@ -307,7 +307,7 @@ func TestBuildModelsList_RoutedAlias_ResidencyPartialViability(t *testing.T) {
 
 	// Now BOTH routes are cloud_managed: nothing is viable, alias omitted.
 	routed[0].Routes[0].TargetBackendClass = backendClassCloudManaged
-	got = buildModelsList(nil, nil, routed, residencySelfHostedOnly, now, modelAvailabilityWindow)
+	got = buildModelsList(nil, nil, routed, residencySelfHostedOnly, now, modelAvailabilityWindow, nil)
 	if len(got) != 0 {
 		t.Fatalf("expected the alias to be omitted when no route is residency-permitted, got %+v", got)
 	}
@@ -320,7 +320,7 @@ func TestBuildModelsList_StaticAliasGetsAliasKind(t *testing.T) {
 	models := []modelDBRow{{ModelID: "llama3", Provider: "vllm", BackendClass: backendClassSelfHosted, DiscoveredAt: now}}
 	aliases := []aliasDBRow{{Alias: "default", TargetModelID: "llama3", OwnedBy: "vllm", BackendClass: backendClassSelfHosted, TargetDiscoveredAt: now}}
 
-	got := buildModelsList(models, aliases, nil, residencyAny, now, modelAvailabilityWindow)
+	got := buildModelsList(models, aliases, nil, residencyAny, now, modelAvailabilityWindow, nil)
 	for _, e := range got {
 		if e.ID == "default" && e.AliasKind != aliasKindStatic {
 			t.Errorf("static alias entry AliasKind = %q, want %q", e.AliasKind, aliasKindStatic)

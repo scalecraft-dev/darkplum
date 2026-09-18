@@ -1,5 +1,6 @@
 import { createContext, useCallback, useContext, useEffect, useState, type ReactNode } from 'react'
 import type { AuthConfig } from '../types'
+import { ROUTES } from '../lib/routes'
 
 interface AuthUser {
   id: string
@@ -35,10 +36,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   useEffect(() => {
     Promise.all([
-      fetch('/auth/config', { credentials: 'same-origin' })
+      fetch(ROUTES.authConfig.path, { credentials: 'same-origin' })
         .then(res => res.ok ? res.json() as Promise<AuthConfig> : null)
         .catch(() => null),
-      fetch('/auth/me', { credentials: 'same-origin' })
+      fetch(ROUTES.authMe.path, { credentials: 'same-origin' })
         .then(res => res.ok ? res.json() as Promise<AuthUser> : null)
         .catch(() => null),
     ]).then(([config, me]) => {
@@ -48,8 +49,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const login = useCallback(async (email: string, password: string) => {
-    const res = await fetch('/auth/login', {
-      method: 'POST',
+    const res = await fetch(ROUTES.authLogin.path, {
+      method: ROUTES.authLogin.method,
       headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
       credentials: 'same-origin',
       body: JSON.stringify({ email, password }),
@@ -64,8 +65,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, [])
 
   const setup = useCallback(async (name: string, email: string, password: string) => {
-    const res = await fetch('/auth/setup', {
-      method: 'POST',
+    const res = await fetch(ROUTES.authSetup.path, {
+      method: ROUTES.authSetup.method,
       headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
       credentials: 'same-origin',
       body: JSON.stringify({ name, email, password }),
@@ -81,8 +82,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const logout = useCallback(async () => {
     try {
-      const res = await fetch('/auth/logout', {
-        method: 'POST',
+      const res = await fetch(ROUTES.authLogout.path, {
+        method: ROUTES.authLogout.method,
         headers: { 'X-Requested-With': 'XMLHttpRequest' },
         credentials: 'same-origin',
       })

@@ -911,36 +911,85 @@ func (h *RoutingHandler) TestAlias(c *gin.Context) {
 	c.Data(resp.StatusCode, "application/json", respBody)
 }
 
-// routingPolicyResponse is the wire shape for GET/PUT /api/v1/routing-policy.
-// Warnings is populated only by PutRoutingPolicy, and only when the new
-// residency is 'self_hosted_only' and at least one routed alias has a route
-// targeting a cloud_managed model — that route will be refused per-request
-// from now on (see DESIGN3's API contract), even though the PUT itself still
-// succeeds with 200.
+// routingPolicyResponse is the wire shape for GET/PUT /api/v1/routing-policy
+// (the org-level policy row; migration 015_principal_policies.sql).
+// AllowedModels/DefaultModel were added alongside per-principal policy --
+// Residency stays a plain (non-nullable) string here, unlike the
+// user/api_key shape, since "any" IS a value an admin can explicitly choose
+// at the org level (there's nothing above org to inherit from). Warnings is
+// populated only by PutRoutingPolicy, and only when the new residency is
+// 'self_hosted_only' and at least one routed alias has a route targeting a
+// cloud_managed model — that route will be refused per-request from now on,
+// even though the PUT itself still succeeds with 200. AffectedPrincipals is
+// set only when the PUT tightens the org policy (see orgPolicyTightened) --
+// see its doc comment for how it's computed.
 type routingPolicyResponse struct {
-	Residency string    `json:"residency"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Warnings  []string  `json:"warnings,omitempty"`
+	Residency          string    `json:"residency"`
+	AllowedModels      *[]string `json:"allowed_models"`
+	DefaultModel       *string   `json:"default_model"`
+	UpdatedAt          time.Time `json:"updated_at"`
+	Warnings           []string  `json:"warnings,omitempty"`
+	AffectedPrincipals *int      `json:"affected_principals,omitempty"`
+}
+
+// orgResidencyString converts the org row's nullable residency column
+// (NULL = any) to the wire value.
+func orgResidencyString(dbResidency *string) string {
+	if dbResidency == nil {
+		return residencyAny
+	}
+	return *dbResidency
 }
 
 // GetRoutingPolicy handles GET /api/v1/routing-policy.
 func (h *RoutingHandler) GetRoutingPolicy(c *gin.Context) {
+	var dbResidency *string
 	var resp routingPolicyResponse
 	err := h.db.QueryRow(c.Request.Context(),
-		`SELECT residency, updated_at FROM routing_policy WHERE id = true`,
-	).Scan(&resp.Residency, &resp.UpdatedAt)
+		`SELECT residency, allowed_models, default_model, updated_at FROM principal_routing_policies WHERE principal_type = 'org'`,
+	).Scan(&dbResidency, &resp.AllowedModels, &resp.DefaultModel, &resp.UpdatedAt)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "get routing policy failed"})
 		return
 	}
+	resp.Residency = orgResidencyString(dbResidency)
 	c.JSON(http.StatusOK, resp)
 }
 
 type putRoutingPolicyRequest struct {
-	Residency string `json:"residency"`
+	Residency     string    `json:"residency"`
+	AllowedModels *[]string `json:"allowed_models"`
+	DefaultModel  *string   `json:"default_model"`
 }
 
-// PutRoutingPolicy handles PUT /api/v1/routing-policy.
+// orgPolicyTightened reports whether newReq narrows what oldResidency/oldAM
+// already permitted -- residency going from any to self_hosted_only, or
+// allowed_models going from unrestricted to restricted, or losing at least
+// one previously-allowed model id. Used to decide whether PutRoutingPolicy
+// computes affected_principals at all (a loosening or no-op change can't
+// shrink anyone's effective set, so it isn't worth a count query).
+func orgPolicyTightened(oldResidency, newResidency string, oldAM, newAM *[]string) bool {
+	if oldResidency != residencySelfHostedOnly && newResidency == residencySelfHostedOnly {
+		return true
+	}
+	if oldAM == nil && newAM != nil {
+		return true
+	}
+	if oldAM != nil && newAM != nil {
+		allowed := make(map[string]bool, len(*newAM))
+		for _, id := range *newAM {
+			allowed[id] = true
+		}
+		for _, id := range *oldAM {
+			if !allowed[id] {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// PutRoutingPolicy handles PUT /api/v1/routing-policy (org level).
 func (h *RoutingHandler) PutRoutingPolicy(c *gin.Context) {
 	var req putRoutingPolicyRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -954,22 +1003,55 @@ func (h *RoutingHandler) PutRoutingPolicy(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
+	if req.AllowedModels != nil {
+		if err := validateAllowedModelIDs(ctx, h.db, *req.AllowedModels); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	if req.DefaultModel != nil {
+		if err := validateDefaultModel(ctx, h.db, *req.DefaultModel, req.AllowedModels); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+
+	var oldDBResidency *string
+	var oldAM *[]string
+	if err := h.db.QueryRow(ctx,
+		`SELECT residency, allowed_models FROM principal_routing_policies WHERE principal_type = 'org'`,
+	).Scan(&oldDBResidency, &oldAM); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "read current routing policy failed"})
+		return
+	}
+	oldResidency := orgResidencyString(oldDBResidency)
+
+	var dbResidency *string
+	if req.Residency == residencySelfHostedOnly {
+		dbResidency = &req.Residency
+	}
+
 	var updatedBy *string
 	if uid := c.GetString("user_id"); uid != "" {
 		updatedBy = &uid
 	}
 
 	var resp routingPolicyResponse
+	var newDBResidency *string
 	err := h.db.QueryRow(ctx, `
-		UPDATE routing_policy
-		SET residency = $1, updated_at = now(), updated_by = $2
-		WHERE id = true
-		RETURNING residency, updated_at
-	`, req.Residency, updatedBy).Scan(&resp.Residency, &resp.UpdatedAt)
+		INSERT INTO principal_routing_policies (principal_type, residency, allowed_models, default_model, updated_at, updated_by)
+		VALUES ('org', $1, $2, $3, now(), $4)
+		ON CONFLICT (principal_type) WHERE principal_type = 'org' DO UPDATE
+			SET residency = EXCLUDED.residency, allowed_models = EXCLUDED.allowed_models,
+				default_model = EXCLUDED.default_model, updated_at = now(), updated_by = EXCLUDED.updated_by
+		RETURNING residency, allowed_models, default_model, updated_at
+	`, dbResidency, req.AllowedModels, req.DefaultModel, updatedBy).
+		Scan(&newDBResidency, &resp.AllowedModels, &resp.DefaultModel, &resp.UpdatedAt)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "update routing policy failed"})
 		return
 	}
+	resp.Residency = orgResidencyString(newDBResidency)
 
 	if resp.Residency == residencySelfHostedOnly {
 		warnings, err := h.cloudManagedRouteWarnings(ctx)
@@ -980,9 +1062,32 @@ func (h *RoutingHandler) PutRoutingPolicy(c *gin.Context) {
 		resp.Warnings = warnings
 	}
 
-	evt := activity.FromContext(c, activity.RoutingPolicyChanged)
+	if orgPolicyTightened(oldResidency, resp.Residency, oldAM, resp.AllowedModels) {
+		// Approximation, not a live gateway call per principal: count of
+		// explicit user/api_key policy rows. A per-principal gateway call
+		// here would mean up to hundreds of synchronous HTTP calls inside
+		// a single admin PUT — the exact "OPA/gateway call inside a loop"
+		// anti-pattern the review checklist flags — so this counts rows
+		// that MIGHT be affected rather than computing exactly which ones
+		// shrank. See DESIGN4's API section, which explicitly allows this.
+		var count int
+		if err := h.db.QueryRow(ctx,
+			`SELECT COUNT(*) FROM principal_routing_policies WHERE principal_type IN ('user','api_key')`,
+		).Scan(&count); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "count affected principals failed"})
+			return
+		}
+		resp.AffectedPrincipals = &count
+	}
+
+	evt := activity.FromContext(c, activity.RoutingPolicyOrgChanged)
 	evt.TargetType = activity.StrPtr("routing_policy")
-	evt.Detail = map[string]any{"residency": resp.Residency}
+	evt.Detail = map[string]any{
+		"residency":           resp.Residency,
+		"allowed_models":      resp.AllowedModels,
+		"default_model":       resp.DefaultModel,
+		"affected_principals": resp.AffectedPrincipals,
+	}
 	h.activity.Record(ctx, evt)
 
 	c.JSON(http.StatusOK, resp)

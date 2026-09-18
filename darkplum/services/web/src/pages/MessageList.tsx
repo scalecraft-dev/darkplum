@@ -72,6 +72,13 @@ function failureCopy(
           ? 'Enable it on the Models page, or pick another model.'
           : 'Pick another model, or ask an administrator to enable this one.',
       }
+    case 'model_not_allowed':
+      return {
+        title: 'That model is not allowed for you',
+        hint: isAdmin
+          ? "This model is enabled for the organisation, but your own policy — or the policy on the key being used — does not include it. Change it under Users & Keys, or pick a model from the list."
+          : 'Your organisation limits which models you can use. Pick one from the list at the top of the page.',
+      }
     case 'model_residency_violation':
       return {
         title: 'Blocked by the routing policy',
@@ -109,6 +116,9 @@ const FailureNotice = ({
     failure.code === 'model_not_found' ||
     failure.code === 'model_not_enabled' ||
     failure.code === 'model_residency_violation'
+  // A per-principal refusal is fixed where per-principal policy is written, not
+  // on the Models page: the model itself is enabled and allowed for the org.
+  const principalPolicyRelated = failure.code === 'model_not_allowed'
 
   return (
     <div className={styles.failure} role="alert">
@@ -148,6 +158,11 @@ const FailureNotice = ({
         {isAdmin && policyRelated && (
           <Link to="/admin/models" className={styles.failureLink}>
             Open Models
+          </Link>
+        )}
+        {isAdmin && principalPolicyRelated && (
+          <Link to="/admin/users" className={styles.failureLink}>
+            Open Users &amp; Keys
           </Link>
         )}
         {failure.model && (

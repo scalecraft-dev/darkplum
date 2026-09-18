@@ -135,6 +135,29 @@ func TestBuildRouter_RoutingDryrun(t *testing.T) {
 	}
 }
 
+// TestBuildRouter_PolicyEffective asserts GET /v1/policy/effective is
+// registered (authenticated, not proxied, not in the recorded group) rather
+// than falling through to the unknown-endpoint 404. testChatHandler's fake
+// policy store has no principal-policy data at all, so a service-key-shaped
+// request (noopMiddleware never sets ContextKeyType, leaving it "" — not
+// KeyTypeService) exercises the 403 branch here; the 200 shape itself is
+// covered by internal/handler's own tests.
+func TestBuildRouter_PolicyEffective(t *testing.T) {
+	router := buildRouter(testChatHandler(), noopMiddleware, noopMiddleware, stubHealthHandler)
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/policy/effective?user_id=11111111-1111-1111-1111-111111111111", nil)
+	router.ServeHTTP(w, req)
+
+	// noopMiddleware never authenticates, so ContextKeyType is "" here — not
+	// the service key — which HandleEffectivePolicy correctly refuses. The
+	// important assertion is that the route exists at all: a 404 would mean
+	// it fell through to the NoRoute handler instead of reaching the handler.
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 (unauthenticated in this test harness, but the route must exist), got %d; body=%s", w.Code, w.Body.String())
+	}
+}
+
 func TestBuildRouter_Health(t *testing.T) {
 	router := buildRouter(testChatHandler(), noopMiddleware, noopMiddleware, stubHealthHandler)
 
@@ -269,6 +292,10 @@ func TestNewHealthHandler_IncludesRoutingAndPolicyStatus(t *testing.T) {
 			Loaded     bool   `json:"loaded"`
 			AgeSeconds *int64 `json:"age_seconds"`
 			Stale      bool   `json:"stale"`
+			Principals struct {
+				Users   int `json:"users"`
+				APIKeys int `json:"api_keys"`
+			} `json:"principals"`
 		} `json:"policy"`
 	}
 	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
@@ -340,6 +367,65 @@ func TestNewHealthHandler_IncludesRoutingAndPolicyStatus(t *testing.T) {
 	}
 	if body.Policy.Stale {
 		t.Error("expected policy.stale=false when never loaded (distinct from stale)")
+	}
+	if body.Policy.Principals.Users != 0 || body.Policy.Principals.APIKeys != 0 {
+		t.Errorf("expected policy.principals={0,0} for a PgStore that has never loaded, got %+v", body.Policy.Principals)
+	}
+}
+
+// fakePolicyHealthStatus is a policyHealthStatus fake letting this test set
+// an arbitrary loaded Snapshot (including PrincipalCounts) without a real
+// database or the policy package's own unexported test seams.
+type fakePolicyHealthStatus struct {
+	status policy.Status
+	snap   policy.Snapshot
+	loaded bool
+}
+
+func (f fakePolicyHealthStatus) Status() policy.Status            { return f.status }
+func (f fakePolicyHealthStatus) Current() (policy.Snapshot, bool) { return f.snap, f.loaded }
+
+// TestNewHealthHandler_ReportsLoadedPrincipalCounts is the loaded-snapshot
+// counterpart of the never-loaded assertion above: once a Snapshot with
+// explicit user/api_key policy rows is current, /health must report their
+// counts rather than always zero.
+func TestNewHealthHandler_ReportsLoadedPrincipalCounts(t *testing.T) {
+	fake := fakePolicyHealthStatus{
+		status: policy.Status{Loaded: true},
+		snap: policy.Snapshot{
+			Residency:       policy.ResidencyAny,
+			PrincipalCounts: policy.PrincipalCounts{Users: 3, APIKeys: 7},
+		},
+		loaded: true,
+	}
+
+	routeMgr := routing.NewManager(nil, 0)
+	upstreamChecker := health.NewChecker(nil)
+	semanticClassifier := router.NewSemanticRouterClassifier("", 0.6, time.Second, 5, 30*time.Second)
+	h := newHealthHandler(upstreamChecker, routeMgr, fake, semanticClassifier)
+
+	router := gin.New()
+	router.GET("/health", h)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/health", nil))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var body struct {
+		Policy struct {
+			Principals struct {
+				Users   int `json:"users"`
+				APIKeys int `json:"api_keys"`
+			} `json:"principals"`
+		} `json:"policy"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v; body=%s", err, w.Body.String())
+	}
+	if body.Policy.Principals.Users != 3 || body.Policy.Principals.APIKeys != 7 {
+		t.Errorf("policy.principals = %+v, want {3 7}", body.Policy.Principals)
 	}
 }
 

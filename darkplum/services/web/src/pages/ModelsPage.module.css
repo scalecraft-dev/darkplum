@@ -412,3 +412,73 @@
     animation: none;
   }
 }
+
+/* --- Display name, editable in place --- */
+
+.nameBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 2px var(--space-2);
+  margin-left: calc(var(--space-2) * -1);
+  background: none;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  color: inherit;
+  text-align: left;
+  cursor: text;
+  transition: border-color var(--transition-fast), background var(--transition-fast);
+}
+
+.nameBtn:hover {
+  background: var(--bg-surface-hover);
+  border-color: var(--border-default);
+}
+
+.nameBtn:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 1px;
+}
+
+.nameBtn:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+
+/* The pencil is a hint, not a control: it appears when the row is being read
+   closely and stays out of the way of the name the rest of the time. */
+.nameIcon {
+  flex-shrink: 0;
+  color: var(--fg-subtle);
+  opacity: 0;
+  transition: opacity var(--transition-fast);
+}
+
+.nameBtn:hover .nameIcon,
+.nameBtn:focus-visible .nameIcon {
+  opacity: 1;
+}
+
+.nameInput {
+  width: 100%;
+  max-width: 18rem;
+  padding: 2px var(--space-2);
+  background: var(--bg-base);
+  border: 1px solid var(--border-focus);
+  border-radius: var(--radius-sm);
+  color: var(--fg-default);
+  font-family: var(--font-sans);
+  font-size: var(--fs-sm);
+}
+
+.nameInput:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 1px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nameBtn,
+  .nameIcon {
+    transition-duration: 0.01ms !important;
+  }
+}

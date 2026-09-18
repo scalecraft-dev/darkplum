@@ -1,0 +1,146 @@
+/* The affordance sits in the chat header beside the picker. It is deliberately
+   quiet: most people never need it, and the one who does is looking for a
+   missing model, not for a banner. */
+
+.trigger {
+  display: inline-flex;
+  flex: 0 1 auto;
+  min-width: 0;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2);
+  background: none;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  color: var(--fg-subtle);
+  font-size: var(--fs-xs);
+  cursor: pointer;
+  transition: color var(--transition-fast), border-color var(--transition-fast);
+}
+
+.trigger:hover {
+  color: var(--fg-default);
+  border-color: var(--border-default);
+}
+
+.trigger:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
+.triggerText {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.trigger svg {
+  flex-shrink: 0;
+  color: var(--warning-fg);
+}
+
+.body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  margin-top: var(--space-4);
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: 11rem 1fr;
+  gap: var(--space-3);
+  align-items: baseline;
+}
+
+.grid dt {
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--fg-muted);
+}
+
+.grid dd {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  font-size: var(--fs-sm);
+  color: var(--fg-default);
+  min-width: 0;
+}
+
+.chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+
+.chip {
+  padding: 1px 6px;
+  background: var(--bg-surface-raised);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-xs);
+  overflow-wrap: anywhere;
+}
+
+/* Which level decided this. A footnote under the answer, never instead of it. */
+.source {
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+}
+
+.none {
+  color: var(--danger-fg);
+  font-weight: var(--fw-medium);
+}
+
+.rule {
+  padding-left: var(--space-3);
+  border-left: 2px solid var(--brand-default);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-muted);
+  max-width: 62ch;
+}
+
+.hint {
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-subtle);
+  max-width: 62ch;
+}
+
+.footer {
+  display: flex;
+  justify-content: flex-end;
+}
+
+@media (max-width: 899px) {
+  .triggerText {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
+  }
+}
+
+@media (max-width: 767px) {
+  .grid {
+    grid-template-columns: 1fr;
+    gap: var(--space-1);
+  }
+
+  .grid dt {
+    margin-top: var(--space-2);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .trigger {
+    transition-duration: 0.01ms !important;
+  }
+}
