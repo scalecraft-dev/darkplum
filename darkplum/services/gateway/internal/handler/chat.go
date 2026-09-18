@@ -1038,9 +1038,13 @@ func policyImpact(snap policy.Snapshot, table *routing.Table, override *policy.P
 // allowedModels is the policy-side counterpart of reachableModels: the
 // enabled models eff permits under its residency, WITHOUT the routability
 // test. Impact counts are about what an admin's policy change takes away,
-// and must not move because a backend happens to be down at save time. A
-// model the route table has never seen has no known class, so it is kept
-// (it is enabled and allowed; residency cannot be judged).
+// and must not move because a backend happens to be down at save time.
+// Under self_hosted_only a model the route table has never seen has no
+// known class and is EXCLUDED — the same deny-when-uncertain rule
+// enforcement applies (such a request is refused anyway), and the safe
+// direction for a preview: it may warn of a loss that turns out not to be
+// one, never stay silent about one that is. Under residency any, class is
+// irrelevant and the model is kept.
 func allowedModels(eff policy.EffectivePolicy, snap policy.Snapshot, table *routing.Table) []string {
 	ids := make([]string, 0, len(snap.Enabled))
 	for id, enabled := range snap.Enabled {
@@ -1055,7 +1059,8 @@ func allowedModels(eff policy.EffectivePolicy, snap policy.Snapshot, table *rout
 			continue
 		}
 		if eff.Residency == policy.ResidencySelfHostedOnly {
-			if route, ok := table.Lookup(id); ok && route.Class == routing.ClassCloudManaged {
+			route, ok := table.Lookup(id)
+			if !ok || route.Class == routing.ClassCloudManaged {
 				continue
 			}
 		}

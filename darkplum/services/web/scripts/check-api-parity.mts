@@ -2,7 +2,8 @@
  * API/UI parity check.
  *
  * Run: node --experimental-strip-types scripts/check-api-parity.mts
- *      (pnpm run check:parity)
+ *      (pnpm run check:parity). Uses the project's own `typescript` package
+ *      for parsing; no other dependency.
  *
  * Three things are asserted, all of them structural rather than stylistic:
  *
@@ -10,8 +11,9 @@
  *      (docs/api-routes.json) with surface "ui", and every golden entry marked
  *      surface "ui" is in ROUTES. Both directions, so a route that is built
  *      and never used fails as loudly as one that is used and never built.
- *   2. Every ROUTES entry is actually reached from a screen: directly, or via
- *      an api.ts wrapper that some file outside src/lib references. ROUTES
+ *   2. Every ROUTES entry is actually reached from a screen, in a value
+ *      position (TypeScript AST, so type-only references do not count):
+ *      directly, or via a src/lib function some screen references. ROUTES
  *      membership alone would let a dead wrapper keep a route green.
  *   3. No HTTP call outside src/lib/api.ts and src/context/AuthContext.tsx:
  *      `fetch(` however it is reached (`window.fetch`, `globalThis.fetch`,
@@ -32,12 +34,13 @@
  * "ui" route is in ROUTES, so a hidden call could at most reach a route that
  * is already declared and already reachable through ROUTES.
  *
- * Exits 1 with a readable list of what is wrong. No dependencies beyond Node.
+ * Exits 1 with a readable list of what is wrong.
  */
 
 import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { join, relative } from 'node:path'
+import ts from 'typescript'
 import { ALL_ROUTES, ROUTES } from '../src/lib/routes.ts'
 
 const WEB_ROOT = fileURLToPath(new URL('..', import.meta.url))
@@ -315,92 +318,129 @@ fail(
 // A ROUTES entry only proves a route is declared; this proves something on a
 // screen uses it. Each `ROUTES.<key>` must be reached either directly from a
 // file outside src/lib (AuthContext does this), or through an exported
-// wrapper in src/lib/api.ts that some file outside src/lib references.
-// Without this, a wrapper nobody calls keeps a "ui" route green forever.
+// function in src/lib (api.ts wrappers, conversations.ts helpers, plain
+// re-exports) that a screen references in a VALUE position. This walks the
+// TypeScript AST rather than matching text: every type position — `typeof
+// f`, `ReturnType<typeof import('./api').f>`, `(typeof ns)['f']`, import
+// declarations — is skipped structurally, so a name that only ever appears
+// in a type cannot keep a dead route green. Comments never reach the AST.
+// An import nobody uses is tsc's job (noUnusedLocals is on and `pnpm run
+// build` runs tsc), so the two together cover it.
 // ---------------------------------------------------------------------------
 
-/** Exported functions of a lib module: name -> the source of its body. A
- *  re-export (`export { a as b } from './api'`) is an export named b whose
- *  "body" is the name a, so reachability flows through it like a wrapper. */
-function exportedFunctions(source: string): Map<string, string> {
-  const fnRe = /export\s+(?:async\s+)?function\s+(\w+)\s*\(|export\s+const\s+(\w+)\s*=/g
-  const starts: Array<{ name: string; at: number }> = []
-  for (let m = fnRe.exec(source); m; m = fnRe.exec(source)) starts.push({ name: m[1] ?? m[2], at: m.index })
-  const out = new Map<string, string>()
-  starts.forEach(({ name, at }, idx) => {
-    out.set(name, source.slice(at, starts[idx + 1]?.at ?? source.length))
-  })
-  for (const m of source.matchAll(/export\s*\{([^}]*)\}\s*from\s*['"][^'"]+['"]/g)) {
-    for (const spec of m[1].split(',')) {
-      const [orig, alias] = spec.trim().split(/\s+as\s+/).map((x) => x?.trim())
-      if (orig) out.set(alias ?? orig, orig)
-    }
-  }
-  return out
+function parse(file: string): ts.SourceFile {
+  return ts.createSourceFile(file, readFileSync(file, 'utf8'), ts.ScriptTarget.Latest, true,
+    file.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS)
 }
 
 /**
- * Drops the places a name can appear without being called: import
- * declarations (an import nobody calls is tsc's business — noUnusedLocals)
- * and type positions (`typeof f`, `import type`). Without this, keeping an
- * import alive with `ReturnType<typeof f>` would count as reaching f's route.
+ * The value-position references inside `root`: identifiers, string literals
+ * (so `ns['f']()` counts), and `ROUTES.<key>` property accesses spelled as
+ * one token. Type nodes, import/export declarations and type-only constructs
+ * contribute nothing.
  */
-function valueUsesOnly(source: string): string {
-  return source
-    .replace(/import\s+type\s+[^;]*?from\s*['"][^'"]+['"];?/g, '')
-    .replace(/import\s*(?:[\w*\s{},]*?)\s*from\s*['"][^'"]+['"];?/g, '')
-    .replace(/\btypeof\s+\w+/g, '')
+function valueRefs(root: ts.Node, into: Set<string>): void {
+  const visit = (node: ts.Node): void => {
+    if (
+      ts.isTypeNode(node) ||
+      ts.isImportDeclaration(node) ||
+      ts.isImportEqualsDeclaration(node) ||
+      ts.isExportDeclaration(node) ||
+      ts.isTypeAliasDeclaration(node) ||
+      ts.isInterfaceDeclaration(node)
+    ) {
+      return
+    }
+    // `x satisfies T` / `x as T` keep x (a value) and drop T (handled above
+    // as a TypeNode child).
+    if (ts.isIdentifier(node)) into.add(node.text)
+    else if (ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node)) into.add(node.text)
+    else if (
+      ts.isPropertyAccessExpression(node) &&
+      ts.isIdentifier(node.expression) &&
+      node.expression.text === 'ROUTES'
+    ) {
+      into.add(`ROUTES.${node.name.text}`)
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(root)
 }
 
-const libFiles = walk(join(SRC_DIR, 'lib'))
-const nonLibSource = walk(SRC_DIR)
-  .filter((f) => !libFiles.includes(f))
-  .map((f) => valueUsesOnly(stripComments(readFileSync(f, 'utf8'))))
-  .join('\n')
-
-/** Rewrites `import { a as b }` aliases back to `a` in a lib module's source,
- *  so a body that calls the alias counts as referencing the original. */
-function unalias(source: string): string {
-  let out = source
-  for (const m of source.matchAll(/import\s*(?:type\s*)?\{([^}]*)\}\s*from/g)) {
-    for (const spec of m[1].split(',')) {
-      const parts = spec.trim().split(/\s+as\s+/)
-      if (parts.length === 2) out = out.replace(new RegExp(`\\b${parts[1].trim()}\\b`, 'g'), parts[0].trim())
+/** Exported functions of a lib module: name -> the value references in its
+ *  body. A re-export (`export { a as b } from './x'`) is an export named b
+ *  that references a, so reachability flows through it like a wrapper. */
+function exportedFunctions(sf: ts.SourceFile): Map<string, Set<string>> {
+  const out = new Map<string, Set<string>>()
+  const isExported = (n: ts.Node) =>
+    ts.canHaveModifiers(n) && (ts.getModifiers(n) ?? []).some((m) => m.kind === ts.SyntaxKind.ExportKeyword)
+  for (const stmt of sf.statements) {
+    if (ts.isFunctionDeclaration(stmt) && stmt.name && isExported(stmt)) {
+      const refs = new Set<string>()
+      valueRefs(stmt, refs)
+      out.set(stmt.name.text, refs)
+    } else if (ts.isVariableStatement(stmt) && isExported(stmt)) {
+      for (const decl of stmt.declarationList.declarations) {
+        if (!ts.isIdentifier(decl.name)) continue
+        const refs = new Set<string>()
+        valueRefs(decl, refs)
+        out.set(decl.name.text, refs)
+      }
+    } else if (ts.isExportDeclaration(stmt) && stmt.exportClause && ts.isNamedExports(stmt.exportClause)) {
+      for (const el of stmt.exportClause.elements) {
+        if (el.isTypeOnly || stmt.isTypeOnly) continue
+        out.set(el.name.text, new Set([(el.propertyName ?? el.name).text]))
+      }
     }
   }
   return out
+}
+
+const libFiles = walk(join(SRC_DIR, 'lib'))
+
+/** Everything a screen (any file outside src/lib) references by value. */
+const screenRefs = new Set<string>()
+for (const f of walk(SRC_DIR)) {
+  if (libFiles.includes(f)) continue
+  valueRefs(parse(f), screenRefs)
 }
 
 /** Every exported function in src/lib, keyed by file#name (two modules may
  *  export the same name — conversations.ts wraps api.ts's deleteConversation
- *  under the same name), with what its body references, so a route reached
- *  through a lib helper (api.ts -> conversations.ts -> ChatPage) counts. */
-const libExports = new Map<string, { name: string; body: string }>()
+ *  under the same name), with what its body references by value, so a route
+ *  reached through a lib helper (api.ts -> conversations.ts -> ChatPage)
+ *  counts. Import aliases inside a lib module (`import { a as b }`) are
+ *  resolved so a body calling b is seen to reference a. */
+const libExports = new Map<string, { name: string; refs: Set<string> }>()
 for (const f of libFiles) {
-  const src = unalias(stripComments(readFileSync(f, 'utf8')))
-  for (const [name, body] of exportedFunctions(src)) {
-    // Bodies too: a lib helper that only names a wrapper in a type keeps
-    // nothing alive.
-    libExports.set(`${relative(WEB_ROOT, f)}#${name}`, { name, body: valueUsesOnly(body) })
+  const sf = parse(f)
+  const aliases = new Map<string, string>()
+  for (const stmt of sf.statements) {
+    if (ts.isImportDeclaration(stmt) && stmt.importClause?.namedBindings && ts.isNamedImports(stmt.importClause.namedBindings)) {
+      for (const el of stmt.importClause.namedBindings.elements) {
+        if (el.propertyName) aliases.set(el.name.text, el.propertyName.text)
+      }
+    }
+  }
+  for (const [name, refs] of exportedFunctions(sf)) {
+    const resolved = new Set<string>()
+    for (const r of refs) resolved.add(aliases.get(r) ?? r)
+    libExports.set(`${relative(WEB_ROOT, f)}#${name}`, { name, refs: resolved })
   }
 }
-const mentions = (haystack: string, name: string) => new RegExp(`\\b${name}\\b`).test(haystack)
 
 // Reachable lib exports: referenced by name from a screen, or from the body
 // of another reachable export in a different module. Fixed point over the
 // (small) export set. Same-named exports are conflated, which can only make
 // something look reachable, never hide a dead route behind a false alarm.
-// Imports and type positions are stripped first (valueUsesOnly), so only a
-// value use counts; an import nobody calls is tsc's job (noUnusedLocals is
-// on, and `pnpm run build` runs tsc), so the two together cover it.
 const reachable = new Set<string>()
-for (const [k, e] of libExports) if (mentions(nonLibSource, e.name)) reachable.add(k)
+for (const [k, e] of libExports) if (screenRefs.has(e.name)) reachable.add(k)
 for (let grew = true; grew; ) {
   grew = false
   for (const [k, e] of libExports) {
     if (reachable.has(k)) continue
     for (const r of reachable) {
-      if (r.split('#')[0] !== k.split('#')[0] && mentions(libExports.get(r)!.body, e.name)) {
+      if (r.split('#')[0] !== k.split('#')[0] && libExports.get(r)!.refs.has(e.name)) {
         reachable.add(k); grew = true; break
       }
     }
@@ -409,8 +449,8 @@ for (let grew = true; grew; ) {
 
 const unreferenced: string[] = []
 for (const routeKey of Object.keys(ROUTES).sort()) {
-  if (mentions(nonLibSource, `ROUTES\\.${routeKey}`)) continue
-  const via = [...libExports].filter(([, e]) => mentions(e.body, `ROUTES\\.${routeKey}`)).map(([k]) => k)
+  if (screenRefs.has(`ROUTES.${routeKey}`)) continue
+  const via = [...libExports].filter(([, e]) => e.refs.has(`ROUTES.${routeKey}`)).map(([k]) => k)
   if (via.some((k) => reachable.has(k))) continue
   const names = via.map((k) => k.split('#')[1])
   unreferenced.push(

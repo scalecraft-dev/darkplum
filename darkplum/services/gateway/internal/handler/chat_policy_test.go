@@ -1173,3 +1173,28 @@ func TestHandleEffectivePolicyImpact_ResidencyTighteningWithoutCloudModelsNarrow
 		t.Errorf("only the pre-existing empty key may be locked out, got %+v", got.LockedOut)
 	}
 }
+
+func TestHandleEffectivePolicyImpact_UnknownClassIsExcludedUnderSelfHostedOnly(t *testing.T) {
+	// m4 is enabled in the catalogue but the route table has never seen it
+	// (backend not yet discovered), so its class is unknown. Under residency
+	// "any" it is allowed; tightening to self_hosted_only must treat it as
+	// lost (deny when uncertain) — the org is narrowed even though no
+	// cloud-managed model is known.
+	snap := impactSnapshot()
+	snap.Enabled["m4"] = true
+	snap.OrgRow.AllowedModels = &[]string{"m1", "m2", "m3", "m4"}
+	h := newTestHandler(fakeProviders{}, baseOverrideRoutes(), snap, true)
+	w, c := newPolicyImpactRequest(t, middleware.KeyTypeService, `{"override":{"level":"org","policy":{"residency":"self_hosted_only"}}}`)
+	h.HandleEffectivePolicyImpact(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body=%s", w.Code, w.Body.String())
+	}
+	got := decodePolicyImpact(t, w.Body.Bytes())
+	if !got.OrgNarrowed {
+		t.Errorf("an enabled model of unknown class must count as lost under self_hosted_only; org_narrowed=false")
+	}
+	// previewUserID's own row allows m1 only (known, self-hosted): unchanged.
+	if impactSet(got.Narrowed)[previewUserID+"/"] {
+		t.Errorf("previewUserID (m1 only) must not be narrowed, got %+v", got.Narrowed)
+	}
+}
