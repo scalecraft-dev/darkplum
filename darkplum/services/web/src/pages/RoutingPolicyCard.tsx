@@ -26,9 +26,16 @@ interface Props {
   onRetry: () => void
   /** Resolves with what the API said the new policy does — or, when the API
    *  refused it, who it would have left with no model (`lockedOut`). */
-  onChange: (
-    draft: OrgPolicyDraft,
-  ) => Promise<{ warnings: string[]; affectedPrincipals: number; lockedOut: string[] }>
+  onChange: (draft: OrgPolicyDraft) => Promise<{
+    warnings: string[]
+    /** Principals with a policy of their own whose reachable set actually
+     *  shrank — not merely how many have a row. */
+    affectedPrincipals: number
+    /** Whether everyone who simply inherits the organisation's policy now
+     *  reaches fewer models too. Independent of affectedPrincipals. */
+    orgNarrowed: boolean
+    lockedOut: string[]
+  }>
 }
 
 const RESIDENCY_OPTIONS: { value: Residency; label: string; consequence: string }[] = [
@@ -81,8 +88,13 @@ export function RoutingPolicyCard({
   /** What the API said the new policy breaks. Written by the API, shown as it
    *  came: these name routed aliases that will start refusing. */
   const [warnings, setWarnings] = useState<string[]>([])
-  /** How many users and keys reach less than they did. Written by the API. */
+  /** How many users and keys with a policy of their own reach less than they
+   *  did. Written by the API. */
   const [affected, setAffected] = useState<number | null>(null)
+  /** Whether everyone who inherits the organisation's policy reaches less too.
+   *  Independent of `affected` — a principal with its own row is never
+   *  counted here even if the org narrowed under it as well. */
+  const [orgNarrowed, setOrgNarrowed] = useState(false)
   /** Who the API said the last attempt would have locked out of every model.
    *  Non-empty means the save was refused and nothing changed. */
   const [lockedOut, setLockedOut] = useState<string[]>([])
@@ -145,6 +157,7 @@ export function RoutingPolicyCard({
     }
     setWarnings(result.warnings)
     setAffected(result.affectedPrincipals)
+    setOrgNarrowed(result.orgNarrowed)
     if (result.warnings.length === 0) setConfirmOpen(false)
   }
 
@@ -152,6 +165,7 @@ export function RoutingPolicyCard({
     if (!canSave) return
     setWarnings([])
     setAffected(null)
+    setOrgNarrowed(false)
     setLockedOut([])
     if (tightening) {
       setConfirmOpen(true)
@@ -336,22 +350,26 @@ export function RoutingPolicyCard({
             )}
           </fieldset>
 
-          {affected !== null && affected > 0 && (
+          {/* affected counts only principals with a policy of their own whose
+              reachable set actually shrank — never "has a row". orgNarrowed is
+              the separate question of whether everyone who simply inherits now
+              reaches less too; the two can both be true, either alone, or
+              neither. `!changed` is how the card knows the save landed: a
+              failed one leaves the form ahead of the stored policy. */}
+          {affected !== null && !changed && (orgNarrowed || affected > 0) && (
             <p className={styles.affected} role="status">
-              {affected === 1
-                ? '1 user or key now reaches fewer models than before.'
-                : `${affected} users and keys now reach fewer models than before.`}{' '}
-              Their own policies are unchanged — the organisation moved under them.
+              {orgNarrowed && "Everyone who inherits the organisation's policy now reaches fewer models."}
+              {orgNarrowed && affected > 0 && ' '}
+              {affected > 0 &&
+                (affected === 1
+                  ? '1 user or key with a policy of its own also reaches fewer.'
+                  : `${affected} users and keys with a policy of their own also reach fewer.`)}
             </p>
           )}
 
-          {/* The API counts only principals that lost something, so nought is
-              worth saying rather than leaving the save silent. `!changed` is
-              how the card knows the save landed: a failed one leaves the form
-              ahead of the stored policy. */}
-          {affected === 0 && !changed && (
+          {affected !== null && !changed && !orgNarrowed && affected === 0 && (
             <p className={styles.affectedQuiet} role="status">
-              No user or key reaches fewer models than before.
+              No one reaches fewer models than before.
             </p>
           )}
 

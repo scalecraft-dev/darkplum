@@ -143,3 +143,39 @@ export function aliasTargets(a: ModelAlias): string[] {
   if (isRoutedAlias(a)) return (a.routes ?? []).map((r) => r.target_model_id)
   return a.target_model_id ? [a.target_model_id] : []
 }
+
+// ---------------------------------------------------------------------------
+// Denial codes
+// ---------------------------------------------------------------------------
+
+/** Every code the usage log's denial filter offers — the same closed
+ *  vocabulary the API's `?denial_code=` query param and a refused request's
+ *  `denial_code` field both accept (activity.go's validDenialCodeFilter). A
+ *  code the API sends that isn't here still renders on a row (see
+ *  denialLabel); it just isn't one of the filter's options. */
+export const DENIAL_CODES = [
+  'model_not_found',
+  'model_not_enabled',
+  'model_residency_violation',
+  'model_not_allowed',
+  'invalid_request',
+  'policy_unavailable',
+  'request_canceled',
+] as const
+
+const DENIAL_LABELS: Record<string, string> = {
+  model_not_found: 'Model not found',
+  model_not_enabled: 'Model disabled',
+  model_residency_violation: 'Blocked by residency policy',
+  model_not_allowed: 'Not allowed for this key',
+  invalid_request: 'Invalid request',
+  policy_unavailable: 'Policy unavailable',
+  request_canceled: 'Request cancelled',
+}
+
+/** Short, admin-facing label for a denial code, e.g. in the activity log. A
+ *  code outside the closed vocabulary above still gets a readable label
+ *  rather than disappearing — it just isn't hand-written. */
+export function denialLabel(code: string): string {
+  return DENIAL_LABELS[code] ?? code.replace(/_/g, ' ')
+}

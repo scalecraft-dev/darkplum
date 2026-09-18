@@ -49,7 +49,35 @@ export function ModelAccessNotice({ models }: Props) {
 
   useEffect(() => { void load() }, [load])
 
-  if (loading || error || !policyLimits(policy) || !policy) return null
+  if (loading) return null
+
+  // Read failed — the "why" affordance is exactly what someone reaches for
+  // when access looks wrong, so it stays put and offers a retry instead of
+  // quietly vanishing.
+  if (error) {
+    return (
+      <div className={styles.loadError} role="alert">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+          <circle cx="12" cy="12" r="10" />
+          <line x1="12" y1="8" x2="12" y2="13" />
+          <line x1="12" y1="16" x2="12.01" y2="16" />
+        </svg>
+        <span>Could not load your access policy — try again</span>
+        <button type="button" className={styles.retryBtn} onClick={() => void load()}>
+          Retry
+        </button>
+      </div>
+    )
+  }
+
+  if (!policy || !policyLimits(policy)) return null
+
+  const allowedSource = policy.sources?.allowed_models
+  const residencySource = policy.sources?.residency
+  const principalSourced =
+    allowedSource === 'user' || allowedSource === 'api_key' ||
+    residencySource === 'user' || residencySource === 'api_key'
+  const orgSourced = allowedSource === 'org' || residencySource === 'org'
 
   return (
     <>
@@ -116,8 +144,12 @@ export function ModelAccessNotice({ models }: Props) {
 
           <p className={styles.rule}>{POLICY_RULE}</p>
           <p className={styles.hint}>
-            Nothing here is something you can change yourself. An administrator can widen it from
-            the Models page.
+            Nothing here is something you can change yourself.{' '}
+            {principalSourced && orgSourced
+              ? "Some of this comes from the organisation's policy, widened from the Models page; the rest is set on you or your key, in Admin → Users & Keys."
+              : principalSourced
+                ? 'An administrator can widen it from Admin → Users & Keys — this is set on you or your key, not on the organisation.'
+                : 'An administrator can widen it from the Models page.'}
           </p>
 
           <div className={styles.footer}>

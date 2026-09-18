@@ -39,6 +39,39 @@
   color: var(--warning-fg);
 }
 
+/* The read failed. Same slot the trigger would sit in, so the affordance
+   never just disappears when access looks broken. */
+.loadError {
+  display: inline-flex;
+  flex: 0 1 auto;
+  min-width: 0;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  color: var(--danger-fg);
+  font-size: var(--fs-xs);
+}
+
+.loadError svg {
+  flex-shrink: 0;
+}
+
+.retryBtn {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--fg-muted);
+  font-size: var(--fs-xs);
+  text-decoration: underline;
+  cursor: pointer;
+}
+
+.retryBtn:hover {
+  color: var(--fg-default);
+}
+
 .body {
   display: flex;
   flex-direction: column;

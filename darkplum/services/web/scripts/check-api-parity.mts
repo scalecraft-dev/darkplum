@@ -8,9 +8,11 @@
  *
  *   1. Every route the UI can call is declared in the golden file
  *      (docs/api-routes.json) with surface "ui", and every golden entry marked
- *      surface "ui" is actually called by the UI. Both directions, so a route
- *      that is built and never used fails as loudly as one that is used and
- *      never built.
+ *      surface "ui" is in ROUTES. Both directions, so a route that is built
+ *      and never used fails as loudly as one that is used and never built.
+ *   4. Every ROUTES entry is actually reached from a screen: directly, or via
+ *      an api.ts wrapper that some file outside src/lib references. ROUTES
+ *      membership alone would let a dead wrapper keep a route green.
  *   2. No HTTP call outside src/lib/api.ts and src/context/AuthContext.tsx:
  *      `fetch(` however it is reached (`window.fetch`, `globalThis.fetch`,
  *      aliased through `const f = fetch`), `new XMLHttpRequest`, `sendBeacon(`,
@@ -36,7 +38,7 @@
 import { readFileSync, readdirSync, statSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { join, relative } from 'node:path'
-import { ALL_ROUTES } from '../src/lib/routes.ts'
+import { ALL_ROUTES, ROUTES } from '../src/lib/routes.ts'
 
 const WEB_ROOT = fileURLToPath(new URL('..', import.meta.url))
 const SRC_DIR = join(WEB_ROOT, 'src')
@@ -184,14 +186,104 @@ const strayPaths: string[] = []
 
 /**
  * Blank out comments so prose ("the first fetch settles") is not read as
- * code, keeping every newline so reported line numbers stay right. Block
- * comments go first; a line comment is `//` at the start of a line or after
- * whitespace, which leaves `https://` inside a string alone.
+ * code, keeping every newline so reported line numbers stay right. This is
+ * a small lexer, not a regex: it tracks string, template and regex-literal
+ * state so a `//` or `/*` inside a quoted string is left alone and the code
+ * after it on the same line is still scanned. Template `${...}` bodies are
+ * treated as code. A `/` starts a regex literal when the previous
+ * significant character cannot end an expression — good enough for the
+ * source this repo has, and an over-eager regex only ever means a comment
+ * survives (a false positive on scan), never that code is hidden.
  */
 function stripComments(source: string): string {
-  return source
-    .replace(/\/\*[\s\S]*?\*\//g, (m) => m.replace(/[^\n]/g, ' '))
-    .replace(/(^|\s)\/\/.*$/gm, '$1')
+  const out: string[] = []
+  const n = source.length
+  let i = 0
+  // What the last significant (non-space, non-comment) character was, to
+  // decide whether a `/` opens a regex literal or is a divide.
+  let prev = ''
+  const regexCanFollow = (ch: string) => ch === '' || '(,=:[!&|?{};+-*%<>~^'.includes(ch)
+  const templateDepth: number[] = [] // brace depth at each nested `${`
+  let braces = 0
+
+  while (i < n) {
+    const ch = source[i]
+    const next = source[i + 1]
+
+    if (ch === '/' && next === '/') {
+      while (i < n && source[i] !== '\n') i++
+      continue
+    }
+    if (ch === '/' && next === '*') {
+      i += 2
+      while (i < n && !(source[i] === '*' && source[i + 1] === '/')) {
+        out.push(source[i] === '\n' ? '\n' : ' ')
+        i++
+      }
+      i += 2
+      continue
+    }
+    if (ch === "'" || ch === '"') {
+      const q = ch
+      out.push(ch); i++
+      while (i < n && source[i] !== q && source[i] !== '\n') {
+        if (source[i] === '\\') { out.push(source[i], source[i + 1] ?? ''); i += 2; continue }
+        out.push(source[i]); i++
+      }
+      if (i < n) { out.push(source[i]); i++ }
+      prev = q
+      continue
+    }
+    if (ch === '`') {
+      out.push(ch); i++
+      while (i < n && source[i] !== '`') {
+        if (source[i] === '\\') { out.push(source[i], source[i + 1] ?? ''); i += 2; continue }
+        if (source[i] === '$' && source[i + 1] === '{') {
+          // Code inside the placeholder: lex it recursively up to the
+          // matching brace, then continue the template.
+          out.push('${'); i += 2
+          let depth = 1
+          let start = i
+          while (i < n && depth > 0) {
+            if (source[i] === '{') depth++
+            else if (source[i] === '}') depth--
+            if (depth > 0) i++
+          }
+          out.push(stripComments(source.slice(start, i)))
+          if (i < n) { out.push('}'); i++ }
+          continue
+        }
+        out.push(source[i]); i++
+      }
+      if (i < n) { out.push(source[i]); i++ }
+      prev = '`'
+      continue
+    }
+    if (ch === '/' && regexCanFollow(prev)) {
+      // Regex literal: copy through to the closing unescaped `/`, honouring
+      // character classes.
+      out.push(ch); i++
+      let inClass = false
+      while (i < n && source[i] !== '\n') {
+        const c = source[i]
+        if (c === '\\') { out.push(c, source[i + 1] ?? ''); i += 2; continue }
+        if (c === '[') inClass = true
+        else if (c === ']') inClass = false
+        out.push(c); i++
+        if (c === '/' && !inClass) break
+      }
+      prev = '/'
+      continue
+    }
+    out.push(ch)
+    if (ch === '{') braces++
+    if (ch === '}') braces--
+    if (!/\s/.test(ch)) prev = ch
+    i++
+  }
+  void templateDepth
+  void braces
+  return out.join('')
 }
 
 for (const file of walk(SRC_DIR).sort()) {
@@ -215,6 +307,98 @@ for (const file of walk(SRC_DIR).sort()) {
 fail(
   `HTTP calls outside ${FETCH_ALLOWED.join(' and ')}:`,
   strayFetch,
+)
+
+// ---------------------------------------------------------------------------
+// 4. Call sites
+//
+// A ROUTES entry only proves a route is declared; this proves something on a
+// screen uses it. Each `ROUTES.<key>` must be reached either directly from a
+// file outside src/lib (AuthContext does this), or through an exported
+// wrapper in src/lib/api.ts that some file outside src/lib references.
+// Without this, a wrapper nobody calls keeps a "ui" route green forever.
+// ---------------------------------------------------------------------------
+
+/** Exported functions of a lib module: name -> the source of its body. */
+function exportedFunctions(source: string): Map<string, string> {
+  const fnRe = /export\s+(?:async\s+)?function\s+(\w+)\s*\(|export\s+const\s+(\w+)\s*=/g
+  const starts: Array<{ name: string; at: number }> = []
+  for (let m = fnRe.exec(source); m; m = fnRe.exec(source)) starts.push({ name: m[1] ?? m[2], at: m.index })
+  const out = new Map<string, string>()
+  starts.forEach(({ name, at }, idx) => {
+    out.set(name, source.slice(at, starts[idx + 1]?.at ?? source.length))
+  })
+  return out
+}
+
+const libFiles = walk(join(SRC_DIR, 'lib'))
+const nonLibSource = walk(SRC_DIR)
+  .filter((f) => !libFiles.includes(f))
+  .map((f) => stripComments(readFileSync(f, 'utf8')))
+  .join('\n')
+
+/** Rewrites `import { a as b }` aliases back to `a` in a lib module's source,
+ *  so a body that calls the alias counts as referencing the original. */
+function unalias(source: string): string {
+  let out = source
+  for (const m of source.matchAll(/import\s*(?:type\s*)?\{([^}]*)\}\s*from/g)) {
+    for (const spec of m[1].split(',')) {
+      const parts = spec.trim().split(/\s+as\s+/)
+      if (parts.length === 2) out = out.replace(new RegExp(`\\b${parts[1].trim()}\\b`, 'g'), parts[0].trim())
+    }
+  }
+  return out
+}
+
+/** Every exported function in src/lib, keyed by file#name (two modules may
+ *  export the same name — conversations.ts wraps api.ts's deleteConversation
+ *  under the same name), with what its body references, so a route reached
+ *  through a lib helper (api.ts -> conversations.ts -> ChatPage) counts. */
+const libExports = new Map<string, { name: string; body: string }>()
+for (const f of libFiles) {
+  const src = unalias(stripComments(readFileSync(f, 'utf8')))
+  for (const [name, body] of exportedFunctions(src)) {
+    libExports.set(`${relative(WEB_ROOT, f)}#${name}`, { name, body })
+  }
+}
+const mentions = (haystack: string, name: string) => new RegExp(`\\b${name}\\b`).test(haystack)
+
+// Reachable lib exports: referenced by name from a screen, or from the body
+// of another reachable export in a different module. Fixed point over the
+// (small) export set. Same-named exports are conflated, which can only make
+// something look reachable, never hide a dead route behind a false alarm.
+// An import counts as a reference here; an import nobody calls is tsc's job
+// (noUnusedLocals is on, and `pnpm run build` runs tsc), so the two together
+// cover it.
+const reachable = new Set<string>()
+for (const [k, e] of libExports) if (mentions(nonLibSource, e.name)) reachable.add(k)
+for (let grew = true; grew; ) {
+  grew = false
+  for (const [k, e] of libExports) {
+    if (reachable.has(k)) continue
+    for (const r of reachable) {
+      if (r.split('#')[0] !== k.split('#')[0] && mentions(libExports.get(r)!.body, e.name)) {
+        reachable.add(k); grew = true; break
+      }
+    }
+  }
+}
+
+const unreferenced: string[] = []
+for (const routeKey of Object.keys(ROUTES).sort()) {
+  if (mentions(nonLibSource, `ROUTES\\.${routeKey}`)) continue
+  const via = [...libExports].filter(([, e]) => mentions(e.body, `ROUTES\\.${routeKey}`)).map(([k]) => k)
+  if (via.some((k) => reachable.has(k))) continue
+  const names = via.map((k) => k.split('#')[1])
+  unreferenced.push(
+    via.length === 0
+      ? `ROUTES.${routeKey} — no src/lib function uses it and nothing outside src/lib references it`
+      : `ROUTES.${routeKey} — used by ${names.join(', ')} but no screen reaches ${names.length === 1 ? 'it' : 'them'}`,
+  )
+}
+fail(
+  'Declared routes no screen uses (wire them, or move them to surface "machine" in the golden file):',
+  unreferenced,
 )
 fail(
   `Literal request paths outside ${PATH_ALLOWED.join(' and ')} — put them in ROUTES:`,

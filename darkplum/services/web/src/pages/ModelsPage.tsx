@@ -529,13 +529,14 @@ export function ModelsPage() {
   }, [loadModels, loadPolicy, loadAliases, loadPrincipals])
 
   /** Resolves with what the API said the change does: the routed-alias routes
-   *  that will now be refused, and how many principals reach less than before.
-   *  Both are the API's own counts — nothing here is inferred. A refusal
-   *  (409: the policy would leave someone with no model) comes back as
-   *  `lockedOut`, the API's list of who, so the card can show it in place. */
+   *  that will now be refused, how many principals with a policy of their own
+   *  reach less than before, and whether everyone who inherits reaches less
+   *  too. All three are the API's own counts — nothing here is inferred. A
+   *  refusal (409: the policy would leave someone with no model) comes back
+   *  as `lockedOut`, the API's list of who, so the card can show it in place. */
   const handlePolicyChange = async (
     draft: OrgPolicyDraft,
-  ): Promise<{ warnings: string[]; affectedPrincipals: number; lockedOut: string[] }> => {
+  ): Promise<{ warnings: string[]; affectedPrincipals: number; orgNarrowed: boolean; lockedOut: string[] }> => {
     setPolicySaving(true)
     try {
       const updated = await updateRoutingPolicy({
@@ -552,15 +553,21 @@ export function ModelsPage() {
       return {
         warnings: updated.warnings ?? [],
         affectedPrincipals: updated.affected_principals ?? 0,
+        orgNarrowed: updated.org_narrowed ?? false,
         lockedOut: [],
       }
     } catch (err) {
       if (err instanceof ApiError && err.status === 409) {
         const lockedOut = err.lockedOut()
-        return { warnings: [], affectedPrincipals: 0, lockedOut: lockedOut.length > 0 ? lockedOut : ['(organisation)'] }
+        return {
+          warnings: [],
+          affectedPrincipals: 0,
+          orgNarrowed: false,
+          lockedOut: lockedOut.length > 0 ? lockedOut : ['(organisation)'],
+        }
       }
       toast((err as Error).message, 'error')
-      return { warnings: [], affectedPrincipals: 0, lockedOut: [] }
+      return { warnings: [], affectedPrincipals: 0, orgNarrowed: false, lockedOut: [] }
     } finally {
       setPolicySaving(false)
     }

@@ -73,14 +73,15 @@ export const ROUTES = {
   listPolicyPrincipals: { method: 'GET', path: '/api/v1/routing-policy/principals' },
 
   // --- Routing policy: per user ---
-  getUserPolicy:       { method: 'GET',    path: '/api/v1/users/:id/routing-policy' },
+  // The stored row is read through .../effective's `stored` field, which is
+  // what the editor needs (own row and merged result together); the plain
+  // GET .../routing-policy is a machine route for scripts (see the golden).
   putUserPolicy:       { method: 'PUT',    path: '/api/v1/users/:id/routing-policy' },
   deleteUserPolicy:    { method: 'DELETE', path: '/api/v1/users/:id/routing-policy' },
   userPolicyEffective: { method: 'GET',    path: '/api/v1/users/:id/routing-policy/effective' },
   userPolicyPreview:   { method: 'POST',   path: '/api/v1/users/:id/routing-policy/preview' },
 
   // --- Routing policy: per API key ---
-  getKeyPolicy:       { method: 'GET',    path: '/api/v1/api-keys/:id/routing-policy' },
   putKeyPolicy:       { method: 'PUT',    path: '/api/v1/api-keys/:id/routing-policy' },
   deleteKeyPolicy:    { method: 'DELETE', path: '/api/v1/api-keys/:id/routing-policy' },
   keyPolicyEffective: { method: 'GET',    path: '/api/v1/api-keys/:id/routing-policy/effective' },

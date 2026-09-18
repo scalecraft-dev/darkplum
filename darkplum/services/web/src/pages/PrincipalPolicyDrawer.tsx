@@ -86,7 +86,9 @@ function modelCount(n: number): string {
 }
 
 /**
- * What a key stops being able to reach: before minus after.
+ * What a key stops being allowed: before minus after. These are allowlists —
+ * the preview's own policy merge, not the live reachable set — so a backend
+ * that happens to be down never shows up here as a key "losing" a model.
  *
  * A null list is "every model", the widest thing a policy can say. So a null
  * `after` loses nothing whatever `before` was, and a null `before` is measured
@@ -105,7 +107,7 @@ function lostModels(
   return from.filter((id) => !after.includes(id))
 }
 
-/** The other direction: what a key can reach that it could not before. */
+/** The other direction: what a key becomes allowed that it was not before. */
 function gainedModels(
   before: string[] | null | undefined,
   after: string[] | null | undefined,
@@ -207,8 +209,11 @@ export function PrincipalPolicyDrawer({ principal, models, aliases, onClose, onS
     [aliases],
   )
 
-  /** What an explicit list starts from: the inherited allowlist if there is
-   *  one, otherwise every enabled model. */
+  /** Every enabled model, sorted. The fallback for "no restriction is known
+   *  yet": what a key's before/after is measured against when a preview
+   *  reports null (inherits everything), and what "Choose models" seeds from
+   *  until the principal's own effective allowlist has loaded. Once it has,
+   *  the actual inherited allowlist is used instead — see the onSelect below. */
   const inheritedAllowed = useMemo(
     () => enabled.map((m) => m.model_id).sort(),
     [enabled],
@@ -476,10 +481,14 @@ export function PrincipalPolicyDrawer({ principal, models, aliases, onClose, onS
                       name="policy-allowed"
                       checked={draft.allowed_models !== null}
                       /* Seeded with what is inherited, so switching to an
-                         explicit list changes nothing until a box is unticked.
-                         Seeding from the reachable set instead would quietly
-                         drop any model whose backend happens to be down. */
-                      onSelect={() => setAllowed(stored?.allowed_models ?? inheritedAllowed)}
+                         explicit list changes nothing until a box is unticked:
+                         this principal's own list if it already has one,
+                         otherwise the inherited allowlist as the last preview
+                         computed it (a policy set, not the reachable set — a
+                         down backend must not quietly drop a model from what
+                         gets ticked), and only every enabled model as a last
+                         resort before that preview has ever come back. */
+                      onSelect={() => setAllowed(stored?.allowed_models ?? effective?.allowed_models ?? inheritedAllowed)}
                       label="Choose models"
                       hint="Only the models ticked here, and never more than what is inherited."
                     />
@@ -633,10 +642,10 @@ export function PrincipalPolicyDrawer({ principal, models, aliases, onClose, onS
                     <div className={styles.impactWarn}>
                       <p>
                         {!isUser
-                          ? `This will block this key from ${modelCount(keysLosing[0].lost.length)} it can reach today.`
+                          ? `This will drop ${modelCount(keysLosing[0].lost.length)} from what this key is allowed.`
                           : keysLosing.length === 1
-                            ? "This will block 1 of this user's keys from models it can reach today."
-                            : `This will block ${keysLosing.length} of this user's keys from models they can reach today.`}
+                            ? "This will narrow what 1 of this user's keys is allowed."
+                            : `This will narrow what ${keysLosing.length} of this user's keys are allowed.`}
                       </p>
                       <ul className={styles.impactList}>
                         {keysLosing.slice(0, 4).map((k) => (
@@ -660,9 +669,9 @@ export function PrincipalPolicyDrawer({ principal, models, aliases, onClose, onS
                     </div>
                   ) : changed ? (
                     <p className={styles.impactQuiet}>
-                      {isUser ? 'No key loses access.' : 'This key loses no model it can reach today.'}
+                      {isUser ? 'No key loses access.' : 'This key is allowed no less than it was.'}
                       {keysGaining.length > 0 &&
-                        ` ${keysGaining.length === 1 ? '1 key reaches' : `${keysGaining.length} keys reach`} more than before.`}
+                        ` ${keysGaining.length === 1 ? '1 key is allowed' : `${keysGaining.length} keys are allowed`} more than before.`}
                     </p>
                   ) : (
                     <p className={styles.impactQuiet}>

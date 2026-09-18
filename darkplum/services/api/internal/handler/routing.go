@@ -925,9 +925,15 @@ func (h *RoutingHandler) TestAlias(c *gin.Context) {
 // populated only by PutRoutingPolicy, and only when the new residency is
 // 'self_hosted_only' and at least one routed alias has a route targeting a
 // cloud_managed model — that route will be refused per-request from now on,
-// even though the PUT itself still succeeds with 200. AffectedPrincipals is
-// set only when the PUT tightens the org policy (see orgPolicyTightened) --
-// see its doc comment for how it's computed.
+// even though the PUT itself still succeeds with 200. AffectedPrincipals and
+// OrgNarrowed are set only when the PUT tightens the org policy (see
+// orgPolicyTightened) and the gateway could evaluate it: AffectedPrincipals
+// is the number of users and keys WITH A POLICY OF THEIR OWN whose reachable
+// set actually shrank (not "has a row", the earlier approximation), and
+// OrgNarrowed says whether the organisation's own reachable set shrank --
+// i.e. whether everyone who simply inherits now reaches fewer models. Both
+// come from the gateway's POST /v1/policy/impact, the same merge that
+// enforces.
 type routingPolicyResponse struct {
 	Residency          string    `json:"residency"`
 	AllowedModels      *[]string `json:"allowed_models"`
@@ -935,6 +941,7 @@ type routingPolicyResponse struct {
 	UpdatedAt          time.Time `json:"updated_at"`
 	Warnings           []string  `json:"warnings,omitempty"`
 	AffectedPrincipals *int      `json:"affected_principals,omitempty"`
+	OrgNarrowed        *bool     `json:"org_narrowed,omitempty"`
 }
 
 // orgResidencyString converts the org row's nullable residency column
@@ -971,8 +978,8 @@ type putRoutingPolicyRequest struct {
 // already permitted -- residency going from any to self_hosted_only, or
 // allowed_models going from unrestricted to restricted, or losing at least
 // one previously-allowed model id. Used to decide whether PutRoutingPolicy
-// computes affected_principals at all (a loosening or no-op change can't
-// shrink anyone's effective set, so it isn't worth a count query).
+// asks the gateway for impact at all (a loosening or no-op change can't
+// shrink anyone's effective set, so it isn't worth a call).
 func orgPolicyTightened(oldResidency, newResidency string, oldAM, newAM *[]string) bool {
 	if oldResidency != residencySelfHostedOnly && newResidency == residencySelfHostedOnly {
 		return true
@@ -1100,12 +1107,15 @@ func (h *RoutingHandler) PutRoutingPolicy(c *gin.Context) {
 	}
 
 	// Lock-out guard, the same rule the user/key PUTs enforce (policy.go):
-	// never write a policy that leaves a principal with no reachable model.
+	// never write a policy that leaves a principal with no allowed model.
 	// An empty org allowlist locks out everyone and needs no gateway call;
-	// any other narrowing is checked org-wide by the gateway's merge via
-	// POST /v1/policy/impact. Widening and residency-only changes can't
-	// empty anyone's allowlist, so they skip the call (and the gateway
-	// dependency) entirely.
+	// any other tightening is evaluated org-wide by the gateway's merge via
+	// POST /v1/policy/impact, which also says who actually reaches less
+	// (affected_principals / org_narrowed below). A widening can neither lock
+	// anyone out nor narrow anyone, so it skips the call entirely. If the
+	// gateway is unreachable: an allowlist narrowing cannot be checked for
+	// lock-outs, so it is refused (502); a residency-only tightening cannot
+	// lock anyone out, so it proceeds without the counts.
 	if req.AllowedModels != nil && len(*req.AllowedModels) == 0 {
 		c.JSON(http.StatusConflict, gin.H{
 			"error":      "an empty organisation allowlist would lock every user and key out of every model",
@@ -1113,12 +1123,20 @@ func (h *RoutingHandler) PutRoutingPolicy(c *gin.Context) {
 		})
 		return
 	}
-	if allowlistNarrowed(oldAM, req.AllowedModels) {
-		impact, err := h.gateway.impact(ctx, policyObject{Residency: dbResidency, AllowedModels: req.AllowedModels, DefaultModel: req.DefaultModel})
+	var impact *gatewayPolicyImpact
+	if orgPolicyTightened(oldResidency, req.Residency, oldAM, req.AllowedModels) {
+		var err error
+		impact, err = h.gateway.impact(ctx, policyObject{Residency: dbResidency, AllowedModels: req.AllowedModels, DefaultModel: req.DefaultModel})
 		if err != nil {
-			c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("%v: %v", errGatewayUnavailable, err)})
-			return
+			if allowlistNarrowed(oldAM, req.AllowedModels) {
+				c.JSON(http.StatusBadGateway, gin.H{"error": fmt.Sprintf("%v: %v", errGatewayUnavailable, err)})
+				return
+			}
+			slog.WarnContext(ctx, "put routing policy: gateway impact unavailable; residency change proceeds without affected counts", "err", err)
+			impact = nil
 		}
+	}
+	if impact != nil {
 		if impact.OrgLockedOut {
 			c.JSON(http.StatusConflict, gin.H{
 				"error":      "this policy would lock every user and key out of every model",
@@ -1133,7 +1151,7 @@ func (h *RoutingHandler) PutRoutingPolicy(c *gin.Context) {
 				return
 			}
 			c.JSON(http.StatusConflict, gin.H{
-				"error":      fmt.Sprintf("this policy would leave %d user(s) or key(s) with no reachable models; widen it, or change their own policies first", len(names)),
+				"error":      fmt.Sprintf("this policy would leave %d user(s) or key(s) with no allowed model; widen it, or change their own policies first", len(names)),
 				"locked_out": names,
 			})
 			return
@@ -1171,22 +1189,11 @@ func (h *RoutingHandler) PutRoutingPolicy(c *gin.Context) {
 		resp.Warnings = warnings
 	}
 
-	if orgPolicyTightened(oldResidency, resp.Residency, oldAM, resp.AllowedModels) {
-		// Approximation, not a live gateway call per principal: count of
-		// explicit user/api_key policy rows. A per-principal gateway call
-		// here would mean up to hundreds of synchronous HTTP calls inside
-		// a single admin PUT — the exact "OPA/gateway call inside a loop"
-		// anti-pattern the review checklist flags — so this counts rows
-		// that MIGHT be affected rather than computing exactly which ones
-		// shrank. See DESIGN4's API section, which explicitly allows this.
-		var count int
-		if err := h.db.QueryRow(ctx,
-			`SELECT COUNT(*) FROM principal_routing_policies WHERE principal_type IN ('user','api_key')`,
-		).Scan(&count); err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": "count affected principals failed"})
-			return
-		}
+	if impact != nil {
+		count := len(impact.Narrowed)
 		resp.AffectedPrincipals = &count
+		narrowed := impact.OrgNarrowed
+		resp.OrgNarrowed = &narrowed
 	}
 
 	evt := activity.FromContext(c, activity.RoutingPolicyOrgChanged)
@@ -1196,6 +1203,7 @@ func (h *RoutingHandler) PutRoutingPolicy(c *gin.Context) {
 		"allowed_models":      resp.AllowedModels,
 		"default_model":       resp.DefaultModel,
 		"affected_principals": resp.AffectedPrincipals,
+		"org_narrowed":        resp.OrgNarrowed,
 	}
 	h.activity.Record(ctx, evt)
 

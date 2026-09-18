@@ -583,3 +583,80 @@ func TestListModels_RoutedAlias_EndToEnd(t *testing.T) {
 		}
 	}
 }
+
+// A Bearer (API-key) caller's list comes from the gateway's own filtered
+// GET /v1/models, called with that caller's credential, so the api and the
+// gateway agree on membership and default_model. When the gateway is down the
+// list degrades to unfiltered and says so with policy_filtered=false.
+func TestListModels_BearerCallerIsFilteredByGateway(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	insertModel(t, ctx, pool, "m1", backendClassSelfHosted, true)
+	insertModel(t, ctx, pool, "m2", backendClassSelfHosted, true)
+	if _, err := pool.Exec(ctx, `INSERT INTO model_aliases (alias, target_model_id) VALUES ('only-m2', 'm2')`); err != nil {
+		t.Fatal(err)
+	}
+
+	var sawAuth string
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/v1/models" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		sawAuth = req.Header.Get("Authorization")
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"m1"}],"default_model":"m1"}`))
+	}))
+	defer gw.Close()
+
+	h := NewModelHandler(gw.URL, "service-key-unused", pool)
+	r := newModelsTestRouter(h)
+
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer dp_user_key")
+	r.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+	if sawAuth != "Bearer dp_user_key" {
+		t.Fatalf("gateway must be called with the caller's own credential, got %q", sawAuth)
+	}
+	var listResp openAIModelsResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &listResp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	ids := map[string]bool{}
+	for _, e := range listResp.Data {
+		ids[e.ID] = true
+	}
+	if !ids["m1"] || ids["m2"] || ids["only-m2"] {
+		t.Errorf("expected only m1 (m2 and its alias filtered), got %v", ids)
+	}
+	if !listResp.PolicyFiltered {
+		t.Errorf("policy_filtered must be true when the gateway answered")
+	}
+	if listResp.DefaultModel == nil || *listResp.DefaultModel != "m1" {
+		t.Errorf("default_model must relay the gateway's, got %v", listResp.DefaultModel)
+	}
+
+	// Gateway down: unfiltered, flagged.
+	h = NewModelHandler("http://127.0.0.1:1", "service-key-unused", pool)
+	r = newModelsTestRouter(h)
+	resp = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer dp_user_key")
+	r.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &listResp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if listResp.PolicyFiltered {
+		t.Errorf("policy_filtered must be false when the gateway could not be reached")
+	}
+	if len(listResp.Data) != 3 {
+		t.Errorf("degraded list must be the unfiltered one (m1, m2, only-m2), got %d entries", len(listResp.Data))
+	}
+}

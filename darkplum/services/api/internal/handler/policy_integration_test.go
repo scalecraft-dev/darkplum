@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -416,15 +417,61 @@ func (fg *fakePolicyGateway) effective(ctx context.Context, userID, apiKeyID str
 // impact mirrors the real gateway's policyImpact (gateway/internal/handler):
 // under an org-level override, every user with a row, every owner of a key
 // with a row, and every non-revoked key those users own is re-merged, and
-// the ones whose allowlist comes out empty are listed. An empty org
-// allowlist short-circuits to org_locked_out.
+// the ones whose allowlist comes out empty (locked_out) or whose reachable
+// set shrinks (narrowed) are listed. "Reachable" here is allowed ∩ enabled
+// models (no residency/routing awareness -- see the type's doc comment). An
+// empty org allowlist short-circuits to org_locked_out.
 func (fg *fakePolicyGateway) impact(ctx context.Context, override *gatewayPolicyOverride) (gatewayPolicyImpact, error) {
-	out := gatewayPolicyImpact{LockedOut: []gatewayPolicyImpactPrincipal{}}
-	org := overriddenRow(override)
-	if org.AllowedModels != nil && len(*org.AllowedModels) == 0 {
+	out := gatewayPolicyImpact{LockedOut: []gatewayPolicyImpactPrincipal{}, Narrowed: []gatewayPolicyImpactPrincipal{}}
+
+	var enabled []string
+	eRows, err := fg.pool.Query(ctx, `SELECT model_id FROM models WHERE enabled ORDER BY model_id`)
+	if err != nil {
+		return out, err
+	}
+	for eRows.Next() {
+		var id string
+		if err := eRows.Scan(&id); err != nil {
+			eRows.Close()
+			return out, err
+		}
+		enabled = append(enabled, id)
+	}
+	eRows.Close()
+	reachable := func(e gatewayEffectivePolicy) map[string]bool {
+		r := map[string]bool{}
+		for _, id := range enabled {
+			if modelAllowed(e.AllowedModels, id) {
+				r[id] = true
+			}
+		}
+		return r
+	}
+	loses := func(before, after map[string]bool) bool {
+		for id := range before {
+			if !after[id] {
+				return true
+			}
+		}
+		return false
+	}
+	empty := func(e gatewayEffectivePolicy) bool { return e.AllowedModels != nil && len(*e.AllowedModels) == 0 }
+
+	orgNow, err := fg.effective(ctx, "", "", nil)
+	if err != nil {
+		return out, err
+	}
+	orgAfter, err := fg.effective(ctx, "", "", override)
+	if err != nil {
+		return out, err
+	}
+	if empty(orgAfter) {
 		out.OrgLockedOut = true
+		out.OrgNarrowed = len(reachable(orgNow)) > 0
 		return out, nil
 	}
+	out.OrgNarrowed = loses(reachable(orgNow), reachable(orgAfter))
+
 	rows, err := fg.pool.Query(ctx, `
 		SELECT DISTINCT u FROM (
 			SELECT user_id::text AS u FROM principal_routing_policies WHERE principal_type = 'user'
@@ -446,20 +493,33 @@ func (fg *fakePolicyGateway) impact(ctx context.Context, override *gatewayPolicy
 		users = append(users, u)
 	}
 	rows.Close()
-	empty := func(e gatewayEffectivePolicy) bool { return e.AllowedModels != nil && len(*e.AllowedModels) == 0 }
 	for _, u := range users {
-		eff, err := fg.effective(ctx, u, "", override)
+		now, err := fg.effective(ctx, u, "", nil)
+		if err != nil {
+			return out, err
+		}
+		after, err := fg.effective(ctx, u, "", override)
 		if err != nil {
 			return out, err
 		}
 		out.Evaluated++
-		if empty(eff) {
+		if empty(after) {
 			out.LockedOut = append(out.LockedOut, gatewayPolicyImpactPrincipal{UserID: u})
 		}
-		for _, k := range eff.Keys {
+		if loses(reachable(now), reachable(after)) {
+			out.Narrowed = append(out.Narrowed, gatewayPolicyImpactPrincipal{UserID: u})
+		}
+		nowKeys := map[string]gatewayEffectivePolicy{}
+		for _, k := range now.Keys {
+			nowKeys[k.APIKeyID] = k.Effective
+		}
+		for _, k := range after.Keys {
 			out.Evaluated++
 			if empty(k.Effective) {
 				out.LockedOut = append(out.LockedOut, gatewayPolicyImpactPrincipal{UserID: u, APIKeyID: k.APIKeyID})
+			}
+			if loses(reachable(nowKeys[k.APIKeyID]), reachable(k.Effective)) {
+				out.Narrowed = append(out.Narrowed, gatewayPolicyImpactPrincipal{UserID: u, APIKeyID: k.APIKeyID})
 			}
 		}
 	}
@@ -955,15 +1015,35 @@ func TestOrgPolicy_AffectedPrincipalsOnTighten(t *testing.T) {
 	if resp := doJSON(t, r, http.MethodPut, "/api/v1/api-keys/"+keyID+"/routing-policy", policyObject{DefaultModel: nil}); resp.Code != http.StatusOK {
 		t.Fatalf("put key policy: status = %d, body = %s", resp.Code, resp.Body.String())
 	}
+	// A third principal already limited to m1: it has a row, but the org
+	// narrowing to m1 takes nothing from it, so it must NOT be counted.
+	alreadyID := newPolicyTestUser(t, ctx, pool)
+	if resp := doJSON(t, r, http.MethodPut, "/api/v1/users/"+alreadyID+"/routing-policy", policyObject{AllowedModels: strs("m1")}); resp.Code != http.StatusOK {
+		t.Fatalf("put already-narrow user policy: status = %d, body = %s", resp.Code, resp.Body.String())
+	}
 
-	// Tightening: nil -> restricted.
+	// Tightening: nil -> restricted. targetID and its key inherit m1,m2 and
+	// drop to m1 (2 narrowed); alreadyID stays at m1; the org itself shrank.
 	resp := doJSON(t, r, http.MethodPut, "/api/v1/routing-policy", map[string]any{"residency": residencyAny, "allowed_models": []string{"m1"}})
 	if resp.Code != http.StatusOK {
 		t.Fatalf("put org policy: status = %d, body = %s", resp.Code, resp.Body.String())
 	}
 	got := decodeJSON[routingPolicyResponse](t, resp.Body.Bytes())
 	if got.AffectedPrincipals == nil || *got.AffectedPrincipals != 2 {
-		t.Fatalf("expected affected_principals=2, got %v", got.AffectedPrincipals)
+		t.Fatalf("expected affected_principals=2 (only those who lost a model), got %v", got.AffectedPrincipals)
+	}
+	if got.OrgNarrowed == nil || !*got.OrgNarrowed {
+		t.Fatalf("expected org_narrowed=true, got %v", got.OrgNarrowed)
+	}
+
+	// Same list again (no-op): nothing shrinks, nothing reported.
+	resp = doJSON(t, r, http.MethodPut, "/api/v1/routing-policy", map[string]any{"residency": residencyAny, "allowed_models": []string{"m1"}})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("no-op org policy: status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+	got = decodeJSON[routingPolicyResponse](t, resp.Body.Bytes())
+	if got.AffectedPrincipals != nil || got.OrgNarrowed != nil {
+		t.Fatalf("expected no counts on a no-op change, got affected=%v org_narrowed=%v", got.AffectedPrincipals, got.OrgNarrowed)
 	}
 
 	// Loosening back must not report affected_principals.
@@ -972,8 +1052,8 @@ func TestOrgPolicy_AffectedPrincipalsOnTighten(t *testing.T) {
 		t.Fatalf("loosen org policy: status = %d, body = %s", resp.Code, resp.Body.String())
 	}
 	got = decodeJSON[routingPolicyResponse](t, resp.Body.Bytes())
-	if got.AffectedPrincipals != nil {
-		t.Fatalf("expected no affected_principals on a loosening change, got %v", *got.AffectedPrincipals)
+	if got.AffectedPrincipals != nil || got.OrgNarrowed != nil {
+		t.Fatalf("expected no counts on a loosening change, got affected=%v org_narrowed=%v", got.AffectedPrincipals, got.OrgNarrowed)
 	}
 }
 
@@ -1180,6 +1260,78 @@ func TestListPrincipalPolicies_PaginationAndLimitCap(t *testing.T) {
 	principals, ok := body["principals"].([]any)
 	if !ok || len(principals) != 3 {
 		t.Fatalf("expected 3 principal entries, got %+v", body["principals"])
+	}
+}
+
+// The wire shape the web's PolicyPrincipal type reads: typed ids (user_id /
+// api_key_id, exactly one set), display = email or key name, owner = the
+// key's owner email. Two pages of one row each must be disjoint and cover
+// both rows -- the pager keys rows by these ids.
+func TestListPrincipalPolicies_WireShapeAndOffsetPaging(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	adminID := newPolicyTestUser(t, ctx, pool)
+	insertModel(t, ctx, pool, "m1", backendClassSelfHosted, true)
+	ownerID := newPolicyTestUser(t, ctx, pool)
+	keyID := newTestAPIKey(t, ctx, pool, ownerID, "ci-key")
+
+	gw := fakeGatewayEffective(t, gatewayEffectivePolicy{Residency: residencyAny, ReachableModels: []string{"m1"}})
+	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	r := newPolicyTestRouter(ph, rh, adminID)
+
+	if resp := doJSON(t, r, http.MethodPut, "/api/v1/users/"+ownerID+"/routing-policy", policyObject{AllowedModels: strs("m1")}); resp.Code != http.StatusOK {
+		t.Fatalf("put user policy: %d %s", resp.Code, resp.Body.String())
+	}
+	if resp := doJSON(t, r, http.MethodPut, "/api/v1/api-keys/"+keyID+"/routing-policy", policyObject{AllowedModels: strs("m1")}); resp.Code != http.StatusOK {
+		t.Fatalf("put key policy: %d %s", resp.Code, resp.Body.String())
+	}
+	var ownerEmail string
+	if err := pool.QueryRow(ctx, `SELECT email FROM users WHERE id = $1`, ownerID).Scan(&ownerEmail); err != nil {
+		t.Fatal(err)
+	}
+
+	type entry struct {
+		PrincipalType string  `json:"principal_type"`
+		PrincipalID   string  `json:"principal_id"`
+		UserID        *string `json:"user_id"`
+		APIKeyID      *string `json:"api_key_id"`
+		Display       string  `json:"display"`
+		Owner         *string `json:"owner"`
+	}
+	type page struct {
+		Principals []entry `json:"principals"`
+		Total      int     `json:"total"`
+	}
+	seen := map[string]entry{}
+	for offset := 0; offset < 2; offset++ {
+		resp := doJSON(t, r, http.MethodGet, fmt.Sprintf("/api/v1/routing-policy/principals?limit=1&offset=%d", offset), nil)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("offset %d: %d %s", offset, resp.Code, resp.Body.String())
+		}
+		pg := decodeJSON[page](t, resp.Body.Bytes())
+		if pg.Total != 2 || len(pg.Principals) != 1 {
+			t.Fatalf("offset %d: total=%d rows=%d, want 2/1", offset, pg.Total, len(pg.Principals))
+		}
+		e := pg.Principals[0]
+		if _, dup := seen[e.PrincipalID]; dup {
+			t.Fatalf("offset %d returned %s again: paging is not disjoint", offset, e.PrincipalID)
+		}
+		seen[e.PrincipalID] = e
+	}
+	u, ok := seen[ownerID]
+	if !ok {
+		t.Fatalf("user row missing from the two pages: %+v", seen)
+	}
+	if u.PrincipalType != "user" || u.UserID == nil || *u.UserID != ownerID || u.APIKeyID != nil || u.Display != ownerEmail || u.Owner != nil {
+		t.Errorf("user row shape wrong: %+v", u)
+	}
+	k, ok := seen[keyID]
+	if !ok {
+		t.Fatalf("key row missing from the two pages: %+v", seen)
+	}
+	if k.PrincipalType != "api_key" || k.APIKeyID == nil || *k.APIKeyID != keyID || k.UserID != nil || k.Display != "ci-key" || k.Owner == nil || *k.Owner != ownerEmail {
+		t.Errorf("key row shape wrong: %+v", k)
 	}
 }
 

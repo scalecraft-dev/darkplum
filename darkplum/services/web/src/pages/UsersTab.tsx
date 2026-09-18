@@ -1,11 +1,14 @@
-import { useState } from 'react'
-import type { User } from '../types'
+import { useMemo, useState } from 'react'
+import type { AdminModel, PrincipalPolicy, User } from '../types'
+import { storedSummary } from '../lib/policy'
 import { useToast } from '../components/Toast'
 import { Avatar, Badge, Button, Input, Modal, Select, Table, TableEmpty } from '../components/ui'
 import styles from './UsersTab.module.css'
 
 interface Props {
   users: User[]
+  /** For labelling model ids in the "Model access" cell's summary. */
+  models: AdminModel[]
   isAdmin: boolean
   currentUserId: string | undefined
   onCreate: (name: string, email: string, password: string, role: 'admin' | 'reader') => Promise<void>
@@ -14,9 +17,9 @@ interface Props {
   onResetPassword?: (id: string, password: string) => Promise<void>
   /** Opens the routing-policy drawer for one user. */
   onEditPolicy?: (user: User) => void
-  /** Ids of users with a routing-policy row of their own. Everyone else
-   *  inherits the organisation's, which is not worth a badge. */
-  policyOwners?: ReadonlySet<string>
+  /** Each user's own routing-policy row, by id. Absent means it inherits the
+   *  organisation's — the "Model access" cell reads this either way. */
+  policyById?: ReadonlyMap<string, PrincipalPolicy>
 }
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
@@ -166,19 +169,35 @@ function ResetPasswordButton({ userId, onReset }: { userId: string; onReset: (id
   )
 }
 
-/** One row's way into its routing policy. Kept as an icon action beside the
- *  others so the row does not grow a column for something most users inherit. */
-function PolicyButton({ label, onClick }: { label: string; onClick: () => void }) {
+/** The "Model access" cell itself: what the row's policy actually is, and the
+ *  way into changing it — not just an unlabelled icon beside the real
+ *  information. Falls back to plain text when there's nothing to click into. */
+function PolicyCell({
+  policy,
+  models,
+  label,
+  onClick,
+}: {
+  policy: PrincipalPolicy | undefined
+  models: AdminModel[]
+  label: string
+  onClick?: () => void
+}) {
+  const summary = policy ? storedSummary(policy, models) : 'Inherits organisation'
+  if (!onClick) {
+    return <span className={styles.muted}>{summary}</span>
+  }
   return (
-    <button className={styles.actionBtn} onClick={onClick} title={label} aria-label={label}>
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <button type="button" className={styles.policyCell} onClick={onClick} title={label} aria-label={label}>
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
         <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
       </svg>
+      <span>{summary} · {policy ? 'edit' : 'narrow'}</span>
     </button>
   )
 }
 
-export function UsersTab({ users, isAdmin, currentUserId, onCreate, onDelete, onRoleChange, onResetPassword, onEditPolicy, policyOwners }: Props) {
+export function UsersTab({ users, models, isAdmin, currentUserId, onCreate, onDelete, onRoleChange, onResetPassword, onEditPolicy, policyById }: Props) {
   const { toast } = useToast()
   const [modalOpen, setModalOpen] = useState(false)
   const [name, setName] = useState('')
@@ -187,6 +206,15 @@ export function UsersTab({ users, isAdmin, currentUserId, onCreate, onDelete, on
   const [role, setRole] = useState<'admin' | 'reader'>('reader')
   const [emailError, setEmailError] = useState('')
   const [loading, setLoading] = useState(false)
+  const [query, setQuery] = useState('')
+
+  const filteredUsers = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    if (!q) return users
+    return users.filter(
+      (u) => u.name.toLowerCase().includes(q) || u.email.toLowerCase().includes(q),
+    )
+  }, [users, query])
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -226,6 +254,29 @@ export function UsersTab({ users, isAdmin, currentUserId, onCreate, onDelete, on
         <div className={styles.toolbarInfo}>
           <span className={styles.count}>{users.length} {users.length === 1 ? 'user' : 'users'}</span>
         </div>
+        <div className={styles.searchWrap}>
+          <svg
+            className={styles.searchIcon}
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <circle cx="11" cy="11" r="8" />
+            <line x1="21" y1="21" x2="16.65" y2="16.65" />
+          </svg>
+          <input
+            className={styles.searchInput}
+            type="text"
+            placeholder="Search name or email..."
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            aria-label="Search users by name or email"
+          />
+        </div>
         {isAdmin && (
           <Button size="sm" onClick={() => setModalOpen(true)}>
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -263,8 +314,15 @@ export function UsersTab({ users, isAdmin, currentUserId, onCreate, onDelete, on
                   <span className={styles.emptyHint}>Add a user to get started</span>
                 </div>
               </TableEmpty>
+            ) : filteredUsers.length === 0 ? (
+              <TableEmpty colSpan={6}>
+                <div className={styles.empty}>
+                  <span className={styles.emptyTitle}>No users match "{query}"</span>
+                  <span className={styles.emptyHint}>Try a different name or email.</span>
+                </div>
+              </TableEmpty>
             ) : (
-              users.map((u) => (
+              filteredUsers.map((u) => (
                 <tr key={u.id}>
                   <td>
                     <div className={styles.userCell}>
@@ -286,20 +344,15 @@ export function UsersTab({ users, isAdmin, currentUserId, onCreate, onDelete, on
                     )}
                   </td>
                   <td>
-                    {policyOwners?.has(u.id) ? (
-                      <Badge variant="warning" bordered>Own policy</Badge>
-                    ) : (
-                      <span className={styles.muted}>Inherits org</span>
-                    )}
+                    <PolicyCell
+                      policy={policyById?.get(u.id)}
+                      models={models}
+                      label={`Routing policy for ${u.name}`}
+                      onClick={isAdmin && onEditPolicy ? () => onEditPolicy(u) : undefined}
+                    />
                   </td>
                   <td className={styles.date}>{new Date(u.created_at).toLocaleDateString()}</td>
                   <td className={styles.actionsCol}>
-                    {isAdmin && onEditPolicy && (
-                      <PolicyButton
-                        label={`Routing policy for ${u.name}`}
-                        onClick={() => onEditPolicy(u)}
-                      />
-                    )}
                     {isAdmin && onResetPassword && (
                       <ResetPasswordButton userId={u.id} onReset={onResetPassword} />
                     )}
@@ -351,7 +404,7 @@ export function UsersTab({ users, isAdmin, currentUserId, onCreate, onDelete, on
           </Select>
           <p className={styles.roleNote}>
             A new user inherits the organisation's routing policy. Narrow it for them from the
-            shield button on their row.
+            Model access cell on their row.
           </p>
           <div className={styles.formFooter}>
             <Button type="button" variant="ghost" onClick={handleClose}>Cancel</Button>

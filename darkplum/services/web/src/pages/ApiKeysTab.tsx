@@ -1,5 +1,6 @@
-import { useEffect, useRef, useState } from 'react'
-import type { ApiKey, User } from '../types'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import type { AdminModel, ApiKey, PrincipalPolicy, User } from '../types'
+import { storedSummary } from '../lib/policy'
 import { useToast } from '../components/Toast'
 import { Badge, Button, Input, Modal, Select, Table, TableEmpty } from '../components/ui'
 import { CopyButton } from '../components/ui/CopyButton'
@@ -8,13 +9,16 @@ import styles from './ApiKeysTab.module.css'
 interface Props {
   users: User[]
   apiKeys: ApiKey[]
+  /** For labelling model ids in the "Model access" cell's summary. */
+  models: AdminModel[]
   isAdmin: boolean
   onCreate: (name: string, userId: string) => Promise<void>
   onRevoke: (id: string) => Promise<void>
   /** Opens the routing-policy drawer for one key. */
   onEditPolicy?: (key: ApiKey) => void
-  /** Ids of keys with a routing-policy row of their own. */
-  policyOwners?: ReadonlySet<string>
+  /** Each key's own routing-policy row, by id. Absent means it inherits its
+   *  owner's — the "Model access" cell reads this either way. */
+  policyById?: ReadonlyMap<string, PrincipalPolicy>
 }
 
 function RevokeButton({ id, onRevoke }: { id: string; onRevoke: (id: string) => Promise<void> }) {
@@ -67,27 +71,53 @@ function RevokeButton({ id, onRevoke }: { id: string; onRevoke: (id: string) => 
   )
 }
 
-/** A key's way into its own routing policy. A key never reaches more than its
- *  owner, so this narrows; it cannot widen. */
-function PolicyButton({ label, onClick }: { label: string; onClick: () => void }) {
+/** The "Model access" cell itself: what the key's policy actually is, and the
+ *  way into changing it — a key never reaches more than its owner, so this
+ *  narrows; it cannot widen. Falls back to plain text when there's nothing to
+ *  click into. */
+function PolicyCell({
+  policy,
+  models,
+  label,
+  onClick,
+}: {
+  policy: PrincipalPolicy | undefined
+  models: AdminModel[]
+  label: string
+  onClick?: () => void
+}) {
+  const summary = policy ? storedSummary(policy, models) : 'Inherits owner'
+  if (!onClick) {
+    return <span className={styles.muted}>{summary}</span>
+  }
   return (
-    <button className={styles.actionBtn} onClick={onClick} title={label} aria-label={label}>
-      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <button type="button" className={styles.policyCell} onClick={onClick} title={label} aria-label={label}>
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
         <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
       </svg>
+      <span>{summary} · {policy ? 'edit' : 'narrow'}</span>
     </button>
   )
 }
 
-export function ApiKeysTab({ users, apiKeys, isAdmin, onCreate, onRevoke, onEditPolicy, policyOwners }: Props) {
+export function ApiKeysTab({ users, apiKeys, models, isAdmin, onCreate, onRevoke, onEditPolicy, policyById }: Props) {
   const { toast } = useToast()
   const [modalOpen, setModalOpen] = useState(false)
   const [keyName, setKeyName] = useState('')
   const [userId, setUserId] = useState('')
   const [loading, setLoading] = useState(false)
+  const [query, setQuery] = useState('')
 
   const activeCount = apiKeys.filter((k) => !k.revoked_at).length
   const revokedCount = apiKeys.filter((k) => k.revoked_at).length
+
+  const filteredKeys = useMemo(() => {
+    const q = query.trim().toLowerCase()
+    if (!q) return apiKeys
+    return apiKeys.filter(
+      (k) => k.name.toLowerCase().includes(q) || (k.user_name ?? '').toLowerCase().includes(q),
+    )
+  }, [apiKeys, query])
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -118,6 +148,29 @@ export function ApiKeysTab({ users, apiKeys, isAdmin, onCreate, onRevoke, onEdit
           {revokedCount > 0 && (
             <span className={styles.countMuted}>{revokedCount} revoked</span>
           )}
+        </div>
+        <div className={styles.searchWrap}>
+          <svg
+            className={styles.searchIcon}
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <circle cx="11" cy="11" r="8" />
+            <line x1="21" y1="21" x2="16.65" y2="16.65" />
+          </svg>
+          <input
+            className={styles.searchInput}
+            type="text"
+            placeholder="Search key name or owner..."
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            aria-label="Search API keys by name or owner"
+          />
         </div>
         {isAdmin && (
           <Button size="sm" onClick={() => setModalOpen(true)}>
@@ -154,8 +207,15 @@ export function ApiKeysTab({ users, apiKeys, isAdmin, onCreate, onRevoke, onEdit
                   <span className={styles.emptyHint}>Generate a key to enable API access</span>
                 </div>
               </TableEmpty>
+            ) : filteredKeys.length === 0 ? (
+              <TableEmpty colSpan={7}>
+                <div className={styles.empty}>
+                  <span className={styles.emptyTitle}>No keys match "{query}"</span>
+                  <span className={styles.emptyHint}>Try a different key name or owner.</span>
+                </div>
+              </TableEmpty>
             ) : (
-              apiKeys.map((k) => (
+              filteredKeys.map((k) => (
                 <tr key={k.id} className={k.revoked_at ? styles.revokedRow : undefined}>
                   <td>
                     <div className={styles.keyCell}>
@@ -174,11 +234,12 @@ export function ApiKeysTab({ users, apiKeys, isAdmin, onCreate, onRevoke, onEdit
                   </td>
                   <td className={styles.date}>{new Date(k.created_at).toLocaleDateString()}</td>
                   <td>
-                    {policyOwners?.has(k.id) ? (
-                      <Badge variant="warning" bordered>Own policy</Badge>
-                    ) : (
-                      <span className={styles.muted}>Inherits owner</span>
-                    )}
+                    <PolicyCell
+                      policy={policyById?.get(k.id)}
+                      models={models}
+                      label={`Routing policy for ${k.name}`}
+                      onClick={isAdmin && !k.revoked_at && onEditPolicy ? () => onEditPolicy(k) : undefined}
+                    />
                   </td>
                   <td>
                     <Badge variant={k.revoked_at ? 'danger' : 'success'}>
@@ -186,12 +247,6 @@ export function ApiKeysTab({ users, apiKeys, isAdmin, onCreate, onRevoke, onEdit
                     </Badge>
                   </td>
                   <td className={styles.actionsCol}>
-                    {isAdmin && !k.revoked_at && onEditPolicy && (
-                      <PolicyButton
-                        label={`Routing policy for ${k.name}`}
-                        onClick={() => onEditPolicy(k)}
-                      />
-                    )}
                     {isAdmin && !k.revoked_at && <RevokeButton id={k.id} onRevoke={onRevoke} />}
                   </td>
                 </tr>
@@ -224,8 +279,8 @@ export function ApiKeysTab({ users, apiKeys, isAdmin, onCreate, onRevoke, onEdit
             ))}
           </Select>
           <p className={styles.ownerNote}>
-            The key starts with exactly what its owner can reach. Narrow it further from the shield
-            button on its row — a key can never reach more than its owner.
+            The key starts with exactly what its owner can reach. Narrow it further from the Model
+            access cell on its row — a key can never reach more than its owner.
           </p>
           <div className={styles.formFooter}>
             <Button type="button" variant="ghost" onClick={handleClose}>Cancel</Button>

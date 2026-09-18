@@ -18,6 +18,46 @@
   color: var(--fg-muted);
 }
 
+/* --- Search --- */
+
+.searchWrap {
+  position: relative;
+  flex: 1;
+  min-width: 160px;
+  max-width: 320px;
+}
+
+.searchIcon {
+  position: absolute;
+  left: var(--space-3);
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--fg-subtle);
+  pointer-events: none;
+  width: 14px;
+  height: 14px;
+}
+
+.searchInput {
+  width: 100%;
+  padding: var(--space-2) var(--space-3) var(--space-2) calc(var(--space-3) + 14px + var(--space-2));
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  color: var(--fg-default);
+  font-size: var(--fs-sm);
+  outline: none;
+  transition: border-color var(--transition-fast);
+}
+
+.searchInput:focus {
+  border-color: var(--border-focus);
+}
+
+.searchInput::placeholder {
+  color: var(--fg-subtle);
+}
+
 /* --- Table card --- */
 
 .tableCard {
@@ -111,6 +151,33 @@
 .date {
   color: var(--fg-muted);
   font-variant-numeric: tabular-nums;
+}
+
+/* --- Model access cell ---
+   The cell is the control: what the policy is, and the way into changing it,
+   in one click rather than an unlabelled icon beside the real information. */
+
+.policyCell {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 2px var(--space-2);
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  color: var(--fg-muted);
+  font-size: var(--fs-xs);
+  text-align: left;
+  transition: color var(--transition-fast), border-color var(--transition-fast);
+}
+
+.policyCell svg {
+  flex-shrink: 0;
+  color: var(--fg-subtle);
+}
+
+.policyCell:hover {
+  color: var(--fg-default);
+  border-color: var(--border-default);
 }
 
 /* --- Action button --- */

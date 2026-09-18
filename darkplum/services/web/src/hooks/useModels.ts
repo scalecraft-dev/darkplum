@@ -17,6 +17,10 @@ interface UseModelsResult {
   /** A caller-triggered re-read is in flight, for button feedback only. */
   isRefetching: boolean
   error: string | null
+  /** False means the API's per-user policy lookup failed and `models` above is
+   *  UNFILTERED — it can contain models this person's policy would refuse.
+   *  True on an older API that never sent the flag: nothing to warn about. */
+  policyFiltered: boolean
   /**
    * Re-runs the fetch immediately — used by "Try again" and by chat when a
    * routing refusal proves the list is stale. Resolves with the models the
@@ -32,6 +36,7 @@ export function useModels(): UseModelsResult {
   const [isLoading, setIsLoading] = useState(true)
   const [isRefetching, setIsRefetching] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [policyFiltered, setPolicyFiltered] = useState(true)
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const hasModelsRef = useRef(false)
   // Monotonic request counter: a poll that started before a manual refetch may
@@ -47,6 +52,7 @@ export function useModels(): UseModelsResult {
       if (seq !== fetchSeqRef.current) return result.data // superseded; do not touch state
       setModels(result.data)
       setDefaultModel(result.default_model ?? '')
+      setPolicyFiltered(result.policy_filtered ?? true)
       setError(null)
       const hadModels = hasModelsRef.current
       const nowHasModels = result.data.length > 0
@@ -103,5 +109,5 @@ export function useModels(): UseModelsResult {
     }
   }, [fetchModels])
 
-  return { models, defaultModel, isLoading, isRefetching, error, refetch }
+  return { models, defaultModel, isLoading, isRefetching, error, policyFiltered, refetch }
 }

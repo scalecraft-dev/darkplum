@@ -925,13 +925,25 @@ func newPolicyImpactRequest(t *testing.T, ctxType string, body string) (*httptes
 	return w, c
 }
 
+type impactPrincipalForTest struct {
+	UserID   string `json:"user_id"`
+	APIKeyID string `json:"api_key_id"`
+}
+
 type policyImpactBodyForTest struct {
-	OrgLockedOut bool `json:"org_locked_out"`
-	LockedOut    []struct {
-		UserID   string `json:"user_id"`
-		APIKeyID string `json:"api_key_id"`
-	} `json:"locked_out"`
-	Evaluated int `json:"evaluated"`
+	OrgLockedOut bool                     `json:"org_locked_out"`
+	LockedOut    []impactPrincipalForTest `json:"locked_out"`
+	OrgNarrowed  bool                     `json:"org_narrowed"`
+	Narrowed     []impactPrincipalForTest `json:"narrowed"`
+	Evaluated    int                      `json:"evaluated"`
+}
+
+func impactSet(ps []impactPrincipalForTest) map[string]bool {
+	out := map[string]bool{}
+	for _, p := range ps {
+		out[p.UserID+"/"+p.APIKeyID] = true
+	}
+	return out
 }
 
 func decodePolicyImpact(t *testing.T, body []byte) policyImpactBodyForTest {
@@ -1022,8 +1034,11 @@ func TestHandleEffectivePolicyImpact_EmptyOrgAllowlistIsOrgLockedOut(t *testing.
 	if !got.OrgLockedOut {
 		t.Errorf("expected org_locked_out=true for an empty org allowlist, got %+v", got)
 	}
-	if got.LockedOut == nil {
-		t.Errorf("locked_out must be [] not null when org_locked_out; body=%s", w.Body.String())
+	if got.LockedOut == nil || got.Narrowed == nil {
+		t.Errorf("locked_out and narrowed must be [] not null when org_locked_out; body=%s", w.Body.String())
+	}
+	if !got.OrgNarrowed {
+		t.Errorf("org_narrowed must be true: the org reached m1..m3 and would reach nothing")
 	}
 }
 
@@ -1066,6 +1081,30 @@ func TestHandleEffectivePolicyImpact_NarrowingReportsExactlyTheDisjointPrincipal
 	if got.Evaluated != 5 {
 		t.Errorf("evaluated = %d, want 5", got.Evaluated)
 	}
+	// Reaches-less: the org itself (m1,m2,m3 -> m2,m3) so every inheriting
+	// principal; previewUserID and previewKeyID (m1 -> nothing);
+	// previewKeyID2 already reached nothing so it is NOT narrowed;
+	// impactUser2 (inherits org: m1,m2,m3 -> m2,m3) and impactKey3 (m3 -> m3,
+	// unchanged) — so impactUser2 yes, impactKey3 no.
+	if !got.OrgNarrowed {
+		t.Errorf("org_narrowed must be true when the org list shrinks")
+	}
+	wantNarrowed := map[string]bool{
+		previewUserID + "/":                true,
+		previewUserID + "/" + previewKeyID: true,
+		impactUser2 + "/":                  true,
+	}
+	gotNarrowed := impactSet(got.Narrowed)
+	for k := range wantNarrowed {
+		if !gotNarrowed[k] {
+			t.Errorf("expected %s in narrowed, got %+v", k, got.Narrowed)
+		}
+	}
+	for k := range gotNarrowed {
+		if !wantNarrowed[k] {
+			t.Errorf("unexpected %s in narrowed", k)
+		}
+	}
 }
 
 func TestHandleEffectivePolicyImpact_WideningLocksNobodyOut(t *testing.T) {
@@ -1081,5 +1120,37 @@ func TestHandleEffectivePolicyImpact_WideningLocksNobodyOut(t *testing.T) {
 	got := decodePolicyImpact(t, w.Body.Bytes())
 	if len(got.LockedOut) != 1 || got.LockedOut[0].APIKeyID != previewKeyID2 {
 		t.Errorf("expected only the pre-existing empty key %s, got %+v", previewKeyID2, got.LockedOut)
+	}
+	if got.OrgNarrowed || len(got.Narrowed) != 0 {
+		t.Errorf("a widening must narrow nobody: org_narrowed=%v narrowed=%+v", got.OrgNarrowed, got.Narrowed)
+	}
+}
+
+func TestHandleEffectivePolicyImpact_ResidencyTighteningNarrowsViaReachability(t *testing.T) {
+	// m3 becomes cloud-managed; tightening the org to self_hosted_only drops
+	// it from everyone's reachable set even though no allowlist changes —
+	// the org is narrowed, and so is impactKey3 (m3 only -> nothing
+	// reachable, but NOT locked out: its allowlist is still [m3]).
+	routes := baseOverrideRoutes()
+	routes["m3"] = routing.Route{ProviderKey: "bedrock", Kind: "bedrock", Class: routing.ClassCloudManaged}
+	h := newTestHandler(fakeProviders{}, routes, impactSnapshot(), true)
+	w, c := newPolicyImpactRequest(t, middleware.KeyTypeService, `{"override":{"level":"org","policy":{"residency":"self_hosted_only"}}}`)
+	h.HandleEffectivePolicyImpact(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body=%s", w.Code, w.Body.String())
+	}
+	got := decodePolicyImpact(t, w.Body.Bytes())
+	if !got.OrgNarrowed {
+		t.Errorf("org_narrowed must be true when residency removes a reachable cloud model")
+	}
+	narrowed := impactSet(got.Narrowed)
+	if !narrowed[impactUser2+"/"+impactKey3] {
+		t.Errorf("impactKey3 (m3 only) must be narrowed, got %+v", got.Narrowed)
+	}
+	if narrowed[previewUserID+"/"] {
+		t.Errorf("previewUserID (m1 only, self-hosted) must not be narrowed")
+	}
+	if len(got.LockedOut) != 1 || got.LockedOut[0].APIKeyID != previewKeyID2 {
+		t.Errorf("residency never locks anyone out; only the pre-existing empty key expected, got %+v", got.LockedOut)
 	}
 }

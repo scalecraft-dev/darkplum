@@ -93,6 +93,7 @@ export function ChatPage() {
     isLoading: modelsLoading,
     isRefetching: modelsRefetching,
     error: modelsError,
+    policyFiltered,
     refetch: refetchModels,
   } = useModels()
   const [conversations, setConversations] = useState<Conversation[]>([])
@@ -808,6 +809,23 @@ export function ChatPage() {
             </div>
           )}
         </div>
+
+        {/* The list below is unfiltered when this shows — a model on it can
+            still be refused. Not dismissable: the risk lasts as long as the
+            policy lookup keeps failing, not as long as someone leaves it up. */}
+        {!modelsLoading && !modelsError && !policyFiltered && (
+          <div className={styles.policyWarning} role="alert">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+              <line x1="12" y1="9" x2="12" y2="13" />
+              <line x1="12" y1="17" x2="12.01" y2="17" />
+            </svg>
+            <span>
+              Model list may be incomplete — the policy service could not be reached. A model shown
+              here can still be refused.
+            </span>
+          </div>
+        )}
 
         {threadLoading ? (
           <div className={styles.threadLoading} role="status" aria-live="polite">

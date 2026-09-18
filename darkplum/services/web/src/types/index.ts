@@ -222,8 +222,14 @@ export interface RoutingPolicy {
    *  readable sentence each, written by the API. */
   warnings?: string[]
   /** Returned by PUT when the new policy is tighter: how many users and keys
-   *  have a smaller reachable set because of it. */
+   *  WITH A POLICY OF THEIR OWN actually reach fewer models because of it —
+   *  not merely how many have a row. Absent when the change did not tighten
+   *  anything, or the gateway could not be asked. */
   affected_principals?: number
+  /** Returned alongside `affected_principals`: whether everyone who simply
+   *  inherits the organisation's policy — no row of their own — now reaches
+   *  fewer models too. `affected_principals` never counts these people. */
+  org_narrowed?: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -270,7 +276,10 @@ export interface EffectivePolicy {
   stored?: PrincipalPolicy | null
 }
 
-/** One of the edited user's keys, and what this change does to its reach. */
+/** One of the edited user's keys: what it is allowed before and after this
+ *  change. Both are allowlists, computed from the policy merge — not the
+ *  live reachable set, so a down backend never shows up as a key "losing"
+ *  something here. */
 export interface PolicyKeyImpact {
   id: string
   name: string
@@ -356,6 +365,11 @@ export interface InferenceEvent {
   route_name?: string | null
   router_reason?: string | null
   status_code: number
+  /** Set on a refused request — the gateway's OpenAI-style error code, e.g.
+   *  model_not_allowed. null on a 2xx row, and on older APIs that predate this
+   *  field. Not a closed enum on this side: an unrecognised code still renders,
+   *  it just falls back to its own words. */
+  denial_code?: string | null
   latency_ms: number
   prompt_tokens: number | null
   completion_tokens: number | null

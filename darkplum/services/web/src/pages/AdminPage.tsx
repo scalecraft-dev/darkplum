@@ -13,7 +13,7 @@ import {
   revokeApiKey,
   updateUserRole,
 } from '../lib/api'
-import type { AdminModel, ApiKey, ModelAlias, PolicyPrincipal, User } from '../types'
+import type { AdminModel, ApiKey, ModelAlias, PolicyPrincipal, PrincipalPolicy, User } from '../types'
 import { useAuth } from '../context/AuthContext'
 import { useToast } from '../components/Toast'
 import { Tab, TabList } from '../components/ui'
@@ -62,11 +62,23 @@ export function AdminPage() {
     }
   }, [toast])
 
-  /** Which users and keys carry their own policy. A failure here costs a badge,
-   *  not the page, so it is not worth a toast. */
+  /** Which users and keys carry their own policy. A failure here costs a
+   *  badge, not the page, so it is not worth a toast. Pages through the whole
+   *  set at the API's cap of 200 per call — an organisation can have more
+   *  principals with a policy of their own than that, and a row past the
+   *  first page must not silently read as "inherits org". */
   const loadPrincipals = useCallback(async () => {
     try {
-      setPrincipals((await listPolicyPrincipals({ limit: 200 })).principals)
+      const limit = 200
+      let all: PolicyPrincipal[] = []
+      let offset = 0
+      for (;;) {
+        const page = await listPolicyPrincipals({ limit, offset })
+        all = all.concat(page.principals)
+        offset += page.principals.length
+        if (page.principals.length === 0 || offset >= page.total) break
+      }
+      setPrincipals(all)
     } catch {
       setPrincipals([])
     }
@@ -82,13 +94,16 @@ export function AdminPage() {
     listModelAliases().then(setAliases).catch(() => setAliases([]))
   }, [loadUsers, loadKeys, loadPrincipals])
 
-  const policyOwners = useMemo(() => {
-    const ids = new Set<string>()
+  /** Every user or key's own policy row, by id — what the "Model access" cell
+   *  on each tab reads to show the actual stored summary rather than just a
+   *  yes/no badge. Absent from the map means it inherits. */
+  const policyById = useMemo(() => {
+    const m = new Map<string, PrincipalPolicy>()
     for (const p of principals) {
       const id = p.principal_type === 'user' ? p.user_id : p.api_key_id
-      if (id) ids.add(id)
+      if (id) m.set(id, p.policy)
     }
-    return ids
+    return m
   }, [principals])
 
   const openUserPolicy = useCallback((user: User) => {
@@ -207,6 +222,7 @@ export function AdminPage() {
         {tab === 'users' && (
           <UsersTab
             users={users}
+            models={models}
             isAdmin={isAdmin}
             currentUserId={currentUser?.id}
             onCreate={handleCreateUser}
@@ -214,18 +230,19 @@ export function AdminPage() {
             onRoleChange={handleRoleChange}
             onResetPassword={handleResetPassword}
             onEditPolicy={openUserPolicy}
-            policyOwners={policyOwners}
+            policyById={policyById}
           />
         )}
         {tab === 'api-keys' && (
           <ApiKeysTab
             users={users}
             apiKeys={keys}
+            models={models}
             isAdmin={isAdmin}
             onCreate={handleCreateKey}
             onRevoke={handleRevoke}
             onEditPolicy={openKeyPolicy}
-            policyOwners={policyOwners}
+            policyById={policyById}
           />
         )}
       </div>

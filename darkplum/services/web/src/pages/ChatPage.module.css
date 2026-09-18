@@ -32,6 +32,25 @@
   flex: 0 0 auto;
 }
 
+/* The picker may be showing models policy would refuse — said plainly, right
+   under it, for as long as it's true. */
+.policyWarning {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-6);
+  background: var(--warning-bg);
+  border-bottom: 1px solid var(--border-default);
+  color: var(--warning-fg);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  flex-shrink: 0;
+}
+
+.policyWarning svg {
+  flex-shrink: 0;
+}
+
 /* --- Opening a stored conversation ---
    Bubble-shaped placeholders in the reading column, alternating sides, so the
    thread does not jump when the real messages land. */

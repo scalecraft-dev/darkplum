@@ -167,7 +167,8 @@
     "method": "GET",
     "path": "/api/v1/users/:id/routing-policy",
     "auth": "admin",
-    "surface": "ui"
+    "surface": "machine",
+    "reason": "Stored row only, for scripts and GitOps-style reconcilers; the UI reads the same row through .../routing-policy/effective's `stored` field alongside the merged result, so the editor never calls this one"
   },
   {
     "service": "api",
@@ -216,7 +217,8 @@
     "method": "GET",
     "path": "/api/v1/api-keys/:id/routing-policy",
     "auth": "admin",
-    "surface": "ui"
+    "surface": "machine",
+    "reason": "Stored row only, for scripts and GitOps-style reconcilers; the UI reads the same row through .../routing-policy/effective's `stored` field alongside the merged result, so the editor never calls this one"
   },
   {
     "service": "api",

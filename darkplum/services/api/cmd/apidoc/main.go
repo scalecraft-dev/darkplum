@@ -40,8 +40,8 @@ type routeEntry struct {
 var filterNotes = map[string]string{
 	"api GET /api/v1/activity":                  "actor_id, event_type, since, until, limit, offset",
 	"api GET /api/v1/activity/export":           "actor_id, event_type, since, until",
-	"api GET /api/v1/usage":                     "user_id, api_key_id, model, purpose, since, until, limit, offset",
-	"api GET /api/v1/usage/export":              "user_id, api_key_id, model, purpose, since, until",
+	"api GET /api/v1/usage":                     "user_id, api_key_id, model, purpose, denial_code (a refusal code, or `any`), since, until, limit, offset",
+	"api GET /api/v1/usage/export":              "user_id, api_key_id, model, purpose, denial_code, since, until",
 	"api GET /api/v1/usage/stats":               "interval, user_id, api_key_id, since, until",
 	"api GET /api/v1/usage/summary":             "since, until",
 	"api GET /api/v1/usage/user-summary":        "since, until",
@@ -108,6 +108,29 @@ func findGolden() (string, error) {
 	return "", fmt.Errorf("could not find docs/api-routes.json near the current directory; pass -golden explicitly")
 }
 
+// preamble is the fixed text above the route inventory: what each auth value
+// means in practice (in particular that admin/session endpoints take a
+// browser session cookie and nothing else today), the policy-endpoint body
+// shapes, and the refusal shapes a client has to handle. Kept here, next to
+// the generator, so it cannot drift from the inventory it introduces.
+const preamble = "## How to read this\n\n" +
+	"**auth** is what a request must carry:\n\n" +
+	"- `public` — nothing.\n" +
+	"- `session` / `admin` — a browser session cookie from `POST /auth/login` (or the OIDC flow), plus the `X-Requested-With: XMLHttpRequest` header. `admin` additionally requires the session's user to have the admin role. **There is no non-interactive credential for these endpoints yet**: an API key does not authenticate them, so scripting the admin API means driving the login flow first. This is a known gap, not a design choice.\n" +
+	"- `api_key` — `Authorization: Bearer <key>` with a user-scoped API key (`POST /api/v1/api-keys`).\n" +
+	"- `service` — the gateway's service credential, held by the api; not for customers.\n\n" +
+	"**surface** `ui` means a screen in the web app calls the route; `machine` means nothing in the UI does, for the reason given. The parity checks in CI (services/web `pnpm run check:parity`, and `route_inventory_test.go` in each service) hold both directions.\n\n" +
+	"### Routing policy bodies\n\n" +
+	"Every routing-policy level (organisation, user, API key) reads and writes the same object:\n\n" +
+	"```json\n{\n  \"residency\": null | \"self_hosted_only\",\n  \"allowed_models\": null | [\"<model id>\", ...],\n  \"default_model\": null | \"<model id or alias>\"\n}\n```\n\n" +
+	"`null` means inherit from the level above (at the organisation, `residency` is `\"any\"` or `\"self_hosted_only\"` — there is nothing above it). `allowed_models` takes concrete model ids only, never aliases. The merged result is `.../routing-policy/effective`: `{allowed_models, residency, default_model, sources:{field: \"org\"|\"user\"|\"api_key\"|\"none\"}, reachable_models, stored}`. `POST .../routing-policy/preview` takes the same body as `PUT` and returns `{effective, keys_affected:[{id,name,before,after}], would_lock_out:[...]}` without writing.\n\n" +
+	"### Refusals\n\n" +
+	"- `400 {\"error\": \"...\"}` — a body that does not validate (unknown model id, an alias in `allowed_models`, a `default_model` outside the effective allowlist).\n" +
+	"- `409 {\"error\": \"...\", \"locked_out\": [\"<user email or key name>\", ...]}` — the write would leave the named principals (or `\"(organisation)\"`) with no allowed model. Nothing was written.\n" +
+	"- `502 {\"error\": \"gateway unavailable: ...\"}` — a write or preview that needs the gateway's merge could not reach it. Nothing was written.\n" +
+	"- On `POST /v1/chat/completions`, a policy refusal is an OpenAI-style error `{\"error\": {\"message\", \"type\": \"permission_error\", \"code\"}}` with `code` one of `model_not_found` (404), `model_not_enabled`, `model_residency_violation`, `model_not_allowed` (403), `policy_unavailable` (503). Each is recorded on the usage log row as `denial_code`.\n\n" +
+	"## Inventory\n\n"
+
 // render builds docs/API.md's full text: one section per service, one line
 // per endpoint, in golden order (not re-sorted, so the doc's ordering
 // matches the golden file an editor already has open).
@@ -115,6 +138,7 @@ func render(entries []routeEntry) string {
 	var b strings.Builder
 	b.WriteString("# Darkplum API route inventory\n\n")
 	b.WriteString("Generated from docs/api-routes.json by cmd/apidoc — do not hand-edit; regenerate with `go run ./cmd/apidoc` from services/api after changing routes.\n\n")
+	b.WriteString(preamble)
 
 	services := []string{"api", "gateway"}
 	for _, svc := range services {

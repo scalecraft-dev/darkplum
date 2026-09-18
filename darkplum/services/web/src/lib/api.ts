@@ -223,6 +223,8 @@ export type UsageFilters = {
   api_key_id?: string
   model?: string
   purpose?: InferencePurpose | 'all'
+  /** The gateway's error code on a refused request, e.g. model_not_allowed. */
+  denial_code?: string
   since?: string
   until?: string
   limit?: number
@@ -266,9 +268,18 @@ export function getKeySummary(params: { since: string; until: string }): Promise
 // Models
 
 /** The chat-facing list, already filtered to what this person's policy allows.
- *  `default_model` is what the picker preselects. Absent on older APIs. */
-export function listModels(): Promise<{ data: Model[]; default_model?: string | null }> {
-  return request<{ data: Model[]; default_model?: string | null }>(ROUTES.listChatModels)
+ *  `default_model` is what the picker preselects. Absent on older APIs.
+ *  `policy_filtered` is false when the per-user policy lookup failed and the
+ *  list below is UNFILTERED — it may contain models the gateway will still
+ *  refuse. Absent on older APIs, which never failed open like this. */
+export function listModels(): Promise<{
+  data: Model[]
+  default_model?: string | null
+  policy_filtered?: boolean
+}> {
+  return request<{ data: Model[]; default_model?: string | null; policy_filtered?: boolean }>(
+    ROUTES.listChatModels,
+  )
 }
 
 // Admin Models
@@ -342,11 +353,10 @@ export function listPolicyPrincipals(params: {
 //
 // Four operations per principal, identical for users and keys: read the merged
 // result (with the principal's own row alongside it), try a change without
-// writing it, write it, or drop the row so the principal inherits again.
-
-export function getUserPolicy(id: string): Promise<PrincipalPolicy> {
-  return request<PrincipalPolicy>(ROUTES.getUserPolicy, { params: { id } })
-}
+// writing it, write it, or drop the row so the principal inherits again. The
+// API's plain GET .../routing-policy (stored row only) is not wrapped here:
+// the UI never needs the row without the merged view, so it is a machine
+// route -- see docs/api-routes.json.
 
 export function putUserPolicy(id: string, body: PrincipalPolicy): Promise<PrincipalPolicy> {
   return request<PrincipalPolicy>(ROUTES.putUserPolicy, { params: { id }, body })
@@ -362,10 +372,6 @@ export function getUserPolicyEffective(id: string): Promise<EffectivePolicy> {
 
 export function previewUserPolicy(id: string, body: PrincipalPolicy): Promise<PolicyPreview> {
   return request<PolicyPreview>(ROUTES.userPolicyPreview, { params: { id }, body })
-}
-
-export function getKeyPolicy(id: string): Promise<PrincipalPolicy> {
-  return request<PrincipalPolicy>(ROUTES.getKeyPolicy, { params: { id } })
 }
 
 export function putKeyPolicy(id: string, body: PrincipalPolicy): Promise<PrincipalPolicy> {

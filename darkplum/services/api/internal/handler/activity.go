@@ -154,17 +154,26 @@ func (h *ActivityHandler) ListActivity(c *gin.Context) {
 
 // inferenceEvent is the JSON shape returned by GET /api/v1/usage.
 type inferenceEvent struct {
-	ID               string    `json:"id"`
-	RequestID        string    `json:"request_id"`
-	APIKeyID         *string   `json:"api_key_id,omitempty"`
-	UserID           *string   `json:"user_id,omitempty"`
-	UserName         *string   `json:"user_name,omitempty"`
-	UserEmail        *string   `json:"user_email,omitempty"`
-	Model            string    `json:"model"`
-	Purpose          string    `json:"purpose"`
-	RouteName        *string   `json:"route_name,omitempty"`
-	RouterReason     *string   `json:"router_reason,omitempty"`
-	StatusCode       int       `json:"status_code"`
+	ID        string  `json:"id"`
+	RequestID string  `json:"request_id"`
+	APIKeyID  *string `json:"api_key_id,omitempty"`
+	UserID    *string `json:"user_id,omitempty"`
+	UserName  *string `json:"user_name,omitempty"`
+	UserEmail *string `json:"user_email,omitempty"`
+	Model     string  `json:"model"`
+	// RequestedModel is what the caller asked for when it differs from Model
+	// (an alias, or a request refused before any model resolved).
+	RequestedModel *string `json:"requested_model,omitempty"`
+	Purpose        string  `json:"purpose"`
+	RouteName      *string `json:"route_name,omitempty"`
+	RouterReason   *string `json:"router_reason,omitempty"`
+	StatusCode     int     `json:"status_code"`
+	// DenialCode is why the gateway refused this request, when it did:
+	// model_not_found, model_not_enabled, model_residency_violation,
+	// model_not_allowed, invalid_request, policy_unavailable, request_canceled.
+	// Null on a request that reached a model. This is the admin's answer to "did my
+	// policy fire, and on whom".
+	DenialCode       *string   `json:"denial_code"`
 	LatencyMS        int       `json:"latency_ms"`
 	PromptTokens     *int      `json:"prompt_tokens,omitempty"`
 	CompletionTokens *int      `json:"completion_tokens,omitempty"`
@@ -190,6 +199,38 @@ func validUsagePurposeFilter(v string) bool {
 	}
 }
 
+// validDenialCodeFilter accepts the ?denial_code= query param: one of the
+// gateway's refusal codes (see gateway/internal/handler/chat.go's
+// respond* helpers and inference_events.denial_code), or the sentinel "any"
+// meaning every refused request regardless of reason. Empty = no filter.
+func validDenialCodeFilter(v string) bool {
+	switch v {
+	case "", "any", "model_not_found", "model_not_enabled", "model_residency_violation",
+		"model_not_allowed", "invalid_request", "policy_unavailable", "request_canceled":
+		return true
+	default:
+		return false
+	}
+}
+
+// appendDenialCodeFilter adds the ?denial_code= clause to a usage WHERE.
+func appendDenialCodeFilter(c *gin.Context, where string, args []any, argN int) (string, []any, int, error) {
+	v := c.Query("denial_code")
+	if !validDenialCodeFilter(v) {
+		return where, args, argN, fmt.Errorf("denial_code must be one of any, model_not_found, model_not_enabled, model_residency_violation, model_not_allowed, invalid_request, policy_unavailable, request_canceled")
+	}
+	switch v {
+	case "":
+	case "any":
+		where += " AND ie.denial_code IS NOT NULL"
+	default:
+		where += fmt.Sprintf(" AND ie.denial_code = $%d", argN)
+		args = append(args, v)
+		argN++
+	}
+	return where, args, argN, nil
+}
+
 // usageListResponse wraps inference events with a total count for pagination.
 type usageListResponse struct {
 	Total  int              `json:"total"`
@@ -197,7 +238,8 @@ type usageListResponse struct {
 }
 
 // ListUsage handles GET /api/v1/usage.
-// Query params: user_id, api_key_id, model, since, until, limit (default 50, max 200), offset.
+// Query params: user_id, api_key_id, model, purpose, denial_code, since, until,
+// limit (default 50, max 200), offset.
 func (h *ActivityHandler) ListUsage(c *gin.Context) {
 	limit, offset, err := parsePagination(c, 50, 200)
 	if err != nil {
@@ -252,6 +294,12 @@ func (h *ActivityHandler) ListUsage(c *gin.Context) {
 		argN++
 	}
 
+	var filterErr error
+	if where, args, argN, filterErr = appendDenialCodeFilter(c, where, args, argN); filterErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": filterErr.Error()})
+		return
+	}
+
 	if v := c.Query("since"); v != "" {
 		t, err := time.Parse(time.RFC3339, v)
 		if err != nil {
@@ -288,8 +336,8 @@ func (h *ActivityHandler) ListUsage(c *gin.Context) {
 		SELECT
 			ie.id::text, ie.request_id, ie.api_key_id::text, ie.user_id::text,
 			u.name, u.email,
-			ie.model, ie.purpose, ie.route_name, ie.router_reason,
-			ie.status_code, ie.latency_ms, ie.prompt_tokens, ie.completion_tokens,
+			ie.model, ie.requested_model, ie.purpose, ie.route_name, ie.router_reason,
+			ie.status_code, ie.denial_code, ie.latency_ms, ie.prompt_tokens, ie.completion_tokens,
 			ie.stream, ie.ip_address::text, ie.created_at
 		FROM inference_events ie
 		LEFT JOIN users u ON u.id = ie.user_id
@@ -310,8 +358,8 @@ func (h *ActivityHandler) ListUsage(c *gin.Context) {
 		var ie inferenceEvent
 		if err := rows.Scan(
 			&ie.ID, &ie.RequestID, &ie.APIKeyID, &ie.UserID, &ie.UserName, &ie.UserEmail,
-			&ie.Model, &ie.Purpose, &ie.RouteName, &ie.RouterReason,
-			&ie.StatusCode, &ie.LatencyMS, &ie.PromptTokens, &ie.CompletionTokens,
+			&ie.Model, &ie.RequestedModel, &ie.Purpose, &ie.RouteName, &ie.RouterReason,
+			&ie.StatusCode, &ie.DenialCode, &ie.LatencyMS, &ie.PromptTokens, &ie.CompletionTokens,
 			&ie.Stream, &ie.IPAddress, &ie.CreatedAt,
 		); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "scan usage failed"})
@@ -662,6 +710,12 @@ func (h *ActivityHandler) ExportUsage(c *gin.Context) {
 		argN++
 	}
 
+	var filterErr error
+	if where, args, argN, filterErr = appendDenialCodeFilter(c, where, args, argN); filterErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": filterErr.Error()})
+		return
+	}
+
 	if v := c.Query("since"); v != "" {
 		t, err := time.Parse(time.RFC3339, v)
 		if err != nil {
@@ -694,10 +748,12 @@ func (h *ActivityHandler) ExportUsage(c *gin.Context) {
 			u.email,
 			ie.api_key_id::text,
 			ie.model,
+			ie.requested_model,
 			ie.purpose,
 			ie.route_name,
 			ie.router_reason,
 			ie.status_code,
+			ie.denial_code,
 			ie.latency_ms,
 			ie.prompt_tokens,
 			ie.completion_tokens,
@@ -721,7 +777,7 @@ func (h *ActivityHandler) ExportUsage(c *gin.Context) {
 	c.Header("Content-Disposition", `attachment; filename="inference_events.csv"`)
 
 	w := csv.NewWriter(c.Writer)
-	_ = w.Write([]string{"timestamp", "request_id", "user_id", "user_name", "user_email", "api_key_id", "model", "purpose", "route_name", "router_reason", "status_code", "latency_ms", "prompt_tokens", "completion_tokens", "stream", "ip_address"})
+	_ = w.Write([]string{"timestamp", "request_id", "user_id", "user_name", "user_email", "api_key_id", "model", "requested_model", "purpose", "route_name", "router_reason", "status_code", "denial_code", "latency_ms", "prompt_tokens", "completion_tokens", "stream", "ip_address"})
 
 	for rows.Next() {
 		var (
@@ -732,10 +788,12 @@ func (h *ActivityHandler) ExportUsage(c *gin.Context) {
 			userEmail        *string
 			apiKeyID         *string
 			model            string
+			requestedModel   *string
 			purpose          string
 			routeName        *string
 			routerReason     *string
 			statusCode       int
+			denialCode       *string
 			latencyMS        int
 			promptTokens     *int
 			completionTokens *int
@@ -743,9 +801,9 @@ func (h *ActivityHandler) ExportUsage(c *gin.Context) {
 			ipAddress        *string
 		)
 		if err := rows.Scan(
-			&createdAt, &requestID, &userID, &userName, &userEmail, &apiKeyID, &model,
+			&createdAt, &requestID, &userID, &userName, &userEmail, &apiKeyID, &model, &requestedModel,
 			&purpose, &routeName, &routerReason,
-			&statusCode, &latencyMS, &promptTokens, &completionTokens, &stream, &ipAddress,
+			&statusCode, &denialCode, &latencyMS, &promptTokens, &completionTokens, &stream, &ipAddress,
 		); err != nil {
 			w.Flush()
 			return
@@ -758,10 +816,12 @@ func (h *ActivityHandler) ExportUsage(c *gin.Context) {
 			derefStr(userEmail),
 			derefStr(apiKeyID),
 			model,
+			derefStr(requestedModel),
 			purpose,
 			derefStr(routeName),
 			derefStr(routerReason),
 			strconv.Itoa(statusCode),
+			derefStr(denialCode),
 			strconv.Itoa(latencyMS),
 			derefInt(promptTokens),
 			derefInt(completionTokens),

@@ -170,12 +170,19 @@ See `terraform/aws/variables.tf` for the full list.
 
 ## API reference
 
-`docs/API.md` lists every endpoint, generated from `docs/api-routes.json`. That
-file is also the parity contract: each route is marked `ui` (the web client
-calls it — checked by `pnpm run check:parity`) or `machine` with a reason (probes,
-the api↔gateway service calls, the OIDC redirect target). Go tests in both
-services fail if a route is registered that the file does not list, or listed
-but not registered.
+`docs/API.md` lists every endpoint, generated from `docs/api-routes.json`, with
+the routing-policy request/response bodies and the refusal shapes (`400`, `409
+locked_out`, `502`, and the chat `denial_code`s). That file is also the parity
+contract: each route is marked `ui` (a screen calls it — checked by `pnpm run
+check:parity`, which also fails on a wrapper no screen reaches) or `machine`
+with a reason (probes, the api↔gateway service calls, the OIDC redirect target,
+the plain stored-row policy GETs). Go tests in both services fail if a route is
+registered that the file does not list, or listed but not registered.
+
+One gap to know before you script against it: the admin endpoints (`auth:
+admin`/`session`) authenticate with a browser session cookie only. An API key
+does not work on them, so there is no non-interactive credential for managing
+users, keys or policy yet — a reconciler has to drive `POST /auth/login` first.
 
 ## Reaching the web UI
 
@@ -298,7 +305,10 @@ policy" on each row). Each level carries the same three settings:
 They merge most-restrictive-wins: **a key can never reach more than its owner,
 and a user never more than the organisation.** The gateway checks the model that
 actually serves the request — including the target a routed alias picks — and
-refuses with `model_not_allowed` (recorded in the usage log). A save at any
+refuses with `model_not_allowed`. Every refusal is recorded on its usage-log row
+as `denial_code` and shown in Admin > Activity (filter by reason, export with
+the same filter), so "did my rule fire, and on whom" has an answer in the
+product, not in `kubectl logs`. A save at any
 level — organisation included — that would leave a user or key with no reachable
 model is refused by the API (`409`, naming who), not just greyed out in the UI,
 and the editor previews "this will block N of this user's keys" before you save.
@@ -309,10 +319,14 @@ level set each part.
 Two limits to know: policy changes take effect within a few seconds (the gateway
 refreshes its policy snapshot; revoking a key is immediate), and per-user policy
 for webchat traffic relies on the api telling the gateway who the user is —
-whoever holds the api's service credential can act as any user. Per-user and
-per-key allowlists are not yet backstopped by a separate cloud IAM role; every
-principal shares the gateway's role until workspaces ship. Groups and
-workspaces are the next principal types; the schema reserves room for them.
+whoever holds the api's service credential can act as any user. That credential
+is a Kubernetes Secret in your own cluster and namespace, so holding it already
+means cluster-admin-level access to your own account; it is not reachable from
+outside, and API-key traffic is unaffected because the key itself is presented
+to the gateway. Per-user and per-key allowlists are not yet backstopped by a
+separate cloud IAM role; every principal shares the gateway's role until
+workspaces ship. Groups and workspaces are the next principal types; the schema
+reserves room for them.
 
 **Routing policy and aliases** (Admin > Models):
 

@@ -2,6 +2,40 @@
 
 Generated from docs/api-routes.json by cmd/apidoc — do not hand-edit; regenerate with `go run ./cmd/apidoc` from services/api after changing routes.
 
+## How to read this
+
+**auth** is what a request must carry:
+
+- `public` — nothing.
+- `session` / `admin` — a browser session cookie from `POST /auth/login` (or the OIDC flow), plus the `X-Requested-With: XMLHttpRequest` header. `admin` additionally requires the session's user to have the admin role. **There is no non-interactive credential for these endpoints yet**: an API key does not authenticate them, so scripting the admin API means driving the login flow first. This is a known gap, not a design choice.
+- `api_key` — `Authorization: Bearer <key>` with a user-scoped API key (`POST /api/v1/api-keys`).
+- `service` — the gateway's service credential, held by the api; not for customers.
+
+**surface** `ui` means a screen in the web app calls the route; `machine` means nothing in the UI does, for the reason given. The parity checks in CI (services/web `pnpm run check:parity`, and `route_inventory_test.go` in each service) hold both directions.
+
+### Routing policy bodies
+
+Every routing-policy level (organisation, user, API key) reads and writes the same object:
+
+```json
+{
+  "residency": null | "self_hosted_only",
+  "allowed_models": null | ["<model id>", ...],
+  "default_model": null | "<model id or alias>"
+}
+```
+
+`null` means inherit from the level above (at the organisation, `residency` is `"any"` or `"self_hosted_only"` — there is nothing above it). `allowed_models` takes concrete model ids only, never aliases. The merged result is `.../routing-policy/effective`: `{allowed_models, residency, default_model, sources:{field: "org"|"user"|"api_key"|"none"}, reachable_models, stored}`. `POST .../routing-policy/preview` takes the same body as `PUT` and returns `{effective, keys_affected:[{id,name,before,after}], would_lock_out:[...]}` without writing.
+
+### Refusals
+
+- `400 {"error": "..."}` — a body that does not validate (unknown model id, an alias in `allowed_models`, a `default_model` outside the effective allowlist).
+- `409 {"error": "...", "locked_out": ["<user email or key name>", ...]}` — the write would leave the named principals (or `"(organisation)"`) with no allowed model. Nothing was written.
+- `502 {"error": "gateway unavailable: ..."}` — a write or preview that needs the gateway's merge could not reach it. Nothing was written.
+- On `POST /v1/chat/completions`, a policy refusal is an OpenAI-style error `{"error": {"message", "type": "permission_error", "code"}}` with `code` one of `model_not_found` (404), `model_not_enabled`, `model_residency_violation`, `model_not_allowed` (403), `policy_unavailable` (503). Each is recorded on the usage log row as `denial_code`.
+
+## Inventory
+
 ## api
 
 - `GET /health` — auth: public, surface: machine (Kubernetes liveness/readiness probe and load-balancer health check; no browser surface)
@@ -27,14 +61,14 @@ Generated from docs/api-routes.json by cmd/apidoc — do not hand-edit; regenera
 - `DELETE /api/v1/users/:id` — auth: admin, surface: ui
 - `PATCH /api/v1/users/:id/role` — auth: admin, surface: ui
 - `PATCH /api/v1/users/:id/password` — auth: admin, surface: ui
-- `GET /api/v1/users/:id/routing-policy` — auth: admin, surface: ui
+- `GET /api/v1/users/:id/routing-policy` — auth: admin, surface: machine (Stored row only, for scripts and GitOps-style reconcilers; the UI reads the same row through .../routing-policy/effective's `stored` field alongside the merged result, so the editor never calls this one)
 - `PUT /api/v1/users/:id/routing-policy` — auth: admin, surface: ui
 - `DELETE /api/v1/users/:id/routing-policy` — auth: admin, surface: ui
 - `GET /api/v1/users/:id/routing-policy/effective` — auth: admin, surface: ui
 - `POST /api/v1/users/:id/routing-policy/preview` — auth: admin, surface: ui
 - `POST /api/v1/api-keys` — auth: admin, surface: ui
 - `DELETE /api/v1/api-keys/:id` — auth: admin, surface: ui
-- `GET /api/v1/api-keys/:id/routing-policy` — auth: admin, surface: ui
+- `GET /api/v1/api-keys/:id/routing-policy` — auth: admin, surface: machine (Stored row only, for scripts and GitOps-style reconcilers; the UI reads the same row through .../routing-policy/effective's `stored` field alongside the merged result, so the editor never calls this one)
 - `PUT /api/v1/api-keys/:id/routing-policy` — auth: admin, surface: ui
 - `DELETE /api/v1/api-keys/:id/routing-policy` — auth: admin, surface: ui
 - `GET /api/v1/api-keys/:id/routing-policy/effective` — auth: admin, surface: ui
@@ -50,8 +84,8 @@ Generated from docs/api-routes.json by cmd/apidoc — do not hand-edit; regenera
 - `GET /api/v1/routing-policy/principals` — auth: admin, surface: ui — filters: limit (max 200), offset
 - `GET /api/v1/activity` — auth: admin, surface: ui — filters: actor_id, event_type, since, until, limit, offset
 - `GET /api/v1/activity/export` — auth: admin, surface: ui — filters: actor_id, event_type, since, until
-- `GET /api/v1/usage` — auth: admin, surface: ui — filters: user_id, api_key_id, model, purpose, since, until, limit, offset
-- `GET /api/v1/usage/export` — auth: admin, surface: ui — filters: user_id, api_key_id, model, purpose, since, until
+- `GET /api/v1/usage` — auth: admin, surface: ui — filters: user_id, api_key_id, model, purpose, denial_code (a refusal code, or `any`), since, until, limit, offset
+- `GET /api/v1/usage/export` — auth: admin, surface: ui — filters: user_id, api_key_id, model, purpose, denial_code, since, until
 - `GET /api/v1/usage/stats` — auth: admin, surface: ui — filters: interval, user_id, api_key_id, since, until
 - `GET /api/v1/usage/summary` — auth: admin, surface: ui — filters: since, until
 - `GET /api/v1/usage/user-summary` — auth: admin, surface: ui — filters: since, until

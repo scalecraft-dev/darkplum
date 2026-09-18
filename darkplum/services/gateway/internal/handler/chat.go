@@ -525,9 +525,15 @@ func (h *ChatHandler) HandleListModels(c *gin.Context) {
 		OwnedBy      string `json:"owned_by"`
 		BackendClass string `json:"backend_class"`
 	}
+	// DefaultModel is the caller's effective default_model (what a request
+	// that names no model will run on) — set only for a user key, where the
+	// list is also filtered; nil for the service key's unfiltered view. The
+	// api relays it to Bearer callers of its own /v1/models so the two lists
+	// agree on both membership and default.
 	type modelsResponse struct {
-		Object string       `json:"object"`
-		Data   []modelEntry `json:"data"`
+		Object       string       `json:"object"`
+		Data         []modelEntry `json:"data"`
+		DefaultModel *string      `json:"default_model,omitempty"`
 	}
 
 	now := time.Now().Unix()
@@ -566,10 +572,11 @@ func (h *ChatHandler) HandleListModels(c *gin.Context) {
 		})
 	}
 
-	c.JSON(http.StatusOK, modelsResponse{
-		Object: "list",
-		Data:   models,
-	})
+	resp := modelsResponse{Object: "list", Data: models}
+	if filterByPolicy {
+		resp.DefaultModel = eff.DefaultModel
+	}
+	c.JSON(http.StatusOK, resp)
 }
 
 // uuidPattern matches a canonical 8-4-4-4-12 hex UUID (any version/variant —
@@ -864,6 +871,17 @@ type policyImpactResponse struct {
 	// owned by a user with one) whose effective allowlist would be empty
 	// under the override. Never null.
 	LockedOut []policyImpactPrincipal `json:"locked_out"`
+	// OrgNarrowed is true when the org's own reachable set (allowed ∧ enabled
+	// ∧ routable ∧ residency-ok) under the override is a strict subset of
+	// what it is now — i.e. everyone who simply inherits the organisation's
+	// policy reaches fewer models than before. A principal with rows of its
+	// own is reported individually in Narrowed instead.
+	OrgNarrowed bool `json:"org_narrowed"`
+	// Narrowed lists every walked principal (same set as LockedOut's domain)
+	// whose reachable set under the override lost at least one model it
+	// reaches now. A locked-out principal is also narrowed unless it already
+	// reached nothing. Never null.
+	Narrowed []policyImpactPrincipal `json:"narrowed"`
 	// Evaluated is how many user/key principals were re-merged.
 	Evaluated int `json:"evaluated"`
 }
@@ -946,23 +964,32 @@ func (h *ChatHandler) HandleEffectivePolicyImpact(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, policyImpact(snap, override))
+	c.JSON(http.StatusOK, policyImpact(snap, h.routes.Snapshot(), override))
 }
 
 // policyImpact is HandleEffectivePolicyImpact's pure core: it re-merges every
-// principal that could be locked out by an org-level override (see the
+// principal that could be affected by an org-level override (see the
 // handler's doc comment for why that set is exactly "users with a row, owners
-// of keys with a row, and every key those users own") and reports the ones
-// whose effective allowlist comes out empty. Split from the handler so tests
-// can drive it with a hand-built Snapshot.
-func policyImpact(snap policy.Snapshot, override *policy.PolicyOverride) policyImpactResponse {
-	resp := policyImpactResponse{LockedOut: []policyImpactPrincipal{}}
+// of keys with a row, and every key those users own"), reports the ones
+// whose effective allowlist comes out empty (LockedOut) and the ones whose
+// reachable set shrinks (Narrowed), and whether the org itself — hence every
+// inheriting principal — reaches less (OrgNarrowed). Split from the handler
+// so tests can drive it with a hand-built Snapshot and route table.
+func policyImpact(snap policy.Snapshot, table *routing.Table, override *policy.PolicyOverride) policyImpactResponse {
+	resp := policyImpactResponse{LockedOut: []policyImpactPrincipal{}, Narrowed: []policyImpactPrincipal{}}
 
-	org := policy.Effective(override.Apply([]policy.PolicyRow{{Level: policy.PrincipalTypeOrg}}))
-	if lockedOut(org) {
+	// The org's own chain is just its row (ChainFor's first element; the
+	// user placeholder is dropped so an inheriting principal's view is
+	// exactly the org's).
+	orgChain := snap.ChainFor("", "")[:1]
+	orgNow := policy.Effective(orgChain)
+	orgAfter := policy.Effective(override.Apply(orgChain))
+	if lockedOut(orgAfter) {
 		resp.OrgLockedOut = true
+		resp.OrgNarrowed = len(reachableModels(orgNow, snap, table)) > 0
 		return resp
 	}
+	resp.OrgNarrowed = losesAny(reachableModels(orgNow, snap, table), reachableModels(orgAfter, snap, table))
 
 	users := make(map[string]bool, len(snap.UserRows)+len(snap.KeyRows))
 	for userID := range snap.UserRows {
@@ -979,19 +1006,42 @@ func policyImpact(snap policy.Snapshot, override *policy.PolicyOverride) policyI
 	}
 	sort.Strings(userIDs)
 
-	for _, userID := range userIDs {
+	evaluate := func(userID, keyID string) {
 		resp.Evaluated++
-		if lockedOut(policy.Effective(override.Apply(snap.ChainFor(userID, "")))) {
-			resp.LockedOut = append(resp.LockedOut, policyImpactPrincipal{UserID: userID})
+		chain := snap.ChainFor(userID, keyID)
+		now := policy.Effective(chain)
+		after := policy.Effective(override.Apply(chain))
+		p := policyImpactPrincipal{UserID: userID, APIKeyID: keyID}
+		if lockedOut(after) {
+			resp.LockedOut = append(resp.LockedOut, p)
 		}
+		if losesAny(reachableModels(now, snap, table), reachableModels(after, snap, table)) {
+			resp.Narrowed = append(resp.Narrowed, p)
+		}
+	}
+	for _, userID := range userIDs {
+		evaluate(userID, "")
 		for _, keyID := range snap.UserKeys[userID] {
-			resp.Evaluated++
-			if lockedOut(policy.Effective(override.Apply(snap.ChainFor(userID, keyID)))) {
-				resp.LockedOut = append(resp.LockedOut, policyImpactPrincipal{UserID: userID, APIKeyID: keyID})
-			}
+			evaluate(userID, keyID)
 		}
 	}
 	return resp
+}
+
+// losesAny reports whether before contains a model after does not — the
+// "reaches fewer models than before" test. A reordering or a widening is
+// not a loss.
+func losesAny(before, after []string) bool {
+	keep := make(map[string]bool, len(after))
+	for _, id := range after {
+		keep[id] = true
+	}
+	for _, id := range before {
+		if !keep[id] {
+			return true
+		}
+	}
+	return false
 }
 
 // lockedOut reports whether eff permits no model at all — a non-nil, empty

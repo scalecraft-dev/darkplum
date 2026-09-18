@@ -14,7 +14,7 @@ import { getUsageStats, listActivity, listUsage } from '../lib/api'
 import { useTheme } from '../context/ThemeContext'
 import type { InferenceEvent, KeyUsageSummary, TimeRange, UsageBucket, UserUsageSummary } from '../types'
 import { eventLabel, eventVariant, formatEventDetail, type EventVariant } from '../lib/activityEvents'
-import { routerReasonText } from '../lib/modelRouting'
+import { denialLabel, routerReasonText } from '../lib/modelRouting'
 import { useToast } from '../components/Toast'
 import { Avatar, Badge, Skeleton } from '../components/ui'
 import styles from './ActivityDrawer.module.css'
@@ -85,13 +85,16 @@ function inferenceToRow(e: InferenceEvent): {
   const purpose = e.purpose ?? 'inference'
   const label =
     e.status_code >= 400
-      ? 'Error'
+      ? e.denial_code
+        ? 'Refused'
+        : 'Error'
       : purpose === 'routing'
         ? 'Classifier'
         : purpose === 'routing_dryrun'
           ? 'Route test'
           : 'Request'
   const detail = [
+    e.denial_code ? `${denialLabel(e.denial_code)} (${e.denial_code})` : '',
     `model: ${e.model}`,
     e.route_name ? `route: ${e.route_name}` : '',
     e.router_reason ? routerReasonText(e.router_reason).toLowerCase() : '',

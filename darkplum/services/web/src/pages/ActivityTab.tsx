@@ -43,7 +43,7 @@ import {
   formatEventDetail,
   type EventVariant,
 } from '../lib/activityEvents'
-import { routerReasonText } from '../lib/modelRouting'
+import { DENIAL_CODES, denialLabel, routerReasonText } from '../lib/modelRouting'
 import { useToast } from '../components/Toast'
 import { Badge, Button, Skeleton, Table, TableEmpty } from '../components/ui'
 import { ActivityDrawer } from './ActivityDrawer'
@@ -216,6 +216,13 @@ function inferenceEventToUnified(e: InferenceEvent): UnifiedEvent {
   // A classifier call is named for what it did: it chose a route, it did not
   // answer anyone. Failures still read as errors whatever their job was.
   const label = e.status_code < 400 ? PURPOSE_LABEL[purpose] : 'Error'
+  const base = `model: ${e.model}, latency: ${e.latency_ms}ms, status: ${e.status_code}`
+  // The refusal reason, said first — it's what an admin reading a failed row
+  // wants to know before the plumbing details.
+  const detail_text =
+    e.status_code >= 400 && e.denial_code
+      ? `${denialLabel(e.denial_code)} · ${e.denial_code} — ${base}`
+      : base
   return {
     id:             e.id,
     created_at:     e.created_at,
@@ -224,7 +231,7 @@ function inferenceEventToUnified(e: InferenceEvent): UnifiedEvent {
     user_display:   display,
     action_label:   label,
     action_variant: e.status_code >= 400 ? 'danger' : purpose === 'inference' ? 'success' : 'info',
-    detail_text:    `model: ${e.model}, latency: ${e.latency_ms}ms, status: ${e.status_code}`,
+    detail_text,
     ip_address:     e.ip_address,
     route:          e.route_name ?? null,
     reason:         e.router_reason ?? null,
@@ -286,6 +293,9 @@ export function ActivityTab() {
   const [personId, setPersonId]   = useState('')
   const [apiKeyId, setApiKeyId]   = useState('')
   const [modelId, setModelId]     = useState('')
+  /** The gateway's error code on a refused request. Meaningless on admin
+   *  events, which are never refusals in this sense. */
+  const [denialCode, setDenialCode] = useState('')
 
   // Filter menus. Read once; a failure costs a menu, not the page.
   const [allUsers, setAllUsers]   = useState<User[]>([])
@@ -332,13 +342,14 @@ export function ActivityTab() {
       user_id: personId || undefined,
       api_key_id: apiKeyId || undefined,
       model: modelId || undefined,
+      denial_code: denialCode || undefined,
       purpose,
     }),
-    [personId, apiKeyId, modelId, purpose],
+    [personId, apiKeyId, modelId, denialCode, purpose],
   )
 
   const filtersActive =
-    eventType !== '' || personId !== '' || apiKeyId !== '' || modelId !== ''
+    eventType !== '' || personId !== '' || apiKeyId !== '' || modelId !== '' || denialCode !== ''
 
   // ---------------------------------------------------------------------------
   // Data fetching
@@ -444,7 +455,7 @@ export function ActivityTab() {
   // page 4 of the old filter is not page 4 of the new one.
   useEffect(() => {
     setPage(0)
-  }, [timeRange, logView, purpose, pageSize, eventType, personId, apiKeyId, modelId])
+  }, [timeRange, logView, purpose, pageSize, eventType, personId, apiKeyId, modelId, denialCode])
 
   useEffect(() => {
     void fetchSummaryAndChart()
@@ -776,6 +787,23 @@ export function ActivityTab() {
           </label>
         )}
 
+        {logView !== 'admin' && (
+          <label className={styles.filter}>
+            <span className={styles.filterLabel}>Denial reason</span>
+            <select
+              className={styles.filterSelect}
+              value={denialCode}
+              onChange={(e) => setDenialCode(e.target.value)}
+            >
+              <option value="">All requests</option>
+              <option value="any">Any refusal</option>
+              {DENIAL_CODES.map((c) => (
+                <option key={c} value={c}>{denialLabel(c)}</option>
+              ))}
+            </select>
+          </label>
+        )}
+
         <label className={`${styles.filter} ${styles.filterRows}`}>
           <span className={styles.filterLabel}>Rows</span>
           <select
@@ -793,7 +821,7 @@ export function ActivityTab() {
           <button
             type="button"
             className={styles.clearFilters}
-            onClick={() => { setEventType(''); setPersonId(''); setApiKeyId(''); setModelId('') }}
+            onClick={() => { setEventType(''); setPersonId(''); setApiKeyId(''); setModelId(''); setDenialCode('') }}
           >
             Clear filters
           </button>

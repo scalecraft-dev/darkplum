@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -123,6 +124,11 @@ type openAIModelsResponse struct {
 	Object       string             `json:"object"`
 	Data         []openAIModelEntry `json:"data"`
 	DefaultModel *string            `json:"default_model"`
+	// PolicyFiltered is false when the caller's policy could not be applied
+	// (the gateway lookup failed) and Data is the UNFILTERED list -- a model
+	// shown may still be refused. The picker says so instead of offering
+	// models that will 403.
+	PolicyFiltered bool `json:"policy_filtered"`
 }
 
 // getSessionEffective returns the session user's effective allowed_models
@@ -174,15 +180,22 @@ func (h *ModelHandler) orgDefaultModel(ctx context.Context) (*string, error) {
 // pointing at them) are omitted entirely — this is a UX convenience for the
 // picker, not the enforcement point (that's the gateway; see policy.Snapshot).
 //
-// For a session (browser) caller -- identified by "user_id" being set in the
-// gin context, which only happens via SessionRequired, never the Bearer/
-// API-key path -- the list is additionally filtered to that user's effective
-// allowed_models (see getSessionEffective) and routed/static alias entries
-// whose every target is disallowed are omitted. A Bearer/API-key caller
-// (no "user_id" in context) gets the unfiltered, residency-only list exactly
-// as before: that caller's own gateway-side enforcement already applies its
-// key's policy per request, and this endpoint's job for that caller is model
-// discovery, not a second, possibly-inconsistent filter.
+// The list is filtered to the caller's effective allowed_models, and
+// default_model is the caller's effective default, for BOTH kinds of caller:
+//
+//   - a session (browser) caller -- "user_id" set in the gin context, which
+//     only happens via SessionRequired -- through getSessionEffective (the
+//     gateway's effective endpoint with the service key, cached 5s per user);
+//   - a Bearer/API-key caller through the gateway's own GET /v1/models,
+//     called with the caller's credential (bearerModels), which the gateway
+//     filters per user key and which now also carries that key's default.
+//
+// The two /v1/models (api and gateway) must give the same credential the
+// same answer -- an SDK caller that lists models and then gets 403 on one
+// of them reads as a broken product. Routed/static alias entries whose every
+// target is disallowed are omitted. If the policy lookup fails the list
+// degrades to residency-only filtering with policy_filtered=false (see
+// openAIModelsResponse); enforcement stays with the gateway either way.
 func (h *ModelHandler) ListModels(c *gin.Context) {
 	ctx := c.Request.Context()
 
@@ -195,6 +208,7 @@ func (h *ModelHandler) ListModels(c *gin.Context) {
 
 	var allowedModels *[]string
 	var defaultModel *string
+	policyFiltered := false
 	if userID := c.GetString("user_id"); userID != "" {
 		am, dm, effErr := h.getSessionEffective(ctx, userID)
 		if effErr != nil {
@@ -202,9 +216,22 @@ func (h *ModelHandler) ListModels(c *gin.Context) {
 		} else {
 			allowedModels = am
 			defaultModel = dm
+			policyFiltered = true
+		}
+	} else if bearer := c.GetHeader("Authorization"); bearer != "" {
+		ids, dm, gwErr := h.bearerModels(ctx, bearer)
+		if gwErr != nil {
+			slog.WarnContext(ctx, "list models: gateway model list unavailable for api-key caller, falling back to unfiltered list", "err", gwErr)
+		} else {
+			allowedModels = &ids
+			defaultModel = dm
+			policyFiltered = true
 		}
 	}
-	if defaultModel == nil {
+	if defaultModel == nil && policyFiltered {
+		// A filtered caller with no effective default: nothing to preselect.
+		// (The org default is already folded into the effective default.)
+	} else if defaultModel == nil {
 		if d, dErr := h.orgDefaultModel(ctx); dErr == nil {
 			defaultModel = d
 		} else {
@@ -327,7 +354,47 @@ func (h *ModelHandler) ListModels(c *gin.Context) {
 	}
 
 	data := buildModelsList(models, aliases, routedAliases, residency, time.Now(), h.availabilityWindow, allowedModels)
-	c.JSON(http.StatusOK, openAIModelsResponse{Object: "list", Data: data, DefaultModel: defaultModel})
+	c.JSON(http.StatusOK, openAIModelsResponse{Object: "list", Data: data, DefaultModel: defaultModel, PolicyFiltered: policyFiltered})
+}
+
+// bearerModels asks the gateway's GET /v1/models with the caller's own
+// Authorization header. For a user API key the gateway filters that list to
+// the key's effective allowlist and reports its effective default_model, so
+// this is the caller's policy view without the api ever seeing which key it
+// is (the api does not validate Bearer keys; the gateway does). A non-2xx
+// from the gateway (a bad key, say) is returned as an error and the caller
+// gets the degraded unfiltered list -- the gateway will refuse the chat
+// request itself.
+func (h *ModelHandler) bearerModels(ctx context.Context, authorization string) ([]string, *string, error) {
+	ctx, cancel := context.WithTimeout(ctx, gatewayEffectiveTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, h.gatewayURL+"/v1/models", nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	req.Header.Set("Authorization", authorization)
+	resp, err := h.client.Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, nil, fmt.Errorf("gateway /v1/models returned %d", resp.StatusCode)
+	}
+	var body struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+		DefaultModel *string `json:"default_model"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1024*1024)).Decode(&body); err != nil {
+		return nil, nil, err
+	}
+	ids := make([]string, 0, len(body.Data))
+	for _, m := range body.Data {
+		ids = append(ids, m.ID)
+	}
+	return ids, body.DefaultModel, nil
 }
 
 // getResidency reads the routing_policy singleton's current residency value.

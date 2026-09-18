@@ -373,12 +373,15 @@ type gatewayPolicyImpactPrincipal struct {
 type gatewayPolicyImpact struct {
 	OrgLockedOut bool                           `json:"org_locked_out"`
 	LockedOut    []gatewayPolicyImpactPrincipal `json:"locked_out"`
+	OrgNarrowed  bool                           `json:"org_narrowed"`
+	Narrowed     []gatewayPolicyImpactPrincipal `json:"narrowed"`
 	Evaluated    int                            `json:"evaluated"`
 }
 
 // impact calls POST {gatewayURL}/v1/policy/impact with an org-level
 // override: which users and keys would have an EMPTY effective allowlist if
-// the org row became policy. This is PUT /api/v1/routing-policy's lock-out
+// the org row became policy (LockedOut), which would reach fewer models than
+// now (Narrowed), and whether the org itself would (OrgNarrowed). This is PUT /api/v1/routing-policy's lock-out
 // guard -- the org-wide counterpart of effectiveWithOverride, so the org PUT
 // refuses lock-outs with the same 409 the user/key PUTs do, decided by the
 // same gateway merge, in one call rather than one per principal.
@@ -697,7 +700,7 @@ func (h *PolicyHandler) PutUserPolicy(c *gin.Context) {
 	}
 	if len(lockedOut) > 0 {
 		c.JSON(http.StatusConflict, gin.H{
-			"error":      "this policy would leave the user (or a key it owns) with no reachable models",
+			"error":      "this policy would leave the user (or a key it owns) with no allowed model",
 			"locked_out": lockedOutNames(lockedOut),
 		})
 		return
@@ -1147,9 +1150,18 @@ func (h *PolicyHandler) PreviewAPIKeyPolicy(c *gin.Context) {
 
 // principalListEntry is one row in GET /api/v1/routing-policy/principals.
 type principalListEntry struct {
-	PrincipalType   string       `json:"principal_type"`
-	PrincipalID     string       `json:"principal_id"`
+	PrincipalType string `json:"principal_type"`
+	// PrincipalID is the user id or api key id, whichever this row is;
+	// UserID/APIKeyID carry the same value in its typed slot (exactly one is
+	// set) so a client can build an edit link without inspecting
+	// PrincipalType.
+	PrincipalID string  `json:"principal_id"`
+	UserID      *string `json:"user_id"`
+	APIKeyID    *string `json:"api_key_id"`
+	// Display is the user's email, or the key's name. Owner is the owning
+	// user's email for a key row (null for a user row).
 	Display         string       `json:"display"`
+	Owner           *string      `json:"owner"`
 	Policy          policyObject `json:"policy"`
 	UpdatedAt       time.Time    `json:"updated_at"`
 	ReachableModels []string     `json:"reachable_models,omitempty"`
@@ -1195,15 +1207,19 @@ func (h *PolicyHandler) ListPrincipalPolicies(c *gin.Context) {
 
 	rows, err := h.db.Query(ctx, `
 		SELECT p.principal_type, COALESCE(p.user_id::text, p.api_key_id::text),
-			COALESCE(u.email, k.name || ' (' || ku.email || ')'),
+			COALESCE(u.email, k.name), ku.email,
 			p.residency, p.allowed_models, p.default_model, p.updated_at,
-			p.user_id, p.api_key_id
+			p.user_id::text, p.api_key_id::text
 		FROM principal_routing_policies p
 		LEFT JOIN users u ON u.id = p.user_id
 		LEFT JOIN api_keys k ON k.id = p.api_key_id
 		LEFT JOIN users ku ON ku.id = k.user_id
 		WHERE p.principal_type IN ('user','api_key')
-		ORDER BY p.updated_at DESC
+		-- The id tiebreaker makes OFFSET paging deterministic when several
+		-- rows share an updated_at (one transaction touching many rows). A
+		-- row edited between two pages can still shift across the boundary;
+		-- the UI reloads from the first page after any edit it makes itself.
+		ORDER BY p.updated_at DESC, COALESCE(p.user_id, p.api_key_id) DESC
 		LIMIT $1 OFFSET $2
 	`, limit, offset)
 	if err != nil {
@@ -1219,7 +1235,7 @@ func (h *PolicyHandler) ListPrincipalPolicies(c *gin.Context) {
 	var raw []rawRow
 	for rows.Next() {
 		var r rawRow
-		if err := rows.Scan(&r.entry.PrincipalType, &r.entry.PrincipalID, &r.entry.Display,
+		if err := rows.Scan(&r.entry.PrincipalType, &r.entry.PrincipalID, &r.entry.Display, &r.entry.Owner,
 			&r.entry.Policy.Residency, &r.entry.Policy.AllowedModels, &r.entry.Policy.DefaultModel, &r.entry.UpdatedAt,
 			&r.userID, &r.apiKeyID); err != nil {
 			rows.Close()
@@ -1237,6 +1253,7 @@ func (h *PolicyHandler) ListPrincipalPolicies(c *gin.Context) {
 
 	entries := make([]principalListEntry, 0, len(raw))
 	for _, r := range raw {
+		r.entry.UserID, r.entry.APIKeyID = r.userID, r.apiKeyID
 		var userID string
 		var apiKeyID *string
 		if r.userID != nil {
