@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { getMyPolicyEffective } from '../lib/api'
-import { POLICY_RULE, policyLimits, residencyLabel, sourceLabel } from '../lib/policy'
+import { POLICY_RULE, policyLimits, residencyLabel, sourceLabelForSelf } from '../lib/policy'
 import { formatModelName } from '../lib/formatModelName'
 import type { EffectivePolicy, Model } from '../types'
 import { Button, Modal } from '../components/ui'
@@ -10,6 +10,9 @@ interface Props {
   /** The entries the picker is offering — used to name allowed ids the way the
    *  picker names them, rather than showing a raw id twice. */
   models: Model[]
+  /** True while the page is already showing that the policy service is down
+   *  (the unfiltered-list banner); this component then stays quiet on error. */
+  suppressError?: boolean
 }
 
 function label(id: string, models: Model[]): string {
@@ -27,7 +30,7 @@ function label(id: string, models: Model[]): string {
  * The affordance only appears once the answer is worth reading: when nothing is
  * narrowed, there is nothing to explain and the header stays clean.
  */
-export function ModelAccessNotice({ models }: Props) {
+export function ModelAccessNotice({ models, suppressError = false }: Props) {
   const [open, setOpen] = useState(false)
   const [policy, setPolicy] = useState<EffectivePolicy | null>(null)
   const [loading, setLoading] = useState(true)
@@ -39,8 +42,9 @@ export function ModelAccessNotice({ models }: Props) {
       setPolicy(await getMyPolicyEffective())
       setError(null)
     } catch (err) {
-      // An older API has no such endpoint. That is not worth telling anyone
-      // about in chat: the affordance simply does not appear.
+      // Shown below as a small error with a retry: the "why" affordance is
+      // what someone reaches for when access looks wrong, so it must not
+      // vanish at exactly that moment.
       setError(err instanceof Error ? err.message : 'Your model access could not be read')
     } finally {
       setLoading(false)
@@ -55,6 +59,9 @@ export function ModelAccessNotice({ models }: Props) {
   // when access looks wrong, so it stays put and offers a retry instead of
   // quietly vanishing.
   if (error) {
+    // When the page already says the policy service is unreachable (the
+    // model-list banner), a second red box for the same outage is noise.
+    if (suppressError) return null
     return (
       <div className={styles.loadError} role="alert">
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -119,7 +126,7 @@ export function ModelAccessNotice({ models }: Props) {
                 </span>
               )}
               {policy.sources?.allowed_models && (
-                <span className={styles.source}>{sourceLabel(policy.sources.allowed_models)}</span>
+                <span className={styles.source}>{sourceLabelForSelf(policy.sources.allowed_models)}</span>
               )}
             </dd>
 
@@ -129,7 +136,7 @@ export function ModelAccessNotice({ models }: Props) {
                 ? 'Self-hosted only — nothing leaves your infrastructure'
                 : residencyLabel(policy.residency)}
               {policy.sources?.residency && (
-                <span className={styles.source}>{sourceLabel(policy.sources.residency)}</span>
+                <span className={styles.source}>{sourceLabelForSelf(policy.sources.residency)}</span>
               )}
             </dd>
 
@@ -137,7 +144,7 @@ export function ModelAccessNotice({ models }: Props) {
             <dd>
               {policy.default_model ? label(policy.default_model, models) : 'Nothing in particular'}
               {policy.sources?.default_model && (
-                <span className={styles.source}>{sourceLabel(policy.sources.default_model)}</span>
+                <span className={styles.source}>{sourceLabelForSelf(policy.sources.default_model)}</span>
               )}
             </dd>
           </dl>

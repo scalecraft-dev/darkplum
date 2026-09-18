@@ -371,14 +371,14 @@
     "service": "api",
     "method": "GET",
     "path": "/v1/models",
-    "auth": "session",
+    "auth": "api_key|session",
     "surface": "ui"
   },
   {
     "service": "api",
     "method": "POST",
     "path": "/v1/chat/completions",
-    "auth": "session",
+    "auth": "api_key|session",
     "surface": "ui"
   },
   {

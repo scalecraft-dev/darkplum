@@ -48,6 +48,21 @@ export function sourceLabel(source: PolicySource): string {
   }
 }
 
+/** The same, said to the person it is about — chat's "why is my access
+ *  limited?" view, where "this user" is the reader. */
+export function sourceLabelForSelf(source: PolicySource): string {
+  switch (source) {
+    case 'org':
+      return 'Set by the organisation'
+    case 'user':
+      return 'Set on you'
+    case 'api_key':
+      return 'Set on your key'
+    default:
+      return 'Not set anywhere'
+  }
+}
+
 /** The short form, for a chip beside the value it explains. */
 export function sourceChip(source: PolicySource): string {
   switch (source) {
@@ -107,7 +122,8 @@ export function storedSummary(policy: PrincipalPolicy, models: AdminModel[]): st
     parts.push(`${n} ${n === 1 ? 'model' : 'models'} allowed`)
   }
   if (policy.default_model) parts.push(`Default ${modelLabel(policy.default_model, models)}`)
-  return parts.length > 0 ? parts.join(' · ') : 'Inherits everything'
+  // A row with every field null narrows nothing: it inherits, same as no row.
+  return parts.length > 0 ? parts.join(' · ') : 'Inherits organisation'
 }
 
 /**

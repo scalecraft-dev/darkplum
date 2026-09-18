@@ -789,7 +789,7 @@ export function ChatPage() {
             value={model}
             onChange={handleModelChange}
           />
-          <ModelAccessNotice models={models} />
+          <ModelAccessNotice models={models} suppressError={!policyFiltered} />
           {canExport && (
             <div className={styles.headerActions}>
               <Button

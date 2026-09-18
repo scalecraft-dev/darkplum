@@ -7,8 +7,9 @@ Generated from docs/api-routes.json by cmd/apidoc — do not hand-edit; regenera
 **auth** is what a request must carry:
 
 - `public` — nothing.
-- `session` / `admin` — a browser session cookie from `POST /auth/login` (or the OIDC flow), plus the `X-Requested-With: XMLHttpRequest` header. `admin` additionally requires the session's user to have the admin role. **There is no non-interactive credential for these endpoints yet**: an API key does not authenticate them, so scripting the admin API means driving the login flow first. This is a known gap, not a design choice.
-- `api_key` — `Authorization: Bearer <key>` with a user-scoped API key (`POST /api/v1/api-keys`).
+- `api_key` — `Authorization: Bearer <key>` with a user-scoped API key (`POST /api/v1/api-keys`). The key's own routing policy applies.
+- `api_key|session` — either of the above two forms. These are the OpenAI-compatible routes an SDK points at: `GET /v1/models` and `POST /v1/chat/completions` on the api take a Bearer key exactly like the gateway does, so an SDK never needs a browser session.
+- `session` / `admin` — a browser session cookie from `POST /auth/login` (or the OIDC flow). `admin` additionally requires the session's user to have the admin role. **There is no non-interactive credential for the `/api/v1/*` admin surface yet**: an API key does not authenticate these routes, so scripting user, key or policy management means driving the login flow first. This is a known gap, not a design choice. Session requests that change state (POST/PUT/PATCH/DELETE) must also send `X-Requested-With: XMLHttpRequest`; GETs and Bearer requests need not.
 - `service` — the gateway's service credential, held by the api; not for customers.
 
 **surface** `ui` means a screen in the web app calls the route; `machine` means nothing in the UI does, for the reason given. The parity checks in CI (services/web `pnpm run check:parity`, and `route_inventory_test.go` in each service) hold both directions.
@@ -25,14 +26,14 @@ Every routing-policy level (organisation, user, API key) reads and writes the sa
 }
 ```
 
-`null` means inherit from the level above (at the organisation, `residency` is `"any"` or `"self_hosted_only"` — there is nothing above it). `allowed_models` takes concrete model ids only, never aliases. The merged result is `.../routing-policy/effective`: `{allowed_models, residency, default_model, sources:{field: "org"|"user"|"api_key"|"none"}, reachable_models, stored}`. `POST .../routing-policy/preview` takes the same body as `PUT` and returns `{effective, keys_affected:[{id,name,before,after}], would_lock_out:[...]}` without writing.
+`null` means inherit from the level above (at the organisation, `residency` is `"any"` or `"self_hosted_only"` — there is nothing above it). `allowed_models` takes concrete model ids only, never aliases. The merged result is `.../routing-policy/effective`: `{allowed_models, residency, default_model, sources:{field: "org"|"user"|"api_key"|"none"}, reachable_models, stored}`. `POST .../routing-policy/preview` takes the same body as `PUT` and returns `{effective, keys_affected:[{id,name,before,after}], would_lock_out:[...]}` without writing. `PUT /api/v1/routing-policy` (organisation) answers with `affected_principals` (users and keys with a policy of their own that are now allowed fewer models) and `org_narrowed` (everyone who inherits is allowed fewer) when the change tightens.
 
 ### Refusals
 
 - `400 {"error": "..."}` — a body that does not validate (unknown model id, an alias in `allowed_models`, a `default_model` outside the effective allowlist).
 - `409 {"error": "...", "locked_out": ["<user email or key name>", ...]}` — the write would leave the named principals (or `"(organisation)"`) with no allowed model. Nothing was written.
 - `502 {"error": "gateway unavailable: ..."}` — a write or preview that needs the gateway's merge could not reach it. Nothing was written.
-- On `POST /v1/chat/completions`, a policy refusal is an OpenAI-style error `{"error": {"message", "type": "permission_error", "code"}}` with `code` one of `model_not_found` (404), `model_not_enabled`, `model_residency_violation`, `model_not_allowed` (403), `policy_unavailable` (503). Each is recorded on the usage log row as `denial_code`.
+- On `POST /v1/chat/completions`, a refusal is an OpenAI-style error `{"error": {"message", "type", "code"}}`. `code` is recorded on the usage-log row as `denial_code` and is one of: `model_not_found` (404), `model_not_enabled`, `model_residency_violation`, `model_not_allowed` (403, `type: permission_error`), `policy_unavailable` (503, the gateway has no policy snapshot and fails closed), `invalid_request` (400, unparseable body or no `model` and no default), `request_canceled` (the caller disconnected before a model answered).
 
 ## Inventory
 
@@ -90,8 +91,8 @@ Every routing-policy level (organisation, user, API key) reads and writes the sa
 - `GET /api/v1/usage/summary` — auth: admin, surface: ui — filters: since, until
 - `GET /api/v1/usage/user-summary` — auth: admin, surface: ui — filters: since, until
 - `GET /api/v1/usage/key-summary` — auth: admin, surface: ui — filters: since, until
-- `GET /v1/models` — auth: session, surface: ui
-- `POST /v1/chat/completions` — auth: session, surface: ui
+- `GET /v1/models` — auth: api_key|session, surface: ui
+- `POST /v1/chat/completions` — auth: api_key|session, surface: ui
 
 ## gateway
 

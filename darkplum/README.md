@@ -308,11 +308,11 @@ actually serves the request — including the target a routed alias picks — an
 refuses with `model_not_allowed`. Every refusal is recorded on its usage-log row
 as `denial_code` and shown in Admin > Activity (filter by reason, export with
 the same filter), so "did my rule fire, and on whom" has an answer in the
-product, not in `kubectl logs`. A save at any
-level — organisation included — that would leave a user or key with no reachable
-model is refused by the API (`409`, naming who), not just greyed out in the UI,
-and the editor previews "this will block N of this user's keys" before you save.
-Every user can open
+product, not in `kubectl logs`. A save at any level — organisation included —
+that would leave a user or key with no allowed model is refused by the API
+(`409`, naming who), not just greyed out in the UI, and the editor shows what
+each of the user's keys is allowed before and after, before you save. Every
+user can open
 "why is my access limited?" in chat to see their effective policy and which
 level set each part.
 

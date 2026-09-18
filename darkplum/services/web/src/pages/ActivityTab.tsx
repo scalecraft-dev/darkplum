@@ -210,13 +210,30 @@ function shortenId(id: string): string {
   return id.length > 16 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id
 }
 
+function ExportIcon() {
+  return (
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ marginRight: '6px' }} aria-hidden="true">
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+      <polyline points="7 10 12 15 17 10" />
+      <line x1="12" y1="15" x2="12" y2="3" />
+    </svg>
+  )
+}
+
 function inferenceEventToUnified(e: InferenceEvent): UnifiedEvent {
   const display = e.user_name ?? e.user_email ?? (e.user_id ? shortenId(e.user_id) : '—')
   const purpose: InferencePurpose = e.purpose ?? 'inference'
   // A classifier call is named for what it did: it chose a route, it did not
-  // answer anyone. Failures still read as errors whatever their job was.
-  const label = e.status_code < 400 ? PURPOSE_LABEL[purpose] : 'Error'
-  const base = `model: ${e.model}, latency: ${e.latency_ms}ms, status: ${e.status_code}`
+  // answer anyone. A deliberate refusal (policy, unknown model, bad request)
+  // is "Refused", not "Error" — an admin scanning the table must be able to
+  // tell a rule firing from a backend falling over without reading detail.
+  const label =
+    e.status_code < 400 ? PURPOSE_LABEL[purpose] : e.denial_code ? 'Refused' : 'Error'
+  // On a refusal `model` may be the resolved id or "(none)"; requested_model
+  // is what the caller actually asked for, and is the only record of it.
+  const asked =
+    e.requested_model && e.requested_model !== e.model ? `, asked for: ${e.requested_model}` : ''
+  const base = `model: ${e.model}${asked}, latency: ${e.latency_ms}ms, status: ${e.status_code}`
   // The refusal reason, said first — it's what an admin reading a failed row
   // wants to know before the plumbing details.
   const detail_text =
@@ -430,13 +447,16 @@ export function ActivityTab() {
   // ---------------------------------------------------------------------------
 
   /** The CSV carries the filters that are on screen — the same objects the
-   *  table was built from, not a second set assembled here. */
-  async function handleExport() {
+   *  table was built from, not a second set assembled here. There are two
+   *  logs, with different filters, so the button always says which one it
+   *  is exporting; the combined view offers both rather than picking one
+   *  silently (a Denial reason filter only exists on requests). */
+  async function handleExport(kind: 'events' | 'requests') {
     const { since, until } = getTimeRange(timeRange)
     setExporting(true)
     try {
       const { blob, filename } =
-        logView === 'api'
+        kind === 'requests'
           ? await exportUsage({ since, until, ...usageFilters })
           : await exportActivity({ since, until, ...activityFilters })
       saveBlob(blob, filename)
@@ -494,14 +514,20 @@ export function ActivityTab() {
     <div>
       {/* Toolbar */}
       <div className={styles.toolbar}>
-        <Button variant="secondary" size="sm" onClick={() => void handleExport()} disabled={exporting}>
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" style={{ marginRight: '6px' }}>
-            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
-            <polyline points="7 10 12 15 17 10" />
-            <line x1="12" y1="15" x2="12" y2="3" />
-          </svg>
-          {exporting ? 'Preparing…' : 'Export CSV'}
-        </Button>
+        <div className={styles.exportGroup}>
+          {(logView === 'admin' || logView === 'all') && (
+            <Button variant="secondary" size="sm" onClick={() => void handleExport('events')} disabled={exporting}>
+              <ExportIcon />
+              {exporting ? 'Preparing…' : 'Export admin events CSV'}
+            </Button>
+          )}
+          {(logView === 'api' || logView === 'all') && (
+            <Button variant="secondary" size="sm" onClick={() => void handleExport('requests')} disabled={exporting}>
+              <ExportIcon />
+              {exporting ? 'Preparing…' : 'Export requests CSV'}
+            </Button>
+          )}
+        </div>
         <div className={styles.timeRange}>
           {TIME_RANGES.map((r) => (
             <button

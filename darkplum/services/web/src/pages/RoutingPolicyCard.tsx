@@ -353,23 +353,23 @@ export function RoutingPolicyCard({
           {/* affected counts only principals with a policy of their own whose
               reachable set actually shrank — never "has a row". orgNarrowed is
               the separate question of whether everyone who simply inherits now
-              reaches less too; the two can both be true, either alone, or
+              is allowed less too; the two can both be true, either alone, or
               neither. `!changed` is how the card knows the save landed: a
               failed one leaves the form ahead of the stored policy. */}
           {affected !== null && !changed && (orgNarrowed || affected > 0) && (
             <p className={styles.affected} role="status">
-              {orgNarrowed && "Everyone who inherits the organisation's policy now reaches fewer models."}
+              {orgNarrowed && "Everyone who inherits the organisation's policy is now allowed fewer models."}
               {orgNarrowed && affected > 0 && ' '}
               {affected > 0 &&
                 (affected === 1
-                  ? '1 user or key with a policy of its own also reaches fewer.'
-                  : `${affected} users and keys with a policy of their own also reach fewer.`)}
+                  ? '1 user or key with a policy of its own is also allowed fewer.'
+                  : `${affected} users and keys with a policy of their own are also allowed fewer.`)}
             </p>
           )}
 
           {affected !== null && !changed && !orgNarrowed && affected === 0 && (
             <p className={styles.affectedQuiet} role="status">
-              No one reaches fewer models than before.
+              No one is allowed fewer models than before.
             </p>
           )}
 

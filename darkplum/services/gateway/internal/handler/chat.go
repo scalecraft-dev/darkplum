@@ -871,16 +871,18 @@ type policyImpactResponse struct {
 	// owned by a user with one) whose effective allowlist would be empty
 	// under the override. Never null.
 	LockedOut []policyImpactPrincipal `json:"locked_out"`
-	// OrgNarrowed is true when the org's own reachable set (allowed ∧ enabled
-	// ∧ routable ∧ residency-ok) under the override is a strict subset of
-	// what it is now — i.e. everyone who simply inherits the organisation's
-	// policy reaches fewer models than before. A principal with rows of its
-	// own is reported individually in Narrowed instead.
+	// OrgNarrowed is true when the org's own allowed set (allowed ∧ enabled
+	// ∧ residency-ok — policy only, not backend health) under the override
+	// loses a model it has now: everyone who simply inherits the
+	// organisation's policy is allowed fewer models than before.
 	OrgNarrowed bool `json:"org_narrowed"`
-	// Narrowed lists every walked principal (same set as LockedOut's domain)
-	// whose reachable set under the override lost at least one model it
-	// reaches now. A locked-out principal is also narrowed unless it already
-	// reached nothing. Never null.
+	// Narrowed lists every principal WITH A POLICY ROW OF ITS OWN whose
+	// allowed set under the override loses a model it has now. Principals
+	// that inherit (a user with no row, a key with no row) are the org or
+	// their owner respectively and are covered by OrgNarrowed or by their
+	// owner's entry; listing them here would count one change many times.
+	// A locked-out principal is also narrowed unless it already had nothing.
+	// Never null.
 	Narrowed []policyImpactPrincipal `json:"narrowed"`
 	// Evaluated is how many user/key principals were re-merged.
 	Evaluated int `json:"evaluated"`
@@ -986,10 +988,10 @@ func policyImpact(snap policy.Snapshot, table *routing.Table, override *policy.P
 	orgAfter := policy.Effective(override.Apply(orgChain))
 	if lockedOut(orgAfter) {
 		resp.OrgLockedOut = true
-		resp.OrgNarrowed = len(reachableModels(orgNow, snap, table)) > 0
+		resp.OrgNarrowed = len(allowedModels(orgNow, snap, table)) > 0
 		return resp
 	}
-	resp.OrgNarrowed = losesAny(reachableModels(orgNow, snap, table), reachableModels(orgAfter, snap, table))
+	resp.OrgNarrowed = losesAny(allowedModels(orgNow, snap, table), allowedModels(orgAfter, snap, table))
 
 	users := make(map[string]bool, len(snap.UserRows)+len(snap.KeyRows))
 	for userID := range snap.UserRows {
@@ -1015,7 +1017,11 @@ func policyImpact(snap policy.Snapshot, table *routing.Table, override *policy.P
 		if lockedOut(after) {
 			resp.LockedOut = append(resp.LockedOut, p)
 		}
-		if losesAny(reachableModels(now, snap, table), reachableModels(after, snap, table)) {
+		_, ownRow := snap.UserRows[userID]
+		if keyID != "" {
+			_, ownRow = snap.KeyRows[keyID]
+		}
+		if ownRow && losesAny(allowedModels(now, snap, table), allowedModels(after, snap, table)) {
 			resp.Narrowed = append(resp.Narrowed, p)
 		}
 	}
@@ -1028,8 +1034,37 @@ func policyImpact(snap policy.Snapshot, table *routing.Table, override *policy.P
 	return resp
 }
 
+// allowedModels is the policy-side counterpart of reachableModels: the
+// enabled models eff permits under its residency, WITHOUT the routability
+// test. Impact counts are about what an admin's policy change takes away,
+// and must not move because a backend happens to be down at save time. A
+// model the route table has never seen has no known class, so it is kept
+// (it is enabled and allowed; residency cannot be judged).
+func allowedModels(eff policy.EffectivePolicy, snap policy.Snapshot, table *routing.Table) []string {
+	ids := make([]string, 0, len(snap.Enabled))
+	for id, enabled := range snap.Enabled {
+		if enabled {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+	out := make([]string, 0, len(ids))
+	for _, id := range ids {
+		if !eff.Allows(id) {
+			continue
+		}
+		if eff.Residency == policy.ResidencySelfHostedOnly {
+			if route, ok := table.Lookup(id); ok && route.Class == routing.ClassCloudManaged {
+				continue
+			}
+		}
+		out = append(out, id)
+	}
+	return out
+}
+
 // losesAny reports whether before contains a model after does not — the
-// "reaches fewer models than before" test. A reordering or a widening is
+// "allowed fewer models than before" test. A reordering or a widening is
 // not a loss.
 func losesAny(before, after []string) bool {
 	keep := make(map[string]bool, len(after))

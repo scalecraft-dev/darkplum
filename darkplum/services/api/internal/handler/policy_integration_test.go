@@ -506,7 +506,14 @@ func (fg *fakePolicyGateway) impact(ctx context.Context, override *gatewayPolicy
 		if empty(after) {
 			out.LockedOut = append(out.LockedOut, gatewayPolicyImpactPrincipal{UserID: u})
 		}
-		if loses(reachable(now), reachable(after)) {
+		// Only principals with a row of their own are "narrowed" (the real
+		// gateway's rule): an inheriting user is the org, an inheriting key is
+		// its owner.
+		var userHasRow bool
+		if err := fg.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM principal_routing_policies WHERE principal_type='user' AND user_id=$1)`, u).Scan(&userHasRow); err != nil {
+			return out, err
+		}
+		if userHasRow && loses(reachable(now), reachable(after)) {
 			out.Narrowed = append(out.Narrowed, gatewayPolicyImpactPrincipal{UserID: u})
 		}
 		nowKeys := map[string]gatewayEffectivePolicy{}
@@ -518,7 +525,11 @@ func (fg *fakePolicyGateway) impact(ctx context.Context, override *gatewayPolicy
 			if empty(k.Effective) {
 				out.LockedOut = append(out.LockedOut, gatewayPolicyImpactPrincipal{UserID: u, APIKeyID: k.APIKeyID})
 			}
-			if loses(reachable(nowKeys[k.APIKeyID]), reachable(k.Effective)) {
+			var keyHasRow bool
+			if err := fg.pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM principal_routing_policies WHERE principal_type='api_key' AND api_key_id=$1)`, k.APIKeyID).Scan(&keyHasRow); err != nil {
+				return out, err
+			}
+			if keyHasRow && loses(reachable(nowKeys[k.APIKeyID]), reachable(k.Effective)) {
 				out.Narrowed = append(out.Narrowed, gatewayPolicyImpactPrincipal{UserID: u, APIKeyID: k.APIKeyID})
 			}
 		}
@@ -1015,6 +1026,9 @@ func TestOrgPolicy_AffectedPrincipalsOnTighten(t *testing.T) {
 	if resp := doJSON(t, r, http.MethodPut, "/api/v1/api-keys/"+keyID+"/routing-policy", policyObject{DefaultModel: nil}); resp.Code != http.StatusOK {
 		t.Fatalf("put key policy: status = %d, body = %s", resp.Code, resp.Body.String())
 	}
+	// A second key with NO row of its own: it inherits its owner and must
+	// NOT be counted separately (the owner is).
+	_ = newTestAPIKey(t, ctx, pool, targetID, "ci-key-inherits")
 	// A third principal already limited to m1: it has a row, but the org
 	// narrowing to m1 takes nothing from it, so it must NOT be counted.
 	alreadyID := newPolicyTestUser(t, ctx, pool)
@@ -1022,8 +1036,9 @@ func TestOrgPolicy_AffectedPrincipalsOnTighten(t *testing.T) {
 		t.Fatalf("put already-narrow user policy: status = %d, body = %s", resp.Code, resp.Body.String())
 	}
 
-	// Tightening: nil -> restricted. targetID and its key inherit m1,m2 and
-	// drop to m1 (2 narrowed); alreadyID stays at m1; the org itself shrank.
+	// Tightening: nil -> restricted. targetID and its key WITH a row inherit
+	// m1,m2 and drop to m1 (2 narrowed); the row-less key rides on its
+	// owner; alreadyID stays at m1; the org itself shrank.
 	resp := doJSON(t, r, http.MethodPut, "/api/v1/routing-policy", map[string]any{"residency": residencyAny, "allowed_models": []string{"m1"}})
 	if resp.Code != http.StatusOK {
 		t.Fatalf("put org policy: status = %d, body = %s", resp.Code, resp.Body.String())

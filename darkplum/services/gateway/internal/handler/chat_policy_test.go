@@ -1081,18 +1081,17 @@ func TestHandleEffectivePolicyImpact_NarrowingReportsExactlyTheDisjointPrincipal
 	if got.Evaluated != 5 {
 		t.Errorf("evaluated = %d, want 5", got.Evaluated)
 	}
-	// Reaches-less: the org itself (m1,m2,m3 -> m2,m3) so every inheriting
-	// principal; previewUserID and previewKeyID (m1 -> nothing);
-	// previewKeyID2 already reached nothing so it is NOT narrowed;
-	// impactUser2 (inherits org: m1,m2,m3 -> m2,m3) and impactKey3 (m3 -> m3,
-	// unchanged) — so impactUser2 yes, impactKey3 no.
+	// Allowed-less: the org itself (m1,m2,m3 -> m2,m3), so org_narrowed for
+	// everyone who inherits. Of the principals WITH A ROW: previewUserID
+	// (m1 -> nothing) is narrowed; previewKeyID2 already had nothing, so it
+	// is not; impactKey3 (m3 -> m3) is unchanged. previewKeyID (no row,
+	// inherits its owner) and impactUser2 (no row, inherits the org) are
+	// deliberately NOT listed — they are their owner / the org.
 	if !got.OrgNarrowed {
 		t.Errorf("org_narrowed must be true when the org list shrinks")
 	}
 	wantNarrowed := map[string]bool{
-		previewUserID + "/":                true,
-		previewUserID + "/" + previewKeyID: true,
-		impactUser2 + "/":                  true,
+		previewUserID + "/": true,
 	}
 	gotNarrowed := impactSet(got.Narrowed)
 	for k := range wantNarrowed {
@@ -1128,9 +1127,10 @@ func TestHandleEffectivePolicyImpact_WideningLocksNobodyOut(t *testing.T) {
 
 func TestHandleEffectivePolicyImpact_ResidencyTighteningNarrowsViaReachability(t *testing.T) {
 	// m3 becomes cloud-managed; tightening the org to self_hosted_only drops
-	// it from everyone's reachable set even though no allowlist changes —
+	// it from everyone's allowed set even though no allowlist changes —
 	// the org is narrowed, and so is impactKey3 (m3 only -> nothing
-	// reachable, but NOT locked out: its allowlist is still [m3]).
+	// allowed under the residency, but NOT locked out: its allowlist is
+	// still [m3]).
 	routes := baseOverrideRoutes()
 	routes["m3"] = routing.Route{ProviderKey: "bedrock", Kind: "bedrock", Class: routing.ClassCloudManaged}
 	h := newTestHandler(fakeProviders{}, routes, impactSnapshot(), true)

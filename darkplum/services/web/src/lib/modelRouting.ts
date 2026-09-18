@@ -167,7 +167,7 @@ const DENIAL_LABELS: Record<string, string> = {
   model_not_found: 'Model not found',
   model_not_enabled: 'Model disabled',
   model_residency_violation: 'Blocked by residency policy',
-  model_not_allowed: 'Not allowed for this key',
+  model_not_allowed: 'Not allowed by policy',
   invalid_request: 'Invalid request',
   policy_unavailable: 'Policy unavailable',
   request_canceled: 'Request cancelled',

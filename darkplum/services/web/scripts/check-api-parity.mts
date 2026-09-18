@@ -10,24 +10,24 @@
  *      (docs/api-routes.json) with surface "ui", and every golden entry marked
  *      surface "ui" is in ROUTES. Both directions, so a route that is built
  *      and never used fails as loudly as one that is used and never built.
- *   4. Every ROUTES entry is actually reached from a screen: directly, or via
+ *   2. Every ROUTES entry is actually reached from a screen: directly, or via
  *      an api.ts wrapper that some file outside src/lib references. ROUTES
  *      membership alone would let a dead wrapper keep a route green.
- *   2. No HTTP call outside src/lib/api.ts and src/context/AuthContext.tsx:
+ *   3. No HTTP call outside src/lib/api.ts and src/context/AuthContext.tsx:
  *      `fetch(` however it is reached (`window.fetch`, `globalThis.fetch`,
  *      aliased through `const f = fetch`), `new XMLHttpRequest`, `sendBeacon(`,
  *      `new EventSource`, `new WebSocket`, and an `axios`/`ky`/`got` import.
  *      Those two files are the only places allowed to speak HTTP; AuthContext
  *      keeps its session calls, and its paths are in ROUTES like everything
  *      else.
- *   3. No literal request path outside src/lib/routes.ts — a string that is,
+ *   4. No literal request path outside src/lib/routes.ts — a string that is,
  *      or starts with, /api/v1, /v1 or /auth, with or without a trailing slash,
  *      so a prefix kept in a constant and joined later is caught too. A path
  *      that is written twice is a path that can drift.
  *
- * Checks 2 and 3 are tripwires against hygiene drift, not a proof: a path
+ * Checks 3 and 4 are tripwires against hygiene drift, not a proof: a path
  * assembled from pieces none of which look like a path would slip past them.
- * The guarantee that matters is check 1 together with the Go route-inventory
+ * The guarantee that matters is checks 1 and 2 together with the Go route-inventory
  * tests: every route the server registers is in the golden, and every golden
  * "ui" route is in ROUTES, so a hidden call could at most reach a route that
  * is already declared and already reachable through ROUTES.
@@ -166,7 +166,7 @@ if (golden) {
 }
 
 // ---------------------------------------------------------------------------
-// 2 & 3. Source scan
+// 3 & 4. Source scan
 // ---------------------------------------------------------------------------
 
 function walk(dir: string, out: string[] = []): string[] {
@@ -310,7 +310,7 @@ fail(
 )
 
 // ---------------------------------------------------------------------------
-// 4. Call sites
+// 2. Call sites
 //
 // A ROUTES entry only proves a route is declared; this proves something on a
 // screen uses it. Each `ROUTES.<key>` must be reached either directly from a

@@ -370,6 +370,9 @@ export interface InferenceEvent {
    *  field. Not a closed enum on this side: an unrecognised code still renders,
    *  it just falls back to its own words. */
   denial_code?: string | null
+  /** What the caller asked for when it differs from `model` (an alias, or a
+   *  request refused before any model resolved). */
+  requested_model?: string | null
   latency_ms: number
   prompt_tokens: number | null
   completion_tokens: number | null
