@@ -1,5 +1,5 @@
-import { useMemo } from 'react'
-import type { Model } from '../types'
+import { Fragment, useMemo } from 'react'
+import type { Model, ModelRouteSummary } from '../types'
 import { formatModelName } from '../lib/formatModelName'
 import { backendClassChatLabel, backendClassOf } from '../lib/modelRouting'
 import { Skeleton } from '../components/ui/Skeleton'
@@ -29,7 +29,8 @@ function optionLabel(m: Model): string {
 
 /** Where a routed alias runs. The entry's own class is the default route's
  *  target; when the API tells us the routes differ, say that instead of
- *  promising a place this message may not go. */
+ *  promising a place this message may not go. The route list that follows
+ *  already says the choice is per message, so this does not repeat it. */
 function routedClassLabel(m: Model): string {
   const routes = m.routes ?? []
   const declared = routes
@@ -38,7 +39,20 @@ function routedClassLabel(m: Model): string {
   const mixed =
     declared.length > 0 && declared.some((c) => c !== backendClassOf(m))
   if (mixed) return 'Where it runs varies by route'
-  return `${backendClassChatLabel(backendClassOf(m))} · default route`
+  return backendClassChatLabel(backendClassOf(m))
+}
+
+/** The full sentence for the status line's title: what the header truncates,
+ *  plus the route descriptions there is never room for. Said once — the visible
+ *  line is the same text, shortened, so nothing is announced twice. */
+function statusTitle(classLabel: string, routes: ModelRouteSummary[]): string {
+  if (routes.length === 0) return classLabel
+  const names = routes.map((r) => r.route_name).join(', ')
+  const described = routes
+    .filter((r) => r.description)
+    .map((r) => `${r.route_name}: ${r.description}`)
+  const head = `${classLabel} · routes: ${names}`
+  return described.length > 0 ? `${head}\n${described.join('\n')}` : head
 }
 
 export function ModelSelector({ models, isLoading, error, value, onChange }: Props) {
@@ -83,6 +97,11 @@ export function ModelSelector({ models, isLoading, error, value, onChange }: Pro
   const selected = models.find((m) => m.id === value) ?? null
   const isCloud = selected ? backendClassOf(selected) === 'cloud_managed' : false
   const selectedRoutes = selected?.alias_kind === 'routed' ? selected.routes ?? [] : null
+  const classLabel = !selected
+    ? ''
+    : selectedRoutes
+      ? routedClassLabel(selected)
+      : backendClassChatLabel(backendClassOf(selected))
 
   return (
     <div className={styles.wrapper}>
@@ -117,53 +136,40 @@ export function ModelSelector({ models, isLoading, error, value, onChange }: Pro
       </select>
 
       {/* With nothing selected there is no backend to describe, and naming one
-          anyway would claim a routing decision the person has not made yet. */}
-      <span className={styles.status} role={selected ? undefined : 'status'}>
+          anyway would claim a routing decision the person has not made yet.
+          A routed alias answers on one of the routes its administrator wrote;
+          which one is decided per message and named under the reply, so this
+          line lists the routes rather than promising one of them. The list is
+          the first thing to give way when the header is short of room. */}
+      <span
+        className={styles.status}
+        role={selected ? undefined : 'status'}
+        title={classLabel ? statusTitle(classLabel, selectedRoutes ?? []) : undefined}
+      >
         <span
           className={`${styles.dot} ${
             !selected ? styles.dotAmber : isCloud ? styles.dotCloud : styles.dotGreen
           }`}
           aria-hidden="true"
         />
-        <span className={styles.statusLabel}>
-          {!selected
-            ? 'No model selected'
-            : selectedRoutes
-              ? routedClassLabel(selected)
-              : backendClassChatLabel(backendClassOf(selected))}
-        </span>
+        <span className={styles.statusLabel}>{classLabel || 'No model selected'}</span>
+        {selectedRoutes && selectedRoutes.length > 0 && (
+          <span className={styles.statusRoutes}>
+            {'· routes: '}
+            {selectedRoutes.map((r, i) => (
+              <Fragment key={r.route_name}>
+                {i > 0 && ', '}
+                <code className={styles.aliasTargetId}>{r.route_name}</code>
+              </Fragment>
+            ))}
+          </span>
+        )}
       </span>
 
-      {/* A routed alias answers on one of the routes its administrator wrote.
-          Which one is decided per message and named under the reply, so the
-          picker says how many there are rather than promising one. */}
-      {selectedRoutes ? (
-        selectedRoutes.length > 0 && (
-          <span className={styles.aliasTarget}>
-            <span aria-hidden="true">
-              Routes to one of {selectedRoutes.length}{' '}
-              {selectedRoutes.length === 1 ? 'model' : 'models'}:{' '}
-              {selectedRoutes.map((r, i) => (
-                <span key={r.route_name}>
-                  {i > 0 && ', '}
-                  <code className={styles.aliasTargetId} title={r.description}>
-                    {r.route_name}
-                  </code>
-                </span>
-              ))}
-            </span>
-            <span className={styles.srOnly}>
-              {`Routes to one of ${selectedRoutes.length} models. ` +
-                selectedRoutes.map((r) => `${r.route_name}: ${r.description}`).join('. ')}
-            </span>
-          </span>
-        )
-      ) : (
-        selected?.alias_of && (
-          <span className={styles.aliasTarget}>
-            Shortcut for <code className={styles.aliasTargetId}>{selected.alias_of}</code>
-          </span>
-        )
+      {!selectedRoutes && selected?.alias_of && (
+        <span className={styles.aliasTarget}>
+          Shortcut for <code className={styles.aliasTargetId}>{selected.alias_of}</code>
+        </span>
       )}
     </div>
   )

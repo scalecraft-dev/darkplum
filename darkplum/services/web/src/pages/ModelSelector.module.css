@@ -1,11 +1,17 @@
+/* Shares the header row with the actions on the right, so everything in here
+   has to stay inside the width it is given — nothing may spill over a button. */
 .wrapper {
   display: flex;
   align-items: center;
   gap: var(--space-3);
   min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
 }
 
 .select {
+  flex: 0 1 auto;
+  min-width: 140px;
   font-size: var(--fs-sm);
   color: var(--fg-default);
   background: var(--bg-surface);
@@ -36,15 +42,27 @@
   display: flex;
   align-items: center;
   gap: var(--space-2);
+  min-width: 0;
+  overflow: hidden;
   font-size: var(--fs-xs);
   color: var(--fg-subtle);
   white-space: nowrap;
 }
 
 /* The dot carries the state on its own, so the words beside it are what gives
-   way first when the header is short of room. */
+   way first when the header is short of room. The full line is on the title. */
 .statusLabel {
   min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The routes a selected alias can reach: supplementary next to where it runs,
+   so it is shrunk to an ellipsis first and dropped entirely on a short header
+   rather than being allowed to reach the actions on the right. */
+.statusRoutes {
+  min-width: 0;
+  flex-shrink: 999;
   overflow: hidden;
   text-overflow: ellipsis;
 }
@@ -73,36 +91,28 @@
   background: var(--danger-fg);
 }
 
-/* Secondary line for alias selections — supplementary, so it is the first
+/* Secondary line for a static alias — supplementary, so it is the first
    thing dropped when the header runs out of room. */
 .aliasTarget {
   display: flex;
   align-items: center;
   gap: var(--space-1);
   min-width: 0;
+  flex-shrink: 999;
+  overflow: hidden;
   font-size: var(--fs-xs);
   color: var(--fg-subtle);
   white-space: nowrap;
 }
 
 .aliasTargetId {
+  min-width: 0;
   font-family: var(--font-mono);
   font-size: var(--fs-xs);
   color: var(--fg-muted);
+  white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-}
-
-.srOnly {
-  position: absolute;
-  width: 1px;
-  height: 1px;
-  padding: 0;
-  margin: -1px;
-  overflow: hidden;
-  clip: rect(0, 0, 0, 0);
-  white-space: nowrap;
-  border: 0;
 }
 
 @keyframes dotPulse {
@@ -111,7 +121,8 @@
 }
 
 @media (max-width: 900px) {
-  .aliasTarget {
+  .aliasTarget,
+  .statusRoutes {
     display: none;
   }
 }

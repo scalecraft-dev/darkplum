@@ -389,6 +389,130 @@ func TestStream_HappyPath(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// Stream() — upstream ignores stream=true and replies with plain JSON
+// ---------------------------------------------------------------------------
+
+func TestStream_JSONUpstreamAdaptedToSSE(t *testing.T) {
+	const (
+		wantID     = "chatcmpl-nonstream-1"
+		wantModel  = "llama-3-8b"
+		wantText   = "Hello from a non-streaming upstream."
+		wantPrompt = 11
+		wantComp   = 6
+	)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// LM Studio / some proxies ignore stream:true and answer with a
+		// plain chat.completion JSON body instead of SSE.
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(buildMockCompletion(wantID, wantModel, wantText, wantPrompt, wantComp))
+	}))
+	defer srv.Close()
+
+	p := newTestProvider(t, srv.URL)
+	req := testRequest()
+	req.Stream = true
+
+	var buf bytes.Buffer
+	stats, err := p.Stream(context.Background(), req, &buf)
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+
+	if stats.Model != wantModel {
+		t.Errorf("Model = %q, want %q", stats.Model, wantModel)
+	}
+	if stats.FinishReason != "stop" {
+		t.Errorf("FinishReason = %q, want %q", stats.FinishReason, "stop")
+	}
+	if stats.PromptTokens != wantPrompt {
+		t.Errorf("PromptTokens = %d, want %d", stats.PromptTokens, wantPrompt)
+	}
+	if stats.CompletionTokens != wantComp {
+		t.Errorf("CompletionTokens = %d, want %d", stats.CompletionTokens, wantComp)
+	}
+
+	written := buf.String()
+	if !strings.HasPrefix(written, "data: ") {
+		t.Errorf("adapted output should be SSE (start with 'data: '), got:\n%s", written)
+	}
+	if !strings.Contains(written, wantText) {
+		t.Errorf("adapted output should contain content %q, got:\n%s", wantText, written)
+	}
+	if !strings.Contains(written, `"finish_reason":"stop"`) {
+		t.Errorf("adapted output should contain finish_reason, got:\n%s", written)
+	}
+	if !strings.HasSuffix(written, provider.StreamDoneSSE) {
+		t.Errorf("adapted output should end with the [DONE] terminator, got:\n%s", written)
+	}
+
+	// Every SSE frame must be independently valid JSON.
+	for _, line := range strings.Split(written, "\n") {
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		payload := strings.TrimPrefix(line, "data: ")
+		if payload == "[DONE]" {
+			continue
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal([]byte(payload), &parsed); err != nil {
+			t.Errorf("adapted SSE data line is not valid JSON: %q: %v", line, err)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Stream() — upstream ignores stream=true and replies with undecodable JSON
+// ---------------------------------------------------------------------------
+
+func TestStream_JSONUpstreamGarbage_NothingWritten(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{not valid json`))
+	}))
+	defer srv.Close()
+
+	p := newTestProvider(t, srv.URL)
+	req := testRequest()
+	req.Stream = true
+
+	var buf bytes.Buffer
+	_, err := p.Stream(context.Background(), req, &buf)
+	if err == nil {
+		t.Fatal("expected error for undecodable JSON body, got nil")
+	}
+	if buf.Len() != 0 {
+		t.Errorf("expected nothing written to w on decode failure, got:\n%s", buf.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Stream() — upstream JSON body with no choices produces an error, no writes
+// ---------------------------------------------------------------------------
+
+func TestStream_JSONUpstreamNoChoices_NothingWritten(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"x","object":"chat.completion","model":"m","choices":[]}`))
+	}))
+	defer srv.Close()
+
+	p := newTestProvider(t, srv.URL)
+	req := testRequest()
+	req.Stream = true
+
+	var buf bytes.Buffer
+	_, err := p.Stream(context.Background(), req, &buf)
+	if err == nil {
+		t.Fatal("expected error for JSON body with no choices, got nil")
+	}
+	if buf.Len() != 0 {
+		t.Errorf("expected nothing written to w, got:\n%s", buf.String())
+	}
+}
+
+// ---------------------------------------------------------------------------
 // Stream() — non-200 response
 // ---------------------------------------------------------------------------
 

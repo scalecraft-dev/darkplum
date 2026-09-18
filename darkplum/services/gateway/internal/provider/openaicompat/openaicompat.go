@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/url"
@@ -38,6 +39,11 @@ const (
 	// tokens (e.g. OOM-killed model process). Legitimate slow generation is not
 	// affected because the timer resets on every received chunk.
 	streamIdleTimeout = 45 * time.Second
+	// maxNonStreamAdaptBodyBytes bounds how much of a non-SSE body is buffered
+	// when a stream=true request is answered with a plain JSON chat.completion
+	// (observed with LM Studio and some OpenAI-compatible proxies that ignore
+	// the stream flag). See adaptNonStreamingResponse.
+	maxNonStreamAdaptBodyBytes = 4 * 1024 * 1024
 )
 
 // OpenAICompatProvider forwards chat requests to an upstream server that
@@ -47,6 +53,10 @@ type OpenAICompatProvider struct {
 	kind       string // backend kind, e.g. "vllm", "lmstudio"
 	upstream   *url.URL
 	httpClient *http.Client
+
+	// nonStreamWarnOnce ensures the "upstream does not stream" warning is
+	// logged at most once per provider instance rather than once per request.
+	nonStreamWarnOnce sync.Once
 }
 
 // New creates an OpenAICompatProvider targeting the given upstream URL.
@@ -272,6 +282,18 @@ func (p *OpenAICompatProvider) Stream(ctx context.Context, req provider.ChatRequ
 		return nil, p.upstreamError(resp.StatusCode, errBytes)
 	}
 
+	// Some OpenAI-compatible upstreams (LM Studio, some proxies) ignore the
+	// stream flag and reply with a plain JSON chat.completion body instead of
+	// SSE. Detect that here and adapt rather than piping the JSON bytes
+	// through as if they were SSE frames, which would leave the client with a
+	// silent empty reply on a 200. Any Content-Type other than
+	// text/event-stream (including a missing header) is treated as
+	// non-streaming.
+	contentType := strings.TrimSpace(resp.Header.Get("Content-Type"))
+	if !strings.HasPrefix(contentType, "text/event-stream") {
+		return p.adaptNonStreamingResponse(resp, w)
+	}
+
 	// Wrap the response body with an idle-timeout reader. If no bytes arrive
 	// within streamIdleTimeout between consecutive reads, the context is
 	// cancelled and the scanner receives an error, cleanly terminating the loop.
@@ -361,6 +383,84 @@ func (p *OpenAICompatProvider) Stream(ctx context.Context, req provider.ChatRequ
 
 	// Final flush after the stream ends.
 	if canFlush {
+		flusher.Flush()
+	}
+
+	return stats, nil
+}
+
+// adaptNonStreamingResponse handles a stream=true request that was answered
+// with a plain JSON chat.completion body instead of SSE. It buffers the body
+// (bounded by maxNonStreamAdaptBodyBytes), decodes it, and — only once that
+// has succeeded — synthesizes an equivalent SSE sequence (one delta chunk,
+// one final chunk carrying finish_reason/usage, then the [DONE] terminator)
+// to w. Because decoding happens before anything is written to w, a decode
+// failure surfaces as a normal error and the caller can still serve a clean
+// JSON error response instead of a corrupted stream.
+func (p *OpenAICompatProvider) adaptNonStreamingResponse(resp *http.Response, w io.Writer) (*provider.StreamStats, error) {
+	p.nonStreamWarnOnce.Do(func() {
+		slog.Warn("openaicompat: upstream does not support streaming, adapting JSON response to SSE",
+			"provider", p.name, "kind", p.kind, "content_type", resp.Header.Get("Content-Type"))
+	})
+
+	limited := io.LimitReader(resp.Body, maxNonStreamAdaptBodyBytes+1)
+	body, err := io.ReadAll(limited)
+	if err != nil {
+		return nil, fmt.Errorf("openaicompat(%s): reading non-streaming response body: %w", p.name, err)
+	}
+	if len(body) > maxNonStreamAdaptBodyBytes {
+		return nil, fmt.Errorf("openaicompat(%s): non-streaming response body exceeds %d bytes", p.name, maxNonStreamAdaptBodyBytes)
+	}
+
+	var cr compatResponse
+	if err := json.Unmarshal(body, &cr); err != nil {
+		return nil, fmt.Errorf("openaicompat(%s): decoding non-streaming response as chat.completion: %w", p.name, err)
+	}
+	if cr.Error != nil {
+		return nil, fmt.Errorf("openaicompat(%s): upstream error: %s (%s)", p.name, cr.Error.Message, cr.Error.Type)
+	}
+	if len(cr.Choices) == 0 || cr.Choices[0].Message == nil {
+		return nil, fmt.Errorf("openaicompat(%s): non-streaming response contained no message choices", p.name)
+	}
+
+	choice := cr.Choices[0]
+	content := choice.Message.Content
+	finishReason := "stop"
+	if choice.FinishReason != nil && *choice.FinishReason != "" {
+		finishReason = *choice.FinishReason
+	}
+
+	stats := &provider.StreamStats{
+		Model:        cr.Model,
+		FinishReason: finishReason,
+	}
+	if cr.Usage != nil {
+		stats.PromptTokens = cr.Usage.PromptTokens
+		stats.CompletionTokens = cr.Usage.CompletionTokens
+	}
+
+	deltaChunk, err := provider.BuildStreamingChunkSSE(cr.ID, cr.Model, content)
+	if err != nil {
+		return nil, fmt.Errorf("openaicompat(%s): building synthesized delta chunk: %w", p.name, err)
+	}
+	finalChunk, err := provider.BuildFinalChunkSSE(cr.ID, cr.Model, finishReason, stats)
+	if err != nil {
+		return nil, fmt.Errorf("openaicompat(%s): building synthesized final chunk: %w", p.name, err)
+	}
+
+	// Nothing has been written to w until this point, so every error path
+	// above leaves w untouched.
+	if _, err := w.Write(deltaChunk); err != nil {
+		return nil, fmt.Errorf("openaicompat(%s): writing synthesized delta chunk: %w", p.name, err)
+	}
+	if _, err := w.Write(finalChunk); err != nil {
+		return nil, fmt.Errorf("openaicompat(%s): writing synthesized final chunk: %w", p.name, err)
+	}
+	if _, err := io.WriteString(w, provider.StreamDoneSSE); err != nil {
+		return nil, fmt.Errorf("openaicompat(%s): writing stream terminator: %w", p.name, err)
+	}
+
+	if flusher, ok := w.(http.Flusher); ok {
 		flusher.Flush()
 	}
 
