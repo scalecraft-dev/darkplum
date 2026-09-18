@@ -20,7 +20,6 @@ import (
 	"github.com/scalecraft/darkplum/gateway/internal/policy"
 	"github.com/scalecraft/darkplum/gateway/internal/provider"
 	"github.com/scalecraft/darkplum/gateway/internal/provider/bedrock"
-	"github.com/scalecraft/darkplum/gateway/internal/recorder"
 	"github.com/scalecraft/darkplum/gateway/internal/router"
 	"github.com/scalecraft/darkplum/gateway/internal/routing"
 )
@@ -96,44 +95,33 @@ type ChatHandler struct {
 	routes    routeSnapshotter
 	policy    policy.Store
 
-	// rulesClassifier, modelClassifier, and semanticClassifier are the three
-	// router.Classifier implementations dispatched to by a routed alias's
-	// classifier_kind (see classifierFor). All three are always non-nil.
+	// rulesClassifier and semanticClassifier are the two router.Classifier
+	// implementations dispatched to by a routed alias's classifier_kind (see
+	// classifierFor). Both are always non-nil.
 	rulesClassifier    router.Classifier
-	modelClassifier    router.Classifier
 	semanticClassifier router.Classifier
-
-	// rec is used only by HandleRoutingDryrun, to record a lone
-	// purpose="routing_dryrun" row for a model or semantic-router classifier
-	// call. The main chat-completion path never touches rec directly: its
-	// purpose="inference"/"routing" pair is built from ctx values by
-	// middleware.Recording after the handler returns (see
-	// HandleChatCompletions's use of the "routing_audit_event" ctx key).
-	rec *recorder.Recorder
 }
 
 // NewChatHandler constructs a ChatHandler.
-func NewChatHandler(providers providerLookup, routes routeSnapshotter, pol policy.Store, rulesClassifier, modelClassifier, semanticClassifier router.Classifier, rec *recorder.Recorder) *ChatHandler {
+func NewChatHandler(providers providerLookup, routes routeSnapshotter, pol policy.Store, rulesClassifier, semanticClassifier router.Classifier) *ChatHandler {
 	return &ChatHandler{
 		providers:          providers,
 		routes:             routes,
 		policy:             pol,
 		rulesClassifier:    rulesClassifier,
-		modelClassifier:    modelClassifier,
 		semanticClassifier: semanticClassifier,
-		rec:                rec,
 	}
 }
 
 // classifierFor returns the router.Classifier a routed alias's
 // classifier_kind selects. Defaults to rules for any unrecognised kind —
-// this should be unreachable given the api's classifier_kind CHECK
-// constraint, but a routed alias must always resolve to SOME classifier
-// rather than panic or leave a nil interface.
+// this covers both an unreachable value given the api's classifier_kind
+// CHECK constraint, and the removed 'model' kind (policy.buildAliases
+// already coerces that to ClassifierKindRules on load, so this default
+// branch is what actually serves it) — a routed alias must always resolve
+// to SOME classifier rather than panic or leave a nil interface.
 func (h *ChatHandler) classifierFor(kind string) router.Classifier {
 	switch kind {
-	case policy.ClassifierKindModel:
-		return h.modelClassifier
 	case policy.ClassifierKindSemanticRouter:
 		return h.semanticClassifier
 	default:
@@ -284,30 +272,6 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 
 		routeName = decision.RouteName
 		routerReason = decision.Reason
-
-		// Set the routing audit event BEFORE the route-resolution check below:
-		// a model classifier that actually called an LLM (decision.ModelCall
-		// != nil) must always produce its purpose="routing" audit row, even
-		// on the defensive fail-closed path where the classifier named a
-		// route alias.Route can't resolve — the model still saw the prompt,
-		// so the audit trail must reflect that regardless of how the request
-		// is ultimately refused.
-		if decision.ModelCall != nil {
-			c.Set("routing_audit_event", recorder.InferenceEvent{
-				RequestID:        c.GetHeader("X-Request-Id"),
-				APIKeyID:         c.GetString(middleware.ContextKeyID),
-				UserID:           attributedUserID(c),
-				IP:               c.ClientIP(),
-				Purpose:          "routing",
-				Model:            decision.ModelCall.Model,
-				Provider:         decision.ModelCall.Provider,
-				Region:           decision.ModelCall.Region,
-				PromptTokens:     decision.ModelCall.PromptTokens,
-				CompletionTokens: decision.ModelCall.CompletionTokens,
-				LatencyMS:        decision.ModelCall.LatencyMS,
-				StatusCode:       decision.ModelCall.StatusCode,
-			})
-		}
 
 		rd, ok := alias.Route(routeName)
 		if !ok {
@@ -560,11 +524,10 @@ type routingDryrunResponse struct {
 // prompt" panel. It runs alias's classifier against text exactly as a real
 // chat completion would, evaluates whether the resulting pick would be
 // refused (route lookup / enabled / residency), and reports the answer —
-// but it NEVER calls the picked route's target model. A model or
-// semantic-router classifier call still happens (it has to, to produce a
-// real answer) and, for a model classifier only, is recorded as a lone
-// purpose="routing_dryrun" row; there is no purpose="inference" row for a
-// dryrun, since nothing was ever dispatched.
+// but it NEVER calls the picked route's target model, and it records
+// nothing: a semantic-router classifier call is CPU-only intent
+// classification, not an LLM inference, so there is nothing to audit beyond
+// the response body itself.
 func (h *ChatHandler) HandleRoutingDryrun(c *gin.Context) {
 	var req routingDryrunRequest
 	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil || req.Alias == "" || req.Text == "" {
@@ -615,23 +578,6 @@ func (h *ChatHandler) HandleRoutingDryrun(c *gin.Context) {
 			},
 		})
 		return
-	}
-
-	if decision.ModelCall != nil && h.rec != nil {
-		h.rec.Record(recorder.InferenceEvent{
-			RequestID:        c.GetHeader("X-Request-Id"),
-			APIKeyID:         c.GetString(middleware.ContextKeyID),
-			UserID:           attributedUserID(c),
-			IP:               c.ClientIP(),
-			Purpose:          "routing_dryrun",
-			Model:            decision.ModelCall.Model,
-			Provider:         decision.ModelCall.Provider,
-			Region:           decision.ModelCall.Region,
-			PromptTokens:     decision.ModelCall.PromptTokens,
-			CompletionTokens: decision.ModelCall.CompletionTokens,
-			LatencyMS:        decision.ModelCall.LatencyMS,
-			StatusCode:       decision.ModelCall.StatusCode,
-		})
 	}
 
 	rd, _ := alias.Route(decision.RouteName)

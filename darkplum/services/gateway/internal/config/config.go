@@ -60,9 +60,8 @@ type Config struct {
 	// vLLM instance. Must never be set in production.
 	DevMode bool
 
-	// ClassifierTimeoutMS bounds a routed alias's model or semantic-router
-	// classifier call. CLASSIFIER_TIMEOUT_MS, default 500, clamped to
-	// [50, 2000].
+	// ClassifierTimeoutMS bounds a routed alias's semantic-router classifier
+	// call. CLASSIFIER_TIMEOUT_MS, default 500, clamped to [50, 2000].
 	ClassifierTimeoutMS int
 	// ClassifierBreakerFailures is the number of consecutive classifier call
 	// failures that opens the circuit breaker. CLASSIFIER_BREAKER_FAILURES,
@@ -205,8 +204,8 @@ func Load() (*Config, error) {
 	}
 
 	// classifierTimeoutMS/classifierBreakerFailures/
-	// classifierBreakerOpenSeconds govern a routed alias's model and
-	// semantic-router classifiers (internal/router). Rejected (not clamped)
+	// classifierBreakerOpenSeconds govern a routed alias's semantic-router
+	// classifier (internal/router). Rejected (not clamped)
 	// out of bounds, matching every other bounded knob in this file
 	// (POLICY_MAX_STALENESS_SECONDS, ROUTE_LAST_GOOD_TTL_SECONDS): a
 	// misconfigured env value should fail loudly at startup, not silently

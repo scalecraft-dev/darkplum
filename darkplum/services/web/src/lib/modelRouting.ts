@@ -79,6 +79,12 @@ export function validateRouteName(name: string): string | null {
   return null
 }
 
+/** Routing is decided once per conversation. Administrators write routes without
+ *  seeing the chat, so this fact is repeated wherever routes are written or
+ *  tested rather than left for them to discover from a transcript. */
+export const STICKINESS_HINT =
+  'Routing happens on the first message of a conversation; later messages in that conversation stay on the model that answered first. Users can start a new chat to be routed again.'
+
 export const MAX_KEYWORDS_PER_ROUTE = 32
 export const MAX_KEYWORD_LENGTH = 64
 export const MAX_ROUTE_DESCRIPTION = 500
@@ -128,7 +134,6 @@ export function routerReasonText(reason: string | null | undefined): string {
     case 'fallback:unknown_category':
       return 'Classifier returned a category no route is named after — default route'
   }
-  if (reason.startsWith('model:')) return 'The classifier model chose this route'
   if (reason.startsWith('semantic:')) return 'Classified by the semantic router'
   return reason
 }

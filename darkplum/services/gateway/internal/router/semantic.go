@@ -23,10 +23,9 @@ const healthProbeCacheTTL = 30 * time.Second
 
 // SemanticRouterClassifier calls an in-cluster vLLM Semantic Router
 // (https://vllm-sr.ai) classification API to pick a route: CPU-only intent
-// classification, not an LLM inference — Classify's Decision never carries a
-// ModelCall, so the caller never writes a second (purpose="routing") audit
-// row for this classifier kind; router_reason and latency on the main row
-// are the only audit trail.
+// classification, not an LLM inference — the caller never writes a second
+// (purpose="routing") audit row for this classifier kind; router_reason and
+// latency on the main row are the only audit trail.
 //
 // Request/response shape: POST {url}/api/v1/classify/intent with
 // {"text": "<truncated last user turn>"}, expecting
@@ -53,9 +52,8 @@ type SemanticRouterClassifier struct {
 // NewSemanticRouterClassifier constructs a SemanticRouterClassifier. url is
 // SEMANTIC_ROUTER_URL (empty disables it — see url doc above); minConfidence
 // is SEMANTIC_ROUTER_MIN_CONFIDENCE (default 0.6); timeout/breakerFailures/
-// breakerOpenDuration are the same CLASSIFIER_TIMEOUT_MS/
-// CLASSIFIER_BREAKER_FAILURES/CLASSIFIER_BREAKER_OPEN_SECONDS knobs the model
-// classifier uses.
+// breakerOpenDuration are the CLASSIFIER_TIMEOUT_MS/
+// CLASSIFIER_BREAKER_FAILURES/CLASSIFIER_BREAKER_OPEN_SECONDS knobs.
 func NewSemanticRouterClassifier(url string, minConfidence float64, timeout time.Duration, breakerFailures int, breakerOpenDuration time.Duration) *SemanticRouterClassifier {
 	return &SemanticRouterClassifier{
 		url:           strings.TrimRight(url, "/"),

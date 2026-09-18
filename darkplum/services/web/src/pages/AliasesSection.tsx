@@ -1,6 +1,7 @@
 import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import type {
   AdminModel,
+  AliasClassifierChoice,
   AliasClassifierKind,
   AliasKind,
   AliasRouteTest,
@@ -18,6 +19,7 @@ import {
   MAX_KEYWORD_LENGTH,
   MAX_ROUTE_DESCRIPTION,
   ROUTE_NAME_HINT,
+  STICKINESS_HINT,
   UNREACHABLE_HINT,
   aliasKindOf,
   backendClassOf,
@@ -40,7 +42,9 @@ interface Props {
   error: string | null
   residency: Residency
   onRetry: () => void
-  onSave: (alias: string, body: ModelAliasInput) => Promise<void>
+  /** Resolves with the API's own configure-time warnings for the saved alias —
+   *  an empty list means there is nothing to say. Throws on failure. */
+  onSave: (alias: string, body: ModelAliasInput) => Promise<string[]>
   onDelete: (alias: string) => Promise<void>
 }
 
@@ -113,10 +117,19 @@ function aliasHealth(a: ModelAlias, residency: Residency): HealthKind {
     .reduce((worst, next) => (HEALTH_RANK[next] > HEALTH_RANK[worst] ? next : worst), 'ok')
 }
 
+/** 'model' is a removed kind that only a pre-migration server still sends. It
+ *  behaves as rules, and is named as such rather than as something choosable. */
 const CLASSIFIER_LABEL: Record<AliasClassifierKind, string> = {
   rules: 'keyword rules',
   semantic_router: 'semantic router',
-  model: 'model classifier',
+  model: 'keyword rules (migrated)',
+}
+
+/** Which of the two writable kinds an existing alias maps onto. A new alias
+ *  starts on the semantic router; the removed 'model' kind reads as rules. */
+function classifierChoiceOf(a: ModelAlias | null): AliasClassifierChoice {
+  if (!a) return 'semantic_router'
+  return a.classifier?.kind === 'semantic_router' ? 'semantic_router' : 'rules'
 }
 
 // ---------------------------------------------------------------------------
@@ -514,7 +527,7 @@ interface EditorProps {
   residency: Residency
   existing: ModelAlias[]
   onClose: () => void
-  onSave: (alias: string, body: ModelAliasInput) => Promise<void>
+  onSave: (alias: string, body: ModelAliasInput) => Promise<string[]>
 }
 
 let routeKeySeq = 0
@@ -563,11 +576,8 @@ function AliasEditor({ editing, models, residency, existing, onClose, onSave }: 
   /** Which route is the default, by key rather than by name: renaming the
    *  default route must not quietly hand the job to another one. */
   const [defaultKey, setDefaultKey] = useState(initial.current.defaultKey)
-  const [classifierKind, setClassifierKind] = useState<AliasClassifierKind>(
-    editing?.classifier?.kind ?? 'rules',
-  )
-  const [classifierModel, setClassifierModel] = useState(
-    editing?.classifier?.kind === 'model' ? editing.classifier.model_id : '',
+  const [classifierKind, setClassifierKind] = useState<AliasClassifierChoice>(
+    classifierChoiceOf(editing),
   )
   const [aliasError, setAliasError] = useState('')
   const [targetError, setTargetError] = useState('')
@@ -575,14 +585,6 @@ function AliasEditor({ editing, models, residency, existing, onClose, onSave }: 
   const [formError, setFormError] = useState('')
   const [announcement, setAnnouncement] = useState('')
   const [saving, setSaving] = useState(false)
-
-  const selfHosted = useMemo(
-    () =>
-      [...models]
-        .filter((m) => backendClassOf(m) === 'self_hosted')
-        .sort((a, b) => a.model_id.localeCompare(b.model_id)),
-    [models],
-  )
 
   /** A routed alias must name a default the API can find, so removing the
    *  default route hands the job to the first one rather than to nothing. */
@@ -662,19 +664,12 @@ function AliasEditor({ editing, models, residency, existing, onClose, onSave }: 
       setFormError('Choose which route answers when nothing else matches.')
       return null
     }
-    if (classifierKind === 'model' && !classifierModel) {
-      setFormError('Choose the self-hosted model that picks the route.')
-      return null
-    }
     setFormError('')
 
     return {
       kind: 'routed',
       default_route: chosenDefault,
-      classifier:
-        classifierKind === 'model'
-          ? { kind: 'model', model_id: classifierModel }
-          : { kind: classifierKind },
+      classifier: { kind: classifierKind },
       routes: routes.map((r) => ({
         route_name: r.route_name.trim(),
         description: r.description.trim(),
@@ -724,6 +719,17 @@ function AliasEditor({ editing, models, residency, existing, onClose, onSave }: 
       </div>
 
       {formError && <p className={styles.serverError} role="alert">{formError}</p>}
+
+      {(editing?.warnings?.length ?? 0) > 0 && (
+        <ul className={styles.warningList}>
+          {editing!.warnings!.map((w) => (
+            <li key={w} className={styles.warningItem}>
+              <span className={styles.srOnly}>Warning: </span>
+              {w}
+            </li>
+          ))}
+        </ul>
+      )}
 
       <div className={styles.editorTop}>
         <div className={styles.field}>
@@ -840,20 +846,6 @@ function AliasEditor({ editing, models, residency, existing, onClose, onSave }: 
           <fieldset className={styles.choiceSet}>
             <legend className={styles.fieldLabel}>How the route is chosen</legend>
             <div className={styles.choices}>
-              <label className={`${styles.choice} ${classifierKind === 'rules' ? styles.choiceChecked : ''}`}>
-                <span className={styles.choiceTop}>
-                  <input
-                    type="radio"
-                    name={`${formId}-classifier`}
-                    checked={classifierKind === 'rules'}
-                    onChange={() => { setClassifierKind('rules'); setFormError('') }}
-                  />
-                  <span className={styles.choiceLabel}>Keyword rules</span>
-                </span>
-                <span className={styles.choiceText}>
-                  Your keywords decide, top route first. No model reads the message to sort it.
-                </span>
-              </label>
               <label className={`${styles.choice} ${classifierKind === 'semantic_router' ? styles.choiceChecked : ''}`}>
                 <span className={styles.choiceTop}>
                   <input
@@ -869,50 +861,30 @@ function AliasEditor({ editing, models, residency, existing, onClose, onSave }: 
                   cluster; route names must match its configured categories.
                 </span>
               </label>
-              <label className={`${styles.choice} ${classifierKind === 'model' ? styles.choiceChecked : ''}`}>
+              <label className={`${styles.choice} ${classifierKind === 'rules' ? styles.choiceChecked : ''}`}>
                 <span className={styles.choiceTop}>
                   <input
                     type="radio"
                     name={`${formId}-classifier`}
-                    checked={classifierKind === 'model'}
-                    onChange={() => { setClassifierKind('model'); setFormError('') }}
+                    checked={classifierKind === 'rules'}
+                    onChange={() => { setClassifierKind('rules'); setFormError('') }}
                   />
-                  <span className={styles.choiceLabel}>A model you host</span>
+                  <span className={styles.choiceLabel}>Keyword rules</span>
                 </span>
                 <span className={styles.choiceText}>
-                  A model reads the message and answers with one of your route names.
+                  Your keywords decide, top route first. No model reads the message to sort it.
                 </span>
               </label>
             </div>
           </fieldset>
 
-          {classifierKind === 'model' && (
-            <div className={styles.field}>
-              <label className={styles.fieldLabel} htmlFor={`${formId}-classifier-model`}>
-                Classifier model
-              </label>
-              <select
-                id={`${formId}-classifier-model`}
-                className={styles.select}
-                value={classifierModel}
-                onChange={(e) => { setClassifierModel(e.target.value); setFormError('') }}
-              >
-                <option value="">Choose a self-hosted model</option>
-                {selfHosted.map((m) => (
-                  <option key={m.id} value={m.model_id}>{targetOptionLabel(m)}</option>
-                ))}
-              </select>
-              <p className={styles.fieldHint}>
-                Self-hosted models only: the message is sent to this model before it is routed, so
-                it must not leave your infrastructure to be sorted.
-              </p>
-              {selfHosted.length === 0 && (
-                <p className={styles.formWarning}>
-                  No self-hosted models have been discovered, so nothing can classify yet. Use
-                  keyword rules until one is available.
-                </p>
-              )}
-            </div>
+          <p className={styles.stickyHint}>{STICKINESS_HINT}</p>
+
+          {editing?.classifier?.kind === 'model' && (
+            <p className={styles.formWarning}>
+              This alias was written against the model classifier, which has been removed. It is
+              shown and saved as keyword rules.
+            </p>
           )}
         </>
       )}
@@ -1044,6 +1016,8 @@ function TestPromptModal({
             </div>
           )}
         </div>
+
+        <p className={styles.stickyHint}>{STICKINESS_HINT}</p>
       </div>
     </Modal>
   )
@@ -1067,9 +1041,18 @@ export function AliasesSection({
   const [editorOpen, setEditorOpen] = useState(false)
   const [editing, setEditing] = useState<ModelAlias | null>(null)
   const [testing, setTesting] = useState<ModelAlias | null>(null)
+  /** What the API had to say about the alias just saved. The save succeeded
+   *  either way, so this reads as a note rather than as a failure. */
+  const [saved, setSaved] = useState<{ alias: string; warnings: string[] } | null>(null)
 
-  const openCreate = () => { setEditing(null); setEditorOpen(true) }
-  const openEdit = (a: ModelAlias) => { setEditing(a); setEditorOpen(true) }
+  const openCreate = () => { setEditing(null); setSaved(null); setEditorOpen(true) }
+  const openEdit = (a: ModelAlias) => { setEditing(a); setSaved(null); setEditorOpen(true) }
+
+  const handleSave = async (alias: string, body: ModelAliasInput): Promise<string[]> => {
+    const warnings = await onSave(alias, body)
+    setSaved(warnings.length > 0 ? { alias, warnings } : null)
+    return warnings
+  }
 
   const handleDelete = async (alias: string) => {
     try {
@@ -1114,8 +1097,22 @@ export function AliasesSection({
           residency={residency}
           existing={aliases}
           onClose={() => setEditorOpen(false)}
-          onSave={onSave}
+          onSave={handleSave}
         />
+      )}
+
+      {!editorOpen && saved && (
+        <div className={styles.savedWarnings} role="status">
+          <p className={styles.savedWarningsTitle}>
+            <code className={styles.alias}>{saved.alias}</code> was saved. Worth knowing:
+          </p>
+          <ul className={styles.warningsList}>
+            {saved.warnings.map((w) => (
+              <li key={w}>{w}</li>
+            ))}
+          </ul>
+          <Button variant="ghost" size="sm" onClick={() => setSaved(null)}>Dismiss</Button>
+        </div>
       )}
 
       {error ? (
@@ -1168,8 +1165,10 @@ export function AliasesSection({
                   const flaggedRoutes = routes
                     .map((r) => ({ route: r, health: healthOf(r, residency) }))
                     .filter((r) => r.health !== 'ok')
+                  const warnings = a.warnings ?? []
+                  const flagged = health !== 'ok' || warnings.length > 0
                   return (
-                    <tr key={a.alias} className={health === 'ok' ? '' : styles.rowFlagged}>
+                    <tr key={a.alias} className={flagged ? styles.rowFlagged : ''}>
                       <td>
                         <div className={styles.aliasCell}>
                           <div className={styles.idCell}>
@@ -1214,6 +1213,16 @@ export function AliasesSection({
                           {copy.label}
                         </Badge>
                         {copy.hint && <p className={styles.statusHint}>{copy.hint}</p>}
+                        {warnings.length > 0 && (
+                          <ul className={styles.rowWarnings}>
+                            {warnings.map((w) => (
+                              <li key={w} className={styles.warningItem}>
+                                <span className={styles.srOnly}>Warning: </span>
+                                {w}
+                              </li>
+                            ))}
+                          </ul>
+                        )}
                       </td>
                       <td className={styles.actionsCol}>
                         <div className={styles.rowActions}>

@@ -38,11 +38,10 @@ func TestBuildAliases_StaticAliasWithNilTargetIsDropped(t *testing.T) {
 func TestBuildAliases_RoutedAliasAssembled(t *testing.T) {
 	aliasRows := []rawAliasRow{
 		{
-			Alias:           "smart-chat",
-			Kind:            AliasKindRouted,
-			DefaultRoute:    strPtr("general"),
-			ClassifierKind:  strPtr(ClassifierKindRules),
-			ClassifierModel: nil,
+			Alias:          "smart-chat",
+			Kind:           AliasKindRouted,
+			DefaultRoute:   strPtr("general"),
+			ClassifierKind: strPtr(ClassifierKindRules),
 		},
 	}
 	routeRows := []rawRouteRow{
@@ -103,7 +102,7 @@ func TestBuildAliases_OneInconsistentAliasDoesNotAffectOthers(t *testing.T) {
 	aliasRows := []rawAliasRow{
 		{Alias: "ok-static", Kind: AliasKindStatic, Target: strPtr("llama-3-8b")},
 		{Alias: "broken-router", Kind: AliasKindRouted, DefaultRoute: strPtr("missing")},
-		{Alias: "ok-router", Kind: AliasKindRouted, DefaultRoute: strPtr("general"), ClassifierKind: strPtr(ClassifierKindModel), ClassifierModel: strPtr("router-model")},
+		{Alias: "ok-router", Kind: AliasKindRouted, DefaultRoute: strPtr("general"), ClassifierKind: strPtr(ClassifierKindSemanticRouter)},
 	}
 	routeRows := []rawRouteRow{
 		{Alias: "ok-router", Name: "general", Description: "d", Target: "llama-3-8b"},
@@ -121,8 +120,32 @@ func TestBuildAliases_OneInconsistentAliasDoesNotAffectOthers(t *testing.T) {
 	if !ok {
 		t.Fatal("expected ok-router to survive")
 	}
-	if def.ClassifierKind != ClassifierKindModel || def.ClassifierModel != "router-model" {
+	if def.ClassifierKind != ClassifierKindSemanticRouter {
 		t.Errorf("got %+v", def)
+	}
+}
+
+// TestBuildAliases_LegacyModelClassifierKindCoercedToRules covers the
+// migration-014 tolerance case: a routed alias row that still carries the
+// removed classifier_kind='model' value (a gateway pod started before the
+// api's migration lands, or against a not-yet-migrated database) must be
+// treated as 'rules', not dropped.
+func TestBuildAliases_LegacyModelClassifierKindCoercedToRules(t *testing.T) {
+	aliasRows := []rawAliasRow{
+		{Alias: "smart-chat", Kind: AliasKindRouted, DefaultRoute: strPtr("general"), ClassifierKind: strPtr("model")},
+	}
+	routeRows := []rawRouteRow{
+		{Alias: "smart-chat", Name: "general", Description: "d", Target: "llama-3-8b"},
+	}
+
+	aliases := buildAliases(aliasRows, routeRows)
+
+	def, ok := aliases["smart-chat"]
+	if !ok {
+		t.Fatal("expected smart-chat to survive with its classifier_kind coerced, not dropped")
+	}
+	if def.ClassifierKind != ClassifierKindRules {
+		t.Errorf("ClassifierKind = %q, want %q", def.ClassifierKind, ClassifierKindRules)
 	}
 }
 

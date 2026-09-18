@@ -10,7 +10,6 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/scalecraft/darkplum/gateway/internal/policy"
-	"github.com/scalecraft/darkplum/gateway/internal/recorder"
 	"github.com/scalecraft/darkplum/gateway/internal/router"
 	"github.com/scalecraft/darkplum/gateway/internal/routing"
 )
@@ -280,26 +279,18 @@ func TestHandleChatCompletions_RoutedAlias_PickedTargetNotFound(t *testing.T) {
 	}
 }
 
-// TestHandleChatCompletions_RoutedAlias_BogusRouteName_StillAudited covers
-// the defensive fail-closed path: a classifier (here standing in for
-// ModelClassifier) names a route that isn't in alias.Routes and isn't
-// alias.DefaultRoute — normally unreachable per policy.buildAliases's
-// invariants, but a real ModelClassifier could still hand back an
-// out-of-band string if that invariant were ever violated. The request must
-// still be refused with 404 model_not_found, but if the classifier actually
-// called an LLM (ModelCall != nil) that call's purpose="routing" audit event
-// must still be recorded — the model saw the prompt regardless of how the
-// route name it returned was handled afterwards.
-func TestHandleChatCompletions_RoutedAlias_BogusRouteName_StillAudited(t *testing.T) {
+// TestHandleChatCompletions_RoutedAlias_BogusRouteName covers the defensive
+// fail-closed path: a classifier names a route that isn't in alias.Routes
+// and isn't alias.DefaultRoute — normally unreachable per
+// policy.buildAliases's invariants, but a Classifier implementation could
+// still hand back an out-of-band string if that invariant were ever
+// violated. The request must still be refused with 404 model_not_found, and
+// the provider must never be dispatched to.
+func TestHandleChatCompletions_RoutedAlias_BogusRouteName(t *testing.T) {
 	vllm := &fakeKindProvider{name: "vllm-default", kind: "vllm"}
-	pt, ctok := 9, 3
 	classifier := &fakeClassifier{decisions: []router.Decision{{
 		RouteName: "does-not-exist",
-		Reason:    "model:does-not-exist",
-		ModelCall: &router.ModelCallInfo{
-			Model: "router-model", Provider: "vllm", LatencyMS: 5, StatusCode: 200,
-			PromptTokens: &pt, CompletionTokens: &ctok,
-		},
+		Reason:    "rules:does-not-exist:x",
 	}}}
 	h := newRoutedTestHandler(
 		fakeProviders{"vllm-default": vllm},
@@ -315,7 +306,7 @@ func TestHandleChatCompletions_RoutedAlias_BogusRouteName_StillAudited(t *testin
 		classifier,
 	)
 
-	w, c := doChat(t, h, "smart-chat")
+	w, _ := doChat(t, h, "smart-chat")
 
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d; body=%s", w.Code, w.Body.String())
@@ -326,18 +317,6 @@ func TestHandleChatCompletions_RoutedAlias_BogusRouteName_StillAudited(t *testin
 	}
 	if vllm.completeCalls != 0 {
 		t.Errorf("provider must never be dispatched to for an unresolved route, got %d calls", vllm.completeCalls)
-	}
-
-	v, ok := c.Get("routing_audit_event")
-	if !ok {
-		t.Fatal("expected a routing_audit_event to still be set even though the route name didn't resolve — the classifier model did see the prompt")
-	}
-	evt, ok := v.(recorder.InferenceEvent)
-	if !ok {
-		t.Fatalf("routing_audit_event has unexpected type %T", v)
-	}
-	if evt.Purpose != "routing" || evt.Model != "router-model" || evt.LatencyMS != 5 {
-		t.Errorf("got %+v", evt)
 	}
 }
 
@@ -371,76 +350,5 @@ func TestHandleChatCompletions_RoutedAlias_ClassifierAborted_NeverDispatches(t *
 	}
 	if code, _ := c.Get("denial_code"); code != "request_canceled" {
 		t.Errorf("denial_code = %v, want request_canceled", code)
-	}
-}
-
-// ---------------------------------------------------------------------------
-// Second audit row: only for a model classifier call
-// ---------------------------------------------------------------------------
-
-func TestHandleChatCompletions_RoutedAlias_ModelClassifier_SetsRoutingAuditEvent(t *testing.T) {
-	vllm := &fakeKindProvider{name: "vllm-default", kind: "vllm"}
-	pt, ctok := 12, 2
-	classifier := &fakeClassifier{decisions: []router.Decision{{
-		RouteName: "code",
-		Reason:    "model:code",
-		ModelCall: &router.ModelCallInfo{
-			Model: "router-model", Provider: "vllm", LatencyMS: 7, StatusCode: 200,
-			PromptTokens: &pt, CompletionTokens: &ctok,
-		},
-	}}}
-	h := newRoutedTestHandler(
-		fakeProviders{"vllm-default": vllm},
-		map[string]routing.Route{
-			"qwen-coder": {ProviderKey: "vllm-default", Kind: "vllm", Class: routing.ClassSelfHosted},
-			"llama-3-8b": {ProviderKey: "vllm-default", Kind: "vllm", Class: routing.ClassSelfHosted},
-		},
-		policy.Snapshot{
-			Enabled:   map[string]bool{"qwen-coder": true, "llama-3-8b": true},
-			Aliases:   map[string]policy.AliasDef{"smart-chat": routedAlias},
-			Residency: policy.ResidencyAny,
-		},
-		classifier,
-	)
-
-	_, c := doChat(t, h, "smart-chat")
-
-	v, ok := c.Get("routing_audit_event")
-	if !ok {
-		t.Fatal("expected a routing_audit_event to be set on ctx for a model classifier call")
-	}
-	evt, ok := v.(recorder.InferenceEvent)
-	if !ok {
-		t.Fatalf("routing_audit_event has unexpected type %T", v)
-	}
-	if evt.Purpose != "routing" || evt.Model != "router-model" || evt.LatencyMS != 7 {
-		t.Errorf("got %+v", evt)
-	}
-	if evt.PromptTokens == nil || *evt.PromptTokens != 12 || evt.CompletionTokens == nil || *evt.CompletionTokens != 2 {
-		t.Errorf("token counts not carried through: %+v", evt)
-	}
-}
-
-// TestHandleChatCompletions_RulesClassifier_NoRoutingAuditEvent asserts the
-// rules classifier (no LLM ever saw the prompt) never sets a second-row ctx
-// key — the rules-classifier Decision from the fake below has ModelCall ==
-// nil, matching a real RulesClassifier's contract.
-func TestHandleChatCompletions_RulesClassifier_NoRoutingAuditEvent(t *testing.T) {
-	vllm := &fakeKindProvider{name: "vllm-default", kind: "vllm"}
-	classifier := &fakeClassifier{decisions: []router.Decision{{RouteName: "general", Reason: "rules:default"}}}
-	h := newRoutedTestHandler(
-		fakeProviders{"vllm-default": vllm},
-		map[string]routing.Route{"llama-3-8b": {ProviderKey: "vllm-default", Kind: "vllm", Class: routing.ClassSelfHosted}},
-		policy.Snapshot{
-			Enabled:   map[string]bool{"llama-3-8b": true},
-			Aliases:   map[string]policy.AliasDef{"smart-chat": routedAlias},
-			Residency: policy.ResidencyAny,
-		},
-		classifier,
-	)
-
-	_, c := doChat(t, h, "smart-chat")
-	if _, ok := c.Get("routing_audit_event"); ok {
-		t.Error("expected no routing_audit_event for a rules classifier decision (no model call)")
 	}
 }

@@ -176,25 +176,23 @@ func main() {
 
 	rec := recorder.New(dbPool)
 
-	// Routed-alias classifiers. rulesClassifier is stateless; modelClassifier
-	// and semanticClassifier each own a circuit breaker over
-	// CLASSIFIER_TIMEOUT_MS/CLASSIFIER_BREAKER_FAILURES/
-	// CLASSIFIER_BREAKER_OPEN_SECONDS, surfaced on /health below.
-	// SemanticRouterURL empty (SEMANTIC_ROUTER_URL unset) is a supported,
-	// permanent "unconfigured" state — every semantic_router alias just
-	// degrades to default_route until an operator sets it.
+	// Routed-alias classifiers. rulesClassifier is stateless; semanticClassifier
+	// owns a circuit breaker over CLASSIFIER_TIMEOUT_MS/
+	// CLASSIFIER_BREAKER_FAILURES/CLASSIFIER_BREAKER_OPEN_SECONDS, surfaced on
+	// /health below. SemanticRouterURL empty (SEMANTIC_ROUTER_URL unset) is a
+	// supported, permanent "unconfigured" state — every semantic_router alias
+	// just degrades to default_route until an operator sets it.
 	rulesClassifier := router.NewRulesClassifier()
 	classifierTimeout := time.Duration(cfg.ClassifierTimeoutMS) * time.Millisecond
 	classifierBreakerOpen := time.Duration(cfg.ClassifierBreakerOpenSeconds) * time.Second
-	modelClassifier := router.NewModelClassifier(reg, routeMgr, polStore, classifierTimeout, cfg.ClassifierBreakerFailures, classifierBreakerOpen)
 	semanticClassifier := router.NewSemanticRouterClassifier(cfg.SemanticRouterURL, cfg.SemanticRouterMinConfidence, classifierTimeout, cfg.ClassifierBreakerFailures, classifierBreakerOpen)
 	log.Printf("gateway: routed-alias classifiers configured: timeout=%s breaker_failures=%d breaker_open=%s semantic_router_url=%q semantic_router_min_confidence=%.2f",
 		classifierTimeout, cfg.ClassifierBreakerFailures, classifierBreakerOpen, cfg.SemanticRouterURL, cfg.SemanticRouterMinConfidence)
 
-	chatHandler := handler.NewChatHandler(reg, routeMgr, polStore, rulesClassifier, modelClassifier, semanticClassifier, rec)
+	chatHandler := handler.NewChatHandler(reg, routeMgr, polStore, rulesClassifier, semanticClassifier)
 
 	gin.SetMode(gin.ReleaseMode)
-	healthHandler := newHealthHandler(upstreamChecker, routeMgr, polStore, modelClassifier, semanticClassifier)
+	healthHandler := newHealthHandler(upstreamChecker, routeMgr, polStore, semanticClassifier)
 	httpRouter := buildRouter(chatHandler, middleware.APIKey(dbPool), middleware.Recording(rec), healthHandler)
 
 	addr := ":" + cfg.Port
@@ -253,12 +251,10 @@ func buildRouter(chatHandler *handler.ChatHandler, apiKeyMW, recordingMW, health
 	// wrapped in recordingMW: recordingMW builds and records exactly one
 	// purpose="inference" InferenceEvent per POST, which is right for
 	// /chat/completions but wrong for a dryrun (it never dispatches to any
-	// model, so there is no "inference" to record — HandleRoutingDryrun
-	// records its own, single, purpose="routing_dryrun" row directly,
-	// only when a model classifier call actually happened). GET /v1/models
-	// is unaffected either way (Recording is a POST-only middleware) but is
-	// kept out of the recorded group for the same reason: it never produces
-	// an inference_events row.
+	// model, and records nothing itself — see HandleRoutingDryrun). GET
+	// /v1/models is unaffected either way (Recording is a POST-only
+	// middleware) but is kept out of the recorded group for the same reason:
+	// it never produces an inference_events row.
 	v1.GET("/models", chatHandler.HandleListModels)
 	v1.POST("/routing/dryrun", chatHandler.HandleRoutingDryrun)
 
@@ -299,18 +295,11 @@ func respondUnknownEndpoint(c *gin.Context) {
 	})
 }
 
-// classifierBreakerStatus is the subset of *router.ModelClassifier that
-// newHealthHandler needs. Defined as an interface so tests can substitute a
-// fake without constructing a real classifier/registry/routes/policy chain.
-type classifierBreakerStatus interface {
-	Status() (breakerOpen bool, consecutiveFailures int)
-}
-
 // semanticRouterHealthStatus is the subset of *router.SemanticRouterClassifier
-// that newHealthHandler needs, for the same reason as classifierBreakerStatus:
-// its own circuit-breaker state (Status) alongside its reachability probe
-// (HealthStatus) — the semantic router classifier has a breaker independent
-// of the model classifier's, and /health must surface both.
+// that newHealthHandler needs. Defined as an interface so tests can
+// substitute a fake without constructing a real classifier/registry/routes
+// chain: its own circuit-breaker state (Status) alongside its reachability
+// probe (HealthStatus) — /health must surface both.
 type semanticRouterHealthStatus interface {
 	HealthStatus(ctx context.Context) string
 	Status() (breakerOpen bool, consecutiveFailures int)
@@ -334,7 +323,7 @@ type semanticRouterHealthStatus interface {
 // log by routing.Manager.Refresh. Similarly, semanticClassifier.HealthStatus
 // is a cached, rate-limited probe (see SemanticRouterClassifier) — this
 // handler never triggers a network call itself.
-func newHealthHandler(upstreamChecker *health.Checker, routeMgr *routing.Manager, polStore *policy.PgStore, modelClassifier classifierBreakerStatus, semanticClassifier semanticRouterHealthStatus) gin.HandlerFunc {
+func newHealthHandler(upstreamChecker *health.Checker, routeMgr *routing.Manager, polStore *policy.PgStore, semanticClassifier semanticRouterHealthStatus) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		upstreams := upstreamChecker.Check(c.Request.Context())
 		upstreamBody := make(map[string]string, len(upstreams))
@@ -354,7 +343,6 @@ func newHealthHandler(upstreamChecker *health.Checker, routeMgr *routing.Manager
 
 		policyStatus := polStore.Status()
 
-		modelBreakerOpen, modelConsecutiveFailures := modelClassifier.Status()
 		srBreakerOpen, srConsecutiveFailures := semanticClassifier.Status()
 		srHealthStatus := semanticClassifier.HealthStatus(c.Request.Context())
 
@@ -365,10 +353,6 @@ func newHealthHandler(upstreamChecker *health.Checker, routeMgr *routing.Manager
 				"models":  routingStatus.Models,
 				"sources": sourcesBody,
 				"classifier": gin.H{
-					"model": gin.H{
-						"breaker_open":         modelBreakerOpen,
-						"consecutive_failures": modelConsecutiveFailures,
-					},
 					"semantic_router": gin.H{
 						"status":               srHealthStatus,
 						"breaker_open":         srBreakerOpen,

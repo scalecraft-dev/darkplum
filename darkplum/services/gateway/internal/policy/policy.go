@@ -24,14 +24,14 @@ const (
 	AliasKindRouted = "routed"
 )
 
-// Classifier kinds for model_aliases.classifier_kind (migration 013).
-// ClassifierKindSemanticRouter is a later addition (see internal/router's
-// SemanticRouterClassifier): it calls an in-cluster vLLM Semantic Router
-// classification API rather than an LLM, and never carries a
-// classifier_model_id.
+// Classifier kinds for model_aliases.classifier_kind (migration 013,
+// narrowed by migration 014: the "model" kind — an in-house classifier
+// prompt protocol — has been removed; only these two remain).
+// ClassifierKindSemanticRouter (see internal/router's
+// SemanticRouterClassifier) calls an in-cluster vLLM Semantic Router
+// classification API rather than an LLM.
 const (
 	ClassifierKindRules          = "rules"
-	ClassifierKindModel          = "model"
 	ClassifierKindSemanticRouter = "semantic_router"
 )
 
@@ -55,15 +55,13 @@ type RouteDef struct {
 // populates Kind and Target (StaticTarget mirrors the pre-routed-alias
 // map[string]string shape for callers that only care about that case). A
 // routed alias additionally populates DefaultRoute, ClassifierKind, and
-// Routes (ordered by model_alias_routes.position); ClassifierModel is set
-// only when ClassifierKind == ClassifierKindModel.
+// Routes (ordered by model_alias_routes.position).
 type AliasDef struct {
-	Kind            string
-	Target          string
-	DefaultRoute    string
-	ClassifierKind  string
-	ClassifierModel string
-	Routes          []RouteDef
+	Kind           string
+	Target         string
+	DefaultRoute   string
+	ClassifierKind string
+	Routes         []RouteDef
 }
 
 // Route returns the named route from a.Routes, or false if no route with

@@ -39,67 +39,6 @@ func TestRecord_NeverBlocksWhenBufferIsFull(t *testing.T) {
 	}
 }
 
-// TestRecordPair_EnqueuesBothWhenRoomExists asserts the ordinary case: both
-// the main and the routing event land in the buffer, in order.
-func TestRecordPair_EnqueuesBothWhenRoomExists(t *testing.T) {
-	r := &Recorder{events: make(chan InferenceEvent, 4)}
-	main := InferenceEvent{RequestID: "req-1", Purpose: "inference"}
-	routing := InferenceEvent{RequestID: "req-1", Purpose: "routing"}
-
-	r.RecordPair(main, routing)
-
-	if len(r.events) != 2 {
-		t.Fatalf("expected both events enqueued, got %d", len(r.events))
-	}
-	if got := <-r.events; got.Purpose != "inference" {
-		t.Errorf("expected the main event first, got %+v", got)
-	}
-	if got := <-r.events; got.Purpose != "routing" {
-		t.Errorf("expected the routing event second, got %+v", got)
-	}
-	if r.DroppedPairs() != 0 {
-		t.Errorf("DroppedPairs() = %d, want 0", r.DroppedPairs())
-	}
-}
-
-// TestRecordPair_DropsBothWhenInsufficientRoom is the core both-or-neither
-// guard: a buffer with room for only one of the two events must enqueue
-// NEITHER, not one of them, and must count the drop.
-func TestRecordPair_DropsBothWhenInsufficientRoom(t *testing.T) {
-	r := &Recorder{events: make(chan InferenceEvent, 1)}
-	r.events <- InferenceEvent{RequestID: "already-buffered"} // leaves exactly 0 free slots
-
-	r.RecordPair(InferenceEvent{RequestID: "main"}, InferenceEvent{RequestID: "routing"})
-
-	if len(r.events) != 1 {
-		t.Fatalf("expected the pair to be dropped entirely, buffer len = %d", len(r.events))
-	}
-	if got := (<-r.events).RequestID; got != "already-buffered" {
-		t.Errorf("expected the pre-existing event untouched, got %q", got)
-	}
-	if r.DroppedPairs() != 1 {
-		t.Errorf("DroppedPairs() = %d, want 1", r.DroppedPairs())
-	}
-}
-
-// TestRecordPair_NeverBlocksWhenBufferIsFull mirrors
-// TestRecord_NeverBlocksWhenBufferIsFull for the pair path.
-func TestRecordPair_NeverBlocksWhenBufferIsFull(t *testing.T) {
-	r := &Recorder{events: make(chan InferenceEvent, 1)}
-	r.events <- InferenceEvent{RequestID: "kept"}
-
-	done := make(chan struct{})
-	go func() {
-		r.RecordPair(InferenceEvent{RequestID: "main"}, InferenceEvent{RequestID: "routing"})
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("RecordPair blocked on a full buffer")
-	}
-}
-
 // setupRecorderDB gives the test its own schema holding an inference_events
 // table in the PRE-routing shape (api migrations 005+007, before 010/011 add
 // requested_model and denial_code). Gated on TEST_DATABASE_URL like the api's

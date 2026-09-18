@@ -210,8 +210,8 @@ func TestValidateRoutedAliasShape_ClassifierKindValidation(t *testing.T) {
 		{"rules with model id set", &putAliasClassifierInput{Kind: "rules", ModelID: strPtr("llama3")}, true},
 		{"semantic_router with no model id", &putAliasClassifierInput{Kind: "semantic_router"}, false},
 		{"semantic_router with model id set", &putAliasClassifierInput{Kind: "semantic_router", ModelID: strPtr("llama3")}, true},
-		{"model with model id", &putAliasClassifierInput{Kind: "model", ModelID: strPtr("llama3")}, false},
-		{"model without model id", &putAliasClassifierInput{Kind: "model"}, true},
+		{"model kind is rejected outright, with model id", &putAliasClassifierInput{Kind: "model", ModelID: strPtr("llama3")}, true},
+		{"model kind is rejected outright, without model id", &putAliasClassifierInput{Kind: "model"}, true},
 		{"unknown kind", &putAliasClassifierInput{Kind: "bogus"}, true},
 		{"nil classifier", nil, true},
 	}
@@ -223,6 +223,26 @@ func TestValidateRoutedAliasShape_ClassifierKindValidation(t *testing.T) {
 				t.Errorf("err = %v, wantErr = %v", err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// TestValidateRoutedAliasShape_ModelClassifierKindRejected asserts the exact
+// 400 message a PUT with {"classifier":{"kind":"model"}} gets: the in-house
+// model classifier is gone, and this must never be confused with the
+// generic "unknown kind" error.
+func TestValidateRoutedAliasShape_ModelClassifierKindRejected(t *testing.T) {
+	req := putAliasRequest{
+		DefaultRoute: "general",
+		Classifier:   &putAliasClassifierInput{Kind: "model", ModelID: strPtr("llama3")},
+		Routes:       []putAliasRouteInput{validRouteInput("general", "llama3")},
+	}
+	_, err := validateRoutedAliasShape(req)
+	if err == nil {
+		t.Fatal("expected an error for classifier kind 'model'")
+	}
+	wantMsg := "classifier kind 'model' is no longer supported; use 'rules' or 'semantic_router'"
+	if err.Error() != wantMsg {
+		t.Errorf("err = %q, want %q", err.Error(), wantMsg)
 	}
 }
 

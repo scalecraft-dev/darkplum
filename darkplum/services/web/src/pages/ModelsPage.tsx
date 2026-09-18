@@ -425,7 +425,8 @@ export function ModelsPage() {
   }
 
   // Throws on failure so the editor can attach the server's message to a field.
-  const handleSaveAlias = async (alias: string, body: ModelAliasInput) => {
+  // Resolves with the API's configure-time warnings for the saved alias.
+  const handleSaveAlias = async (alias: string, body: ModelAliasInput): Promise<string[]> => {
     const existing = aliases.some((a) => a.alias === alias)
     const saved = await putModelAlias(alias, body)
     setAliases((prev) => {
@@ -437,6 +438,7 @@ export function ModelsPage() {
         ? `now has ${body.routes.length} ${body.routes.length === 1 ? 'route' : 'routes'}`
         : `now points at ${body.target_model_id}`
     toast(existing ? `Alias ${alias} ${changed}` : `Alias ${alias} created`, 'success')
+    return saved.warnings ?? []
   }
 
   const handleDeleteAlias = async (alias: string) => {

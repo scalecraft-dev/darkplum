@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -42,12 +40,13 @@ type InferenceEvent struct {
 	// Region is the cloud region for the backend. Populated for Bedrock, empty for vLLM.
 	Region string
 
-	// Purpose is inference_events.purpose (migration 013): "inference"
-	// (the default — see queueRoutingSchema/purposeOrDefault), "routing" (a
-	// routed alias's model-classifier call), or "routing_dryrun" (a
-	// POST /v1/routing/dryrun model-classifier call). Left empty by ordinary
-	// callers; purposeOrDefault fills in "inference" at insert time so every
-	// existing call site keeps recording exactly what it always has.
+	// Purpose is inference_events.purpose (migration 013): "inference" is
+	// the only value the gateway writes today (see
+	// queueRoutingSchema/purposeOrDefault) — "routing" and "routing_dryrun"
+	// were only ever produced by the removed in-house model classifier;
+	// historic rows may still carry them, but nothing writes them anymore.
+	// Left empty by ordinary callers; purposeOrDefault fills in "inference"
+	// at insert time.
 	Purpose string
 	// RouteName is the route a routed alias resolved to (empty for a static
 	// alias, a plain model id, or when Purpose != "inference").
@@ -66,18 +65,6 @@ type InferenceEvent struct {
 type Recorder struct {
 	pool   *pgxpool.Pool
 	events chan InferenceEvent
-
-	// enqueueMu serialises every send onto events (both Record and
-	// RecordPair) so RecordPair's capacity check and its two sends are
-	// atomic with respect to any other concurrent writer stealing the last
-	// free slot — see RecordPair. Only writers take this lock; flush() is
-	// the sole reader and never needs it.
-	enqueueMu sync.Mutex
-
-	// pairDropped counts routing pairs dropped for insufficient buffer room
-	// (RecordPair's both-or-neither rule). Exported via DroppedPairs for
-	// tests/metrics.
-	pairDropped atomic.Int64
 
 	// schemaLevel indexes into the package-level schemas slice: the column
 	// set writeBatch currently believes inference_events supports. 0 (the
@@ -106,47 +93,11 @@ func New(pool *pgxpool.Pool) *Recorder {
 
 // Record enqueues an InferenceEvent. It never blocks.
 func (r *Recorder) Record(evt InferenceEvent) {
-	r.enqueueMu.Lock()
-	defer r.enqueueMu.Unlock()
 	select {
 	case r.events <- evt:
 	default:
 		slog.Warn("inference event buffer full, dropping event", "request_id", evt.RequestID)
 	}
-}
-
-// RecordPair enqueues main and routing together, atomically: either both are
-// queued or neither is (see handler/chat.go: a routed alias's model
-// classifier call produces exactly these two rows — purpose="inference" and
-// purpose="routing" — sharing one request_id, and a partial write would
-// leave an orphaned routing row or an inference row silently missing its
-// classifier explanation). Never blocks: if the buffer does not currently
-// have room for both, the pair is dropped, pairDropped is incremented, and a
-// warning is logged — exactly like Record's full-buffer drop, just for two
-// events instead of one.
-func (r *Recorder) RecordPair(main, routing InferenceEvent) {
-	r.enqueueMu.Lock()
-	defer r.enqueueMu.Unlock()
-
-	if len(r.events)+2 > cap(r.events) {
-		r.pairDropped.Add(1)
-		slog.Warn("inference event buffer has insufficient room for a routing pair, dropping both", "request_id", main.RequestID)
-		return
-	}
-	// Both sends below are guaranteed to succeed without blocking: the
-	// capacity check above was taken under enqueueMu, and every other writer
-	// (Record) also takes enqueueMu before sending, so no concurrent send can
-	// consume the two slots just reserved. The only concurrent access to
-	// r.events without the lock is flush()'s receive, which only ever
-	// increases free capacity.
-	r.events <- main
-	r.events <- routing
-}
-
-// DroppedPairs reports how many RecordPair calls have been dropped for
-// insufficient buffer room, for tests and /health-style diagnostics.
-func (r *Recorder) DroppedPairs() int64 {
-	return r.pairDropped.Load()
 }
 
 // Drain flushes all remaining events in the channel and returns.

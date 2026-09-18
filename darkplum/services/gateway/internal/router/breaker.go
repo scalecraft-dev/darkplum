@@ -6,12 +6,12 @@ import (
 	"time"
 )
 
-// breaker is the consecutive-failure circuit breaker shared by ModelClassifier
-// and SemanticRouterClassifier: after threshold consecutive call failures, it
+// breaker is the consecutive-failure circuit breaker used by
+// SemanticRouterClassifier: after threshold consecutive call failures, it
 // stays open for openDuration (fallback:circuit_open, no call attempted)
 // before allowing a call through again. Safe for concurrent use.
 type breaker struct {
-	name         string // for log lines, e.g. "model classifier" / "semantic router"
+	name         string // for log lines, e.g. "semantic router"
 	threshold    int
 	openDuration time.Duration
 

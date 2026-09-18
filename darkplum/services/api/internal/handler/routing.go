@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -36,6 +38,13 @@ const (
 	routeKeywordsMaxCount  = 32  // mirrors model_alias_routes.keywords' cardinality CHECK
 
 	aliasTestMaxTextBytes = 16 * 1024 // 16 KiB, per DESIGN3's /model-aliases/:alias/test contract
+
+	// classifierKindSemanticRouter mirrors model_aliases.classifier_kind's
+	// 'semantic_router' value (migration 010, narrowed to two values by 014).
+	// It is the only classifier kind that triggers a gateway health probe for
+	// the "Semantic Router is not installed" warning — see
+	// semanticRouterNeedsWarning.
+	classifierKindSemanticRouter = "semantic_router"
 )
 
 // validAliasFormat is a pure predicate so alias validation can be unit tested
@@ -80,6 +89,20 @@ func normalizeKeyword(kw string) (string, bool) {
 	return strings.ToLower(trimmed), true
 }
 
+// semanticRouterHealthCacheTTL bounds how often PutAlias/ListAliases probe
+// the gateway's own unauthenticated GET /health for Semantic Router status,
+// mirroring the gateway's own SemanticRouterClassifier.HealthStatus cache —
+// a cheap cached probe, not a per-request round trip.
+const semanticRouterHealthCacheTTL = 30 * time.Second
+
+// semanticRouterProbeTimeout bounds one health probe call.
+const semanticRouterProbeTimeout = 2 * time.Second
+
+// semanticRouterNotConfiguredWarning is the exact warning text surfaced on a
+// routed alias using classifier_kind='semantic_router' when the gateway's
+// own /health reports routing.classifier.semantic_router.status != "configured".
+const semanticRouterNotConfiguredWarning = "Semantic Router is not installed on the gateway — run 'make deploy-semantic-router'. Until then this alias always uses its default route."
+
 // RoutingHandler serves the model-alias and routing-policy admin endpoints.
 type RoutingHandler struct {
 	db       *pgxpool.Pool
@@ -91,9 +114,19 @@ type RoutingHandler struct {
 	// gatewayURL and serviceKey are used by TestAlias to proxy an admin's
 	// "test a prompt" request to the gateway's routing dryrun endpoint,
 	// mirroring ChatHandler/ModelHandler's own gateway-calling fields.
+	// gatewayURL is also used, unauthenticated, by semanticRouterNeedsWarning.
 	gatewayURL string
 	serviceKey string
 	httpClient *http.Client
+
+	// srProbeMu guards the cached result of the last gateway /health probe
+	// (see semanticRouterNeedsWarning): srProbeWarn is valid until
+	// srProbeExpiresAt. A probe failure (gateway unreachable, bad response)
+	// never fails the calling request — it caches "no warning" for the same
+	// TTL and logs once, rather than retrying on every alias in the response.
+	srProbeMu        sync.Mutex
+	srProbeWarn      bool
+	srProbeExpiresAt time.Time
 }
 
 // NewRoutingHandler returns a RoutingHandler backed by db. gatewayURL and
@@ -119,9 +152,11 @@ func (h *RoutingHandler) SetAvailabilityWindow(w time.Duration) {
 }
 
 // aliasClassifierResponse is the wire shape of a routed alias's classifier.
+// ModelID no longer exists (migration 014 dropped model_aliases.
+// classifier_model_id along with the classifier_kind='model' value it
+// belonged to) -- Kind is always 'rules' or 'semantic_router' now.
 type aliasClassifierResponse struct {
-	Kind    string  `json:"kind"`
-	ModelID *string `json:"model_id,omitempty"`
+	Kind string `json:"kind"`
 }
 
 // aliasRouteResponse is the wire shape of one route within a routed alias's
@@ -158,6 +193,12 @@ type aliasResponse struct {
 	Routes             []aliasRouteResponse     `json:"routes,omitempty"`
 	CreatedAt          time.Time                `json:"created_at"`
 	UpdatedAt          time.Time                `json:"updated_at"`
+	// Warnings is populated only for a routed alias whose classifier is
+	// semantic_router, and only when the gateway's own /health reports its
+	// Semantic Router as not "configured" — see
+	// RoutingHandler.semanticRouterWarnings. Never populated for a static
+	// alias or a rules-classified routed alias.
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // rowsQuerier is satisfied by both *pgxpool.Pool and pgx.Tx, mirroring
@@ -226,7 +267,6 @@ func (h *RoutingHandler) ListAliases(c *gin.Context) {
 			a.target_model_id,
 			a.default_route,
 			a.classifier_kind,
-			a.classifier_model_id,
 			(m.model_id IS NOT NULL) AS target_exists,
 			COALESCE(m.enabled, false) AS target_enabled,
 			m.backend_class,
@@ -246,15 +286,15 @@ func (h *RoutingHandler) ListAliases(c *gin.Context) {
 	now := time.Now()
 	aliases := make([]aliasResponse, 0)
 	var routedNames []string
+	var semanticRouterAliasIdx []int
 	for rows.Next() {
 		var a aliasResponse
 		var targetModelID *string
 		var defaultRoute *string
 		var classifierKind *string
-		var classifierModelID *string
 		var targetDiscoveredAt *time.Time
 		if err := rows.Scan(
-			&a.Alias, &a.Kind, &targetModelID, &defaultRoute, &classifierKind, &classifierModelID,
+			&a.Alias, &a.Kind, &targetModelID, &defaultRoute, &classifierKind,
 			&a.TargetExists, &a.TargetEnabled, &a.TargetBackendClass, &targetDiscoveredAt, &a.CreatedAt, &a.UpdatedAt,
 		); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "scan alias failed"})
@@ -269,7 +309,10 @@ func (h *RoutingHandler) ListAliases(c *gin.Context) {
 				a.DefaultRoute = *defaultRoute
 			}
 			if classifierKind != nil {
-				a.Classifier = &aliasClassifierResponse{Kind: *classifierKind, ModelID: classifierModelID}
+				a.Classifier = &aliasClassifierResponse{Kind: *classifierKind}
+				if *classifierKind == classifierKindSemanticRouter {
+					semanticRouterAliasIdx = append(semanticRouterAliasIdx, len(aliases))
+				}
 			}
 			routedNames = append(routedNames, a.Alias)
 		}
@@ -288,6 +331,12 @@ func (h *RoutingHandler) ListAliases(c *gin.Context) {
 	for i := range aliases {
 		if aliases[i].Kind == aliasKindRouted {
 			aliases[i].Routes = routesByAlias[aliases[i].Alias]
+		}
+	}
+
+	if len(semanticRouterAliasIdx) > 0 && h.semanticRouterNeedsWarning(ctx) {
+		for _, idx := range semanticRouterAliasIdx {
+			aliases[idx].Warnings = []string{semanticRouterNotConfiguredWarning}
 		}
 	}
 
@@ -389,11 +438,11 @@ func validateRoutedAliasShape(req putAliasRequest) ([]putAliasRouteInput, error)
 			return nil, fmt.Errorf("classifier.model_id must not be set when classifier.kind is %q", req.Classifier.Kind)
 		}
 	case "model":
-		if req.Classifier.ModelID == nil || *req.Classifier.ModelID == "" {
-			return nil, errors.New("classifier.model_id is required when classifier.kind is 'model'")
-		}
+		// Owner decision, ratified by product: the in-house "model" classifier
+		// (an Arch-Router prompt-protocol re-implementation) is removed.
+		return nil, errors.New("classifier kind 'model' is no longer supported; use 'rules' or 'semantic_router'")
 	default:
-		return nil, errors.New("classifier.kind must be 'rules', 'semantic_router', or 'model'")
+		return nil, errors.New("classifier.kind must be 'rules' or 'semantic_router'")
 	}
 
 	return normalized, nil
@@ -494,9 +543,9 @@ func (h *RoutingHandler) PutAlias(c *gin.Context) {
 
 // putStaticAlias is the kind='static' half of PutAlias: unchanged behaviour
 // from before routed aliases existed, except the upsert now also resets
-// default_route/classifier_kind/classifier_model_id to NULL and clears any
-// leftover model_alias_routes rows, so retargeting a previously-routed alias
-// back to static leaves no orphaned routing state behind.
+// default_route/classifier_kind to NULL and clears any leftover
+// model_alias_routes rows, so retargeting a previously-routed alias back to
+// static leaves no orphaned routing state behind.
 func (h *RoutingHandler) putStaticAlias(c *gin.Context, tx pgx.Tx, alias string, req putAliasRequest) {
 	ctx := c.Request.Context()
 
@@ -537,11 +586,11 @@ func (h *RoutingHandler) putStaticAlias(c *gin.Context, tx pgx.Tx, alias string,
 	var row aliasResponse
 	var created bool
 	err = tx.QueryRow(ctx, `
-		INSERT INTO model_aliases (alias, kind, target_model_id, default_route, classifier_kind, classifier_model_id, created_at, updated_at)
-		VALUES ($1, 'static', $2, NULL, NULL, NULL, now(), now())
+		INSERT INTO model_aliases (alias, kind, target_model_id, default_route, classifier_kind, created_at, updated_at)
+		VALUES ($1, 'static', $2, NULL, NULL, now(), now())
 		ON CONFLICT (alias) DO UPDATE
 			SET kind = 'static', target_model_id = EXCLUDED.target_model_id,
-				default_route = NULL, classifier_kind = NULL, classifier_model_id = NULL,
+				default_route = NULL, classifier_kind = NULL,
 				updated_at = now()
 		RETURNING alias, target_model_id, created_at, updated_at, (xmax = 0)
 	`, alias, req.TargetModelID).Scan(&row.Alias, &row.TargetModelID, &row.CreatedAt, &row.UpdatedAt, &created)
@@ -653,34 +702,6 @@ func (h *RoutingHandler) putRoutedAlias(c *gin.Context, tx pgx.Tx, alias string,
 		}
 	}
 
-	// Classifier model: exists and backend_class = self_hosted. 400 either
-	// way (unlike a missing route target, which 404s) — the gateway
-	// re-validates this per request and degrades to default_route rather
-	// than failing closed if it ever drifts (see DESIGN3's
-	// fallback:classifier_invalid).
-	var classifierModelID *string
-	if req.Classifier.Kind == "model" {
-		info, ok := targetsByID[*req.Classifier.ModelID]
-		if !ok {
-			var bc string
-			err := tx.QueryRow(ctx, `SELECT backend_class FROM models WHERE model_id = $1`, *req.Classifier.ModelID).Scan(&bc)
-			if errors.Is(err, pgx.ErrNoRows) {
-				c.JSON(http.StatusBadRequest, gin.H{"error": "classifier model not found: " + *req.Classifier.ModelID})
-				return
-			}
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": "check classifier model failed"})
-				return
-			}
-			info = targetInfo{backendClass: bc}
-		}
-		if info.backendClass != backendClassSelfHosted {
-			c.JSON(http.StatusBadRequest, gin.H{"error": "classifier model must be self_hosted: " + *req.Classifier.ModelID})
-			return
-		}
-		classifierModelID = req.Classifier.ModelID
-	}
-
 	// 409: residency is currently self_hosted_only and one or more routes
 	// target a cloud_managed model. The per-request check in the gateway
 	// still enforces later flips (an admin flipping residency back to 'any'
@@ -708,14 +729,14 @@ func (h *RoutingHandler) putRoutedAlias(c *gin.Context, tx pgx.Tx, alias string,
 	var createdAt, updatedAt time.Time
 	var created bool
 	err = tx.QueryRow(ctx, `
-		INSERT INTO model_aliases (alias, kind, target_model_id, default_route, classifier_kind, classifier_model_id, created_at, updated_at)
-		VALUES ($1, 'routed', NULL, $2, $3, $4, now(), now())
+		INSERT INTO model_aliases (alias, kind, target_model_id, default_route, classifier_kind, created_at, updated_at)
+		VALUES ($1, 'routed', NULL, $2, $3, now(), now())
 		ON CONFLICT (alias) DO UPDATE
 			SET kind = 'routed', target_model_id = NULL, default_route = EXCLUDED.default_route,
-				classifier_kind = EXCLUDED.classifier_kind, classifier_model_id = EXCLUDED.classifier_model_id,
+				classifier_kind = EXCLUDED.classifier_kind,
 				updated_at = now()
 		RETURNING created_at, updated_at, (xmax = 0)
-	`, alias, req.DefaultRoute, req.Classifier.Kind, classifierModelID).Scan(&createdAt, &updatedAt, &created)
+	`, alias, req.DefaultRoute, req.Classifier.Kind).Scan(&createdAt, &updatedAt, &created)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "upsert alias failed"})
 		return
@@ -754,10 +775,13 @@ func (h *RoutingHandler) putRoutedAlias(c *gin.Context, tx pgx.Tx, alias string,
 		Alias:        alias,
 		Kind:         aliasKindRouted,
 		DefaultRoute: req.DefaultRoute,
-		Classifier:   &aliasClassifierResponse{Kind: req.Classifier.Kind, ModelID: classifierModelID},
+		Classifier:   &aliasClassifierResponse{Kind: req.Classifier.Kind},
 		Routes:       routesByAlias[alias],
 		CreatedAt:    createdAt,
 		UpdatedAt:    updatedAt,
+	}
+	if req.Classifier.Kind == classifierKindSemanticRouter && h.semanticRouterNeedsWarning(ctx) {
+		resp.Warnings = []string{semanticRouterNotConfiguredWarning}
 	}
 
 	evtType := activity.ModelAliasUpdated
@@ -994,4 +1018,84 @@ func (h *RoutingHandler) cloudManagedRouteWarnings(ctx context.Context) ([]strin
 		return nil, fmt.Errorf("cloud-managed routes rows: %w", err)
 	}
 	return warnings, nil
+}
+
+// semanticRouterNeedsWarning reports whether a routed alias using
+// classifier_kind='semantic_router' should carry
+// semanticRouterNotConfiguredWarning right now. It probes the gateway's own
+// unauthenticated GET {gatewayURL}/health at most once per
+// semanticRouterHealthCacheTTL (shared across every call from PutAlias and
+// ListAliases, not per alias) and caches the result for that window.
+//
+// A probe failure (gateway unreachable, non-200, unparseable body) never
+// fails the caller's request and never surfaces a warning for that window —
+// "no signal" is treated as "assume configured" rather than alarming an
+// admin over a transient network blip — but it is logged once per window via
+// slog.Warn so an operator can still notice a gateway that is down for an
+// extended period.
+func (h *RoutingHandler) semanticRouterNeedsWarning(ctx context.Context) bool {
+	h.srProbeMu.Lock()
+	if time.Now().Before(h.srProbeExpiresAt) {
+		warn := h.srProbeWarn
+		h.srProbeMu.Unlock()
+		return warn
+	}
+	h.srProbeMu.Unlock()
+
+	warn, err := h.probeSemanticRouterConfigured(ctx)
+	if err != nil {
+		slog.Warn("routing: gateway health probe for semantic router status failed", "err", err)
+		warn = false
+	}
+
+	h.srProbeMu.Lock()
+	h.srProbeWarn = warn
+	h.srProbeExpiresAt = time.Now().Add(semanticRouterHealthCacheTTL)
+	h.srProbeMu.Unlock()
+	return warn
+}
+
+// gatewayHealthResponse is the subset of the gateway's GET /health body
+// semanticRouterNeedsWarning needs. See gateway cmd/main.go's
+// newHealthHandler for the full shape.
+type gatewayHealthResponse struct {
+	Routing struct {
+		Classifier struct {
+			SemanticRouter struct {
+				Status string `json:"status"`
+			} `json:"semantic_router"`
+		} `json:"classifier"`
+	} `json:"routing"`
+}
+
+// probeSemanticRouterConfigured calls the gateway's unauthenticated /health
+// and reports whether routing.classifier.semantic_router.status is anything
+// other than "configured" (i.e. a warning is warranted). Returns a non-nil
+// error for any failure to obtain that answer (network, non-200, bad JSON) —
+// the caller decides how to degrade.
+func (h *RoutingHandler) probeSemanticRouterConfigured(ctx context.Context) (bool, error) {
+	probeCtx, cancel := context.WithTimeout(ctx, semanticRouterProbeTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(probeCtx, http.MethodGet, h.gatewayURL+"/health", nil)
+	if err != nil {
+		return false, fmt.Errorf("build gateway health request: %w", err)
+	}
+
+	resp, err := h.httpClient.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("call gateway health: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("gateway health returned %d", resp.StatusCode)
+	}
+
+	var body gatewayHealthResponse
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64*1024)).Decode(&body); err != nil {
+		return false, fmt.Errorf("decode gateway health: %w", err)
+	}
+
+	return body.Routing.Classifier.SemanticRouter.Status != "configured", nil
 }

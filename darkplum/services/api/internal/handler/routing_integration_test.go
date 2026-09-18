@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -511,8 +512,8 @@ func TestPutAlias_Routed_CreateListAndDeleteCascades(t *testing.T) {
 	if row.DefaultRoute != "general" {
 		t.Fatalf("default_route = %q, want general", row.DefaultRoute)
 	}
-	if row.Classifier == nil || row.Classifier.Kind != "rules" || row.Classifier.ModelID != nil {
-		t.Fatalf("classifier = %+v, want rules with no model_id", row.Classifier)
+	if row.Classifier == nil || row.Classifier.Kind != "rules" {
+		t.Fatalf("classifier = %+v, want rules", row.Classifier)
 	}
 	if len(row.Routes) != 2 {
 		t.Fatalf("routes = %+v, want 2 entries", row.Routes)
@@ -601,8 +602,153 @@ func TestPutAlias_Routed_SemanticRouterClassifierEchoedBack(t *testing.T) {
 	if err := json.Unmarshal(resp.Body.Bytes(), &row); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if row.Classifier == nil || row.Classifier.Kind != "semantic_router" || row.Classifier.ModelID != nil {
-		t.Fatalf("classifier = %+v, want semantic_router with no model_id", row.Classifier)
+	if row.Classifier == nil || row.Classifier.Kind != "semantic_router" {
+		t.Fatalf("classifier = %+v, want semantic_router", row.Classifier)
+	}
+}
+
+// fakeGatewayHealth returns an httptest.Server serving the gateway's
+// unauthenticated GET /health with the given Semantic Router status, in the
+// same shape RoutingHandler.probeSemanticRouterConfigured parses.
+func fakeGatewayHealth(t *testing.T, status string) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/health" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"status":"ok","routing":{"classifier":{"semantic_router":{"status":%q}}}}`, status)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestPutAlias_Routed_SemanticRouterConfigured_NoWarning asserts the
+// happy path: when the gateway reports its Semantic Router as "configured",
+// PutAlias's response carries no warnings at all.
+func TestPutAlias_Routed_SemanticRouterConfigured_NoWarning(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	userID := newTestUser(t, ctx, pool)
+	insertModel(t, ctx, pool, "llama3", backendClassSelfHosted, true)
+	gw := fakeGatewayHealth(t, "configured")
+	h := NewRoutingHandler(pool, activity.NewRecorder(pool), gw.URL, "unused")
+	r := newRoutingTestRouter(h, userID)
+
+	body := routedBody("general", [2]string{"general", "llama3"})
+	body["classifier"] = map[string]any{"kind": "semantic_router"}
+	resp := doJSON(t, r, http.MethodPut, "/api/v1/model-aliases/smart", body)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+	var row aliasResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &row); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(row.Warnings) != 0 {
+		t.Fatalf("expected no warnings when the gateway reports semantic_router configured, got %v", row.Warnings)
+	}
+}
+
+// TestPutAlias_Routed_SemanticRouterNotConfigured_Warns covers the core
+// contract: the PUT still succeeds (200) but carries the exact warning text,
+// and GET /model-aliases surfaces the same warning for that alias afterward
+// (the cached probe result is shared, not re-fetched per request).
+func TestPutAlias_Routed_SemanticRouterNotConfigured_Warns(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	userID := newTestUser(t, ctx, pool)
+	insertModel(t, ctx, pool, "llama3", backendClassSelfHosted, true)
+	gw := fakeGatewayHealth(t, "unconfigured")
+	h := NewRoutingHandler(pool, activity.NewRecorder(pool), gw.URL, "unused")
+	r := newRoutingTestRouter(h, userID)
+
+	body := routedBody("general", [2]string{"general", "llama3"})
+	body["classifier"] = map[string]any{"kind": "semantic_router"}
+	resp := doJSON(t, r, http.MethodPut, "/api/v1/model-aliases/smart", body)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (a warning must never fail the request); body = %s", resp.Code, resp.Body.String())
+	}
+	var row aliasResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &row); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(row.Warnings) != 1 || row.Warnings[0] != semanticRouterNotConfiguredWarning {
+		t.Fatalf("warnings = %v, want [%q]", row.Warnings, semanticRouterNotConfiguredWarning)
+	}
+
+	listResp := doJSON(t, r, http.MethodGet, "/api/v1/model-aliases", nil)
+	if listResp.Code != http.StatusOK {
+		t.Fatalf("list status = %d, body = %s", listResp.Code, listResp.Body.String())
+	}
+	var rows []aliasResponse
+	if err := json.Unmarshal(listResp.Body.Bytes(), &rows); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	if len(rows) != 1 || len(rows[0].Warnings) != 1 || rows[0].Warnings[0] != semanticRouterNotConfiguredWarning {
+		t.Fatalf("list rows = %+v, want the same warning on the semantic_router alias", rows)
+	}
+}
+
+// TestPutAlias_Routed_RulesAliasNeverCarriesSemanticRouterWarning asserts the
+// warning is scoped to classifier_kind='semantic_router' only — a
+// rules-classified routed alias never probes or warns, even when the
+// gateway's Semantic Router is unconfigured.
+func TestPutAlias_Routed_RulesAliasNeverCarriesSemanticRouterWarning(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	userID := newTestUser(t, ctx, pool)
+	insertModel(t, ctx, pool, "llama3", backendClassSelfHosted, true)
+	gw := fakeGatewayHealth(t, "unconfigured")
+	h := NewRoutingHandler(pool, activity.NewRecorder(pool), gw.URL, "unused")
+	r := newRoutingTestRouter(h, userID)
+
+	body := routedBody("general", [2]string{"general", "llama3"}) // classifier: rules (routedBody's default)
+	resp := doJSON(t, r, http.MethodPut, "/api/v1/model-aliases/smart", body)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+	var row aliasResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &row); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(row.Warnings) != 0 {
+		t.Fatalf("expected no warnings on a rules-classified alias, got %v", row.Warnings)
+	}
+}
+
+// TestPutAlias_Routed_SemanticRouterGatewayUnreachable_NeverFailsRequest
+// covers the fail-open contract: an unreachable gateway must never fail (or
+// even delay beyond the probe timeout) the PUT, must not produce a warning
+// (no signal is treated as "assume configured"), and logs exactly the kind
+// of operator-visible warning the design calls for.
+func TestPutAlias_Routed_SemanticRouterGatewayUnreachable_NeverFailsRequest(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	userID := newTestUser(t, ctx, pool)
+	insertModel(t, ctx, pool, "llama3", backendClassSelfHosted, true)
+	buf := captureLogs(t)
+	// Port 1 on loopback: nothing listens there, so the dial fails immediately
+	// (connection refused) rather than waiting out the 2s probe timeout.
+	h := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://127.0.0.1:1", "unused")
+	r := newRoutingTestRouter(h, userID)
+
+	body := routedBody("general", [2]string{"general", "llama3"})
+	body["classifier"] = map[string]any{"kind": "semantic_router"}
+	resp := doJSON(t, r, http.MethodPut, "/api/v1/model-aliases/smart", body)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("an unreachable gateway must never fail the PUT: status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+	var row aliasResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &row); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(row.Warnings) != 0 {
+		t.Fatalf("expected no warnings when the health probe itself fails, got %v", row.Warnings)
+	}
+	if !strings.Contains(buf.String(), "semantic router") {
+		t.Errorf("expected a logged warning about the failed health probe, got: %s", buf.String())
 	}
 }
 
@@ -632,12 +778,12 @@ func TestPutAlias_Routed_ValidationErrors(t *testing.T) {
 		{"duplicate route names", routedBody("general", [2]string{"general", "llama3"}, [2]string{"general", "claude-3-sonnet"}), http.StatusBadRequest},
 		{"target not found", routedBody("general", [2]string{"general", "does-not-exist"}), http.StatusNotFound},
 		{"target is itself an alias", routedBody("general", [2]string{"general", "base"}), http.StatusBadRequest},
-		{"classifier model not self_hosted", func() map[string]any {
+		{"classifier kind 'model' is rejected outright, with a self_hosted model id", func() map[string]any {
 			b := routedBody("general", [2]string{"general", "llama3"})
 			b["classifier"] = map[string]any{"kind": "model", "model_id": "not-self-hosted"}
 			return b
 		}(), http.StatusBadRequest},
-		{"classifier model not found", func() map[string]any {
+		{"classifier kind 'model' is rejected outright, with a nonexistent model id", func() map[string]any {
 			b := routedBody("general", [2]string{"general", "llama3"})
 			b["classifier"] = map[string]any{"kind": "model", "model_id": "does-not-exist"}
 			return b
@@ -653,7 +799,13 @@ func TestPutAlias_Routed_ValidationErrors(t *testing.T) {
 	}
 }
 
-func TestPutAlias_Routed_ClassifierModelSelfHostedSucceeds(t *testing.T) {
+// TestPutAlias_Routed_ClassifierKindModelRejected is the full HTTP-path
+// regression guard for the removed in-house model classifier: even a
+// self_hosted, otherwise-valid classifier model id must not resurrect
+// classifier_kind='model' — it is rejected outright with the exact message
+// admins/CI should see, before any database round trip that used to check
+// backend_class.
+func TestPutAlias_Routed_ClassifierKindModelRejected(t *testing.T) {
 	pool := setupTestDB(t)
 	ctx := context.Background()
 	userID := newTestUser(t, ctx, pool)
@@ -666,15 +818,12 @@ func TestPutAlias_Routed_ClassifierModelSelfHostedSucceeds(t *testing.T) {
 	body["classifier"] = map[string]any{"kind": "model", "model_id": "classifier-model"}
 
 	resp := doJSON(t, r, http.MethodPut, "/api/v1/model-aliases/smart", body)
-	if resp.Code != http.StatusOK {
-		t.Fatalf("status = %d, body = %s", resp.Code, resp.Body.String())
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", resp.Code, resp.Body.String())
 	}
-	var row aliasResponse
-	if err := json.Unmarshal(resp.Body.Bytes(), &row); err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if row.Classifier == nil || row.Classifier.Kind != "model" || row.Classifier.ModelID == nil || *row.Classifier.ModelID != "classifier-model" {
-		t.Fatalf("classifier = %+v", row.Classifier)
+	wantMsg := "classifier kind 'model' is no longer supported; use 'rules' or 'semantic_router'"
+	if msg := decodeErrorBody(t, resp); msg != wantMsg {
+		t.Fatalf("error = %q, want %q", msg, wantMsg)
 	}
 }
 

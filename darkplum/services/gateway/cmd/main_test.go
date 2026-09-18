@@ -77,8 +77,7 @@ func testChatHandler() *handler.ChatHandler {
 			snap:   policy.Snapshot{Enabled: map[string]bool{"llama-3-8b": true}, Residency: policy.ResidencyAny},
 			loaded: true,
 		},
-		rules, rules, rules,
-		nil,
+		rules, rules,
 	)
 }
 
@@ -236,9 +235,8 @@ func TestNewHealthHandler_IncludesRoutingAndPolicyStatus(t *testing.T) {
 	polStore := policy.NewPgStore(nil, 900*time.Second)
 
 	upstreamChecker := health.NewChecker(nil)
-	modelClassifier := router.NewModelClassifier(nil, staticRoutes{table: routing.NewTable(nil)}, fakePolicyStore{}, time.Second, 5, 30*time.Second)
 	semanticClassifier := router.NewSemanticRouterClassifier("", 0.6, time.Second, 5, 30*time.Second)
-	h := newHealthHandler(upstreamChecker, routeMgr, polStore, modelClassifier, semanticClassifier)
+	h := newHealthHandler(upstreamChecker, routeMgr, polStore, semanticClassifier)
 
 	router := gin.New()
 	router.GET("/health", h)
@@ -260,10 +258,6 @@ func TestNewHealthHandler_IncludesRoutingAndPolicyStatus(t *testing.T) {
 				LastErrorKind         *string `json:"last_error_kind"`
 			} `json:"sources"`
 			Classifier struct {
-				Model struct {
-					BreakerOpen         bool `json:"breaker_open"`
-					ConsecutiveFailures int  `json:"consecutive_failures"`
-				} `json:"model"`
 				SemanticRouter struct {
 					Status              string `json:"status"`
 					BreakerOpen         bool   `json:"breaker_open"`
@@ -306,12 +300,6 @@ func TestNewHealthHandler_IncludesRoutingAndPolicyStatus(t *testing.T) {
 		t.Errorf("routing.sources.lmstudio-dev.last_error_kind = %v, want \"unreachable\"", failingStatus.LastErrorKind)
 	}
 
-	if body.Routing.Classifier.Model.BreakerOpen {
-		t.Error("expected routing.classifier.model.breaker_open=false for a fresh classifier")
-	}
-	if body.Routing.Classifier.Model.ConsecutiveFailures != 0 {
-		t.Errorf("routing.classifier.model.consecutive_failures = %d, want 0", body.Routing.Classifier.Model.ConsecutiveFailures)
-	}
 	if body.Routing.Classifier.SemanticRouter.Status != "unconfigured" {
 		t.Errorf("routing.classifier.semantic_router.status = %q, want unconfigured (SEMANTIC_ROUTER_URL unset)", body.Routing.Classifier.SemanticRouter.Status)
 	}
@@ -326,6 +314,12 @@ func TestNewHealthHandler_IncludesRoutingAndPolicyStatus(t *testing.T) {
 	// what's already exposed on the authenticated /v1/models surface.
 	if bytes.Contains(w.Body.Bytes(), []byte("llama-3-8b")) || bytes.Contains(w.Body.Bytes(), []byte("mistral-7b")) {
 		t.Error("unauthenticated /health must not expose model ids, only counts")
+	}
+
+	// The removed in-house model classifier must have no trace in
+	// routing.classifier: only semantic_router remains.
+	if bytes.Contains(w.Body.Bytes(), []byte(`"model"`)) {
+		t.Errorf("routing.classifier must not contain a \"model\" entry anymore, got: %s", w.Body.String())
 	}
 
 	// Item 2 regression guard: /health must never leak upstream hostnames or

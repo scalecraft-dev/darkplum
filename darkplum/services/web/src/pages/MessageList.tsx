@@ -1,4 +1,4 @@
-import { memo, useEffect, useRef, useState } from 'react'
+import { memo, useEffect, useId, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -206,19 +206,24 @@ const ThinkingIndicator = () => (
 const Provenance = ({
   model,
   route,
-  routerReason,
+  reason,
   rerouted,
+  reasonId,
+  reasonOpen,
+  onToggleReason,
 }: {
   model: string
   route?: string | null
-  routerReason?: string | null
+  /** Already in plain language. Empty when the gateway sent no reason. */
+  reason: string
   rerouted?: boolean
+  reasonId: string
+  reasonOpen: boolean
+  onToggleReason: () => void
 }) => {
-  const reason = routerReasonText(routerReason)
   const spoken = [
     `Answered by ${formatModelName(model)}`,
     route ? `route ${route}` : '',
-    reason,
     rerouted ? 'the model this conversation had been using was no longer available' : '',
   ]
     .filter(Boolean)
@@ -226,24 +231,51 @@ const Provenance = ({
 
   return (
     <span className={styles.provenance}>
-      <span aria-hidden="true">
-        answered by <span className={styles.provenanceId} title={model}>{formatModelName(model)}</span>
-        {route && (
-          <>
-            {' · route '}
-            <span className={styles.provenanceId} title={reason || undefined}>{route}</span>
-          </>
-        )}
-        {rerouted && (
-          <span
-            className={styles.provenanceNote}
-            title="The model this conversation had been using is no longer available, so the alias chose again."
-          >
-            re-routed
-          </span>
-        )}
+      <span className={styles.provenanceLine}>
+        <span aria-hidden="true">
+          answered by <span className={styles.provenanceId} title={model}>{formatModelName(model)}</span>
+          {route && (
+            <>
+              {' · route '}
+              <span className={styles.provenanceId}>{route}</span>
+            </>
+          )}
+          {rerouted && (
+            <span
+              className={styles.provenanceNote}
+              title="The model this conversation had been using is no longer available, so the alias chose again."
+            >
+              re-routed
+            </span>
+          )}
+        </span>
+        <span className={styles.srOnly}>{spoken}</span>
       </span>
-      <span className={styles.srOnly}>{spoken}</span>
+      {reason && (
+        <button
+          type="button"
+          className={styles.reasonToggle}
+          onClick={onToggleReason}
+          aria-expanded={reasonOpen}
+          aria-controls={reasonId}
+        >
+          {reasonOpen ? 'Hide why' : 'Why this route?'}
+          <svg
+            className={`${styles.reasonChevron} ${reasonOpen ? styles.reasonChevronOpen : ''}`}
+            width="12"
+            height="12"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="2.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            <polyline points="6 9 12 15 18 9" />
+          </svg>
+        </button>
+      )}
     </span>
   )
 }
@@ -270,48 +302,64 @@ const AssistantBubble = memo(({
   isStreaming: boolean
   isLast: boolean
   onRegenerate?: () => void
-}) => (
-  <div className={`${styles.message} ${styles.assistant}`}>
-    <div className={styles.bubble}>
-      {isStreaming && !content ? (
-        <ThinkingIndicator />
-      ) : (
-        <>
-          <ReactMarkdown
-            remarkPlugins={remarkPlugins}
-            rehypePlugins={rehypePlugins}
-            components={mdComponents}
-          >
-            {content}
-          </ReactMarkdown>
-          {isStreaming && <span className={styles.cursor} aria-hidden="true" />}
-          {!isStreaming && content && (
-            <div className={styles.actions}>
-              <CopyButton value={content} label="Copy" />
-              {model && (
-                <Provenance
-                  model={model}
-                  route={route}
-                  routerReason={routerReason}
-                  rerouted={rerouted}
-                />
-              )}
-              {isLast && onRegenerate && (
-                <button className={styles.regenerate} onClick={onRegenerate} type="button">
-                  <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M1 4v5h5" />
-                    <path d="M3.51 10a6 6 0 1 0 .49-5L1 9" />
-                  </svg>
-                  Regenerate
-                </button>
-              )}
-            </div>
-          )}
-        </>
-      )}
+}) => {
+  const reasonId = useId()
+  // Closed by default: the line under a reply is a footnote, and the reason is
+  // one tap away rather than a hover only a mouse can find.
+  const [reasonOpen, setReasonOpen] = useState(false)
+  const reason = routerReasonText(routerReason)
+
+  return (
+    <div className={`${styles.message} ${styles.assistant}`}>
+      <div className={styles.bubble}>
+        {isStreaming && !content ? (
+          <ThinkingIndicator />
+        ) : (
+          <>
+            <ReactMarkdown
+              remarkPlugins={remarkPlugins}
+              rehypePlugins={rehypePlugins}
+              components={mdComponents}
+            >
+              {content}
+            </ReactMarkdown>
+            {isStreaming && <span className={styles.cursor} aria-hidden="true" />}
+            {!isStreaming && content && (
+              <div className={styles.footer}>
+                <div className={styles.actions}>
+                  <CopyButton value={content} label="Copy" />
+                  {model && (
+                    <Provenance
+                      model={model}
+                      route={route}
+                      reason={reason}
+                      rerouted={rerouted}
+                      reasonId={reasonId}
+                      reasonOpen={reasonOpen}
+                      onToggleReason={() => setReasonOpen((prev) => !prev)}
+                    />
+                  )}
+                  {isLast && onRegenerate && (
+                    <button className={styles.regenerate} onClick={onRegenerate} type="button">
+                      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M1 4v5h5" />
+                        <path d="M3.51 10a6 6 0 1 0 .49-5L1 9" />
+                      </svg>
+                      Regenerate
+                    </button>
+                  )}
+                </div>
+                {model && reason && reasonOpen && (
+                  <p className={styles.provenanceReason} id={reasonId}>{reason}</p>
+                )}
+              </div>
+            )}
+          </>
+        )}
+      </div>
     </div>
-  </div>
-))
+  )
+})
 AssistantBubble.displayName = 'AssistantBubble'
 
 export function MessageList({

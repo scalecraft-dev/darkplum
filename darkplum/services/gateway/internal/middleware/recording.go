@@ -167,23 +167,12 @@ func Recording(rec *recorder.Recorder) gin.HandlerFunc {
 			RouterLatencyMS:  routerLatencyMS,
 		}
 
-		// A routed alias's model classifier call produces a second,
-		// purpose="routing" event — set on ctx by ChatHandler.
-		// HandleChatCompletions right after the classifier call, since only
-		// the handler has the classifier call's own provider/tokens/latency/
-		// status metadata. The pair is enqueued atomically (both or
-		// neither — see Recorder.RecordPair): a partial write would leave a
-		// purpose="routing" row with no matching purpose="inference" row to
-		// explain, or vice versa. No such event exists for a rules or
-		// semantic-router classifier decision (no LLM saw the prompt), so
-		// the ordinary single-event Record path below is unchanged for
-		// those and for every non-routed request.
-		if v, ok := c.Get("routing_audit_event"); ok {
-			if routingEvt, ok := v.(recorder.InferenceEvent); ok {
-				rec.RecordPair(main, routingEvt)
-				return
-			}
-		}
+		// A routed alias's classifier decision never produces a second audit
+		// row today: RulesClassifier is pure I/O-free matching, and
+		// SemanticRouterClassifier calls a CPU-only classification API, not
+		// an LLM — neither is "a model seeing the prompt" in the sense that
+		// would warrant its own purpose="routing" event. Every request
+		// records exactly one InferenceEvent.
 		rec.Record(main)
 	}
 }

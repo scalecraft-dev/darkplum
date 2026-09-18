@@ -7,10 +7,8 @@
 // the unchanged route/enabled/residency chain, and a forbidden pick is
 // refused rather than silently redirected.
 //
-// Three Classifier implementations exist:
+// Two Classifier implementations exist:
 //   - RulesClassifier: ordered keyword/builtin-signal matching, no I/O.
-//   - ModelClassifier: asks a self-hosted LLM (via the provider registry) to
-//     name a route.
 //   - SemanticRouterClassifier: calls an in-cluster vLLM Semantic Router
 //     classification API (CPU-only, not an LLM inference).
 package router
@@ -28,7 +26,7 @@ import (
 type Input struct {
 	// Text is the text to classify: the last user turn, system prompt
 	// excluded, truncated via Truncate before being handed to a Classifier.
-	// Both RulesClassifier's keyword matching and ModelClassifier/
+	// Both RulesClassifier's keyword matching and
 	// SemanticRouterClassifier's calls operate on this value.
 	Text string
 	// OriginalLen is the rune length of the untruncated last-user-turn text.
@@ -56,28 +54,6 @@ type Decision struct {
 	// was chosen. See the Reason* and Builtin* constants for every value a
 	// Classifier in this package can produce.
 	Reason string
-	// ModelCall is non-nil only when this Decision came from an actual LLM
-	// call (ModelClassifier that reached prov.Complete) — never for
-	// RulesClassifier, SemanticRouterClassifier (CPU classification, not an
-	// LLM inference), or a ModelClassifier fallback that short-circuited
-	// before calling the model (classifier_invalid, circuit_open). The
-	// caller (handler/chat.go) uses this to build the second, purpose=
-	// "routing" audit row — "no model saw the prompt" means no second row.
-	ModelCall *ModelCallInfo
-}
-
-// ModelCallInfo carries the audit-relevant metadata of one classifier model
-// call, mirroring the subset of recorder.InferenceEvent fields that describe
-// a single provider call (see handler/chat.go's use of this to build the
-// purpose="routing" event).
-type ModelCallInfo struct {
-	Model            string
-	Provider         string
-	Region           string
-	PromptTokens     *int
-	CompletionTokens *int
-	LatencyMS        int
-	StatusCode       int
 }
 
 // Classifier decides a route for one request against a routed alias. Classify
@@ -98,33 +74,24 @@ var ErrAborted = errors.New("router: classification aborted, do not dispatch")
 
 // Reason vocabulary. Every Classifier in this package produces exactly one
 // of these (rules match/default reasons are built with fmt.Sprintf — see
-// rules.go — but always start with "rules:"; model-classifier success
-// reasons start with "model:"; semantic-router success reasons start with
-// "semantic:").
+// rules.go — but always start with "rules:"; semantic-router success
+// reasons start with "semantic:").
 const (
 	// ReasonRulesDefault is used by RulesClassifier when no route's keywords
 	// or builtin signals matched.
 	ReasonRulesDefault = "rules:default"
 
-	// ReasonFallbackClassifierInvalid is used by ModelClassifier and
-	// SemanticRouterClassifier when the per-request validity check fails:
-	// for a model classifier, classifier_model_id is not currently a
-	// self_hosted, enabled model; for the semantic router, SEMANTIC_ROUTER_URL
-	// is unset.
+	// ReasonFallbackClassifierInvalid is used by SemanticRouterClassifier
+	// when the per-request validity check fails: SEMANTIC_ROUTER_URL is
+	// unset.
 	ReasonFallbackClassifierInvalid = "fallback:classifier_invalid"
 
-	// ReasonFallbackUnparseable is used by ModelClassifier when the model's
-	// response, trimmed, does not exactly (case-insensitively) match any of
-	// the alias's route names.
-	ReasonFallbackUnparseable = "fallback:unparseable"
-
-	// ReasonFallbackTimeout is used by ModelClassifier and
-	// SemanticRouterClassifier when the call did not produce a usable
-	// response within the configured budget (a context.DeadlineExceeded) —
-	// and, since the closed vocabulary has no separate bucket for a hard
-	// transport failure, for any other non-canceled call error too: from the
-	// request's perspective the effect (no answer, fall back to
-	// default_route) is identical either way.
+	// ReasonFallbackTimeout is used by SemanticRouterClassifier when the call
+	// did not produce a usable response within the configured budget (a
+	// context.DeadlineExceeded) — and, since the closed vocabulary has no
+	// separate bucket for a hard transport failure, for any other
+	// non-canceled call error too: from the request's perspective the effect
+	// (no answer, fall back to default_route) is identical either way.
 	ReasonFallbackTimeout = "fallback:timeout"
 
 	// ReasonFallbackCircuitOpen is used when the classifier's circuit
@@ -155,6 +122,29 @@ const (
 // builtinLongThreshold is the character count above which BuiltinLong
 // matches (Input.OriginalLen > builtinLongThreshold).
 const builtinLongThreshold = 8000
+
+// matchRouteName finds the route in routes whose Name matches name (e.g. the
+// semantic router's "category"), returning the route's canonical-case Name.
+// It first tries an exact case-insensitive match (strings.EqualFold,
+// unchanged behaviour for callers that only differ by case); if that fails,
+// it falls back to comparing normalizeRouteToken of both sides, so a
+// decision like "computer science" or "Computer_Science" still matches a
+// route literally named "computer-science".
+func matchRouteName(routes []policy.RouteDef, name string) (string, bool) {
+	for _, r := range routes {
+		if strings.EqualFold(r.Name, name) {
+			return r.Name, true
+		}
+	}
+
+	normalized := normalizeRouteToken(name)
+	for _, r := range routes {
+		if normalizeRouteToken(r.Name) == normalized {
+			return r.Name, true
+		}
+	}
+	return "", false
+}
 
 // normalizeRouteToken normalises a route name or a classifier-provided
 // category/route field for loose matching (see matchRouteName): lowercased,

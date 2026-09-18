@@ -128,13 +128,13 @@ func (f *fakePolicyStore) Current() (policy.Snapshot, bool) { return f.snap, f.l
 var _ policy.Store = (*fakePolicyStore)(nil)
 
 // newTestHandler wires a ChatHandler from plain fakes — no network, no DB.
-// The three classifiers are a real RulesClassifier for all of them: none of
-// these tests exercise a routed alias, so the classifier is never invoked,
-// but a real (rather than nil) Classifier keeps NewChatHandler's contract
-// (all three always non-nil) honest even for tests that don't care.
+// The two classifiers are a real RulesClassifier for both: none of these
+// tests exercise a routed alias, so the classifier is never invoked, but a
+// real (rather than nil) Classifier keeps NewChatHandler's contract (both
+// always non-nil) honest even for tests that don't care.
 func newTestHandler(providers fakeProviders, routes map[string]routing.Route, snap policy.Snapshot, loaded bool) *ChatHandler {
 	rules := router.NewRulesClassifier()
-	return NewChatHandler(providers, staticRoutes{table: routing.NewTable(routes)}, &fakePolicyStore{snap: snap, loaded: loaded}, rules, rules, rules, nil)
+	return NewChatHandler(providers, staticRoutes{table: routing.NewTable(routes)}, &fakePolicyStore{snap: snap, loaded: loaded}, rules, rules)
 }
 
 // fakeClassifier is a router.Classifier test double whose Decision/error is
@@ -165,12 +165,12 @@ var _ router.Classifier = (*fakeClassifier)(nil)
 
 // newRoutedTestHandler wires a ChatHandler for the routed-alias tests, with
 // a scripted classifier standing in for whichever classifier_kind the test's
-// alias uses (rules/model/semantic_router — the handler only cares that
+// alias uses (rules/semantic_router — the handler only cares that
 // classifierFor's dispatch reaches the SAME fake regardless of kind, so one
-// fake wired to all three slots keeps these tests independent of that
-// dispatch detail unless a test overrides it directly).
+// fake wired to both slots keeps these tests independent of that dispatch
+// detail unless a test overrides it directly).
 func newRoutedTestHandler(providers fakeProviders, routes map[string]routing.Route, snap policy.Snapshot, classifier router.Classifier) *ChatHandler {
-	return NewChatHandler(providers, staticRoutes{table: routing.NewTable(routes)}, &fakePolicyStore{snap: snap, loaded: true}, classifier, classifier, classifier, nil)
+	return NewChatHandler(providers, staticRoutes{table: routing.NewTable(routes)}, &fakePolicyStore{snap: snap, loaded: true}, classifier, classifier)
 }
 
 // ---------------------------------------------------------------------------

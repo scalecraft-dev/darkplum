@@ -229,14 +229,14 @@ func (s *PgStore) loadFromDB(ctx context.Context) (Snapshot, error) {
 
 	var aliasRows []rawAliasRow
 	arows, err := s.pool.Query(ctx, `
-		SELECT alias, kind, target_model_id, default_route, classifier_kind, classifier_model_id
+		SELECT alias, kind, target_model_id, default_route, classifier_kind
 		  FROM model_aliases`)
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("policy: query model_aliases: %w", err)
 	}
 	for arows.Next() {
 		var a rawAliasRow
-		if err := arows.Scan(&a.Alias, &a.Kind, &a.Target, &a.DefaultRoute, &a.ClassifierKind, &a.ClassifierModel); err != nil {
+		if err := arows.Scan(&a.Alias, &a.Kind, &a.Target, &a.DefaultRoute, &a.ClassifierKind); err != nil {
 			arows.Close()
 			return Snapshot{}, fmt.Errorf("policy: scan model_aliases row: %w", err)
 		}
@@ -266,17 +266,16 @@ type rawRouteRow struct {
 	Keywords    []string
 }
 
-// rawAliasRow is one scanned model_aliases row (migration 013). Target,
-// DefaultRoute, ClassifierKind, and ClassifierModel are nullable per the
-// alias_kind_shape CHECK constraint (NULL for the fields that don't apply to
-// this row's Kind).
+// rawAliasRow is one scanned model_aliases row (migration 013, narrowed by
+// 014 — classifier_model_id is no longer selected, see buildAliases). Target,
+// DefaultRoute, and ClassifierKind are nullable per the alias_kind_shape
+// CHECK constraint (NULL for the fields that don't apply to this row's Kind).
 type rawAliasRow struct {
-	Alias           string
-	Kind            string
-	Target          *string
-	DefaultRoute    *string
-	ClassifierKind  *string
-	ClassifierModel *string
+	Alias          string
+	Kind           string
+	Target         *string
+	DefaultRoute   *string
+	ClassifierKind *string
 }
 
 // buildAliases assembles the Aliases map of a Snapshot from the raw scanned
@@ -293,6 +292,15 @@ type rawAliasRow struct {
 // edit, or simply two independently-deployed services never being perfectly
 // in sync) — resolving a request to an empty target would be worse than
 // dropping the alias and refusing it with 404 model_not_found instead.
+//
+// classifier_kind = 'model' (the in-house classifier prompt protocol,
+// removed by migration 014) is a similar tolerance case: the api's
+// migration coerces every existing row to 'rules', but a gateway pod
+// started before that migration lands against a freshly onboarded (or
+// not-yet-migrated) customer database may still load a row carrying the old
+// value. Rather than drop the alias, it is treated as classifier_kind
+// 'rules' — RulesClassifier is always a safe, I/O-free degrade — with one
+// WARN logged for the whole snapshot load, not per alias or per request.
 func buildAliases(aliasRows []rawAliasRow, routeRows []rawRouteRow) map[string]AliasDef {
 	// routesByAlias holds every candidate route for a routed alias, still in
 	// model_alias_routes.position order. A static alias never has an entry.
@@ -311,6 +319,7 @@ func buildAliases(aliasRows []rawAliasRow, routeRows []rawRouteRow) map[string]A
 	}
 
 	aliases := make(map[string]AliasDef, len(aliasRows))
+	sawLegacyModelClassifierKind := false
 	for _, a := range aliasRows {
 		if a.Kind == AliasKindStatic {
 			if a.Target == nil {
@@ -334,8 +343,12 @@ func buildAliases(aliasRows []rawAliasRow, routeRows []rawRouteRow) map[string]A
 		if a.ClassifierKind != nil {
 			def.ClassifierKind = *a.ClassifierKind
 		}
-		if a.ClassifierModel != nil {
-			def.ClassifierModel = *a.ClassifierModel
+		if def.ClassifierKind == legacyClassifierKindModel {
+			// See buildAliases's doc comment: the model classifier is gone,
+			// but a not-yet-migrated (or pre-migration-014) row may still
+			// carry this value. Coerce to rules rather than drop the alias.
+			def.ClassifierKind = ClassifierKindRules
+			sawLegacyModelClassifierKind = true
 		}
 
 		if len(def.Routes) == 0 {
@@ -348,8 +361,18 @@ func buildAliases(aliasRows []rawAliasRow, routeRows []rawRouteRow) map[string]A
 		}
 		aliases[a.Alias] = def
 	}
+	if sawLegacyModelClassifierKind {
+		log.Printf("policy: WARNING one or more routed aliases had classifier_kind=%q (removed) — treating as %q for this snapshot; run migration 014 to persist the change", legacyClassifierKindModel, ClassifierKindRules)
+	}
 	return aliases
 }
+
+// legacyClassifierKindModel is the removed "model" classifier_kind value
+// (the in-house Arch-Router prompt protocol classifier, deleted alongside
+// internal/router's ModelClassifier). Not exported as a policy.ClassifierKind*
+// constant — it is not a value the gateway ever selects a classifier by,
+// only one it tolerates on load. See buildAliases.
+const legacyClassifierKindModel = "model"
 
 // compile-time interface check.
 var _ Store = (*PgStore)(nil)

@@ -145,8 +145,13 @@ export interface ModelAliasRoute extends AliasTargetHealth {
   keywords: string[]
 }
 
-/** How a routed alias decides which route answers. */
-export type AliasClassifierKind = 'rules' | 'model' | 'semantic_router'
+/** How a routed alias decides which route answers. Two can be written:
+ *  'semantic_router' (the primary path) and 'rules'. 'model' is removed — only
+ *  a pre-migration server still sends it, and the UI reads it as rules. */
+export type AliasClassifierKind = 'rules' | 'semantic_router' | 'model'
+
+/** The two kinds an administrator can choose. Read-only 'model' is not one. */
+export type AliasClassifierChoice = 'rules' | 'semantic_router'
 
 export type AliasClassifier =
   | { kind: 'rules'; model_id?: null }
@@ -163,6 +168,10 @@ export interface ModelAlias extends AliasTargetHealth {
   default_route?: string | null
   classifier?: AliasClassifier | null
   routes?: ModelAliasRoute[]
+  /** Configure-time notes from the API, one readable sentence each — e.g. the
+   *  Semantic Router is not installed on the gateway. Nothing is refused for
+   *  them: the alias saves and answers on its default route. */
+  warnings?: string[]
   created_at: string
   updated_at: string
 }
@@ -181,7 +190,7 @@ export type ModelAliasInput =
   | {
       kind: 'routed'
       default_route: string
-      classifier: AliasClassifier
+      classifier: { kind: AliasClassifierChoice }
       routes: ModelAliasRouteInput[]
     }
 

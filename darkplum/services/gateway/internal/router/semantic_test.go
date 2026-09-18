@@ -35,7 +35,7 @@ func TestDecideFromSemanticResult(t *testing.T) {
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if d.RouteName != "code" || d.Reason != "semantic:code" || d.ModelCall != nil {
+		if d.RouteName != "code" || d.Reason != "semantic:code" {
 			t.Errorf("got %+v", d)
 		}
 	})
@@ -122,9 +122,6 @@ func TestSemanticRouterClassifier_HappyPath(t *testing.T) {
 	}
 	if d.RouteName != "code" || d.Reason != "semantic:code" {
 		t.Errorf("got %+v", d)
-	}
-	if d.ModelCall != nil {
-		t.Error("semantic router classification must never produce a ModelCall (no second audit row — not an LLM inference)")
 	}
 	if status := c.HealthStatus(context.Background()); status != "configured" {
 		t.Errorf("HealthStatus() = %q, want configured", status)
