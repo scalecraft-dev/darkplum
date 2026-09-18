@@ -866,3 +866,106 @@ func TestGetConversation_BackfillsProvenanceRecordedAfterAppend(t *testing.T) {
 		t.Fatalf("backfill must persist, stored = %v", stored)
 	}
 }
+
+// backfillProvenance must never attribute a model to a turn other than the
+// one whose request_id it looked up: if a regenerate re-used the seq with a
+// different request_id, the UPDATE must not touch it.
+func TestBackfillProvenance_DoesNotAttributeAcrossReusedSeq(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	userA := newTestUserLabeled(t, ctx, pool, "a")
+	h := NewConversationHandler(pool, activity.NewRecorder(pool))
+	rA := newConversationsTestRouter(h, userA)
+
+	created := doJSON(t, rA, http.MethodPost, "/api/v1/conversations", map[string]any{
+		"messages": []map[string]any{{"role": "user", "content": "q"}},
+	})
+	var full conversationFull
+	if err := json.Unmarshal(created.Body.Bytes(), &full); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	doJSON(t, rA, http.MethodPost, "/api/v1/conversations/"+full.ID+"/messages", map[string]any{
+		"messages": []map[string]any{{"role": "assistant", "content": "old reply", "request_id": "req-old"}},
+	})
+
+	// Simulate the race: the read of the old row (seq 2, req-old) has happened,
+	// then a regenerate replaces seq 2 with a different request id, and only
+	// then does the old row's audit event arrive and the backfill run.
+	stale := []conversationMessage{{Seq: 2, Role: roleAssistant, RequestID: strPtr("req-old")}}
+	doJSON(t, rA, http.MethodDelete, "/api/v1/conversations/"+full.ID+"/messages?from_seq=2", nil)
+	doJSON(t, rA, http.MethodPost, "/api/v1/conversations/"+full.ID+"/messages", map[string]any{
+		"messages": []map[string]any{{"role": "assistant", "content": "new reply", "request_id": "req-new"}},
+	})
+	insertInferenceEvent(t, ctx, pool, "req-old", userA, "old-model")
+	h.backfillProvenance(ctx, userA, full.ID, stale)
+
+	var model *string
+	var rid string
+	if err := pool.QueryRow(ctx, `SELECT model, request_id FROM conversation_messages WHERE conversation_id = $1 AND seq = 2`, full.ID).Scan(&model, &rid); err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	if rid != "req-new" || model != nil {
+		t.Fatalf("regenerated turn was mis-attributed: request_id=%s model=%v", rid, model)
+	}
+	if stale[0].Model != nil {
+		t.Fatalf("backfill must not report a model it did not persist")
+	}
+}
+
+func strPtr(v string) *string { return &v }
+
+// Eight simultaneous imports of the same local conversation (a user with two
+// tabs open during the one-time migration) must produce exactly one server
+// conversation with its messages stored once, and every caller must get it.
+func TestCreateConversation_ConcurrentImportsOfSameKeyYieldOneConversation(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	userA := newTestUserLabeled(t, ctx, pool, "a")
+	h := NewConversationHandler(pool, activity.NewRecorder(pool))
+	rA := newConversationsTestRouter(h, userA)
+
+	body := map[string]any{
+		"import_key": "conv_local_42",
+		"title":      "Imported twice?",
+		"messages": []map[string]any{
+			{"role": "user", "content": "q"},
+			{"role": "assistant", "content": "a"},
+		},
+	}
+	const n = 8
+	ids := make([]string, n)
+	codes := make([]int, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			resp := doJSON(t, rA, http.MethodPost, "/api/v1/conversations", body)
+			codes[i] = resp.Code
+			var full conversationFull
+			if json.Unmarshal(resp.Body.Bytes(), &full) == nil {
+				ids[i] = full.ID
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	for i := 0; i < n; i++ {
+		if codes[i] != http.StatusCreated && codes[i] != http.StatusOK {
+			t.Fatalf("request %d: status %d", i, codes[i])
+		}
+		if ids[i] == "" || ids[i] != ids[0] {
+			t.Fatalf("request %d returned conversation %q, want the single conversation %q", i, ids[i], ids[0])
+		}
+	}
+	var convs, msgs int
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM conversations WHERE user_id = $1 AND import_key = 'conv_local_42'`, userA).Scan(&convs); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM conversation_messages WHERE conversation_id = $1`, ids[0]).Scan(&msgs); err != nil {
+		t.Fatalf("count messages: %v", err)
+	}
+	if convs != 1 || msgs != 2 {
+		t.Fatalf("expected 1 conversation with 2 messages, got %d / %d", convs, msgs)
+	}
+}

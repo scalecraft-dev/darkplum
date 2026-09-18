@@ -147,12 +147,19 @@ func (h *ConversationHandler) backfillProvenance(ctx context.Context, userID, co
 			}
 			continue
 		}
-		if _, err := h.db.Exec(ctx, `
+		// request_id is part of the predicate: between the SELECT above and this
+		// UPDATE a regenerate may have truncated and re-used the same seq for a
+		// different reply, and that reply must not inherit this one's model.
+		tag, err := h.db.Exec(ctx, `
 			UPDATE conversation_messages SET model = $1
-			WHERE conversation_id = $2 AND seq = $3 AND model IS NULL
-		`, model, convID, m.Seq); err != nil {
+			WHERE conversation_id = $2 AND seq = $3 AND request_id = $4 AND model IS NULL
+		`, model, convID, m.Seq, *m.RequestID)
+		if err != nil {
 			slog.WarnContext(ctx, "conversation provenance backfill update failed", "conversation", convID, "seq", m.Seq, "err", err)
 			continue
+		}
+		if tag.RowsAffected() == 0 {
+			continue // the turn at this seq is no longer the one we looked up
 		}
 		m.Model = &model
 	}
