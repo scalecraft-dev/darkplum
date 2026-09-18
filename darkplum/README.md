@@ -194,9 +194,14 @@ policy state and is meant for in-cluster probes and operators only.
 ## Conversation history
 
 Chat history is stored in the platform's Postgres database, in your account.
-Conversation content is readable only by its owner: there is no administrator
-endpoint that reads another user's conversations, and the usage log holds
-metadata only (who, when, which model, tokens) — never text. Each stored reply
+Conversation content is readable only by its owner through the platform: there
+is no administrator endpoint that reads another user's conversations, and the
+usage log holds metadata only (who, when, which model, tokens) — never text.
+That rule is enforced by the application, not by the database: the services
+share one Postgres role and row-level security is not enabled, so whoever holds
+the database credential (the operator who ran Terraform) can read every row
+directly, exactly as they can read the audit rows. Treat that credential
+accordingly. Each stored reply
 records the model that actually produced it, taken from the usage log rather
 than from the browser. Users can download their own history as JSON and delete
 conversations permanently (hard delete, no undo); deleting a user deletes all of
