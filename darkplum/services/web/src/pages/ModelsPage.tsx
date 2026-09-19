@@ -225,11 +225,13 @@ interface ProviderSectionProps {
   models: AdminModel[]
   togglingIds: Set<string>
   residency: Residency
+  /** The organisation's allowlist, or null when every enabled model is allowed. */
+  allowedModels: string[] | null
   onToggle: (model: AdminModel) => void
   onRename: (model: AdminModel, displayName: string | null) => Promise<void>
 }
 
-function ProviderSection({ provider, models, togglingIds, residency, onToggle, onRename }: ProviderSectionProps) {
+function ProviderSection({ provider, models, togglingIds, residency, allowedModels, onToggle, onRename }: ProviderSectionProps) {
   const [collapsed, setCollapsed] = useState(false)
 
   const enabledCount = models.filter((m) => m.enabled).length
@@ -253,17 +255,22 @@ function ProviderSection({ provider, models, togglingIds, residency, onToggle, o
   const renderModelRow = (m: AdminModel) => {
     const displayName = m.display_name ?? formatModelName(m.model_id)
     const cls = backendClassOf(m)
-    // Enabled, but the routing policy refuses cloud-managed models.
-    const blocked = m.enabled && residency === 'self_hosted_only' && cls === 'cloud_managed'
+    // Enabled, but the organisation's policy refuses it anyway: residency
+    // refuses cloud-managed models; an allowlist refuses anything not on it.
+    const residencyBlocked = m.enabled && residency === 'self_hosted_only' && cls === 'cloud_managed'
+    const allowlistBlocked = m.enabled && allowedModels !== null && !allowedModels.includes(m.model_id)
+    const blocked = residencyBlocked || allowlistBlocked
     // Configured, but the gateway has not seen its backend for a few minutes.
     const unreachable = !isReachable(m)
     // One hint per row. A policy refusal outranks an unreachable backend: it
     // still refuses the request once the backend comes back.
-    const hint = blocked
+    const hint = residencyBlocked
       ? 'Enabled, but refused while routing is self-hosted only.'
-      : unreachable
-        ? UNREACHABLE_HINT
-        : null
+      : allowlistBlocked
+        ? "Enabled, but not on the organisation's allowed list, so refused."
+        : unreachable
+          ? UNREACHABLE_HINT
+          : null
     return (
       <tr key={m.id} className={blocked || unreachable ? styles.rowFlagged : ''}>
         <td>
@@ -477,6 +484,7 @@ export function ModelsPage() {
   const [principalsError, setPrincipalsError] = useState<string | null>(null)
 
   const residency: Residency = policy?.residency ?? 'any'
+  const allowedModels: string[] | null = policy?.allowed_models ?? null
 
   const loadModels = useCallback(async () => {
     try {
@@ -788,6 +796,7 @@ export function ModelsPage() {
           filter={filter}
           togglingIds={togglingIds}
           residency={residency}
+          allowedModels={allowedModels}
           totalEnabled={totalEnabled}
           totalUnreachable={totalUnreachable}
           policyRestricted={policyRestricted}
@@ -852,6 +861,7 @@ interface ModelsTabProps {
   filter: Filter
   togglingIds: Set<string>
   residency: Residency
+  allowedModels: string[] | null
   totalEnabled: number
   totalUnreachable: number
   policyRestricted: boolean
@@ -871,6 +881,7 @@ function ModelsTab({
   filter,
   togglingIds,
   residency,
+  allowedModels,
   totalEnabled,
   totalUnreachable,
   policyRestricted,
@@ -1041,6 +1052,7 @@ function ModelsTab({
             models={providerModels}
             togglingIds={togglingIds}
             residency={residency}
+            allowedModels={allowedModels}
             onToggle={onToggle}
             onRename={onRename}
           />

@@ -14,7 +14,8 @@ import styles from './Tabs.module.css'
 //
 // Selection follows focus (automatic activation), which is what the pattern
 // calls for when switching tabs is cheap and has no side effects — as it is
-// here, where every tab's data is already in hand.
+// here, where every tab's data is already in hand. Panels are hidden, not
+// unmounted, so switching away never discards what someone was doing.
 // ---------------------------------------------------------------------------
 
 /** Two tab sets on one page must never share an id. A TabList's `scope`
@@ -100,10 +101,7 @@ export function Tab({ id, active = false, count, children, ...props }: TabProps)
       role="tab"
       id={tabDomId(scope, id)}
       aria-selected={active}
-      // Only the open panel is mounted, so only the open tab claims to control
-      // one. A reference to an element that is not in the document would be
-      // invalid ARIA, and says nothing useful about a tab that is not selected.
-      aria-controls={active ? panelDomId(scope, id) : undefined}
+      aria-controls={panelDomId(scope, id)}
       // Roving tabindex: Tab reaches the row, then the arrow keys move within
       // it — one stop for the whole set rather than one per tab.
       tabIndex={active ? 0 : -1}
@@ -132,12 +130,18 @@ interface TabPanelProps {
 }
 
 export function TabPanel({ id, scope, active, children }: TabPanelProps) {
-  if (!active) return null
+  // Every panel stays mounted and the inactive ones are hidden, rather than
+  // unmounted: a half-edited policy, an alias being written, a collapsed
+  // provider section must all still be there when the person comes back to
+  // the tab. `hidden` removes the panel from layout and from the
+  // accessibility tree, so nothing leaks; aria-controls can name every
+  // panel because every panel exists.
   return (
     <div
       role="tabpanel"
       id={panelDomId(scope, id)}
       aria-labelledby={tabDomId(scope, id)}
+      hidden={!active}
       // Every panel here opens on prose — a heading, or the note about the
       // organisation's policy — before it reaches a control. The pattern asks
       // for a tab stop in exactly that case, so that tabbing out of the tab
