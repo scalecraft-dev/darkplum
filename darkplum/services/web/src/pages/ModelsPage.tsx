@@ -894,6 +894,10 @@ function ModelsTab({
               className={styles.policyNoteLink}
               to={{ search: '?tab=policy' }}
               onClick={(e) => {
+                // A plain click switches in place and hands focus to the tab;
+                // a modified or middle click keeps the browser's own
+                // open-in-new-tab behaviour via the real href.
+                if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
                 e.preventDefault()
                 onGoToTab('policy')
               }}
