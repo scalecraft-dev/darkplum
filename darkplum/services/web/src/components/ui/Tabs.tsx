@@ -135,7 +135,12 @@ export function TabPanel({ id, scope, active, children }: TabPanelProps) {
   // provider section must all still be there when the person comes back to
   // the tab. `hidden` removes the panel from layout and from the
   // accessibility tree, so nothing leaks; aria-controls can name every
-  // panel because every panel exists.
+  // panel because every panel exists. One seam to know: a modal opened from
+  // inside a panel is portalled to <body> and keeps its own open state, so
+  // it is not hidden with the panel. Today every way to switch tabs is a
+  // click or a key the modal's focus trap already blocks; a future non-modal
+  // entry point (a global shortcut, say) would need to close such a modal
+  // first.
   return (
     <div
       role="tabpanel"
