@@ -83,7 +83,7 @@ function failureCopy(
       return {
         title: 'Blocked by the routing policy',
         hint: isAdmin
-          ? 'The policy allows self-hosted models only. Pick a self-hosted model, or change the routing policy on the Models page.'
+          ? 'The policy allows self-hosted models only. Pick a self-hosted model, or change the routing policy under Models → Policy.'
           : 'Your organization allows self-hosted models only. Pick a self-hosted model from the list.',
       }
     case 'policy_unavailable':
@@ -112,10 +112,12 @@ const FailureNotice = ({
 }) => {
   const { title, hint } = failureCopy(failure.code, isAdmin)
   const modelGone = failure.modelGone ?? false
-  const policyRelated =
-    failure.code === 'model_not_found' ||
-    failure.code === 'model_not_enabled' ||
-    failure.code === 'model_residency_violation'
+  // Fixed in the catalogue: the model is missing from it, or switched off in it.
+  const catalogueRelated =
+    failure.code === 'model_not_found' || failure.code === 'model_not_enabled'
+  // Fixed in the organisation's routing policy, which is its own tab on the
+  // Models page — the model is enabled, the policy is what refuses it.
+  const orgPolicyRelated = failure.code === 'model_residency_violation'
   // A per-principal refusal is fixed where per-principal policy is written, not
   // on the Models page: the model itself is enabled and allowed for the org.
   const principalPolicyRelated = failure.code === 'model_not_allowed'
@@ -155,9 +157,14 @@ const FailureNotice = ({
             Try again
           </button>
         )}
-        {isAdmin && policyRelated && (
+        {isAdmin && catalogueRelated && (
           <Link to="/admin/models" className={styles.failureLink}>
             Open Models
+          </Link>
+        )}
+        {isAdmin && orgPolicyRelated && (
+          <Link to="/admin/models?tab=policy" className={styles.failureLink}>
+            Open routing policy
           </Link>
         )}
         {isAdmin && principalPolicyRelated && (

@@ -130,6 +130,15 @@ export function storedSummary(policy: PrincipalPolicy, models: AdminModel[]): st
  * Whether an effective policy narrows anything at all. When it does not, chat
  * has nothing to explain and the "why" affordance stays off the header.
  */
+/** Whether the organisation's own policy narrows anything: a residency
+ *  tighter than "any", or an allowlist at all. The policy card marks itself
+ *  restricted by this, and the catalogue tab says so by the same test. */
+export function orgPolicyRestricted(
+  policy: { residency: Residency; allowed_models?: string[] | null } | null,
+): boolean {
+  return policy !== null && (policy.residency === 'self_hosted_only' || (policy.allowed_models ?? null) !== null)
+}
+
 export function policyLimits(effective: EffectivePolicy | null): boolean {
   if (!effective) return false
   return effective.allowed_models !== null || effective.residency === 'self_hosted_only'

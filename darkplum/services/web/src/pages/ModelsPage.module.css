@@ -1,11 +1,39 @@
-/* --- Section heading above the model inventory --- */
+/* --- Cross-tab note ---
+   The catalogue and the policy that narrows it now live on separate tabs, so
+   the catalogue says once that something else is filtering it, at the weight
+   of the summary line rather than of a warning. */
 
-.sectionHeading {
-  font-size: var(--fs-md);
-  font-weight: var(--fw-semibold);
-  color: var(--fg-default);
-  letter-spacing: -0.01em;
+/* No gap: the glyph carries its own 4px, the same way it does inside a badge
+   and in the summary line. */
+.policyNote {
+  display: flex;
+  align-items: center;
   margin-bottom: var(--space-4);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-normal);
+  color: var(--fg-muted);
+  max-width: 68ch;
+}
+
+.policyNote svg {
+  flex-shrink: 0;
+  color: var(--warning-fg);
+}
+
+.policyNoteLink {
+  color: var(--brand-fg);
+  font-weight: var(--fw-medium);
+  text-decoration: none;
+  border-radius: var(--radius-sm);
+}
+
+.policyNoteLink:hover {
+  text-decoration: underline;
+}
+
+.policyNoteLink:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
 }
 
 /* --- Search + filter toolbar --- */
@@ -481,4 +509,18 @@
   .nameIcon {
     transition-duration: 0.01ms !important;
   }
+}
+
+/* Visually hidden, read by assistive tech — the Models tab's heading, whose
+   visible name is the tab itself. */
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }

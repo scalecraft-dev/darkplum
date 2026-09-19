@@ -16,24 +16,43 @@ import {
 import type { AdminModel, ApiKey, ModelAlias, PolicyPrincipal, PrincipalPolicy, User } from '../types'
 import { useAuth } from '../context/AuthContext'
 import { useToast } from '../components/Toast'
-import { Tab, TabList } from '../components/ui'
+import { Tab, TabList, TabPanel } from '../components/ui'
 import { KeyRevealModal } from './KeyRevealModal'
 import { UsersTab } from './UsersTab'
 import { ApiKeysTab } from './ApiKeysTab'
 import { PrincipalPolicyDrawer, type PolicyPrincipalRef } from './PrincipalPolicyDrawer'
 import pageStyles from './PageLayout.module.css'
-import styles from './AdminPage.module.css'
 
-type Tab = 'users' | 'api-keys'
+type TabKey = 'users' | 'api-keys'
+
+function tabFromParam(value: string | null): TabKey {
+  return value === 'api-keys' ? 'api-keys' : 'users'
+}
 
 export function AdminPage() {
   const { user: currentUser } = useAuth()
   const isAdmin = currentUser?.role === 'admin'
   const { toast } = useToast()
+  // The open tab is read from the URL rather than held beside it, so a link to
+  // ?tab=api-keys and the tab someone is looking at can never disagree.
   const [searchParams, setSearchParams] = useSearchParams()
-  const [tab, setTab] = useState<Tab>(() =>
-    searchParams.get('tab') === 'api-keys' ? 'api-keys' : 'users',
+  const tab = tabFromParam(searchParams.get('tab'))
+  const setTab = useCallback(
+    (next: TabKey) => {
+      setSearchParams(
+        (prev) => {
+          const params = new URLSearchParams(prev)
+          params.set('tab', next)
+          return params
+        },
+        // Replace: switching tabs is not a place someone navigated to, so Back
+        // should leave the page rather than walk back through the tabs.
+        { replace: true },
+      )
+    },
+    [setSearchParams],
   )
+
   const [users, setUsers] = useState<User[]>([])
   const [keys, setKeys] = useState<ApiKey[]>([])
   const [revealKey, setRevealKey] = useState<string | null>(null)
@@ -125,22 +144,23 @@ export function AdminPage() {
   }, [])
 
   // Deep link from the access overview on the Models page: ?tab=…&policy=<id>.
-  // The drawer opens as soon as the row it names has been read, and the query
-  // is cleared so a reload does not reopen it unasked.
+  // The drawer opens as soon as the row it names has been read, and `policy` is
+  // cleared so a reload does not reopen it unasked. `tab` stays — it is now the
+  // only record of which tab is open, and is set here to the one that actually
+  // holds the row, whatever the link asked for.
   useEffect(() => {
     const target = searchParams.get('policy')
     if (!target) return
     const key = keys.find((k) => k.id === target)
     const user = users.find((u) => u.id === target)
     if (!key && !user) return
-    if (key) {
-      setTab('api-keys')
-      openKeyPolicy(key)
-    } else if (user) {
-      setTab('users')
-      openUserPolicy(user)
-    }
+    const landOn: TabKey = key ? 'api-keys' : 'users'
+    if (key) openKeyPolicy(key)
+    else if (user) openUserPolicy(user)
+    // One write: setting the tab and dropping `policy` in two separate calls
+    // would race, the second overwriting the first from a stale snapshot.
     const next = new URLSearchParams(searchParams)
+    next.set('tab', landOn)
     next.delete('policy')
     setSearchParams(next, { replace: true })
   }, [searchParams, setSearchParams, users, keys, openUserPolicy, openKeyPolicy])
@@ -192,8 +212,9 @@ export function AdminPage() {
         <p className={pageStyles.subtitle}>Manage users, API keys and what each one can reach</p>
       </div>
 
-      <TabList>
+      <TabList label="Users and keys sections" scope="admin-page">
         <Tab
+          id="users"
           active={tab === 'users'}
           count={users.length > 0 ? users.length : undefined}
           onClick={() => setTab('users')}
@@ -207,6 +228,7 @@ export function AdminPage() {
           Users
         </Tab>
         <Tab
+          id="api-keys"
           active={tab === 'api-keys'}
           count={keys.length > 0 ? keys.length : undefined}
           onClick={() => setTab('api-keys')}
@@ -218,34 +240,33 @@ export function AdminPage() {
         </Tab>
       </TabList>
 
-      <div className={styles.tabContent}>
-        {tab === 'users' && (
-          <UsersTab
-            users={users}
-            models={models}
-            isAdmin={isAdmin}
-            currentUserId={currentUser?.id}
-            onCreate={handleCreateUser}
-            onDelete={handleDeleteUser}
-            onRoleChange={handleRoleChange}
-            onResetPassword={handleResetPassword}
-            onEditPolicy={openUserPolicy}
-            policyById={policyById}
-          />
-        )}
-        {tab === 'api-keys' && (
-          <ApiKeysTab
-            users={users}
-            apiKeys={keys}
-            models={models}
-            isAdmin={isAdmin}
-            onCreate={handleCreateKey}
-            onRevoke={handleRevoke}
-            onEditPolicy={openKeyPolicy}
-            policyById={policyById}
-          />
-        )}
-      </div>
+      <TabPanel id="users" scope="admin-page" active={tab === 'users'}>
+        <UsersTab
+          users={users}
+          models={models}
+          isAdmin={isAdmin}
+          currentUserId={currentUser?.id}
+          onCreate={handleCreateUser}
+          onDelete={handleDeleteUser}
+          onRoleChange={handleRoleChange}
+          onResetPassword={handleResetPassword}
+          onEditPolicy={openUserPolicy}
+          policyById={policyById}
+        />
+      </TabPanel>
+
+      <TabPanel id="api-keys" scope="admin-page" active={tab === 'api-keys'}>
+        <ApiKeysTab
+          users={users}
+          apiKeys={keys}
+          models={models}
+          isAdmin={isAdmin}
+          onCreate={handleCreateKey}
+          onRevoke={handleRevoke}
+          onEditPolicy={openKeyPolicy}
+          policyById={policyById}
+        />
+      </TabPanel>
 
       {revealKey && (
         <KeyRevealModal keyValue={revealKey} onClose={() => setRevealKey(null)} />

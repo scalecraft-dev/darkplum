@@ -1,7 +1,28 @@
+/* Sideways scroll rather than collapsed columns. The minimum is what these
+   tables need before an ARN, a model id or a status pair stops being legible;
+   on any laptop width the table is simply 100% and this never engages. */
+.scroll {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+.scroll:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: -2px;
+}
+
 .table {
   width: 100%;
+  min-width: 640px;
   border-collapse: collapse;
   font-size: var(--fs-sm);
+}
+
+/* A table showing its empty state has no columns to keep legible, and the
+   minimum above would push its centred message off to the right where it can
+   only be found by scrolling. Nothing to protect, so drop it. */
+.table:has(.empty) {
+  min-width: 0;
 }
 
 .table thead th {

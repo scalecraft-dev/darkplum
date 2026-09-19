@@ -190,7 +190,7 @@ export function ApiKeysTab({ users, apiKeys, models, isAdmin, onCreate, onRevoke
       </div>
 
       <div className={styles.tableCard}>
-        <Table>
+        <Table label="API keys">
           <thead>
             <tr>
               <th>Name</th>

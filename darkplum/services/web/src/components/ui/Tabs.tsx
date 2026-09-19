@@ -1,18 +1,83 @@
+import { createContext, useContext, useRef } from 'react'
 import styles from './Tabs.module.css'
 
 // ---------------------------------------------------------------------------
-// TabList — the container row
+// The WAI-ARIA tab pattern, implemented once for every page that uses tabs.
+//
+// A tab and its panel are tied together by ids derived from the same `id` a
+// caller already has for its tab key, so no caller has to invent a pair:
+//
+//   <TabList label="Models sections">
+//     <Tab id="models" active={tab === 'models'} onClick={…}>Models</Tab>
+//   </TabList>
+//   <TabPanel id="models" active={tab === 'models'}>…</TabPanel>
+//
+// Selection follows focus (automatic activation), which is what the pattern
+// calls for when switching tabs is cheap and has no side effects — as it is
+// here, where every tab's data is already in hand.
+// ---------------------------------------------------------------------------
+
+/** Two tab sets on one page must never share an id. A TabList's `scope`
+ *  prefixes every id under it; a TabPanel is a sibling of the list, so it
+ *  takes the same `scope` explicitly. */
+const tabDomId = (scope: string | undefined, id: string) => `tab-${scope ? `${scope}-` : ''}${id}`
+const panelDomId = (scope: string | undefined, id: string) => `tabpanel-${scope ? `${scope}-` : ''}${id}`
+const ScopeContext = createContext<string | undefined>(undefined)
+
+// ---------------------------------------------------------------------------
+// TabList — the container row, and the keyboard contract
 // ---------------------------------------------------------------------------
 
 interface TabListProps {
+  /** Names the set for anyone who reaches it by keyboard or screen reader —
+   *  "Models sections" rather than a second, unexplained list of buttons. */
+  label: string
+  /** Id prefix shared with this list's TabPanels (see tabDomId). */
+  scope?: string
   children: React.ReactNode
 }
 
-export function TabList({ children }: TabListProps) {
+export function TabList({ label, scope, children }: TabListProps) {
+  const ref = useRef<HTMLDivElement>(null)
+
+  /** Left/Right wrap around the row, Home/End jump to its ends. The tabs are
+   *  read from the DOM rather than from a registry, so the order a reader
+   *  moves through is exactly the order they are rendered in. Focus moves and
+   *  the tab is activated, as automatic activation requires. */
+  const onKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    const keys = ['ArrowLeft', 'ArrowRight', 'Home', 'End']
+    if (!keys.includes(e.key)) return
+    const el = ref.current
+    if (!el) return
+    const tabs = [...el.querySelectorAll<HTMLButtonElement>('[role="tab"]:not([disabled])')]
+    if (tabs.length === 0) return
+    const current = tabs.findIndex((t) => t === document.activeElement)
+    if (current === -1) return
+    e.preventDefault()
+    const next =
+      e.key === 'ArrowLeft'
+        ? (current - 1 + tabs.length) % tabs.length
+        : e.key === 'ArrowRight'
+          ? (current + 1) % tabs.length
+          : e.key === 'Home'
+            ? 0
+            : tabs.length - 1
+    tabs[next].focus()
+    tabs[next].click()
+  }
+
   return (
-    <div className={styles.tabList} role="tablist">
-      {children}
-    </div>
+    <ScopeContext.Provider value={scope}>
+      <div
+        ref={ref}
+        className={styles.tabList}
+        role="tablist"
+        aria-label={label}
+        onKeyDown={onKeyDown}
+      >
+        {children}
+      </div>
+    </ScopeContext.Provider>
   )
 }
 
@@ -20,17 +85,28 @@ export function TabList({ children }: TabListProps) {
 // Tab — a single tab button
 // ---------------------------------------------------------------------------
 
-interface TabProps extends React.ButtonHTMLAttributes<HTMLButtonElement> {
+interface TabProps extends Omit<React.ButtonHTMLAttributes<HTMLButtonElement>, 'id'> {
+  /** The tab's key. Also what its panel is found by. */
+  id: string
   active?: boolean
   count?: number
   children: React.ReactNode
 }
 
-export function Tab({ active = false, count, children, ...props }: TabProps) {
+export function Tab({ id, active = false, count, children, ...props }: TabProps) {
+  const scope = useContext(ScopeContext)
   return (
     <button
       role="tab"
+      id={tabDomId(scope, id)}
       aria-selected={active}
+      // Only the open panel is mounted, so only the open tab claims to control
+      // one. A reference to an element that is not in the document would be
+      // invalid ARIA, and says nothing useful about a tab that is not selected.
+      aria-controls={active ? panelDomId(scope, id) : undefined}
+      // Roving tabindex: Tab reaches the row, then the arrow keys move within
+      // it — one stop for the whole set rather than one per tab.
+      tabIndex={active ? 0 : -1}
       className={`${styles.tab} ${active ? styles.tabActive : ''}`}
       {...props}
     >
@@ -39,5 +115,38 @@ export function Tab({ active = false, count, children, ...props }: TabProps) {
         <span className={styles.tabCount}>{count}</span>
       )}
     </button>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// TabPanel — what the open tab is naming
+// ---------------------------------------------------------------------------
+
+interface TabPanelProps {
+  /** The id of the tab this panel belongs to. */
+  id: string
+  /** The same `scope` as the TabList the tab lives in. */
+  scope?: string
+  active: boolean
+  children: React.ReactNode
+}
+
+export function TabPanel({ id, scope, active, children }: TabPanelProps) {
+  if (!active) return null
+  return (
+    <div
+      role="tabpanel"
+      id={panelDomId(scope, id)}
+      aria-labelledby={tabDomId(scope, id)}
+      // Every panel here opens on prose — a heading, or the note about the
+      // organisation's policy — before it reaches a control. The pattern asks
+      // for a tab stop in exactly that case, so that tabbing out of the tab
+      // row lands on the panel and reads it, rather than skipping past it into
+      // the first input.
+      tabIndex={0}
+      className={styles.tabPanel}
+    >
+      {children}
+    </div>
   )
 }

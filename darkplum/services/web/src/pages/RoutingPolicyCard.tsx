@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { AdminModel, ModelAlias, Residency, RoutingPolicy } from '../types'
 import { backendClassOf } from '../lib/modelRouting'
-import { POLICY_RULE, POLICY_TIMING, aliasTargetIds, modelLabel } from '../lib/policy'
+import { POLICY_RULE, POLICY_TIMING, aliasTargetIds, modelLabel, orgPolicyRestricted } from '../lib/policy'
 import { Button, Modal } from '../components/ui'
 import { Skeleton } from '../components/ui/Skeleton'
 import { ModelAllowlistPicker } from './ModelAllowlistPicker'
@@ -182,7 +182,7 @@ export function RoutingPolicyCard({
     void commit()
   }
 
-  const restricted = saved.residency === 'self_hosted_only' || saved.allowed_models !== null
+  const restricted = orgPolicyRestricted(saved)
 
   return (
     <section

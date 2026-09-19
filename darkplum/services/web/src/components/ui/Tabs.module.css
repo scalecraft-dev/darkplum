@@ -24,6 +24,14 @@
   color: var(--fg-default);
 }
 
+/* Only the open tab is in the tab order, so its focus ring is the one thing
+   telling a keyboard reader the arrow keys now move within the row. */
+.tab:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: -2px;
+  border-radius: var(--radius-sm);
+}
+
 .tabActive {
   color: var(--fg-default);
   border-bottom-color: var(--brand-default);
@@ -42,4 +50,16 @@
 .tabActive .tabCount {
   background: var(--brand-muted);
   color: var(--brand-default);
+}
+
+/* The panel is a tab stop so its opening prose is read rather than skipped;
+   the ring is drawn outside it so it never crowds the content. */
+.tabPanel {
+  min-height: 0;
+}
+
+.tabPanel:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 4px;
+  border-radius: var(--radius-md);
 }

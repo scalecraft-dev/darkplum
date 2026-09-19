@@ -1123,7 +1123,7 @@ export function AliasesSection({
         </div>
       ) : (
         <div className={styles.tableWrap}>
-          <Table>
+          <Table label="Aliases">
             <thead>
               <tr>
                 <th>Alias</th>

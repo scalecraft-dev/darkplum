@@ -88,7 +88,7 @@ export function AccessOverviewSection({
             <Button variant="secondary" size="sm" onClick={onRetry}>Try again</Button>
           </div>
         ) : (
-          <Table>
+          <Table label="Access overview">
             <thead>
               <tr>
                 <th>Principal</th>

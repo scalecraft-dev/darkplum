@@ -152,11 +152,14 @@ export function ModelAccessNotice({ models, suppressError = false }: Props) {
           <p className={styles.rule}>{POLICY_RULE}</p>
           <p className={styles.hint}>
             Nothing here is something you can change yourself.{' '}
+            {/* Named, not linked: whoever reads this is being told their access
+                is narrow, which usually means they are not the administrator
+                who could follow the link. */}
             {principalSourced && orgSourced
-              ? "Some of this comes from the organisation's policy, widened from the Models page; the rest is set on you or your key, in Admin → Users & Keys."
+              ? "Some of this comes from the organisation's policy, widened under Admin → Models → Policy; the rest is set on you or your key, in Admin → Users & Keys."
               : principalSourced
                 ? 'An administrator can widen it from Admin → Users & Keys — this is set on you or your key, not on the organisation.'
-                : 'An administrator can widen it from the Models page.'}
+                : 'An administrator can widen it under Admin → Models → Policy.'}
           </p>
 
           <div className={styles.footer}>

@@ -846,7 +846,7 @@ export function ActivityTab() {
       </div>
 
       <div className={styles.tableCard}>
-        <Table>
+        <Table label="Activity events">
           <thead>
             <tr>
               <th>Time</th>

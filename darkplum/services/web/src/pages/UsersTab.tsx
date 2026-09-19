@@ -293,7 +293,7 @@ export function UsersTab({ users, models, isAdmin, currentUserId, onCreate, onDe
       </div>
 
       <div className={styles.tableCard}>
-        <Table>
+        <Table label="Users">
           <thead>
             <tr>
               <th>Name</th>

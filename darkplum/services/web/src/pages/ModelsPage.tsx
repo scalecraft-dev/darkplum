@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { Link, useSearchParams } from 'react-router-dom'
 import {
   ApiError,
   deleteModelAlias,
@@ -13,9 +14,10 @@ import {
 } from '../lib/api'
 import { formatModelName } from '../lib/formatModelName'
 import { UNREACHABLE_HINT, backendClassLabel, backendClassOf, isReachable } from '../lib/modelRouting'
+import { orgPolicyRestricted } from '../lib/policy'
 import type { AdminModel, ModelAlias, ModelAliasInput, PolicyPrincipal, Residency, RoutingPolicy } from '../types'
 import { useToast } from '../components/Toast'
-import { Badge, Table, TableEmpty } from '../components/ui'
+import { Badge, Tab, TabList, TabPanel, Table, TableEmpty } from '../components/ui'
 import { CopyButton } from '../components/ui/CopyButton'
 import { Skeleton } from '../components/ui/Skeleton'
 import { AccessOverviewSection } from './AccessOverviewSection'
@@ -29,6 +31,18 @@ import styles from './ModelsPage.module.css'
 const PRINCIPALS_PAGE = 100
 
 type Filter = 'all' | 'enabled' | 'disabled'
+
+/** The three things this page is: a catalogue, the aliases that point into it,
+ *  and the policy that decides which of it anyone actually reaches. Each is a
+ *  tab; `?tab=` names the open one so any of them can be linked to. */
+type TabKey = 'models' | 'aliases' | 'policy'
+/** Prefix for this page's tab/panel DOM ids, so another tab set on the same
+ *  page could never share an id with these. */
+const TAB_SCOPE = 'models-page'
+
+function tabFromParam(value: string | null): TabKey {
+  return value === 'aliases' || value === 'policy' ? value : 'models'
+}
 
 const PROVIDER_LABELS: Record<string, string> = {
   bedrock: 'AWS Bedrock',
@@ -351,7 +365,7 @@ function ProviderSection({ provider, models, togglingIds, residency, onToggle, o
             vendorGroups.map(([vendor, vendorModels]) => (
               <div key={vendor}>
                 <div className={styles.vendorHeading}>{vendorLabel(vendor)}</div>
-                <Table>
+                <Table label={`${vendorLabel(vendor)} models on ${providerLabel(provider)}`}>
                   <thead>
                     <tr>
                       <th>Model</th>
@@ -369,7 +383,7 @@ function ProviderSection({ provider, models, togglingIds, residency, onToggle, o
             ))
           ) : (
             // Non-bedrock: flat table
-            <Table>
+            <Table label={`${providerLabel(provider)} models`}>
               <thead>
                 <tr>
                   <th>Model</th>
@@ -426,6 +440,21 @@ function LoadingSkeleton() {
 
 export function ModelsPage() {
   const { toast } = useToast()
+  // The open tab is read from the URL rather than held beside it, so a deep
+  // link (?tab=policy) and the page's own cross-tab links are the same thing.
+  const [searchParams, setSearchParams] = useSearchParams()
+  const tab = tabFromParam(searchParams.get('tab'))
+  const selectTab = useCallback(
+    (next: TabKey) => {
+      const params = new URLSearchParams(searchParams)
+      params.set('tab', next)
+      // Replace: switching tabs is not a place someone navigated to, so Back
+      // should leave the page rather than walk back through the tabs.
+      setSearchParams(params, { replace: true })
+    },
+    [searchParams, setSearchParams],
+  )
+
   const [models, setModels] = useState<AdminModel[]>([])
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState('')
@@ -686,6 +715,22 @@ export function ModelsPage() {
   const totalEnabled = models.filter((m) => m.enabled).length
   const totalUnreachable = models.filter((m) => !isReachable(m)).length
 
+  /** The same test the policy card uses to mark itself restricted. On the
+   *  catalogue tab it is the reason a row can be enabled and still refused, so
+   *  it is said there too rather than only on the tab that owns it. */
+  const policyRestricted = orgPolicyRestricted(policy)
+
+  /** Switching tabs from a link INSIDE a panel unmounts that panel, and the
+   *  focused link with it — the browser then drops focus to <body>. The tab
+   *  row stays mounted, so focus is handed to the tab that was just opened. */
+  const goToTab = useCallback(
+    (next: TabKey) => {
+      selectTab(next)
+      requestAnimationFrame(() => document.getElementById(`tab-${TAB_SCOPE}-${next}`)?.focus())
+    },
+    [selectTab],
+  )
+
   return (
     <div className={pageStyles.page}>
       <div className={pageStyles.header}>
@@ -693,40 +738,175 @@ export function ModelsPage() {
         <p className={pageStyles.subtitle}>Choose what your organization can send requests to</p>
       </div>
 
-      <RoutingPolicyCard
-        policy={policy}
-        loading={policyLoading}
-        error={policyError}
-        saving={policySaving}
-        models={models}
-        aliases={aliases}
-        onRetry={() => void loadPolicy()}
-        onChange={handlePolicyChange}
-      />
+      <TabList label="Models sections" scope={TAB_SCOPE}>
+        <Tab
+          id="models"
+          active={tab === 'models'}
+          count={totalEnabled > 0 ? totalEnabled : undefined}
+          onClick={() => selectTab('models')}
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <rect x="3" y="3" width="7" height="7" />
+            <rect x="14" y="3" width="7" height="7" />
+            <rect x="14" y="14" width="7" height="7" />
+            <rect x="3" y="14" width="7" height="7" />
+          </svg>
+          Models
+        </Tab>
+        <Tab
+          id="aliases"
+          active={tab === 'aliases'}
+          count={aliases.length > 0 ? aliases.length : undefined}
+          onClick={() => selectTab('aliases')}
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z" />
+            <line x1="7" y1="7" x2="7.01" y2="7" />
+          </svg>
+          Aliases
+        </Tab>
+        <Tab
+          id="policy"
+          active={tab === 'policy'}
+          count={principalsTotal > 0 ? principalsTotal : undefined}
+          onClick={() => selectTab('policy')}
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+          </svg>
+          Policy
+        </Tab>
+      </TabList>
 
-      <AccessOverviewSection
-        principals={principals}
-        total={principalsTotal}
-        models={models}
-        loading={principalsLoading}
-        loadingMore={principalsLoadingMore}
-        error={principalsError}
-        onRetry={() => void loadPrincipals()}
-        onLoadMore={() => void loadMorePrincipals()}
-      />
+      <TabPanel id="models" scope={TAB_SCOPE} active={tab === 'models'}>
+        <ModelsTab
+          models={models}
+          filtered={filtered}
+          providerGroups={providerGroups}
+          loading={loading}
+          search={search}
+          filter={filter}
+          togglingIds={togglingIds}
+          residency={residency}
+          totalEnabled={totalEnabled}
+          totalUnreachable={totalUnreachable}
+          policyRestricted={policyRestricted}
+          onGoToTab={goToTab}
+          onSearch={setSearch}
+          onFilter={setFilter}
+          onToggle={handleToggle}
+          onRename={handleRename}
+        />
+      </TabPanel>
 
-      <AliasesSection
-        aliases={aliases}
-        models={models}
-        loading={aliasesLoading || loading}
-        error={aliasesError}
-        residency={residency}
-        onRetry={() => void loadAliases()}
-        onSave={handleSaveAlias}
-        onDelete={handleDeleteAlias}
-      />
+      <TabPanel id="aliases" scope={TAB_SCOPE} active={tab === 'aliases'}>
+        <AliasesSection
+          aliases={aliases}
+          models={models}
+          loading={aliasesLoading || loading}
+          error={aliasesError}
+          residency={residency}
+          onRetry={() => void loadAliases()}
+          onSave={handleSaveAlias}
+          onDelete={handleDeleteAlias}
+        />
+      </TabPanel>
 
-      <h2 className={styles.sectionHeading}>Available models</h2>
+      <TabPanel id="policy" scope={TAB_SCOPE} active={tab === 'policy'}>
+        <RoutingPolicyCard
+          policy={policy}
+          loading={policyLoading}
+          error={policyError}
+          saving={policySaving}
+          models={models}
+          aliases={aliases}
+          onRetry={() => void loadPolicy()}
+          onChange={handlePolicyChange}
+        />
+
+        <AccessOverviewSection
+          principals={principals}
+          total={principalsTotal}
+          models={models}
+          loading={principalsLoading}
+          loadingMore={principalsLoadingMore}
+          error={principalsError}
+          onRetry={() => void loadPrincipals()}
+          onLoadMore={() => void loadMorePrincipals()}
+        />
+      </TabPanel>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Models tab — the catalogue
+// ---------------------------------------------------------------------------
+
+interface ModelsTabProps {
+  models: AdminModel[]
+  filtered: AdminModel[]
+  providerGroups: [string, AdminModel[]][]
+  loading: boolean
+  search: string
+  filter: Filter
+  togglingIds: Set<string>
+  residency: Residency
+  totalEnabled: number
+  totalUnreachable: number
+  policyRestricted: boolean
+  onGoToTab: (tab: TabKey) => void
+  onSearch: (value: string) => void
+  onFilter: (value: Filter) => void
+  onToggle: (model: AdminModel) => void
+  onRename: (model: AdminModel, displayName: string | null) => Promise<void>
+}
+
+function ModelsTab({
+  models,
+  filtered,
+  providerGroups,
+  loading,
+  search,
+  filter,
+  togglingIds,
+  residency,
+  totalEnabled,
+  totalUnreachable,
+  policyRestricted,
+  onGoToTab,
+  onSearch,
+  onFilter,
+  onToggle,
+  onRename,
+}: ModelsTabProps) {
+  return (
+    <>
+      {/* The catalogue on its own reads as "everything here is reachable". When
+          the policy says otherwise, that is said once, here, with the way to
+          go and read it. */}
+      {policyRestricted && (
+        <p className={styles.policyNote}>
+          <LockGlyph />
+          <span>
+            The organisation's policy limits what is reachable —{' '}
+            <Link
+              className={styles.policyNoteLink}
+              to={{ search: '?tab=policy' }}
+              onClick={(e) => {
+                e.preventDefault()
+                onGoToTab('policy')
+              }}
+            >
+              Policy tab
+            </Link>
+          </span>
+        </p>
+      )}
+
+      {/* Named for anyone navigating by heading, like the other two tabs; the
+          visible name is the tab itself. */}
+      <h2 className={styles.srOnly}>Available models</h2>
 
       {/* Search + filters */}
       <div className={styles.toolbar}>
@@ -749,7 +929,7 @@ export function ModelsPage() {
             type="text"
             placeholder="Search models..."
             value={search}
-            onChange={(e) => setSearch(e.target.value)}
+            onChange={(e) => onSearch(e.target.value)}
             aria-label="Search models"
           />
         </div>
@@ -758,7 +938,7 @@ export function ModelsPage() {
             <button
               key={f}
               className={`${styles.chip} ${filter === f ? styles.chipActive : ''}`}
-              onClick={() => setFilter(f)}
+              onClick={() => onFilter(f)}
             >
               {f === 'all' ? 'All' : f === 'enabled' ? 'Enabled' : 'Disabled'}
             </button>
@@ -795,7 +975,7 @@ export function ModelsPage() {
       ) : models.length === 0 ? (
         <div className={styles.providerSection}>
           <div className={styles.providerCard}>
-            <Table>
+            <Table label="Models">
               <thead>
                 <tr>
                   <th>Model</th>
@@ -824,7 +1004,7 @@ export function ModelsPage() {
       ) : filtered.length === 0 ? (
         <div className={styles.providerSection}>
           <div className={styles.providerCard}>
-            <Table>
+            <Table label="Models matching your filters">
               <thead>
                 <tr>
                   <th>Model</th>
@@ -857,11 +1037,11 @@ export function ModelsPage() {
             models={providerModels}
             togglingIds={togglingIds}
             residency={residency}
-            onToggle={handleToggle}
-            onRename={handleRename}
+            onToggle={onToggle}
+            onRename={onRename}
           />
         ))
       )}
-    </div>
+    </>
   )
 }

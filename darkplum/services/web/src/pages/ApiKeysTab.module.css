@@ -239,3 +239,21 @@
   color: var(--fg-subtle);
   max-width: 56ch;
 }
+
+/* --- Responsive ---
+   The same rule ModelsPage uses: below 767px the toolbar stops being a row
+   competing for one line and stacks, with the search taking the full width.
+   The gap only exists here — on a wide screen `space-between` already does
+   the spacing. */
+
+@media (max-width: 767px) {
+  .toolbar {
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--space-3);
+  }
+
+  .searchWrap {
+    max-width: none;
+  }
+}
