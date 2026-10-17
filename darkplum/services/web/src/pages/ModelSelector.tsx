@@ -7,7 +7,8 @@ import {
   isEgress,
   vendorLabel,
 } from '../lib/modelRouting'
-import { EgressGlyph } from '../components/ui'
+import { AWS_OPT_IN_PICKER_LINE, needsAwsOptIn } from '../lib/dataRetention'
+import { EgressGlyph, OptInGlyph } from '../components/ui'
 import { Skeleton } from '../components/ui/Skeleton'
 import styles from './ModelSelector.module.css'
 
@@ -158,13 +159,19 @@ export function ModelSelector({ models, isLoading, error, value, onChange }: Pro
     : selectedRoutes
       ? routedClassLabel(selected)
       : directClassLabel(selected)
-  const classLabel = where?.text ?? ''
+  // A concrete model AWS will refuse until the account's Bedrock
+  // data-retention mode is raised stays on the list — an administrator may be
+  // about to fix it — but the line says so instead of where it runs, since it
+  // will not run anywhere yet. A routed alias keeps its normal line: only some
+  // of its routes may be affected, and the per-turn error names the one.
+  const optIn = !selectedRoutes && needsAwsOptIn(selected)
+  const classLabel = optIn ? AWS_OPT_IN_PICKER_LINE : (where?.text ?? '')
   const selectedClass = selected ? displayClassOf(selected) : null
 
   /** Four states for the dot, and the label always says the same thing the dot
    *  does — the dot is a shortcut for people who already know it, never the
    *  only carrier of the state. */
-  const dotClass = !selected
+  const dotClass = !selected || optIn
     ? styles.dotAmber
     : where?.egress
       ? styles.dotEgress
@@ -230,12 +237,16 @@ export function ModelSelector({ models, isLoading, error, value, onChange }: Pro
           line lists the routes rather than promising one of them. The list is
           the first thing to give way when the header is short of room. */}
       <span
-        className={`${styles.status} ${where?.egress ? styles.statusEgress : ''}`}
+        className={`${styles.status} ${where?.egress || optIn ? styles.statusEgress : ''}`}
         role={selected ? undefined : 'status'}
         title={classLabel ? statusTitle(classLabel, selectedRoutes ?? []) : undefined}
       >
         <span className={`${styles.dot} ${dotClass}`} aria-hidden="true" />
-        {where?.egress && <EgressGlyph className={styles.statusGlyph} />}
+        {optIn ? (
+          <OptInGlyph className={styles.statusGlyph} />
+        ) : (
+          where?.egress && <EgressGlyph className={styles.statusGlyph} />
+        )}
         <span className={styles.statusLabel}>{classLabel || 'No model selected'}</span>
         {selectedRoutes && selectedRoutes.length > 0 && (
           <span className={styles.statusRoutes}>

@@ -517,7 +517,7 @@ export function RoutingPolicyCard({
               <p className={styles.warningsTitle}>Not saved.</p>
               <p className={styles.warningsHint}>{refusal}</p>
               <p className={styles.warningsHint}>
-                Repoint the route on the Aliases tab, or choose a rung that permits where it
+                Repoint the route under Admin &gt; Routing, or choose a rung that permits where it
                 points. Nothing has changed.
               </p>
             </div>

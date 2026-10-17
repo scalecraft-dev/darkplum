@@ -48,8 +48,16 @@ import {
 } from '../src/lib/residency.ts'
 import { chatTagline, pickDefaultModel, type ChoosableModel } from '../src/lib/modelChoice.ts'
 import {
+  DENIAL_CODES,
   RETRY_AFTER_DEFAULT_SECONDS,
   RETRY_AFTER_MAX_SECONDS,
+  aliasReferenceConsequence,
+  aliasReferencesTo,
+  denialLabel,
+  isRouteTargetRefusal,
+  routeFallbackHint,
+  routeFallbackOf,
+  routerReasonText,
   failedVendorLabel,
   formatRetryCountdown,
   parseRetryAfter,
@@ -78,8 +86,25 @@ import {
   serialiseModelFilter,
   supportsUiKeyInstall,
   vendorKeyProblem,
+  vendorErrorCopy,
+  vendorTakesWorkspaceId,
+  WORKSPACE_REQUIRED_MESSAGE,
+  workspaceIdProblem,
+  workspaceIdToSend,
+  workspaceRequiredCopy,
 } from '../src/lib/vendorKeys.ts'
-import type { DisplayClass } from '../src/types/index.ts'
+import { formatEventDetail } from '../src/lib/activityEvents.ts'
+import {
+  AWS_OPT_IN_LABEL,
+  AWS_OPT_IN_PICKER_LINE,
+  DATA_RETENTION_CODE,
+  awsOptInCountText,
+  awsOptInRouteWarning,
+  awsOptInStatusHint,
+  dataRetentionFailureCopy,
+  needsAwsOptIn,
+} from '../src/lib/dataRetention.ts'
+import type { DisplayClass, ModelAlias, ModelAliasRoute } from '../src/types/index.ts'
 
 const failures: string[] = []
 
@@ -1061,6 +1086,231 @@ if (!WEB_PORT_FORWARD_COMMAND.startsWith('kubectl port-forward -n darkplum-syste
   failures.push('WEB_PORT_FORWARD_COMMAND must match the command the Makefile prints')
 }
 
+// --- vendor_error copy ---------------------------------------------------------
+{
+  const full = vendorErrorCopy(
+    'Anthropic',
+    'Anthropic answered HTTP 400 (invalid_request_error) to the key check. Nothing was stored.',
+    400,
+    'invalid_request_error',
+  )
+  if (!full.startsWith('Anthropic answered HTTP 400 (invalid_request_error) to the key check. Nothing was stored.')) {
+    failures.push('vendorErrorCopy must lead with the server message verbatim')
+  }
+  if (!full.includes('not a network problem')) failures.push('vendorErrorCopy must say it is not a network problem')
+  const bare = vendorErrorCopy('OpenAI', '', 429, 'Bad Type!')
+  if (!bare.startsWith('OpenAI answered HTTP 429 (unknown) to the key check.')) {
+    failures.push(`vendorErrorCopy fallback wrong: ${bare}`)
+  }
+  if (/runbook/i.test(full + bare)) failures.push('vendorErrorCopy must not point at the network runbook')
+}
+
+// --- the Anthropic workspace id ------------------------------------------------
+// Anthropic refuses an org-level key unless every request names a workspace.
+// Only Anthropic is asked; the id mirrors the api's ^[A-Za-z0-9_-]{1,64}$;
+// empty is valid (it clears); absent is sent only when there is nothing to say.
+{
+  check('vendorTakesWorkspaceId(anthropic)', vendorTakesWorkspaceId('anthropic'), true)
+  check('vendorTakesWorkspaceId(openai)', vendorTakesWorkspaceId('openai'), false)
+
+  check('workspaceIdProblem(empty)', workspaceIdProblem(''), null)
+  check('workspaceIdProblem(blank)', workspaceIdProblem('   '), null)
+  check('workspaceIdProblem(wrkspc id)', workspaceIdProblem('wrkspc_01AbC-x9'), null)
+  check('workspaceIdProblem(padded)', workspaceIdProblem('  wrkspc_01  '), null)
+  check('workspaceIdProblem(64 chars)', workspaceIdProblem('a'.repeat(64)), null)
+  for (const bad of ['a'.repeat(65), 'wrkspc 01', 'wrkspc.01', '"wrkspc_01"', 'wrkspc/01', 'wrkspç']) {
+    if (workspaceIdProblem(bad) === null) failures.push(`workspaceIdProblem(${JSON.stringify(bad)}) must refuse it`)
+  }
+
+  check('workspaceIdToSend(openai, value)', workspaceIdToSend('openai', 'wrkspc_1', null), undefined)
+  check('workspaceIdToSend(anthropic, empty over none)', workspaceIdToSend('anthropic', '', null), undefined)
+  check('workspaceIdToSend(anthropic, empty over stored) clears', workspaceIdToSend('anthropic', ' ', 'wrkspc_1'), '')
+  check('workspaceIdToSend(anthropic, value) trimmed', workspaceIdToSend('anthropic', ' wrkspc_2 ', null), 'wrkspc_2')
+  check('workspaceIdToSend(anthropic, unchanged) still sent', workspaceIdToSend('anthropic', 'wrkspc_1', 'wrkspc_1'), 'wrkspc_1')
+
+  const server =
+    'This key is not scoped to an Anthropic workspace. Enter the workspace ID to use with it, or use a key created inside a workspace.'
+  check('WORKSPACE_REQUIRED_MESSAGE matches the api', WORKSPACE_REQUIRED_MESSAGE, server)
+  check(
+    'workspaceRequiredCopy(server message)',
+    workspaceRequiredCopy(server),
+    `${server} Keys created inside a workspace don't need this.`,
+  )
+  check(
+    'workspaceRequiredCopy(empty) falls back to the api sentence',
+    workspaceRequiredCopy(''),
+    `${server} Keys created inside a workspace don't need this.`,
+  )
+
+  check(
+    'activity labels for workspace_id_before/after',
+    formatEventDetail({ workspace_id_before: 'wrkspc_a', workspace_id_after: 'wrkspc_b' }),
+    'workspace before: wrkspc_a, workspace after: wrkspc_b',
+  )
+}
+
+// --- Bedrock data-retention opt-in -------------------------------------------
+// Every sentence the chat card, the Models row, the picker and the alias
+// editor say about it, pinned word for word, plus the precedence inputs.
+{
+  check('needsAwsOptIn(needs_aws_opt_in)', needsAwsOptIn({ availability: { state: 'needs_aws_opt_in' } }), true)
+  check('needsAwsOptIn(ok)', needsAwsOptIn({ availability: { state: 'ok' } }), false)
+  check('needsAwsOptIn(unknown) says nothing', needsAwsOptIn({ availability: { state: 'unknown' } }), false)
+  check('needsAwsOptIn(null)', needsAwsOptIn({ availability: null }), false)
+  check('needsAwsOptIn(absent, older api / non-Bedrock)', needsAwsOptIn({}), false)
+  check('needsAwsOptIn(no model)', needsAwsOptIn(null), false)
+  check('DATA_RETENTION_CODE matches the gateway', DATA_RETENTION_CODE, 'model_requires_data_retention')
+  check('AWS_OPT_IN_LABEL', AWS_OPT_IN_LABEL, 'Needs AWS opt-in')
+  check('denialLabel(model_requires_data_retention) is the badge phrase', denialLabel(DATA_RETENTION_CODE), AWS_OPT_IN_LABEL)
+  check(
+    'DENIAL_CODES offers model_requires_data_retention (api accepts the filter)',
+    (DENIAL_CODES as readonly string[]).includes(DATA_RETENTION_CODE),
+    true,
+  )
+  check(
+    'awsOptInStatusHint',
+    awsOptInStatusHint({ availability: { state: 'needs_aws_opt_in', account_mode: 'default', required_mode: 'aws_review' } }),
+    "Bedrock refuses this model while your AWS account's data-retention mode is 'default'; it needs 'aws_review'. Raising it lets AWS retain and review prompts to models like this one for up to 30 days, inside AWS — the model provider does not receive them. Set it per region with the Bedrock data-retention API; see the runbook.",
+  )
+  check(
+    'awsOptInStatusHint(no modes) never prints an empty quote',
+    awsOptInStatusHint({ availability: { state: 'needs_aws_opt_in' } }).startsWith(
+      "Bedrock refuses this model while your AWS account's data-retention mode is 'unknown'; it needs 'aws_review'.",
+    ),
+    true,
+  )
+  check('awsOptInCountText(1)', awsOptInCountText(1), '1 needs an AWS opt-in')
+  check('awsOptInCountText(3)', awsOptInCountText(3), '3 need an AWS opt-in')
+  check(
+    'AWS_OPT_IN_PICKER_LINE',
+    AWS_OPT_IN_PICKER_LINE,
+    "Needs an AWS opt-in — an administrator has to raise the account's Bedrock data-retention mode",
+  )
+  check(
+    'awsOptInRouteWarning',
+    awsOptInRouteWarning('anthropic.claude-fable-5-1-v1:0'),
+    'anthropic.claude-fable-5-1-v1:0 needs an AWS opt-in before it can answer.',
+  )
+  const direct = dataRetentionFailureCopy({ modelName: 'Claude Fable 5.1' })
+  check('dataRetentionFailureCopy(direct).title', direct.title, 'Claude Fable 5.1 needs an AWS opt-in')
+  check('dataRetentionFailureCopy(direct).hint is empty', direct.hint, '')
+  const routed = dataRetentionFailureCopy({ modelName: 'Claude Fable 5.1', route: 'deep-analysis', alias: 'smart' })
+  check('dataRetentionFailureCopy(routed).title', routed.title, 'Claude Fable 5.1 needs an AWS opt-in')
+  check(
+    'dataRetentionFailureCopy(routed).hint',
+    routed.hint,
+    'Your message was routed to it via the deep-analysis route of smart.',
+  )
+}
+
+// --- a routed alias falling back to its default route ----------------------
+// The gateway answers a non-default route whose target is disabled or not
+// reachable on the alias's default route, and records why. Policy refusals
+// never fall back. These pin what the UI says about it, before and after.
+
+{
+  check(
+    'routerReasonText(fallback disabled)',
+    routerReasonText('fallback:route_target_disabled:code'),
+    "Fell back to the default route — the model on route 'code' is disabled",
+  )
+  check(
+    'routerReasonText(fallback unreachable)',
+    routerReasonText('fallback:route_target_unreachable:code'),
+    "Fell back to the default route — the model on route 'code' is not reachable",
+  )
+  check('routeFallbackOf(timeout) is null', routeFallbackOf('fallback:timeout'), null)
+  check('routeFallbackOf(disabled).route', routeFallbackOf('fallback:route_target_disabled:code')?.route, 'code')
+  check(
+    'routeFallbackHint(disabled)',
+    routeFallbackHint('disabled', 'general'),
+    'This model is turned off, so messages that take this route fall back to the default route general until it is fixed.',
+  )
+  // The gateway's two no-fallback sentences (chat.go resolveRoutedPick).
+  check(
+    'isRouteTargetRefusal(both unusable)',
+    isRouteTargetRefusal(
+      'model_not_enabled',
+      `route "code" of alias "auto" selects model "a", which is disabled, and the alias's default route "general" selects "b", which is also disabled. Enable one of them on the Models page or retarget the route.`,
+    ),
+    true,
+  )
+  check(
+    'isRouteTargetRefusal(default route)',
+    isRouteTargetRefusal(
+      'model_not_found',
+      `route "general" of alias "auto" is the alias's default route and selects model "b", which is not available on this gateway. Enable it on the Models page or retarget the route.`,
+    ),
+    true,
+  )
+  check(
+    'isRouteTargetRefusal(residency) is false',
+    isRouteTargetRefusal(
+      'model_residency_violation',
+      `route "code" of alias "auto" selects model "a", which is not enabled/allowed by residency`,
+    ),
+    false,
+  )
+
+  const route = (name: string, target: string, enabled = true): ModelAliasRoute => ({
+    route_name: name,
+    description: '',
+    target_model_id: target,
+    keywords: [],
+    target_exists: true,
+    target_enabled: enabled,
+    target_backend_class: 'self_hosted',
+  })
+  const alias = (a: Partial<ModelAlias> & { alias: string }): ModelAlias => ({
+    target_model_id: null,
+    target_exists: true,
+    target_enabled: true,
+    target_backend_class: 'self_hosted',
+    created_at: '',
+    updated_at: '',
+    ...a,
+  })
+  const aliases: ModelAlias[] = [
+    alias({
+      alias: 'auto',
+      kind: 'routed',
+      default_route: 'general',
+      routes: [route('general', 'llama'), route('code', 'fable')],
+    }),
+    alias({ alias: 'default-chat', kind: 'static', target_model_id: 'fable' }),
+    alias({
+      alias: 'smart',
+      kind: 'routed',
+      default_route: 'general',
+      routes: [route('general', 'off', false), route('deep', 'fable')],
+    }),
+  ]
+  const refs = aliasReferencesTo('fable', aliases)
+  check('aliasReferencesTo(fable).length', refs.length, 3)
+  check('auto/code outcome', refs[0]?.outcome, 'fallback')
+  check(
+    'auto/code consequence',
+    refs[0] && aliasReferenceConsequence(refs[0]),
+    'messages will use its default route general (llama) instead',
+  )
+  check('default-chat outcome', refs[1]?.outcome, 'refused')
+  check(
+    'default-chat consequence',
+    refs[1] && aliasReferenceConsequence(refs[1]),
+    'refused until it is retargeted or the model is re-enabled',
+  )
+  check('smart/deep outcome (default disabled)', refs[2]?.outcome, 'refused')
+  const llamaRefs = aliasReferencesTo('llama', aliases)
+  check('aliasReferencesTo(llama).length', llamaRefs.length, 1)
+  check('auto/general isDefault', llamaRefs[0]?.isDefault, true)
+  check(
+    'auto/general consequence',
+    llamaRefs[0] && aliasReferenceConsequence(llamaRefs[0]),
+    'messages that land here will be refused until it is retargeted or re-enabled',
+  )
+  check('aliasReferencesTo(unused).length', aliasReferencesTo('nothing', aliases).length, 0)
+}
+
 // --- report ------------------------------------------------------------------
 
 if (failures.length > 0) {
@@ -1073,5 +1323,5 @@ if (failures.length > 0) {
 }
 
 console.log(
-  `Residency truth table holds (${table.cells.length} cells from ${RESIDENCY_TRUTH_TABLE_PATH} + ladder order + restricted rule + class rank, model fallback, empty-state claim, vendor rate-limit wait, who a vendor failure names, and the vendor-key helpers: glob matching, filter serialisation over every subset of a catalogue, the checklist's headings, what a Replace opens on, the key entry line, the installing and removing windows, the transport gate, which of the two transport faults each refusal names, and the admitted diff).`,
+  `Residency truth table holds (${table.cells.length} cells from ${RESIDENCY_TRUTH_TABLE_PATH} + ladder order + restricted rule + class rank, model fallback, empty-state claim, vendor rate-limit wait, who a vendor failure names, and the vendor-key helpers: glob matching, filter serialisation over every subset of a catalogue, the checklist's headings, what a Replace opens on, the key entry line, the installing and removing windows, the transport gate, which of the two transport faults each refusal names, the admitted diff, the Bedrock data-retention opt-in copy, and the routed-alias fallback: reason text, route hints, the no-fallback refusal, and which aliases a disable affects).`,
 )

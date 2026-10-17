@@ -601,7 +601,8 @@ set-anthropic-key remove-anthropic-key: PK_ENV := ANTHROPIC_API_KEY
 set-anthropic-key remove-anthropic-key: PK_FILE := anthropic-api-key
 set-anthropic-key remove-anthropic-key: PK_FILTER := ANTHROPIC_MODEL_FILTER
 set-anthropic-key: PK_AUTH := x-api-key: 
-set-anthropic-key: PK_EXTRA := header = "anthropic-version: 2023-06-01"
+set-anthropic-key: PK_EXTRA := header = "anthropic-version: 2023-06-01"$(if $(WORKSPACE),\nheader = "anthropic-workspace-id: $(WORKSPACE)")
+set-anthropic-key: PK_WORKSPACE := $(WORKSPACE)
 set-anthropic-key: PK_URL := https://api.anthropic.com/v1/models?limit=1000
 set-anthropic-key: PK_EXAMPLE := claude-*
 set-anthropic-key: PK_CONSOLE := a workspace-scoped key with a workspace spend limit (console.anthropic.com > Workspaces)
@@ -616,12 +617,13 @@ set-openai-key: PK_URL := https://api.openai.com/v1/models
 set-openai-key: PK_EXAMPLE := gpt-*
 set-openai-key: PK_CONSOLE := a project-scoped key with a model allowlist and a project budget (platform.openai.com > Projects)
 
-set-anthropic-key: ## Install or rotate the org's Anthropic API key: read -s ANTHROPIC_API_KEY && export ANTHROPIC_API_KEY && make set-anthropic-key MODELS='claude-*' [DEV=1] [ALLOW_ALL=1]
+set-anthropic-key: ## Install or rotate the org's Anthropic API key: read -s ANTHROPIC_API_KEY && export ANTHROPIC_API_KEY && make set-anthropic-key MODELS='claude-*' [WORKSPACE=wrkspc_...] [DEV=1] [ALLOW_ALL=1]
 set-openai-key: ## Install or rotate the org's OpenAI API key: read -s OPENAI_API_KEY && export OPENAI_API_KEY && make set-openai-key MODELS='gpt-*' [DEV=1] [ALLOW_ALL=1]
 set-anthropic-key set-openai-key:
 	@KEY="$${$(PK_ENV)}"; \
 	[ -n "$$KEY" ] || { echo "ERROR: set $(PK_ENV) in the environment first, e.g.  read -s $(PK_ENV) && export $(PK_ENV)"; exit 1; }; \
 	[[ "$$KEY" =~ ^[A-Za-z0-9_-]+$$ ]] || { echo "ERROR: $(PK_ENV) contains characters no $(PK_VENDOR) key has. Nothing was changed."; exit 1; }; \
+	[ -z "$(PK_WORKSPACE)" ] || [[ "$(PK_WORKSPACE)" =~ ^[A-Za-z0-9_-]{1,64}$$ ]] || { echo "ERROR: WORKSPACE must be an Anthropic workspace id such as wrkspc_01AbC... Nothing was changed."; exit 1; }; \
 	K="$(_PK_KUBECTL)"; NS=darkplum-system; \
 	OLD_FILTER=$$($$K get configmap darkplum-provider-config -n $$NS -o jsonpath='{.data.$(PK_FILTER)}' 2>/dev/null); \
 	FILTER="$(MODELS)"; FILTER="$${FILTER// /}"; [ -n "$$FILTER" ] || FILTER="$$OLD_FILTER"; \
@@ -639,6 +641,10 @@ set-anthropic-key set-openai-key:
 		echo "Checking the key against $(PK_VENDOR)..."; \
 		RESP=$$(printf 'header = "$(PK_AUTH)%s"\n$(PK_EXTRA)\n' "$$KEY" | curl -sS --max-time 30 -K - -w '\n%{http_code}' '$(PK_URL)') || { echo "ERROR: could not reach $(PK_VENDOR). Nothing was changed. (SKIP_VERIFY=1 skips this check.)"; exit 1; }; \
 		CODE=$$(echo "$$RESP" | tail -1); \
+		if [ "$$CODE" = "400" ] && echo "$$RESP" | grep -q "anthropic-workspace-id"; then \
+			echo "ERROR: this key was created at organisation level, so $(PK_VENDOR) needs a workspace id with it:"; \
+			echo "       make $@ WORKSPACE=wrkspc_...   (Anthropic console > Workspaces), or use a key created inside a workspace."; \
+			echo "       Nothing was changed."; exit 1; fi; \
 		[ "$$CODE" = "200" ] || { echo "ERROR: $(PK_VENDOR) rejected this key (HTTP $$CODE). Nothing was changed."; exit 1; }; \
 		IDS=$$(echo "$$RESP" | sed '$$d' | jq -r '.data[].id'); \
 		TOTAL=$$(echo "$$IDS" | grep -c . || true); MATCHED=""; \
@@ -661,8 +667,16 @@ set-anthropic-key set-openai-key:
 		STAMP=$$(jq -rn --arg old "$$OLD_STAMP" '[now, (($$old | try fromdateiso8601 catch 0) + 1)] | max | floor | todateiso8601'); \
 		$$K patch configmap darkplum-provider-config -n $$NS --type merge -p "$$(jq -n --arg k '$(PK_FILTER)' --arg v "$$FILTER" --arg t "$$STAMP" '{data:{($$k):$$v, ($$k+"_SET_AT"):$$t}}')" >/dev/null; \
 	fi; \
-	if [ -z "$$HAD_KEY" ] || [ "$$FILTER" != "$$OLD_FILTER" ]; then \
-		echo "Restarting the gateway to load the $(PK_VENDOR) filter..."; \
+	if [ "$(PK_VENDOR)" = "Anthropic" ]; then \
+		OLD_WS=$$($$K get configmap darkplum-provider-config -n $$NS -o jsonpath='{.data.ANTHROPIC_WORKSPACE_ID}' 2>/dev/null); \
+		if [ "$(PK_WORKSPACE)" != "$$OLD_WS" ]; then \
+			STAMP=$$(jq -rn --arg old "$$($$K get configmap darkplum-provider-config -n $$NS -o jsonpath='{.data.$(PK_FILTER)_SET_AT}' 2>/dev/null)" '[now, (($$old | try fromdateiso8601 catch 0) + 1)] | max | floor | todateiso8601'); \
+			$$K patch configmap darkplum-provider-config -n $$NS --type merge -p "$$(jq -n --arg w '$(PK_WORKSPACE)' --arg k '$(PK_FILTER)' --arg t "$$STAMP" '{data:{ANTHROPIC_WORKSPACE_ID:$$w, ($$k+"_SET_AT"):$$t}}')" >/dev/null; \
+			RESTART=1; \
+		fi; \
+	fi; \
+	if [ -z "$$HAD_KEY" ] || [ "$$FILTER" != "$$OLD_FILTER" ] || [ -n "$$RESTART" ]; then \
+		echo "Restarting the gateway to load the $(PK_VENDOR) settings..."; \
 		$$K rollout restart deploy/darkplum-gateway -n $$NS >/dev/null; \
 		$$K rollout status deploy/darkplum-gateway -n $$NS --timeout=180s; \
 	else \
@@ -683,6 +697,7 @@ remove-anthropic-key remove-openai-key:
 	$$K patch secret darkplum-provider-keys -n $$NS --type json -p '[{"op":"remove","path":"/data/$(PK_FILE)"}]' >/dev/null 2>&1 || true; \
 	$$K patch configmap darkplum-provider-config -n $$NS --type json -p '[{"op":"remove","path":"/data/$(PK_FILTER)"}]' >/dev/null 2>&1 || true; \
 	$$K patch configmap darkplum-provider-config -n $$NS --type json -p '[{"op":"remove","path":"/data/$(PK_FILTER)_SET_AT"}]' >/dev/null 2>&1 || true; \
+	[ "$(PK_VENDOR)" != "Anthropic" ] || $$K patch configmap darkplum-provider-config -n $$NS --type json -p '[{"op":"remove","path":"/data/ANTHROPIC_WORKSPACE_ID"}]' >/dev/null 2>&1 || true; \
 	$$K rollout restart deploy/darkplum-gateway -n $$NS >/dev/null; \
 	$$K rollout status deploy/darkplum-gateway -n $$NS --timeout=180s; \
 	echo "$(PK_VENDOR) key and filter removed. Its models keep their settings, show as unreachable, and refuse requests."; \

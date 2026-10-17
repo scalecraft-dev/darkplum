@@ -111,7 +111,7 @@ func TestVerifyKey_HappyPath(t *testing.T) {
 	})
 	p := newTestProvider(t, srv, nil, Config{DefaultMaxTokens: 4096})
 
-	ids, err := p.VerifyKey(context.Background(), "sk-ant-candidate-key")
+	ids, err := p.VerifyKey(context.Background(), "sk-ant-candidate-key", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -135,7 +135,7 @@ func TestVerifyKey_UsesTheSubmittedKeyNotTheInstalledOne(t *testing.T) {
 	installed := &fakeCreds{key: "sk-ant-installed", version: 1}
 	p := New(installed, Config{DefaultMaxTokens: 4096, BaseURL: srv.URL})
 
-	if _, err := p.VerifyKey(context.Background(), "sk-ant-candidate"); err != nil {
+	if _, err := p.VerifyKey(context.Background(), "sk-ant-candidate", ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if gotKey != "sk-ant-candidate" {
@@ -150,7 +150,7 @@ func TestVerifyKey_AuthFailureClassifiesAsAuthFailed(t *testing.T) {
 	})
 	p := newTestProvider(t, srv, nil, Config{DefaultMaxTokens: 4096})
 
-	_, err := p.VerifyKey(context.Background(), "sk-ant-bad-key")
+	_, err := p.VerifyKey(context.Background(), "sk-ant-bad-key", "")
 	if err == nil {
 		t.Fatal("expected an error")
 	}
@@ -164,7 +164,7 @@ func TestVerifyKey_NetworkFailureIsNotAuthFailed(t *testing.T) {
 	srv.Server.Close()
 	p := newTestProvider(t, srv, nil, Config{DefaultMaxTokens: 4096})
 
-	_, err := p.VerifyKey(context.Background(), "sk-ant-x")
+	_, err := p.VerifyKey(context.Background(), "sk-ant-x", "")
 	if err == nil {
 		t.Fatal("expected an error")
 	}
@@ -183,7 +183,7 @@ func TestVerifyKey_NeverTouchesCredsourceOrCachedClient(t *testing.T) {
 	creds := &callCountingCreds{key: "sk-ant-installed"}
 	p := New(creds, Config{DefaultMaxTokens: 4096, BaseURL: srv.Server.URL})
 
-	if _, err := p.VerifyKey(context.Background(), "sk-ant-candidate"); err != nil {
+	if _, err := p.VerifyKey(context.Background(), "sk-ant-candidate", ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 

@@ -287,6 +287,94 @@ type routeContext struct {
 	Route string
 }
 
+// routedPickRefusal is the refusal for a routed alias whose picked route
+// (and, where applicable, its default route) cannot serve: disabled or not in
+// the route table.
+type routedPickRefusal struct {
+	Code    string
+	Message string
+}
+
+// routedPick is the effective routing decision after the classifier's pick
+// has been checked for disabled/unreachable targets.
+type routedPick struct {
+	RouteName string
+	Reason    string
+	Target    string
+	Refusal   *routedPickRefusal // non-nil: refuse; Target is the picked route's target
+}
+
+// targetState reports why target cannot serve: "" if usable,
+// "model_not_found" if absent from the route table, "model_not_enabled" if
+// disabled. Policy (residency/allowlist) is deliberately NOT considered.
+func targetState(snap policy.Snapshot, tbl *routing.Table, target string) string {
+	if _, ok := tbl.Lookup(target); !ok {
+		return "model_not_found"
+	}
+	if !snap.Enabled[target] {
+		return "model_not_enabled"
+	}
+	return ""
+}
+
+func targetStateText(code string) string {
+	if code == "model_not_found" {
+		return "not available on this gateway"
+	}
+	return "disabled"
+}
+
+// resolveRoutedPick applies the owner rule to a classifier decision: if the
+// picked route's target is disabled or unreachable and the pick is not the
+// default route, serve the alias's own default route instead (when its
+// target is usable). Policy refusals (residency, allowlist) are never
+// fallback cases — they are evaluated afterwards on the returned target.
+// Shared by HandleChatCompletions and HandleRoutingDryrun so both report the
+// same decision. A pick naming an unknown route is returned untouched (the
+// caller fails closed).
+func resolveRoutedPick(snap policy.Snapshot, tbl *routing.Table, aliasName string, alias policy.AliasDef, d router.Decision) routedPick {
+	pick := routedPick{RouteName: d.RouteName, Reason: d.Reason}
+	rd, ok := alias.Route(d.RouteName)
+	if !ok {
+		return pick
+	}
+	pick.Target = rd.Target
+	state := targetState(snap, tbl, rd.Target)
+	if state == "" {
+		return pick
+	}
+	if d.RouteName == alias.DefaultRoute {
+		pick.Refusal = &routedPickRefusal{
+			Code: state,
+			Message: fmt.Sprintf("route %q of alias %q is the alias's default route and selects model %q, which is %s. Enable it on the Models page or retarget the route.",
+				d.RouteName, aliasName, rd.Target, targetStateText(state)),
+		}
+		return pick
+	}
+	def, dok := alias.Route(alias.DefaultRoute)
+	if !dok {
+		return pick // unreachable per buildAliases; refuse via the normal path
+	}
+	dstate := targetState(snap, tbl, def.Target)
+	if dstate != "" {
+		pick.Refusal = &routedPickRefusal{
+			Code: state,
+			Message: fmt.Sprintf("route %q of alias %q selects model %q, which is %s, and the alias's default route %q selects %q, which is also %s. Enable one of them on the Models page or retarget the route.",
+				d.RouteName, aliasName, rd.Target, targetStateText(state), alias.DefaultRoute, def.Target, targetStateText(dstate)),
+		}
+		return pick
+	}
+	kind := "route_target_disabled"
+	if state == "model_not_found" {
+		kind = "route_target_unreachable"
+	}
+	return routedPick{
+		RouteName: alias.DefaultRoute,
+		Reason:    "fallback:" + kind + ":" + d.RouteName,
+		Target:    def.Target,
+	}
+}
+
 // attributedUserID applies the same X-Darkplum-User-Id trust rule as
 // middleware.Recording's resolveAttributedUserID: the header is honoured
 // only for a service-key caller (the api proxying a session user's
@@ -430,6 +518,7 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 	routeName := ""
 	routerReason := ""
 	var routerLatencyMS *int
+	var routedRefusal *routedPickRefusal
 
 	alias, isAlias := snap.Aliases[req.Model]
 	switch {
@@ -457,8 +546,10 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 			return
 		}
 
-		routeName = decision.RouteName
-		routerReason = decision.Reason
+		pick := resolveRoutedPick(snap, h.routes.Snapshot(), req.Model, alias, decision)
+		routeName = pick.RouteName
+		routerReason = pick.Reason
+		routedRefusal = pick.Refusal
 
 		rd, ok := alias.Route(routeName)
 		if !ok {
@@ -494,6 +585,28 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 	}
 	if routerLatencyMS != nil {
 		c.Set("router_latency_ms", *routerLatencyMS)
+	}
+
+	if routedRefusal != nil {
+		// Both the classifier's pick and the alias's default route are
+		// unusable (disabled/unreachable): nothing to fall back to.
+		if rt, found := h.routes.Snapshot().Lookup(resolvedModel); found {
+			c.Set("backend_class", rt.Class)
+			c.Header("X-Darkplum-Backend-Class", rt.Class)
+			c.Header("X-Darkplum-Provider", rt.Kind)
+		}
+		c.Set("denial_code", routedRefusal.Code)
+		logDenial(c, routedRefusal.Code, req.Model, resolvedModel, c.GetString("backend_class"))
+		status, typ := http.StatusForbidden, "permission_error"
+		if routedRefusal.Code == "model_not_found" {
+			status, typ = http.StatusNotFound, "invalid_request_error"
+		}
+		c.JSON(status, openAIError{Error: openAIErrorBody{
+			Message: routedRefusal.Message,
+			Type:    typ,
+			Code:    routedRefusal.Code,
+		}})
+		return
 	}
 
 	route, ok := h.routes.Snapshot().Lookup(resolvedModel)
@@ -642,7 +755,10 @@ func (h *ChatHandler) handleStream(c *gin.Context, prov provider.Provider, chatR
 			// send a JSON error body — that would corrupt the stream. Write an
 			// SSE error event so clients that handle "event: error" frames can
 			// surface the failure gracefully.
-			_ = writeStreamError(c.Writer, err)
+			if _, _, ok := dataRetentionResponse("", err); ok {
+				c.Set("denial_code", provider.DenialModelRequiresDataRetention)
+			}
+			_ = writeStreamError(c.Writer, err, c.GetString("route_name"))
 		}
 		return
 	}
@@ -722,6 +838,10 @@ func (h *ChatHandler) HandleListModels(c *gin.Context) {
 		Created      int64  `json:"created"`
 		OwnedBy      string `json:"owned_by"`
 		BackendClass string `json:"backend_class"`
+		// Availability is set only for models whose provider can report it
+		// (Bedrock). Not sensitive, so it rides on service-key and user-key
+		// responses alike.
+		Availability *provider.Availability `json:"availability,omitempty"`
 	}
 	// DefaultModel is the caller's effective default_model (what a request
 	// that names no model will run on) — set only for a user key, where the
@@ -783,13 +903,20 @@ func (h *ChatHandler) HandleListModels(c *gin.Context) {
 		if filterByPolicy && (!eff.Allows(id) || !policy.ResidencyPermits(eff.Residency, route.Class)) {
 			continue
 		}
-		models = append(models, modelEntry{
+		entry := modelEntry{
 			ID:           id,
 			Object:       "model",
 			Created:      now,
 			OwnedBy:      route.Kind,
 			BackendClass: route.Class,
-		})
+		}
+		if prov, ok := h.providers.Get(route.ProviderKey); ok {
+			if ar, ok := prov.(provider.AvailabilityReporter); ok {
+				av := ar.ModelAvailability(id)
+				entry.Availability = &av
+			}
+		}
+		models = append(models, entry)
 	}
 
 	resp := modelsResponse{Object: "list", Data: models}
@@ -1537,14 +1664,19 @@ func (h *ChatHandler) HandleRoutingDryrun(c *gin.Context) {
 		return
 	}
 
-	rd, _ := alias.Route(decision.RouteName)
-	target := rd.Target
+	pick := resolveRoutedPick(snap, h.routes.Snapshot(), req.Alias, alias, decision)
+	target := pick.Target
 
 	resp := routingDryrunResponse{
-		RouteName:     decision.RouteName,
+		RouteName:     pick.RouteName,
 		TargetModelID: target,
-		Reason:        decision.Reason,
+		Reason:        pick.Reason,
 		LatencyMS:     latency,
+	}
+	if pick.Refusal != nil {
+		resp.WouldBeRefused = &routingDryrunRefusal{Code: pick.Refusal.Code, Message: pick.Refusal.Message}
+		c.JSON(http.StatusOK, resp)
+		return
 	}
 
 	// Evaluate the same route/enabled/residency chain HandleChatCompletions
@@ -1783,6 +1915,18 @@ func genericUpstreamMessage(code string) string {
 	return "the upstream model backend returned an error"
 }
 
+// dataRetentionResponse renders the 422 model_requires_data_retention response
+// when err is a provider.DataRetentionRefusal. It is a refusal, not an upstream
+// failure: the caller records denial_code so Activity can filter on it.
+func dataRetentionResponse(route string, err error) (int, []byte, bool) {
+	var dr provider.DataRetentionRefusal
+	if !errors.As(err, &dr) {
+		return 0, nil, false
+	}
+	model, mode, required := dr.DataRetentionRefusal()
+	return http.StatusUnprocessableEntity, provider.DataRetentionErrorBody(model, route, mode, required), true
+}
+
 // handleProviderError maps a provider error to an HTTP response. A
 // provider.APIError (BedrockAPIError today; any future vendor provider's own
 // error type) carries a pre-translated status, body, and retry-after value —
@@ -1793,6 +1937,11 @@ func genericUpstreamMessage(code string) string {
 // openaicompat dial error, which embeds the upstream URL) can carry internal
 // detail that must not leave the gateway.
 func handleProviderError(c *gin.Context, err error) {
+	if status, body, ok := dataRetentionResponse(c.GetString("route_name"), err); ok {
+		c.Set("denial_code", provider.DenialModelRequiresDataRetention)
+		c.Data(status, "application/json", body)
+		return
+	}
 	var apiErr provider.APIError
 	if errors.As(err, &apiErr) {
 		if ra := apiErr.RetryAfterSeconds(); ra > 0 {
@@ -1821,10 +1970,12 @@ func handleProviderError(c *gin.Context, err error) {
 // closed-vocabulary message handleProviderError's JSON path would have used.
 // There is no way to relay Retry-After on a committed SSE stream, so a
 // mid-stream 429 carries no header equivalent here.
-func writeStreamError(w io.Writer, err error) error {
+func writeStreamError(w io.Writer, err error, route string) error {
 	var apiErr provider.APIError
 	var payload []byte
-	if errors.As(err, &apiErr) {
+	if _, body, ok := dataRetentionResponse(route, err); ok {
+		payload = body
+	} else if errors.As(err, &apiErr) {
 		payload = apiErr.ResponseBody()
 	} else {
 		_, code := genericUpstreamError(err)

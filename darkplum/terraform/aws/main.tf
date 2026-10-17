@@ -111,6 +111,18 @@ module "pod_identity_gateway" {
             Effect   = "Allow"
             Action   = ["bedrock:ListInferenceProfiles"]
             Resource = "*"
+          },
+          {
+            # Read-only: lets the gateway tell an administrator, before anyone
+            # sends a prompt, that a model (Claude Fable 5 and later) needs the
+            # account's Bedrock data-retention mode raised. The write
+            # (bedrock:PutAccountDataRetention) is deliberately NOT granted —
+            # that is a data-handling decision for the account owner, made with
+            # their own credentials, never by the platform.
+            Sid      = "ReadDataRetentionMode"
+            Effect   = "Allow"
+            Action   = ["bedrock:GetAccountDataRetention"]
+            Resource = "*"
           }
         ]
       )

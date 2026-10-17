@@ -6,7 +6,30 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"regexp"
 )
+
+var vendorErrorTypePattern = regexp.MustCompile(`^[a-z_]{1,40}$`)
+
+// SanitizeVendorErrorType extracts error.type from a vendor's JSON error body
+// (Anthropic and OpenAI share the {"error":{"type":...}} shape) and returns it
+// only if it matches ^[a-z_]{1,40}$; anything else, including an unparseable
+// body, yields "unknown". The message field is never read.
+func SanitizeVendorErrorType(body []byte) string {
+	var env struct {
+		Error struct {
+			Type any `json:"type"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(body, &env) != nil {
+		return "unknown"
+	}
+	t, ok := env.Error.Type.(string)
+	if !ok || !vendorErrorTypePattern.MatchString(t) {
+		return "unknown"
+	}
+	return t
+}
 
 // vendorErrorBody / vendorErrorDetail is the OpenAI-compatible wire shape
 // every error a direct vendor API provider (anthropic, openai) returns is
@@ -47,6 +70,26 @@ type VendorAPIError struct {
 	Body       []byte
 	RetryAfter int
 	Cause      error
+	// Code is the closed-vocabulary error code written into Body
+	// (provider_auth_failed, provider_rate_limited, invalid_request,
+	// upstream_error, upstream_timeout). VendorStatus is the HTTP status the
+	// vendor itself returned, 0 when the failure never got a response. Both
+	// exist so an operator-facing log line can say WHICH closed outcome
+	// happened without carrying a byte of the vendor's own text.
+	Code         string
+	VendorStatus int
+	// VendorErrorType is the vendor's own JSON error.type, sanitised to
+	// ^[a-z_]{1,40}$ (else "unknown") by SanitizeVendorErrorType. Empty when
+	// the caller did not attach one. Only the type tag is ever kept, never
+	// the vendor's message.
+	VendorErrorType string
+	// WorkspaceRequired is set by the anthropic provider when the vendor's
+	// 400 says the API key is not scoped to a workspace and the request must
+	// carry the anthropic-workspace-id header. Only the boolean is kept,
+	// never the vendor's message. It drives POST /v1/providers/anthropic/
+	// verify's workspace_required outcome; the chat path still renders the
+	// ordinary generic 400 invalid_request.
+	WorkspaceRequired bool
 }
 
 // Error deliberately never includes Cause: Cause may wrap raw vendor text (an
@@ -83,7 +126,8 @@ func NewVendorAPIError(vendor string, statusCode int, errType, code, message str
 		// practice; fall back to a minimal static body rather than panic.
 		body = []byte(`{"error":{"message":"the model provider returned an error","type":"upstream_error","code":"upstream_error"}}`)
 	}
-	return &VendorAPIError{Vendor: vendor, StatusCode: statusCode, Body: body, RetryAfter: retryAfter, Cause: cause}
+	return &VendorAPIError{Vendor: vendor, StatusCode: statusCode, Body: body, RetryAfter: retryAfter, Code: code,
+		Cause: cause}
 }
 
 // NewVendorInvalidRequestError builds a 400 invalid_request error whose
@@ -123,6 +167,10 @@ func ReportAuthFailed(status AuthFailureReporter, name string) {
 			st.Configured = existing.Configured
 			st.ModelCount = existing.ModelCount
 			st.LastSyncAt = existing.LastSyncAt
+			st.FilterSource = existing.FilterSource
+			st.Filter = existing.Filter
+			st.EnvFilterSetAt = existing.EnvFilterSetAt
+			st.WorkspaceID = existing.WorkspaceID
 			break
 		}
 	}
@@ -140,6 +188,12 @@ func ReportAuthFailed(status AuthFailureReporter, name string) {
 // retained only for Unwrap/internal diagnostics — it is NEVER surfaced in
 // the response body, and must never itself carry the vendor API key.
 func TranslateVendorHTTPStatus(vendor string, statusCode, retryAfterSeconds int, status AuthFailureReporter, cause error) *VendorAPIError {
+	e := translateVendorHTTPStatus(vendor, statusCode, retryAfterSeconds, status, cause)
+	e.VendorStatus = statusCode
+	return e
+}
+
+func translateVendorHTTPStatus(vendor string, statusCode, retryAfterSeconds int, status AuthFailureReporter, cause error) *VendorAPIError {
 	switch {
 	case statusCode == 429:
 		return NewVendorAPIError(vendor, 429, "rate_limit_error", "provider_rate_limited",
@@ -192,4 +246,19 @@ func IsTransportTimeout(err error) bool {
 		return true
 	}
 	return errors.Is(err, context.DeadlineExceeded)
+}
+
+// VendorResponseError returns the *VendorAPIError in err's chain when the
+// vendor actually answered with an HTTP response other than 401/403 (429
+// included) — the "vendor_error" verify outcome. Transport failures
+// (VendorStatus == 0) and auth failures return nil, false.
+func VendorResponseError(err error) (*VendorAPIError, bool) {
+	var apiErr *VendorAPIError
+	if !errors.As(err, &apiErr) {
+		return nil, false
+	}
+	if apiErr.VendorStatus == 0 || apiErr.VendorStatus == 401 || apiErr.VendorStatus == 403 {
+		return nil, false
+	}
+	return apiErr, true
 }

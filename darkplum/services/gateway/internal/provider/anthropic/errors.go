@@ -74,7 +74,11 @@ func translateError(err error, status authFailureReporter, name string) error {
 		// net/http constant) and every other 4xx/5xx fall into its default
 		// branch: there is no wire-contract code more specific than
 		// upstream_error for them.
-		return provider.TranslateVendorHTTPStatus("anthropic", sdkErr.StatusCode, retryAfterSeconds(sdkErr), status, err)
+		translated := provider.TranslateVendorHTTPStatus("anthropic", sdkErr.StatusCode, retryAfterSeconds(sdkErr), status, err)
+		// Only the vendor's error.type tag (sanitised), never its message.
+		translated.VendorErrorType = provider.SanitizeVendorErrorType([]byte(sdkErr.RawJSON()))
+		translated.WorkspaceRequired = IsWorkspaceRequiredError(sdkErr)
+		return translated
 	}
 
 	var idleErr *idleTimeoutError
@@ -167,6 +171,23 @@ func isSamplingParamUnsupportedError(err error) bool {
 		}
 	}
 	return false
+}
+
+// workspaceHeaderMarker is the substring Anthropic's "this API key is not
+// scoped to a workspace" 400 message always contains (it names the header the
+// request must add).
+const workspaceHeaderMarker = "anthropic-workspace-id"
+
+// IsWorkspaceRequiredError reports whether err is (or wraps) a vendor 400
+// whose parsed error.message says the request must include the
+// anthropic-workspace-id header. The message is matched here and never
+// forwarded anywhere.
+func IsWorkspaceRequiredError(err error) bool {
+	var sdkErr *sdk.Error
+	if !errors.As(err, &sdkErr) || sdkErr.StatusCode != http.StatusBadRequest {
+		return false
+	}
+	return strings.Contains(strings.ToLower(vendorErrorMessage(sdkErr)), workspaceHeaderMarker)
 }
 
 // IsAuthError reports whether err is (or wraps) a vendor 401/403 response.

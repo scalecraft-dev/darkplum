@@ -186,3 +186,37 @@ func TestManager_BedrockVsVLLMCollision(t *testing.T) {
 		t.Errorf("expected vllm-default to win over bedrock, got %q", route.ProviderKey)
 	}
 }
+
+// refreshingBedrock adds the optional data-retention refresh seam.
+type refreshingBedrock struct {
+	fakeBedrockProvider
+	refreshes int
+	order     *[]string
+}
+
+func (f *refreshingBedrock) RefreshAccountDataRetention(_ context.Context) {
+	f.refreshes++
+	*f.order = append(*f.order, "refresh")
+}
+
+func TestBedrockSource_RefreshesDataRetentionOncePerTickAndNeverFailsDiscovery(t *testing.T) {
+	var order []string
+	fake := &refreshingBedrock{
+		fakeBedrockProvider: fakeBedrockProvider{name: "bedrock", models: map[string]bool{"us.anthropic.claude-fable-5": true}},
+		order:               &order,
+	}
+	state := &bedrockSourceState{
+		region: "us-east-1",
+		newFn:  func(context.Context, string) (bedrockDiscoverer, error) { return fake, nil },
+	}
+	src := newBedrockSourceFromState(state)
+	for i := 0; i < 3; i++ {
+		ids, err := src.Discover(context.Background())
+		if err != nil || len(ids) != 1 {
+			t.Fatalf("tick %d: ids=%v err=%v", i, ids, err)
+		}
+	}
+	if fake.refreshes != 3 {
+		t.Errorf("refreshes = %d, want 3 (once per tick)", fake.refreshes)
+	}
+}

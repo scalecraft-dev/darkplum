@@ -179,7 +179,8 @@ type inferenceEvent struct {
 	StatusCode   int     `json:"status_code"`
 	// DenialCode is why the gateway refused this request, when it did:
 	// model_not_found, model_not_enabled, model_residency_violation,
-	// model_not_allowed, invalid_request, policy_unavailable, request_canceled.
+	// model_not_allowed, invalid_request, policy_unavailable, request_canceled,
+	// model_requires_data_retention.
 	// Null on a request that reached a model. This is the admin's answer to "did my
 	// policy fire, and on whom".
 	DenialCode       *string   `json:"denial_code"`
@@ -222,7 +223,8 @@ func validUsagePurposeFilter(v string) bool {
 func validDenialCodeFilter(v string) bool {
 	switch v {
 	case "", "any", "model_not_found", "model_not_enabled", "model_residency_violation",
-		"model_not_allowed", "invalid_request", "policy_unavailable", "request_canceled":
+		"model_not_allowed", "invalid_request", "policy_unavailable", "request_canceled",
+		"model_requires_data_retention":
 		return true
 	default:
 		return false
@@ -233,7 +235,7 @@ func validDenialCodeFilter(v string) bool {
 func appendDenialCodeFilter(c *gin.Context, where string, args []any, argN int) (string, []any, int, error) {
 	v := c.Query("denial_code")
 	if !validDenialCodeFilter(v) {
-		return where, args, argN, fmt.Errorf("denial_code must be one of any, model_not_found, model_not_enabled, model_residency_violation, model_not_allowed, invalid_request, policy_unavailable, request_canceled")
+		return where, args, argN, fmt.Errorf("denial_code must be one of any, model_not_found, model_not_enabled, model_residency_violation, model_not_allowed, invalid_request, policy_unavailable, request_canceled, model_requires_data_retention")
 	}
 	switch v {
 	case "":

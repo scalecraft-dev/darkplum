@@ -68,6 +68,11 @@ type Config struct {
 	// 401/403 (see translateError) — in addition to the periodic Report
 	// calls routing.NewAnthropicSource makes on every discovery tick.
 	Status authFailureReporter
+	// WorkspaceID returns the effective Anthropic workspace id, "" for none.
+	// Evaluated per request; when non-empty every request carries an
+	// anthropic-workspace-id header (a per-request option, so the
+	// version-cached SDK client is never rebuilt for it). nil means none.
+	WorkspaceID func() string
 }
 
 // Provider implements provider.Provider for the direct Anthropic API.
@@ -151,6 +156,25 @@ func (p *Provider) sdkClientFor() (*sdk.Client, error) {
 	return p.sdkClient, nil
 }
 
+// requestOptions returns the per-request SDK options for the effective
+// workspace id: the anthropic-workspace-id header when one is in force.
+func (p *Provider) requestOptions(ctx context.Context) []option.RequestOption {
+	if id, ok := provider.WorkspaceOverrideFromContext(ctx); ok {
+		return workspaceOptions(id)
+	}
+	if p.cfg.WorkspaceID == nil {
+		return nil
+	}
+	return workspaceOptions(p.cfg.WorkspaceID())
+}
+
+func workspaceOptions(workspaceID string) []option.RequestOption {
+	if workspaceID == "" {
+		return nil
+	}
+	return []option.RequestOption{option.WithHeader("anthropic-workspace-id", workspaceID)}
+}
+
 // resolveMaxTokens picks the max_tokens value to send: the caller's value if
 // set, else Config.DefaultMaxTokens, clamped to the model's own max output
 // tokens if discovery has learned it (see DiscoverModels).
@@ -185,11 +209,12 @@ func (p *Provider) Complete(ctx context.Context, req provider.ChatRequest) (*pro
 	maxTokens := p.resolveMaxTokens(req.Model, req.MaxTokens)
 	params := buildParams(req, norm, maxTokens, true)
 
-	msg, err := client.Messages.New(ctx, params)
+	reqOpts := p.requestOptions(ctx)
+	msg, err := client.Messages.New(ctx, params, reqOpts...)
 	if err != nil && isSamplingParamUnsupportedError(err) {
 		slog.Info("anthropic: retrying without sampling parameters (temperature, top_p)", "model", req.Model)
 		params = buildParams(req, norm, maxTokens, false)
-		msg, err = client.Messages.New(ctx, params)
+		msg, err = client.Messages.New(ctx, params, reqOpts...)
 	}
 	if err != nil {
 		return nil, translateError(err, p.cfg.Status, p.Name())
@@ -224,12 +249,13 @@ func (p *Provider) Stream(ctx context.Context, req provider.ChatRequest, w io.Wr
 	idleCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 
-	stream := client.Messages.NewStreaming(idleCtx, params)
+	reqOpts := p.requestOptions(ctx)
+	stream := client.Messages.NewStreaming(idleCtx, params, reqOpts...)
 	if stream.Err() != nil && isSamplingParamUnsupportedError(stream.Err()) {
 		slog.Info("anthropic: retrying stream without sampling parameters (temperature, top_p)", "model", req.Model)
 		_ = stream.Close()
 		params = buildParams(req, norm, maxTokens, false)
-		stream = client.Messages.NewStreaming(idleCtx, params)
+		stream = client.Messages.NewStreaming(idleCtx, params, reqOpts...)
 	}
 	if stream.Err() != nil {
 		// Nothing has been written to w yet at this point: NewStreaming's

@@ -268,16 +268,6 @@
   white-space: nowrap;
 }
 
-/* The alias had to choose again mid-conversation. Rare, and worth a mark of
-   its own rather than a colour change on the line. */
-.provenanceNote {
-  margin-left: var(--space-2);
-  padding: 0 var(--space-1);
-  color: var(--warning-fg);
-  border: 1px solid var(--warning-border);
-  border-radius: var(--radius-sm);
-}
-
 .srOnly {
   position: absolute;
   width: 1px;

@@ -1,13 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { Link, useSearchParams } from 'react-router-dom'
+import { Link, Navigate, useSearchParams } from 'react-router-dom'
 import {
   ApiError,
-  deleteModelAlias,
   getRoutingPolicy,
   listAdminModels,
   listModelAliases,
   listPolicyPrincipals,
-  putModelAlias,
   setModelDisplayName,
   setVendorFilter,
   toggleModel,
@@ -18,6 +16,8 @@ import {
   UNKNOWN_CLASS_HINT,
   UNREACHABLE_HINT,
   UNSUPPORTED_CONTENT_NOTE,
+  aliasReferenceConsequence,
+  aliasReferencesTo,
   backendClassLabel,
   backendClassTooltip,
   backendClassVariant,
@@ -25,6 +25,7 @@ import {
   displayClassOf,
   isEgress,
   isReachable,
+  isRoutedAlias,
   isVendorProvider,
   providerLabel,
   vendorLabel,
@@ -37,11 +38,11 @@ import {
 } from '../lib/policy'
 import { canInstallKeyOverTransport, installPhase, keyTransportHelp } from '../lib/vendorKeys'
 import type { KeyTransportHelp } from '../lib/vendorKeys'
+import type { AliasReference } from '../lib/modelRouting'
 import type {
   AdminModel,
   DisplayClass,
   ModelAlias,
-  ModelAliasInput,
   PolicyPrincipal,
   ProviderStatus,
   Residency,
@@ -55,6 +56,8 @@ import {
   ClassGlyph,
   EgressGlyph,
   LockGlyph,
+  Modal,
+  OptInGlyph,
   Tab,
   TabList,
   TabPanel,
@@ -64,9 +67,14 @@ import {
   UnreachableGlyph,
 } from '../components/ui'
 import { CopyButton } from '../components/ui/CopyButton'
+import {
+  AWS_OPT_IN_LABEL,
+  awsOptInCountText,
+  awsOptInStatusHint,
+  needsAwsOptIn,
+} from '../lib/dataRetention'
 import { Skeleton } from '../components/ui/Skeleton'
 import { AccessOverviewSection } from './AccessOverviewSection'
-import { AliasesSection } from './AliasesSection'
 import { RoutingPolicyCard, type OrgPolicyDraft } from './RoutingPolicyCard'
 import { VendorEnableModal } from './VendorEnableModal'
 import { VendorInstallModal, type Outcome, type VendorInstallMode } from './VendorInstallModal'
@@ -90,16 +98,17 @@ const EMPTY_FILTER: string[] = []
 
 type Filter = 'all' | 'enabled' | 'disabled'
 
-/** The three things this page is: a catalogue, the aliases that point into it,
- *  and the policy that decides which of it anyone actually reaches. Each is a
- *  tab; `?tab=` names the open one so any of them can be linked to. */
-type TabKey = 'models' | 'aliases' | 'policy'
+/** The two things this page is: a catalogue, and the policy that decides
+ *  which of it anyone actually reaches. Each is a tab; `?tab=` names the open
+ *  one so either can be linked to. Aliases and routed aliases have their own
+ *  page, Admin > Routing; `?tab=aliases` is redirected there so old links land. */
+type TabKey = 'models' | 'policy'
 /** Prefix for this page's tab/panel DOM ids, so another tab set on the same
  *  page could never share an id with these. */
 const TAB_SCOPE = 'models-page'
 
 function tabFromParam(value: string | null): TabKey {
-  return value === 'aliases' || value === 'policy' ? value : 'models'
+  return value === 'policy' ? value : 'models'
 }
 
 /** Extract the vendor from a Bedrock inference profile ID.
@@ -135,6 +144,7 @@ type RowFlag =
   | { kind: 'disabled_by_policy'; hint: string }
   | { kind: 'blocked'; hint: string }
   | { kind: 'unknown'; hint: string }
+  | { kind: 'aws_opt_in'; hint: string }
   | { kind: 'unreachable'; hint: string }
   | null
 
@@ -164,6 +174,9 @@ function rowFlag(
         hint: "Turning this on is not enough: it is not on the organisation's allowed list.",
       }
     }
+    // Off, and AWS would refuse it once on — the same "turning this on is not
+    // enough" situation, explained in the account's own terms.
+    if (needsAwsOptIn(m)) return { kind: 'aws_opt_in', hint: awsOptInStatusHint(m) }
     return null
   }
 
@@ -182,8 +195,11 @@ function rowFlag(
       hint: "Enabled, but not on the organisation's allowed list, so refused.",
     }
   }
-  // A policy refusal outranks an unreachable backend: it still refuses the
-  // request once the backend comes back.
+  // Precedence: Blocked by policy > Needs AWS opt-in > Not reachable. A policy
+  // refusal still refuses once the account is changed, and an account that
+  // refuses the model still refuses once the backend comes back. 'unknown'
+  // availability says nothing and falls through.
+  if (needsAwsOptIn(m)) return { kind: 'aws_opt_in', hint: awsOptInStatusHint(m) }
   if (!isReachable(m)) return { kind: 'unreachable', hint: UNREACHABLE_HINT }
   return null
 }
@@ -420,6 +436,15 @@ function ProviderSection({
                   Blocked by policy
                 </Badge>
               )}
+              {/* Warning while it is on and being refused; neutral while it
+                  is off, like the disabled policy badge — nothing is being
+                  refused yet. */}
+              {flag?.kind === 'aws_opt_in' && (
+                <Badge variant={m.enabled ? 'warning' : 'neutral'} bordered>
+                  <OptInGlyph />
+                  {AWS_OPT_IN_LABEL}
+                </Badge>
+              )}
               {flag?.kind === 'unknown' && (
                 <Badge variant="neutral" bordered dashed>
                   <UnknownGlyph />
@@ -612,7 +637,16 @@ function LoadingSkeleton() {
 // Main page
 // ---------------------------------------------------------------------------
 
+/** Before Routing had its own page, aliases were a tab here. A bookmark or a
+ *  link written then (`/admin/models?tab=aliases`) goes to where they live now,
+ *  replacing the history entry so Back does not bounce through the redirect. */
 export function ModelsPage() {
+  const [searchParams] = useSearchParams()
+  if (searchParams.get('tab') === 'aliases') return <Navigate to="/admin/routing" replace />
+  return <ModelsPageBody />
+}
+
+function ModelsPageBody() {
   const { toast } = useToast()
   // The open tab is read from the URL rather than held beside it, so a deep
   // link (?tab=policy) and the page's own cross-tab links are the same thing.
@@ -664,9 +698,17 @@ export function ModelsPage() {
   const [policyError, setPolicyError] = useState<string | null>(null)
   const [policySaving, setPolicySaving] = useState(false)
 
+  /** Read for two things only: the disable check (does an alias point at this
+   *  model?) and the policy card's "add every target of alias" helper. They are
+   *  edited on Admin > Routing; this page never writes them. */
   const [aliases, setAliases] = useState<ModelAlias[]>([])
-  const [aliasesLoading, setAliasesLoading] = useState(true)
-  const [aliasesError, setAliasesError] = useState<string | null>(null)
+  /** False until a read has succeeded. The disable check reads afresh rather
+   *  than trust an empty list that is only empty because the read failed. */
+  const [aliasesLoaded, setAliasesLoaded] = useState(false)
+  /** A disable waiting on confirmation because aliases point at the model. */
+  const [pendingDisable, setPendingDisable] = useState<
+    { model: AdminModel; refs: AliasReference[] } | null
+  >(null)
 
   const [principals, setPrincipals] = useState<PolicyPrincipal[]>([])
   const [principalsTotal, setPrincipalsTotal] = useState(0)
@@ -699,8 +741,7 @@ export function ModelsPage() {
     }
   }, [toast])
 
-  // Policy and aliases report their own failures inside their card rather than
-  // as a toast: the reason belongs next to the control it disables.
+  // The policy reports its own failure inside its card rather than as a toast: the reason belongs next to the control it disables.
   const loadPolicy = useCallback(async () => {
     setPolicyLoading(true)
     try {
@@ -748,15 +789,14 @@ export function ModelsPage() {
     }
   }, [principals.length, toast])
 
+  /** Quiet on failure: nothing on this page displays the aliases, and the
+   *  disable check re-reads them (and says so if that fails) before it acts. */
   const loadAliases = useCallback(async () => {
-    setAliasesLoading(true)
     try {
       setAliases(await listModelAliases())
-      setAliasesError(null)
-    } catch (err) {
-      setAliasesError((err as Error).message)
-    } finally {
-      setAliasesLoading(false)
+      setAliasesLoaded(true)
+    } catch {
+      setAliasesLoaded(false)
     }
   }, [])
 
@@ -793,9 +833,7 @@ export function ModelsPage() {
       })
       setPolicy(updated)
       toast('Routing policy saved', 'success')
-      // The aliases carry per-route health, and the principals carry reachable
-      // sets; this may have just changed both.
-      void loadAliases()
+      // The principals carry reachable sets; this may have just changed them.
       void loadPrincipals()
       return {
         warnings: updated.warnings ?? [],
@@ -854,29 +892,47 @@ export function ModelsPage() {
     }
   }
 
-  // Throws on failure so the editor can attach the server's message to a field.
-  // Resolves with the API's configure-time warnings for the saved alias.
-  const handleSaveAlias = async (alias: string, body: ModelAliasInput): Promise<string[]> => {
-    const existing = aliases.some((a) => a.alias === alias)
-    const saved = await putModelAlias(alias, body)
-    setAliases((prev) => {
-      const next = prev.filter((a) => a.alias !== saved.alias)
-      return [...next, saved].sort((a, b) => a.alias.localeCompare(b.alias))
-    })
-    const changed =
-      'kind' in body
-        ? `now has ${body.routes.length} ${body.routes.length === 1 ? 'route' : 'routes'}`
-        : `now points at ${body.target_model_id}`
-    toast(existing ? `Alias ${alias} ${changed}` : `Alias ${alias} created`, 'success')
-    return saved.warnings ?? []
-  }
-
-  const handleDeleteAlias = async (alias: string) => {
-    await deleteModelAlias(alias)
-    setAliases((prev) => prev.filter((a) => a.alias !== alias))
-  }
-
+  /**
+   * Turning a model off is checked against the aliases first: a static alias
+   * on it, or the default route of a routed one, starts refusing, and any
+   * other route moves to its alias's default. Nobody should learn that from a
+   * chat transcript. A model nothing points at is turned off as before.
+   */
   const handleToggle = async (model: AdminModel) => {
+    if (!model.enabled) {
+      await applyToggle(model)
+      return
+    }
+    let current = aliases
+    // A routed alias without its routes cannot be checked, and a list that
+    // never loaded is not a list of nothing; read them fresh rather than guess
+    // that nothing points here.
+    if (!aliasesLoaded || current.some((a) => isRoutedAlias(a) && a.routes === undefined)) {
+      setTogglingIds((prev) => new Set(prev).add(model.id))
+      try {
+        current = await listModelAliases()
+        setAliases(current)
+        setAliasesLoaded(true)
+      } catch (err) {
+        toast(`Could not check which aliases use this model: ${(err as Error).message}`, 'error')
+        return
+      } finally {
+        setTogglingIds((prev) => {
+          const next = new Set(prev)
+          next.delete(model.id)
+          return next
+        })
+      }
+    }
+    const refs = aliasReferencesTo(model.model_id, current)
+    if (refs.length > 0) {
+      setPendingDisable({ model, refs })
+      return
+    }
+    await applyToggle(model)
+  }
+
+  const applyToggle = async (model: AdminModel) => {
     const newEnabled = !model.enabled
     setTogglingIds((prev) => new Set(prev).add(model.id))
 
@@ -935,6 +991,7 @@ export function ModelsPage() {
 
   const totalEnabled = models.filter((m) => m.enabled).length
   const totalUnreachable = models.filter((m) => !isReachable(m)).length
+  const totalAwsOptIn = models.filter(needsAwsOptIn).length
 
   /**
    * Vendors whose key works and whose models are every one of them still off.
@@ -1059,10 +1116,9 @@ export function ModelsPage() {
         default_model: policy?.default_model ?? null,
       })
       setPolicy(updated)
-      void loadAliases()
       void loadPrincipals()
     },
-    [policy, loadAliases, loadPrincipals],
+    [policy, loadPrincipals],
   )
 
   /** Enables one model for the modal. Throws with the API's own message so a
@@ -1130,18 +1186,6 @@ export function ModelsPage() {
           Models
         </Tab>
         <Tab
-          id="aliases"
-          active={tab === 'aliases'}
-          count={aliases.length > 0 ? aliases.length : undefined}
-          onClick={() => selectTab('aliases')}
-        >
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z" />
-            <line x1="7" y1="7" x2="7.01" y2="7" />
-          </svg>
-          Aliases
-        </Tab>
-        <Tab
           id="policy"
           active={tab === 'policy'}
           count={principalsTotal > 0 ? principalsTotal : undefined}
@@ -1174,6 +1218,7 @@ export function ModelsPage() {
           allowedModels={allowedModels}
           totalEnabled={totalEnabled}
           totalUnreachable={totalUnreachable}
+          totalAwsOptIn={totalAwsOptIn}
           policyRestricted={policyRestricted}
           onGoToTab={goToTab}
           onSearch={setSearch}
@@ -1184,19 +1229,6 @@ export function ModelsPage() {
           onManageVendor={(vendor, mode) => setManaging({ vendor, mode })}
           onCheckAgain={() => void loadModels()}
           onAdoptFilter={handleAdoptFilter}
-        />
-      </TabPanel>
-
-      <TabPanel id="aliases" scope={TAB_SCOPE} active={tab === 'aliases'}>
-        <AliasesSection
-          aliases={aliases}
-          models={models}
-          loading={aliasesLoading || loading}
-          error={aliasesError}
-          residency={residency}
-          onRetry={() => void loadAliases()}
-          onSave={handleSaveAlias}
-          onDelete={handleDeleteAlias}
         />
       </TabPanel>
 
@@ -1245,6 +1277,51 @@ export function ModelsPage() {
         />
       )}
 
+      {/* Outside every TabPanel for the same reason as the modals below. */}
+      {pendingDisable !== null && (
+        <Modal
+          open
+          onClose={() => setPendingDisable(null)}
+          title={`Disable ${pendingDisable.model.display_name ?? formatModelName(pendingDisable.model.model_id)}?`}
+          description={`${pendingDisable.refs.length === 1 ? 'An alias uses' : 'Aliases use'} ${pendingDisable.model.model_id}. Turning it off changes what happens to messages sent to ${pendingDisable.refs.length === 1 ? 'it' : 'them'}:`}
+        >
+          <ul className={styles.refList}>
+            {pendingDisable.refs.map((r) => (
+              <li key={`${r.alias}/${r.route ?? ''}`}>
+                <code className={styles.refId}>{r.alias}</code>
+                {r.route === null ? (
+                  ' → '
+                ) : (
+                  <>
+                    {r.isDefault ? ' — default route ' : ' — route '}
+                    <code className={styles.refId}>{r.route}</code>
+                    {': '}
+                  </>
+                )}
+                <span className={r.outcome === 'refused' ? styles.refRefused : undefined}>
+                  {aliasReferenceConsequence(r)}
+                </span>
+              </li>
+            ))}
+          </ul>
+          <div className={styles.confirmFooter}>
+            <Button variant="ghost" onClick={() => setPendingDisable(null)}>
+              Cancel
+            </Button>
+            <Button
+              variant="danger"
+              onClick={() => {
+                const { model } = pendingDisable
+                setPendingDisable(null)
+                void applyToggle(model)
+              }}
+            >
+              Disable anyway
+            </Button>
+          </div>
+        </Modal>
+      )}
+
       {/* Beside the enable modal and for the same reason: a dialog lives in a
           portal, so one rendered inside a TabPanel would stay mounted in a
           hidden subtree when the panel closed — a focus trap with nothing on
@@ -1260,6 +1337,9 @@ export function ModelsPage() {
             providers.find((p) => p.name === managing.vendor)?.filter ?? EMPTY_FILTER
           }
           enabledModelIds={managingModels.filter((m) => m.enabled).map((m) => m.model_id)}
+          currentWorkspaceId={
+            providers.find((p) => p.name === managing.vendor)?.workspace_id ?? null
+          }
           transportOk={keyTransportAllowed}
           transportHelp={keyTransportFault}
           onClose={() => setManaging(null)}
@@ -1293,6 +1373,9 @@ interface ModelsTabProps {
   allowedModels: string[] | null
   totalEnabled: number
   totalUnreachable: number
+  /** Rows AWS refuses until the account's Bedrock data-retention mode is
+   *  raised. Whole catalogue, like the other counts. */
+  totalAwsOptIn: number
   policyRestricted: boolean
   onGoToTab: (tab: TabKey) => void
   onSearch: (value: string) => void
@@ -1324,6 +1407,7 @@ function ModelsTab({
   allowedModels,
   totalEnabled,
   totalUnreachable,
+  totalAwsOptIn,
   policyRestricted,
   onGoToTab,
   onSearch,
@@ -1444,6 +1528,12 @@ function ModelsTab({
               <EgressGlyph />
               {egressEnabled} {egressEnabled === 1 ? 'sends prompts' : 'send prompts'} outside your
               cloud account
+            </span>
+          )}
+          {totalAwsOptIn > 0 && (
+            <span className={styles.summaryFlag}>
+              <OptInGlyph />
+              {awsOptInCountText(totalAwsOptIn)}
             </span>
           )}
           {totalUnreachable > 0 && (

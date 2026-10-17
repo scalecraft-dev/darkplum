@@ -188,3 +188,48 @@ func TestPgStore_LoadFromDB_VendorProviderSettingsPopulatesSnapshot(t *testing.T
 		t.Errorf("openai SetAt = %v, want %v", openai.SetAt, openaiSetAt)
 	}
 }
+
+// TestPgStore_LoadVendorFilters_WorkspaceID covers migration 019: with the
+// column present the id (and NULL => "") round-trips; without it (the
+// fixture above is the pre-019 shape, 42703) the load still succeeds.
+func TestPgStore_LoadVendorFilters_WorkspaceID(t *testing.T) {
+	ctx := context.Background()
+	setAt := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+
+	t.Run("column_present", func(t *testing.T) {
+		pool := setupPolicyDB(t)
+		withVendorProviderSettingsTable(t, pool)
+		if _, err := pool.Exec(ctx, `ALTER TABLE vendor_provider_settings ADD COLUMN workspace_id TEXT NULL`); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO vendor_provider_settings (vendor, model_filter, filter_set_at, workspace_id)
+			VALUES ('anthropic', ARRAY['claude-*'], $1, 'wrkspc_01'), ('openai', ARRAY['gpt-*'], $1, NULL)`, setAt); err != nil {
+			t.Fatal(err)
+		}
+		got, err := (&PgStore{pool: pool}).loadVendorFilters(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got["anthropic"].WorkspaceID != "wrkspc_01" || got["openai"].WorkspaceID != "" {
+			t.Errorf("workspace ids = %q / %q", got["anthropic"].WorkspaceID, got["openai"].WorkspaceID)
+		}
+	})
+
+	t.Run("column_missing_pre_019", func(t *testing.T) {
+		pool := setupPolicyDB(t)
+		withVendorProviderSettingsTable(t, pool)
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO vendor_provider_settings (vendor, model_filter, filter_set_at)
+			VALUES ('anthropic', ARRAY['claude-*'], $1)`, setAt); err != nil {
+			t.Fatal(err)
+		}
+		got, err := (&PgStore{pool: pool}).loadVendorFilters(ctx)
+		if err != nil {
+			t.Fatalf("pre-019 schema must still load: %v", err)
+		}
+		if got["anthropic"].WorkspaceID != "" || len(got["anthropic"].Filter) != 1 {
+			t.Errorf("unexpected row %+v", got["anthropic"])
+		}
+	})
+}

@@ -21,7 +21,7 @@ import {
   MAX_KEYWORD_LENGTH,
   MAX_ROUTE_DESCRIPTION,
   ROUTE_NAME_HINT,
-  STICKINESS_HINT,
+  PER_MESSAGE_ROUTING_HINT,
   UNKNOWN_CLASS_HINT,
   UNREACHABLE_HINT,
   aliasKindOf,
@@ -33,6 +33,7 @@ import {
   isReachable,
   isRoutedAlias,
   multimodalRouteNote,
+  routeFallbackHint,
   routerReasonText,
   targetClassOf,
   validateAlias,
@@ -40,6 +41,11 @@ import {
   vendorLabel,
 } from '../lib/modelRouting'
 import { residencyLabel, residencyPermits } from '../lib/policy'
+import {
+  AWS_OPT_IN_OPTION_NOTE,
+  awsOptInRouteWarning,
+  needsAwsOptIn,
+} from '../lib/dataRetention'
 import { useToast } from '../components/Toast'
 import { Badge, Button, ClassGlyph, Input, Modal, Table, TableEmpty } from '../components/ui'
 import { CopyButton } from '../components/ui/CopyButton'
@@ -61,7 +67,15 @@ interface Props {
 
 /** 'partial' belongs to a routed alias only: some of its routes answer and
  *  some are refused, which is neither of the other two things. */
-type HealthKind = 'ok' | 'partial' | 'unknown' | 'missing' | 'disabled' | 'blocked' | 'unreachable'
+type HealthKind =
+  | 'ok'
+  | 'partial'
+  | 'fallback'
+  | 'unknown'
+  | 'missing'
+  | 'disabled'
+  | 'blocked'
+  | 'unreachable'
 
 /**
  * Most permanent problem first: a missing target outranks a disabled one, and
@@ -89,6 +103,11 @@ const HEALTH_COPY: Record<
   ok: {
     label: 'Active',
     variant: 'success',
+    hint: '',
+  },
+  fallback: {
+    label: 'Falling back',
+    variant: 'warning',
     hint: '',
   },
   partial: {
@@ -180,6 +199,12 @@ function aliasClassChips(
  * general terms.
  */
 function statusHint(a: ModelAlias, health: HealthKind, residency: Residency): string {
+  if (health === 'fallback') {
+    return `Messages that take a route listed below are answered on the default route ${a.default_route ?? ''} instead, until its target is fixed.`
+  }
+  if (health === 'partial' && routeHealths(a, residency).some((r) => r.health === 'fallback')) {
+    return `Messages that take a working route are answered as normal. Of the routes listed below, those blocked by policy are refused with the route named, and those whose target is off or unreachable fall back to the default route ${a.default_route ?? ''}.`
+  }
   if (health !== 'blocked') return HEALTH_COPY[health].hint
   const targets: AliasTargetHealth[] = isRoutedAlias(a) ? a.routes ?? [] : [a]
   const offending = targets.find((t) => healthOf(t, residency) === 'blocked')
@@ -187,7 +212,7 @@ function statusHint(a: ModelAlias, health: HealthKind, residency: Residency): st
 }
 
 /** Short words for one route's problem, next to the route it belongs to. */
-const ROUTE_HEALTH_LABEL: Record<Exclude<HealthKind, 'ok' | 'partial'>, string> = {
+const ROUTE_HEALTH_LABEL: Record<Exclude<HealthKind, 'ok' | 'partial' | 'fallback'>, string> = {
   missing: 'target missing',
   disabled: 'target disabled',
   blocked: 'blocked by policy',
@@ -197,6 +222,7 @@ const ROUTE_HEALTH_LABEL: Record<Exclude<HealthKind, 'ok' | 'partial'>, string> 
 
 const HEALTH_RANK: Record<HealthKind, number> = {
   ok: 0,
+  fallback: 1,
   partial: 1,
   unreachable: 2,
   unknown: 3,
@@ -214,13 +240,38 @@ const HEALTH_RANK: Record<HealthKind, number> = {
  * answer and some do not, that mixture is its own state; only when nothing can
  * answer does the worst route speak for the whole alias.
  */
+/** Target states the gateway falls back from. Policy refusals are not among
+ *  them: a route the policy blocks is refused with the route named. */
+const FALLBACK_STATES = new Set<HealthKind>(['missing', 'disabled', 'unreachable'])
+
+/**
+ * Each route's health as a message on it experiences it. A non-default route
+ * whose target is off, missing or unreachable is answered on the alias's
+ * default route while that route can answer — 'fallback', with the target's
+ * own state kept in `raw` for the words beside it.
+ */
+function routeHealths(
+  a: ModelAlias,
+  residency: Residency,
+): { route: ModelAliasRoute; raw: HealthKind; health: HealthKind }[] {
+  const routes = a.routes ?? []
+  const def = routes.find((r) => r.route_name === a.default_route)
+  const defaultOk = def !== undefined && healthOf(def, residency) === 'ok'
+  return routes.map((route) => {
+    const raw = healthOf(route, residency)
+    const falls = defaultOk && route !== def && FALLBACK_STATES.has(raw)
+    return { route, raw, health: falls ? 'fallback' : raw }
+  })
+}
+
 function aliasHealth(a: ModelAlias, residency: Residency): HealthKind {
   if (!isRoutedAlias(a)) return healthOf(a, residency)
   const routes = a.routes ?? []
   if (routes.length === 0) return 'missing'
-  const healths = routes.map((r) => healthOf(r, residency))
+  const healths = routeHealths(a, residency).map((r) => r.health)
   if (healths.every((h) => h === 'ok')) return 'ok'
-  if (healths.some((h) => h === 'ok')) return 'partial'
+  if (healths.every((h) => h === 'ok' || h === 'fallback')) return 'fallback'
+  if (healths.some((h) => h === 'ok' || h === 'fallback')) return 'partial'
   return healths.reduce((worst, next) => (HEALTH_RANK[next] > HEALTH_RANK[worst] ? next : worst), 'ok')
 }
 
@@ -287,6 +338,7 @@ function DeleteAliasButton({ alias, onDelete }: { alias: string; onDelete: (alia
 function targetOptionLabel(m: AdminModel): string {
   const notes = [
     m.enabled ? '' : 'disabled',
+    needsAwsOptIn(m) ? AWS_OPT_IN_OPTION_NOTE : '',
     isReachable(m) ? '' : 'not reachable',
   ].filter(Boolean)
   return notes.length > 0 ? `${m.model_id} (${notes.join(', ')})` : m.model_id
@@ -345,20 +397,36 @@ function ModelOptions({ models }: { models: AdminModel[] }) {
 
 /** What is wrong with this target as things stand, in one sentence, or null.
  *  The residency sentence names the rung in force and the class that conflicts
- *  with it, so the fix is legible without opening the other tab. */
+ *  with it, so the fix is legible without opening the Policy tab on
+ *  another page. */
 function targetWarning(
   models: AdminModel[],
   targetModelId: string,
   residency: Residency,
+  /** For a non-default route whose default can answer: the default's name. A
+   *  missing, disabled or unreachable target then falls back rather than refuses. */
+  fallbackTo: string | null = null,
 ): string | null {
   if (!targetModelId) return null
   const model = models.find((m) => m.model_id === targetModelId)
-  if (!model) return 'No model has this ID. Requests that take this route are refused.'
-  if (!model.enabled) return 'This model is turned off, so this route is refused until you enable it.'
+  if (!model) {
+    return fallbackTo
+      ? routeFallbackHint('missing', fallbackTo)
+      : 'No model has this ID. Requests that take this route are refused.'
+  }
+  if (!model.enabled) {
+    return fallbackTo
+      ? routeFallbackHint('disabled', fallbackTo)
+      : 'This model is turned off, so this route is refused until you enable it.'
+  }
   const cls = displayClassOf(model)
   if (cls === 'unknown') return UNKNOWN_CLASS_HINT
   if (!residencyPermits(residency, cls)) return blockedHint(cls, residency)
-  if (!isReachable(model)) return UNREACHABLE_HINT
+  // Same precedence as the Models row: policy > AWS opt-in > reachability.
+  if (needsAwsOptIn(model)) return awsOptInRouteWarning(model.model_id)
+  if (!isReachable(model)) {
+    return fallbackTo ? routeFallbackHint('unreachable', fallbackTo) : UNREACHABLE_HINT
+  }
   return null
 }
 
@@ -536,6 +604,8 @@ interface RouteRowProps {
   index: number
   count: number
   isDefault: boolean
+  /** The default route's name, when it is not this route and can answer. */
+  fallbackTo: string | null
   radioName: string
   models: AdminModel[]
   residency: Residency
@@ -554,6 +624,7 @@ function RouteRow({
   index,
   count,
   isDefault,
+  fallbackTo,
   radioName,
   models,
   residency,
@@ -568,7 +639,7 @@ function RouteRow({
 }: RouteRowProps) {
   const fieldId = useId()
   const label = route.route_name || `route ${index + 1}`
-  const warning = targetWarning(models, route.target_model_id, residency)
+  const warning = targetWarning(models, route.target_model_id, residency, isDefault ? null : fallbackTo)
   const multimodal = multimodalWarning(route.route_name, route.keywords)
 
   return (
@@ -882,6 +953,14 @@ function AliasEditor({ editing, models, residency, existing, onClose, onSave }: 
   }
 
   const staticWarning = targetWarning(models, target, residency)
+  // The route a broken non-default route falls back to — only while the
+  // default itself can answer; otherwise those routes are refused as before.
+  const defaultDraft = routes.find((r) => r.key === defaultKey) ?? null
+  const defaultFallback =
+    defaultDraft && defaultDraft.route_name && defaultDraft.target_model_id &&
+    targetWarning(models, defaultDraft.target_model_id, residency) === null
+      ? defaultDraft.route_name
+      : null
   const keywordsUsed = classifierKind === 'rules'
 
   return (
@@ -1006,6 +1085,7 @@ function AliasEditor({ editing, models, residency, existing, onClose, onSave }: 
                 index={i}
                 count={routes.length}
                 isDefault={defaultKey === r.key}
+                fallbackTo={defaultFallback}
                 radioName={`${formId}-default`}
                 models={models}
                 residency={residency}
@@ -1057,7 +1137,7 @@ function AliasEditor({ editing, models, residency, existing, onClose, onSave }: 
             </div>
           </fieldset>
 
-          <p className={styles.stickyHint}>{STICKINESS_HINT}</p>
+          <p className={styles.routingHint}>{PER_MESSAGE_ROUTING_HINT}</p>
 
           {editing?.classifier?.kind === 'model' && (
             <p className={styles.formWarning}>
@@ -1196,7 +1276,7 @@ function TestPromptModal({
           )}
         </div>
 
-        <p className={styles.stickyHint}>{STICKINESS_HINT}</p>
+        <p className={styles.routingHint}>{PER_MESSAGE_ROUTING_HINT}</p>
       </div>
     </Modal>
   )
@@ -1342,9 +1422,7 @@ export function AliasesSection({
                   const copy = HEALTH_COPY[health]
                   const classChips = aliasClassChips(a, models)
                   const routes = a.routes ?? []
-                  const flaggedRoutes = routes
-                    .map((r) => ({ route: r, health: healthOf(r, residency) }))
-                    .filter((r) => r.health !== 'ok')
+                  const flaggedRoutes = routeHealths(a, residency).filter((r) => r.health !== 'ok')
                   const warnings = a.warnings ?? []
                   const flagged = health !== 'ok' || warnings.length > 0
                   return (
@@ -1370,12 +1448,14 @@ export function AliasesSection({
                             </span>
                             {flaggedRoutes.length > 0 && (
                               <ul className={styles.routeFlags}>
-                                {flaggedRoutes.map(({ route, health: routeHealth }) => (
+                                {flaggedRoutes.map(({ route, raw, health: routeHealth }) => (
                                   <li key={route.route_name}>
                                     <code className={styles.targetId}>{route.route_name}</code>
                                     {' → '}
                                     <code className={styles.targetId}>{route.target_model_id}</code>
-                                    {` — ${ROUTE_HEALTH_LABEL[routeHealth as Exclude<HealthKind, 'ok' | 'partial'>]}`}
+                                    {` — ${ROUTE_HEALTH_LABEL[raw as Exclude<HealthKind, 'ok' | 'partial' | 'fallback'>]}`}
+                                    {routeHealth === 'fallback' &&
+                                      `, falls back to the default route ${a.default_route ?? ''} until it is fixed`}
                                   </li>
                                 ))}
                               </ul>

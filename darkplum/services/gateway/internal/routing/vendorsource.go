@@ -54,7 +54,10 @@ type vendorFilterPolicySource interface {
 	// the timestamp they were set at) and whether a live, loaded snapshot has
 	// one — false when the snapshot hasn't loaded, the table doesn't exist
 	// yet, or the vendor has never been installed from the UI.
-	VendorFilter(vendor string) (filter []string, setAt time.Time, ok bool)
+	// workspaceID is the row's Anthropic workspace id ("" when none); it is
+	// read in the same call so it can never come from a different snapshot
+	// than the filter and stamp it rides with.
+	VendorFilter(vendor string) (filter []string, setAt time.Time, workspaceID string, ok bool)
 }
 
 // vendorFilterResult is what a vendorFilterFunc resolves to on one discovery
@@ -75,6 +78,10 @@ type vendorFilterResult struct {
 	// startup, or the zero time if it was unset/unparseable — see
 	// config.Load's parseVendorFilterSetAt.
 	EnvSetAt time.Time
+	// WorkspaceID is the effective Anthropic workspace id ("" for none). It
+	// follows the SAME winner as Patterns: the DB row's value when Source is
+	// "db" (empty there means explicitly cleared), the env value otherwise.
+	WorkspaceID string
 }
 
 // vendorFilterFunc resolves one vendor's EFFECTIVE model filter, evaluated
@@ -133,12 +140,12 @@ func sameGlobSet(a, b []string) bool {
 // — this can only happen if a ConfigMap was hand-edited to copy a
 // filter_set_at without copying the filter itself, since every real writer
 // (the UI's PUT, and `make set-*-key`) stamps the pair it wrote together.
-func NewVendorFilterFunc(vendor string, envFilter []string, envSetAt time.Time, polStore vendorFilterPolicySource) vendorFilterFunc {
+func NewVendorFilterFunc(vendor string, envFilter []string, envSetAt time.Time, envWorkspaceID string, polStore vendorFilterPolicySource) vendorFilterFunc {
 	var warnMu sync.Mutex
 	var lastWarnKey string
 
 	return func() vendorFilterResult {
-		dbFilter, dbSetAt, dbOK := polStore.VendorFilter(vendor)
+		dbFilter, dbSetAt, dbWorkspaceID, dbOK := polStore.VendorFilter(vendor)
 
 		if dbOK && dbSetAt.Equal(envSetAt) && !sameGlobSet(dbFilter, envFilter) {
 			key := fmt.Sprintf("%s|%v|%v", dbSetAt.Format(time.RFC3339Nano), dbFilter, envFilter)
@@ -152,7 +159,13 @@ func NewVendorFilterFunc(vendor string, envFilter []string, envSetAt time.Time, 
 			}
 		}
 
-		return resolveVendorFilter(dbFilter, dbSetAt, dbOK, envFilter, envSetAt)
+		res := resolveVendorFilter(dbFilter, dbSetAt, dbOK, envFilter, envSetAt)
+		if res.Source == "db" {
+			res.WorkspaceID = dbWorkspaceID
+		} else {
+			res.WorkspaceID = envWorkspaceID
+		}
+		return res
 	}
 }
 
@@ -329,6 +342,7 @@ func (s *vendorSourceState) report(state string, configured bool, modelCount int
 		ModelCount:   modelCount,
 		FilterSource: fr.Source,
 		Filter:       fr.Patterns,
+		WorkspaceID:  fr.WorkspaceID,
 	}
 	if !fr.EnvSetAt.IsZero() {
 		envSetAt := fr.EnvSetAt
@@ -381,3 +395,8 @@ func (e *vendorDiscoveryError) Error() string {
 }
 
 func (e *vendorDiscoveryError) Unwrap() error { return e.cause }
+
+// EffectiveWorkspaceID returns the workspace id carried by f's current
+// resolution ("" for none). cmd/main.go hands the anthropic provider a closure
+// over this so every request reads the live last-writer-wins value.
+func EffectiveWorkspaceID(f vendorFilterFunc) string { return f().WorkspaceID }

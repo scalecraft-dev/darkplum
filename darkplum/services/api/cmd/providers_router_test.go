@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -127,7 +128,13 @@ func TestProviderRoutes_NonAdminSessionRefused403(t *testing.T) {
 	deps := newProvidersRouterTestDeps(t)
 	r := buildRouter(deps)
 
-	token, err := auth.SignSessionJWT("11111111-1111-1111-1111-111111111111", "member@example.com", "Member", "member", deps.authCfg.Secret, time.Hour)
+	// The session's user must exist (ValidateSession is DB-authoritative).
+	var memberID string
+	if err := deps.pool.QueryRow(context.Background(),
+		`INSERT INTO users (email, name, role) VALUES ('member@example.com', 'Member', 'reader') RETURNING id::text`).Scan(&memberID); err != nil {
+		t.Fatalf("insert member: %v", err)
+	}
+	token, err := auth.SignSessionJWT(memberID, "member@example.com", "Member", "reader", deps.authCfg.Secret, time.Hour)
 	if err != nil {
 		t.Fatalf("sign session jwt: %v", err)
 	}

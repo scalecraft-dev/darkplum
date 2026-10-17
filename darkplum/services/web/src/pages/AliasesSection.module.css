@@ -742,7 +742,7 @@
 
 /* One fact repeated wherever routes are written or tested, so it is never
    learned from a transcript instead. Wide enough to stay one or two lines. */
-.stickyHint {
+.routingHint {
   max-width: 78ch;
   font-size: var(--fs-xs);
   line-height: var(--lh-relaxed);

@@ -11,7 +11,8 @@ import {
 } from '../lib/modelRouting'
 import { formatModelName } from '../lib/formatModelName'
 import { useToast } from '../components/Toast'
-import { Badge, ClassGlyph } from '../components/ui'
+import { AWS_OPT_IN_LABEL, needsAwsOptIn } from '../lib/dataRetention'
+import { Badge, ClassGlyph, OptInGlyph } from '../components/ui'
 import styles from './ModelAllowlistPicker.module.css'
 
 interface Props {
@@ -156,6 +157,12 @@ export function ModelAllowlistPicker({ models, aliases, value, onChange, label }
                       <ClassGlyph cls={cls} />
                       {backendClassLabel(cls)}
                     </Badge>
+                    {needsAwsOptIn(m) && (
+                      <Badge variant="warning" bordered>
+                        <OptInGlyph />
+                        {AWS_OPT_IN_LABEL}
+                      </Badge>
+                    )}
                     {!isReachable(m) && <Badge variant="warning" bordered>Not reachable</Badge>}
                   </span>
                 </label>

@@ -66,6 +66,11 @@ type ProviderStatus struct {
 	// var is unset/unparseable. Lets the UI offer "Adopt filter" (a DB write
 	// of the env's own value) even while FilterSource is "env".
 	EnvFilterSetAt *time.Time `json:"env_filter_set_at"`
+	// WorkspaceID is the effective Anthropic workspace id (sent as the
+	// anthropic-workspace-id header), "" when none. It rides on the same
+	// last-writer-wins source as Filter (FilterSource covers both). Not a
+	// secret; ADMIN-ONLY like the filter fields (never on /health).
+	WorkspaceID string `json:"workspace_id"`
 }
 
 // StatusRegistry is a concurrency-safe store of the current ProviderStatus

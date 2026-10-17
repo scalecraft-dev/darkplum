@@ -62,6 +62,20 @@ export class ApiError extends Error {
     return typeof code === 'string' ? code : ''
   }
 
+  /** The `vendor_error` 422's two closed fields, or null when this isn't one. */
+  vendorError(): { status: number | null; type: string | null } | null {
+    const d = this.details as
+      | { error?: { code?: unknown; vendor_http_status?: unknown; vendor_error_type?: unknown } }
+      | undefined
+    if (d?.error?.code !== 'vendor_error') return null
+    const status = d.error.vendor_http_status
+    const type = d.error.vendor_error_type
+    return {
+      status: typeof status === 'number' ? status : null,
+      type: typeof type === 'string' ? type : null,
+    }
+  }
+
   /** The model ids a `models_enabled` 409 names, or []. */
   enabledModels(): string[] {
     const d = this.details as { error?: { models?: unknown } } | undefined
@@ -486,7 +500,7 @@ export interface VendorVerification {
  */
 export function verifyVendorKey(
   vendor: VendorName,
-  body: { key?: string; model_filter?: string[] } = {},
+  body: { key?: string; model_filter?: string[]; workspace_id?: string } = {},
 ): Promise<VendorVerification> {
   return request<VendorVerification>(ROUTES.verifyProviderKey, { params: { vendor }, body })
 }
@@ -506,20 +520,22 @@ export interface VendorKeyInstalled {
  *  anything is written, so a mistyped key cannot replace a working one. */
 export function installVendorKey(
   vendor: VendorName,
-  body: { key: string; model_filter: string[] },
+  body: { key: string; model_filter: string[]; workspace_id?: string },
 ): Promise<VendorKeyInstalled> {
   return request<VendorKeyInstalled>(ROUTES.putProviderKey, { params: { vendor }, body })
 }
 
 /** Changes which of the vendor's models are catalogued, using the key already
- *  installed. The key is not involved and is not asked for. */
+ *  installed. The key is not involved and is not asked for. `workspaceId` is
+ *  Anthropic's: undefined leaves the stored one alone, "" clears it. */
 export function setVendorFilter(
   vendor: VendorName,
   modelFilter: string[],
+  workspaceId?: string,
 ): Promise<{ admitted: string[] }> {
   return request<{ admitted: string[] }>(ROUTES.putProviderFilter, {
     params: { vendor },
-    body: { model_filter: modelFilter },
+    body: { model_filter: modelFilter, workspace_id: workspaceId },
   })
 }
 
@@ -666,7 +682,8 @@ export function getConversation(id: string): Promise<ConversationFull> {
   return request<ConversationFull>(ROUTES.getConversation, { params: { id } })
 }
 
-/** `pinned_model: null` clears the pin — the alias classifies again next turn. */
+/** `pinned_model` is the API's; webchat never sends it, since a routed alias
+ *  classifies every message rather than holding a thread to one model. */
 export function updateConversation(
   id: string,
   patch: { title?: string; model?: string; pinned_model?: string | null },
@@ -728,6 +745,10 @@ export class ChatError extends Error {
    *  is a rate limit: no other refusal has an interval to offer, and a number
    *  on one would be invented. */
   readonly retryAfterSeconds?: number
+  /** model_requires_data_retention only: the concrete model AWS refused and,
+   *  for a routed alias, the route that picked it. */
+  readonly refusedModel?: string
+  readonly route?: string
 
   constructor(
     message: string,
@@ -737,6 +758,8 @@ export class ChatError extends Error {
       status?: number
       param?: string
       retryAfterSeconds?: number
+      refusedModel?: string
+      route?: string
     } = {},
   ) {
     super(message)
@@ -746,7 +769,14 @@ export class ChatError extends Error {
     this.status = opts.status
     this.param = opts.param
     this.retryAfterSeconds = opts.retryAfterSeconds
+    this.refusedModel = opts.refusedModel
+    this.route = opts.route
   }
+}
+
+/** A non-empty string off an error body, or undefined. */
+function stringOrUndefined(v: unknown): string | undefined {
+  return typeof v === 'string' && v !== '' ? v : undefined
 }
 
 /** What the gateway said about the request itself, as soon as the response
@@ -834,17 +864,30 @@ export async function streamChat(
     let code: string | undefined
     let type: string | undefined
     let param: string | undefined
+    let refusedModel: string | undefined
+    let route: string | undefined
     const trimmed = raw.trim()
     if (trimmed.startsWith('{')) {
       try {
         const body = JSON.parse(trimmed) as {
-          error?: { message?: string; code?: string; type?: string; param?: string } | string
+          error?:
+            | {
+                message?: string
+                code?: string
+                type?: string
+                param?: string
+                model?: unknown
+                route?: unknown
+              }
+            | string
         }
         if (body.error && typeof body.error === 'object') {
           message = body.error.message
           code = body.error.code
           type = body.error.type
           param = typeof body.error.param === 'string' ? body.error.param : undefined
+          refusedModel = stringOrUndefined(body.error.model)
+          route = stringOrUndefined(body.error.route)
         } else if (typeof body.error === 'string' && body.error) {
           message = body.error
         }
@@ -858,6 +901,8 @@ export async function streamChat(
         type,
         status: res.status,
         param,
+        refusedModel,
+        route,
         // Read only on the one status that can carry it. The vendor's own
         // interval reaches us through the gateway and the api unmodified; a
         // 429 that arrives without one still gets a wait, decided by the UI.
@@ -897,7 +942,14 @@ export async function streamChat(
         try {
           const parsed = JSON.parse(data) as {
             choices?: Array<{ delta: { content?: string } }>
-            error?: { message: string; code?: string; type?: string; param?: string }
+            error?: {
+              message: string
+              code?: string
+              type?: string
+              param?: string
+              model?: unknown
+              route?: unknown
+            }
           }
           if (parsed.error) {
             // No status and no Retry-After here: the response committed as a
@@ -908,6 +960,8 @@ export async function streamChat(
                 code: parsed.error.code,
                 type: parsed.error.type,
                 param: typeof parsed.error.param === 'string' ? parsed.error.param : undefined,
+                refusedModel: stringOrUndefined(parsed.error.model),
+                route: stringOrUndefined(parsed.error.route),
               }),
             )
             return

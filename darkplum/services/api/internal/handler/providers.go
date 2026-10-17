@@ -98,6 +98,101 @@ func secretFileName(vendor string) string {
 func configFilterKey(vendor string) string      { return strings.ToUpper(vendor) + "_MODEL_FILTER" }
 func configFilterSetAtKey(vendor string) string { return configFilterKey(vendor) + "_SET_AT" }
 
+// configWorkspaceIDKey is the ConfigMap key carrying the Anthropic workspace
+// id (anthropic only). It is written together with the filter and SET_AT, so
+// one stamp governs all three; an empty string clears it.
+const configWorkspaceIDKey = "ANTHROPIC_WORKSPACE_ID"
+
+// workspaceIDRe bounds a submitted Anthropic workspace id; it ends up in an
+// HTTP header on the gateway, so the alphabet is deliberately narrow.
+var workspaceIDRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+// checkWorkspaceID validates the optional workspace_id of a request. nil means
+// the field was absent (keep the current value). Writes the 400 and reports
+// ok=false on a non-anthropic vendor (the field is meaningless there) or a
+// malformed id; "" is valid and means "clear".
+func checkWorkspaceID(c *gin.Context, vendor string, ws *string) bool {
+	if ws == nil {
+		return true
+	}
+	if vendor != vendorAnthropic {
+		errJSON(c, http.StatusBadRequest, "invalid_request", "workspace_id is only supported for anthropic")
+		return false
+	}
+	if *ws != "" && !workspaceIDRe.MatchString(*ws) {
+		errJSON(c, http.StatusBadRequest, "invalid_workspace_id", "workspace_id must be 1-64 characters of letters, digits, underscore, or hyphen (or empty to clear it)")
+		return false
+	}
+	return true
+}
+
+// workspaceIDFor reads the gateway's reported effective workspace id for
+// vendor from the cached providers block ("" if none, "" and found=false if
+// the vendor is not in the block).
+func workspaceIDFor(providers []gatewayProviderStatus, vendor string) (id string, found bool) {
+	for _, p := range providers {
+		if p.Name == vendor {
+			if p.WorkspaceID != nil {
+				return *p.WorkspaceID, true
+			}
+			return "", true
+		}
+	}
+	return "", false
+}
+
+func filterSourceFor(providers []gatewayProviderStatus, vendor string) string {
+	for _, p := range providers {
+		if p.Name == vendor {
+			return p.FilterSource
+		}
+	}
+	return ""
+}
+
+// currentWorkspaceID is the workspace id in force right now for an
+// "absent = keep current" write: the stored row's value, except when the
+// gateway reports the env pair as winning (a newer `make set-*-key` write) or
+// there is no stored row, where it is the gateway-reported effective value.
+// Always "" for openai.
+func currentWorkspaceID(vendor string, rowExists bool, rowWorkspaceID *string, providers []gatewayProviderStatus) string {
+	if vendor != vendorAnthropic {
+		return ""
+	}
+	if rowExists && filterSourceFor(providers, vendor) != "env" {
+		if rowWorkspaceID != nil {
+			return *rowWorkspaceID
+		}
+		return ""
+	}
+	if id, found := workspaceIDFor(providers, vendor); found {
+		return id
+	}
+	if rowWorkspaceID != nil {
+		return *rowWorkspaceID
+	}
+	return ""
+}
+
+// finalWorkspaceID applies a request's optional workspace_id (nil = keep) on
+// top of the current one.
+func finalWorkspaceID(requested *string, current string) string {
+	if requested != nil {
+		return *requested
+	}
+	return current
+}
+
+// workspaceAuditDetail adds workspace_id_before/after to an audit detail map,
+// omitted when both are empty. The id is not a secret.
+func workspaceAuditDetail(detail map[string]any, before, after string) {
+	if before == "" && after == "" {
+		return
+	}
+	detail["workspace_id_before"] = before
+	detail["workspace_id_after"] = after
+}
+
 func vendorDisplayName(vendor string) string {
 	switch vendor {
 	case vendorAnthropic:
@@ -213,6 +308,11 @@ func lastN(s string, n int) string {
 type apiErrorBody struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+	// VendorHTTPStatus / VendorErrorType are set only on the vendor_error
+	// code: the HTTP status the vendor answered the key check with and its
+	// sanitised error.type tag. Both are re-validated here, never relayed raw.
+	VendorHTTPStatus int    `json:"vendor_http_status,omitempty"`
+	VendorErrorType  string `json:"vendor_error_type,omitempty"`
 }
 
 func errJSON(c *gin.Context, status int, code, message string) {
@@ -391,12 +491,35 @@ var verifyErrorMessages = map[string]string{
 	"unreachable":            "could not reach the vendor to verify this key",
 	"key_required":           "no key is installed for this vendor yet",
 	"filter_matched_nothing": "the selected models are not reachable with this key",
+	"workspace_required":     "This key is not scoped to an Anthropic workspace. Enter the workspace ID to use with it, or use a key created inside a workspace.",
 }
 
 // translateVerifyError maps a gateway-reported verify error CODE to a fixed
 // api message, defaulting to auth_failed for any code this api doesn't
 // recognize -- fail closed rather than forward an unknown, possibly
 // attacker-influenced string.
+var vendorErrorTypePattern = regexp.MustCompile(`^[a-z_]{1,40}$`)
+
+// translateVendorError builds the vendor_error body from the gateway's two
+// closed fields, re-validating both (a status outside 100-599 or a type that
+// is not ^[a-z_]{1,40}$ is replaced, never forwarded). The message is authored
+// here from the vendor's display name; no gateway text is used.
+func translateVendorError(vendor string, status int, errType string) apiErrorBody {
+	if status < 100 || status > 599 {
+		status = http.StatusBadGateway
+	}
+	if !vendorErrorTypePattern.MatchString(errType) {
+		errType = "unknown"
+	}
+	return apiErrorBody{
+		Code: "vendor_error",
+		Message: fmt.Sprintf("%s answered HTTP %d (%s) to the key check. Nothing was stored.",
+			vendorDisplayName(vendor), status, errType),
+		VendorHTTPStatus: status,
+		VendorErrorType:  errType,
+	}
+}
+
 func translateVerifyError(code string) apiErrorBody {
 	if msg, ok := verifyErrorMessages[code]; ok {
 		return apiErrorBody{Code: code, Message: msg}
@@ -535,8 +658,10 @@ type gatewayVerifyResult struct {
 // used -- see translateVerifyError and this file's package doc comment.
 type gatewayVerifyErrorEnvelope struct {
 	Error struct {
-		Code    string `json:"code"`
-		Message string `json:"message"`
+		Code             string `json:"code"`
+		Message          string `json:"message"`
+		VendorHTTPStatus int    `json:"vendor_http_status"`
+		VendorErrorType  string `json:"vendor_error_type"`
 	} `json:"error"`
 }
 
@@ -548,14 +673,18 @@ type gatewayVerifyErrorEnvelope struct {
 // means the gateway could not be reached or returned something this api
 // doesn't understand; callers treat that as "verification failed, nothing
 // was stored".
-func (h *ProvidersHandler) gatewayVerify(ctx context.Context, vendor, key string, filter []string) (*gatewayVerifyResult, *apiErrorBody, error) {
+//
+// workspaceID, when non-nil, is sent as the gateway's workspace_id (a pointer
+// so an explicit "" -- check with no workspace -- survives); nil omits it.
+func (h *ProvidersHandler) gatewayVerify(ctx context.Context, vendor, key string, filter []string, workspaceID *string) (*gatewayVerifyResult, *apiErrorBody, error) {
 	ctx, cancel := context.WithTimeout(ctx, gatewayProviderCallTimeout)
 	defer cancel()
 
 	body, err := json.Marshal(struct {
 		Key         string   `json:"key,omitempty"`
 		ModelFilter []string `json:"model_filter"`
-	}{Key: key, ModelFilter: filter})
+		WorkspaceID *string  `json:"workspace_id,omitempty"`
+	}{Key: key, ModelFilter: filter, WorkspaceID: workspaceID})
 	if err != nil {
 		return nil, nil, fmt.Errorf("encode verify request: %w", err)
 	}
@@ -585,6 +714,10 @@ func (h *ProvidersHandler) gatewayVerify(ctx context.Context, vendor, key string
 		var out gatewayVerifyErrorEnvelope
 		if err := json.NewDecoder(io.LimitReader(resp.Body, 256*1024)).Decode(&out); err != nil {
 			return nil, nil, fmt.Errorf("decode gateway verify error: %w", err)
+		}
+		if out.Error.Code == "vendor_error" {
+			translated := translateVendorError(vendor, out.Error.VendorHTTPStatus, out.Error.VendorErrorType)
+			return nil, &translated, nil
 		}
 		translated := translateVerifyError(out.Error.Code)
 		return nil, &translated, nil
@@ -643,11 +776,18 @@ func (h *ProvidersHandler) syncModelsBounded() {
 // mirrorConfigMap writes this vendor's filter and its SET_AT stamp into the
 // darkplum-provider-config ConfigMap, matching the Makefile's own
 // <VENDOR>_MODEL_FILTER[_SET_AT] keys exactly.
-func (h *ProvidersHandler) mirrorConfigMap(ctx context.Context, vendor string, filter []string, filterSetAt time.Time) error {
-	return h.kube.SetConfig(ctx, map[string]string{
+//
+// For anthropic the workspace id is written in the same patch (ANTHROPIC_WORKSPACE_ID,
+// empty string clears), so filter, stamp and workspace id always land together.
+func (h *ProvidersHandler) mirrorConfigMap(ctx context.Context, vendor string, filter []string, filterSetAt time.Time, workspaceID string) error {
+	kv := map[string]string{
 		configFilterKey(vendor):      strings.Join(filter, ","),
 		configFilterSetAtKey(vendor): filterSetAt.UTC().Format(time.RFC3339),
-	})
+	}
+	if vendor == vendorAnthropic {
+		kv[configWorkspaceIDKey] = workspaceID
+	}
+	return h.kube.SetConfig(ctx, kv)
 }
 
 // envFilterSetAtFor and configuredFor read the gateway's last-synced
@@ -714,6 +854,10 @@ func partiallyInstalledMessage(vendor string, providersBefore []gatewayProviderS
 type verifyRequest struct {
 	Key         string   `json:"key"`
 	ModelFilter []string `json:"model_filter"`
+	// WorkspaceID (anthropic only): scopes a submitted key's check to that
+	// workspace; with no key, overrides the installed workspace id for the
+	// check. Absent = the gateway's own effective value; "" = no workspace.
+	WorkspaceID *string `json:"workspace_id"`
 }
 
 type verifyResponseBody struct {
@@ -737,6 +881,9 @@ func (h *ProvidersHandler) PostVerify(c *gin.Context) {
 		errJSON(c, http.StatusBadRequest, "invalid_key_format", "key must be 20-512 characters of letters, digits, underscore, or hyphen")
 		return
 	}
+	if !checkWorkspaceID(c, vendor, req.WorkspaceID) {
+		return
+	}
 	// Only when a key was actually submitted -- verifying with the
 	// already-installed credential (req.Key == "") never puts a credential
 	// on the wire from the browser, so there is nothing this connection's
@@ -746,7 +893,7 @@ func (h *ProvidersHandler) PostVerify(c *gin.Context) {
 	}
 
 	ctx := c.Request.Context()
-	result, apiErr, err := h.gatewayVerify(ctx, vendor, req.Key, req.ModelFilter)
+	result, apiErr, err := h.gatewayVerify(ctx, vendor, req.Key, req.ModelFilter, req.WorkspaceID)
 	if err != nil {
 		slog.WarnContext(ctx, "provider verify: gateway call failed", "vendor", vendor, "err", err)
 		errJSON(c, http.StatusBadGateway, "gateway_unreachable", "could not reach the gateway to verify this key")
@@ -768,7 +915,10 @@ func (h *ProvidersHandler) PostVerify(c *gin.Context) {
 type putKeyRequest struct {
 	Key         string   `json:"key"`
 	ModelFilter []string `json:"model_filter"`
-	AllowAll    bool     `json:"allow_all"`
+	// WorkspaceID (anthropic only): absent/null keeps the current workspace
+	// id, "" clears it, a value sets it.
+	WorkspaceID *string `json:"workspace_id"`
+	AllowAll    bool    `json:"allow_all"`
 }
 
 type putKeyResponseBody struct {
@@ -820,6 +970,9 @@ func (h *ProvidersHandler) PutKey(c *gin.Context) {
 		errJSON(c, http.StatusBadRequest, "filter_required", "model_filter must name at least one model or family")
 		return
 	}
+	if !checkWorkspaceID(c, vendor, req.WorkspaceID) {
+		return
+	}
 	if pattern, bad := firstBareWildcard(req.ModelFilter); bad && !req.AllowAll {
 		errJSON(c, http.StatusUnprocessableEntity, "filter_too_broad", bareWildcardMessage(vendor, pattern))
 		return
@@ -857,19 +1010,29 @@ func (h *ProvidersHandler) PutKey(c *gin.Context) {
 
 	var previousFilter []string
 	var previousFilterSetAt *time.Time
+	var previousWorkspaceID *string
+	previousRowExists := false
 	if err := h.withShortTx(ctx, func(tx pgx.Tx) error {
 		err := tx.QueryRow(ctx,
-			`SELECT model_filter, filter_set_at FROM vendor_provider_settings WHERE vendor = $1`, vendor,
-		).Scan(&previousFilter, &previousFilterSetAt)
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			return err
+			`SELECT model_filter, filter_set_at, workspace_id FROM vendor_provider_settings WHERE vendor = $1`, vendor,
+		).Scan(&previousFilter, &previousFilterSetAt, &previousWorkspaceID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
 		}
-		return nil
+		previousRowExists = err == nil
+		return err
 	}); err != nil {
 		slog.ErrorContext(ctx, "put provider key: read previous settings failed", "vendor", vendor, "err", err)
 	}
 
-	result, apiErr, vErr := h.gatewayVerify(ctx, vendor, req.Key, req.ModelFilter)
+	currentWorkspace := currentWorkspaceID(vendor, previousRowExists, previousWorkspaceID, providersBefore)
+	workspaceID := finalWorkspaceID(req.WorkspaceID, currentWorkspace)
+	var verifyWorkspace *string
+	if vendor == vendorAnthropic {
+		verifyWorkspace = &workspaceID
+	}
+
+	result, apiErr, vErr := h.gatewayVerify(ctx, vendor, req.Key, req.ModelFilter, verifyWorkspace)
 	if vErr != nil {
 		slog.WarnContext(ctx, "put provider key: gateway verify failed", "vendor", vendor, "err", vErr)
 		errJSON(c, http.StatusBadGateway, "gateway_unreachable", "could not reach the gateway to verify this key; nothing was stored")
@@ -899,16 +1062,17 @@ func (h *ProvidersHandler) PutKey(c *gin.Context) {
 	upsertOnce := func() error {
 		return h.withShortTx(ctx, func(tx pgx.Tx) error {
 			_, err := tx.Exec(ctx, `
-				INSERT INTO vendor_provider_settings (vendor, model_filter, filter_set_at, installing_until, removing_until, updated_at, updated_by)
-				VALUES ($1, $2, $3, $4, NULL, now(), $5)
+				INSERT INTO vendor_provider_settings (vendor, model_filter, filter_set_at, installing_until, removing_until, updated_at, updated_by, workspace_id)
+				VALUES ($1, $2, $3, $4, NULL, now(), $5, NULLIF($6, ''))
 				ON CONFLICT (vendor) DO UPDATE
 					SET model_filter = EXCLUDED.model_filter,
 						filter_set_at = EXCLUDED.filter_set_at,
 						installing_until = EXCLUDED.installing_until,
 						removing_until = NULL,
 						updated_at = now(),
-						updated_by = EXCLUDED.updated_by
-			`, vendor, req.ModelFilter, filterSetAt, installingUntil, actorID)
+						updated_by = EXCLUDED.updated_by,
+						workspace_id = EXCLUDED.workspace_id
+			`, vendor, req.ModelFilter, filterSetAt, installingUntil, actorID, workspaceID)
 			return err
 		})
 	}
@@ -924,7 +1088,7 @@ func (h *ProvidersHandler) PutKey(c *gin.Context) {
 
 	var warnings []string
 	if !upsertFailed {
-		if err := retryOnce(func() error { return h.mirrorConfigMap(ctx, vendor, req.ModelFilter, filterSetAt) }); err != nil {
+		if err := retryOnce(func() error { return h.mirrorConfigMap(ctx, vendor, req.ModelFilter, filterSetAt, workspaceID) }); err != nil {
 			slog.ErrorContext(ctx, "put provider key: configmap mirror failed", "vendor", vendor, "err", err)
 			warnings = append(warnings, "the model filter was saved but has not yet reached the gateway's configuration; it will apply on the gateway's next resync")
 		}
@@ -951,6 +1115,7 @@ func (h *ProvidersHandler) PutKey(c *gin.Context) {
 		"model_filter_before": previousFilter,
 		"model_filter_after":  req.ModelFilter,
 	}
+	workspaceAuditDetail(evt.Detail, currentWorkspace, workspaceID)
 	h.activity.Record(ctx, evt)
 
 	if err := retryOnce(func() error { return h.gatewayRefresh(ctx, vendor) }); err != nil {
@@ -967,7 +1132,10 @@ func (h *ProvidersHandler) PutKey(c *gin.Context) {
 // putFilterRequest is PUT /api/v1/providers/:vendor/filter's body.
 type putFilterRequest struct {
 	ModelFilter []string `json:"model_filter"`
-	AllowAll    bool     `json:"allow_all"`
+	// WorkspaceID (anthropic only): absent/null keeps the current workspace
+	// id, "" clears it, a value sets it.
+	WorkspaceID *string `json:"workspace_id"`
+	AllowAll    bool    `json:"allow_all"`
 }
 
 type putFilterResponseBody struct {
@@ -1003,6 +1171,9 @@ func (h *ProvidersHandler) PutFilter(c *gin.Context) {
 		errJSON(c, http.StatusBadRequest, "filter_required", "model_filter must name at least one model or family")
 		return
 	}
+	if !checkWorkspaceID(c, vendor, req.WorkspaceID) {
+		return
+	}
 	if pattern, bad := firstBareWildcard(req.ModelFilter); bad && !req.AllowAll {
 		errJSON(c, http.StatusUnprocessableEntity, "filter_too_broad", bareWildcardMessage(vendor, pattern))
 		return
@@ -1033,19 +1204,29 @@ func (h *ProvidersHandler) PutFilter(c *gin.Context) {
 
 	var previousFilter []string
 	var previousFilterSetAt *time.Time
+	var previousWorkspaceID *string
+	previousRowExists := false
 	if err := h.withShortTx(ctx, func(tx pgx.Tx) error {
 		err := tx.QueryRow(ctx,
-			`SELECT model_filter, filter_set_at FROM vendor_provider_settings WHERE vendor = $1`, vendor,
-		).Scan(&previousFilter, &previousFilterSetAt)
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			return err
+			`SELECT model_filter, filter_set_at, workspace_id FROM vendor_provider_settings WHERE vendor = $1`, vendor,
+		).Scan(&previousFilter, &previousFilterSetAt, &previousWorkspaceID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
 		}
-		return nil
+		previousRowExists = err == nil
+		return err
 	}); err != nil {
 		slog.ErrorContext(ctx, "put provider filter: read previous settings failed", "vendor", vendor, "err", err)
 	}
 
-	result, apiErr, vErr := h.gatewayVerify(ctx, vendor, "", req.ModelFilter)
+	currentWorkspace := currentWorkspaceID(vendor, previousRowExists, previousWorkspaceID, providersBefore)
+	workspaceID := finalWorkspaceID(req.WorkspaceID, currentWorkspace)
+	var verifyWorkspace *string
+	if vendor == vendorAnthropic {
+		verifyWorkspace = &workspaceID
+	}
+
+	result, apiErr, vErr := h.gatewayVerify(ctx, vendor, "", req.ModelFilter, verifyWorkspace)
 	if vErr != nil {
 		slog.WarnContext(ctx, "put provider filter: gateway verify failed", "vendor", vendor, "err", vErr)
 		errJSON(c, http.StatusBadGateway, "gateway_unreachable", "could not reach the gateway to verify this filter; nothing was changed")
@@ -1071,14 +1252,15 @@ func (h *ProvidersHandler) PutFilter(c *gin.Context) {
 	upsertOnce := func() error {
 		return h.withShortTx(ctx, func(tx pgx.Tx) error {
 			_, err := tx.Exec(ctx, `
-				INSERT INTO vendor_provider_settings (vendor, model_filter, filter_set_at, updated_at, updated_by)
-				VALUES ($1, $2, $3, now(), $4)
+				INSERT INTO vendor_provider_settings (vendor, model_filter, filter_set_at, updated_at, updated_by, workspace_id)
+				VALUES ($1, $2, $3, now(), $4, NULLIF($5, ''))
 				ON CONFLICT (vendor) DO UPDATE
 					SET model_filter = EXCLUDED.model_filter,
 						filter_set_at = EXCLUDED.filter_set_at,
 						updated_at = now(),
-						updated_by = EXCLUDED.updated_by
-			`, vendor, req.ModelFilter, filterSetAt, actorID)
+						updated_by = EXCLUDED.updated_by,
+						workspace_id = EXCLUDED.workspace_id
+			`, vendor, req.ModelFilter, filterSetAt, actorID, workspaceID)
 			return err
 		})
 	}
@@ -1089,7 +1271,7 @@ func (h *ProvidersHandler) PutFilter(c *gin.Context) {
 	}
 
 	var warnings []string
-	if err := retryOnce(func() error { return h.mirrorConfigMap(ctx, vendor, req.ModelFilter, filterSetAt) }); err != nil {
+	if err := retryOnce(func() error { return h.mirrorConfigMap(ctx, vendor, req.ModelFilter, filterSetAt, workspaceID) }); err != nil {
 		slog.ErrorContext(ctx, "put provider filter: configmap mirror failed", "vendor", vendor, "err", err)
 		warnings = append(warnings, "the model filter was saved but has not yet reached the gateway's configuration; it will apply on the gateway's next resync")
 	}
@@ -1105,6 +1287,7 @@ func (h *ProvidersHandler) PutFilter(c *gin.Context) {
 		"model_filter_before": previousFilter,
 		"model_filter_after":  req.ModelFilter,
 	}
+	workspaceAuditDetail(evt.Detail, currentWorkspace, workspaceID)
 	h.activity.Record(ctx, evt)
 
 	if err := retryOnce(func() error { return h.gatewayRefresh(ctx, vendor) }); err != nil {

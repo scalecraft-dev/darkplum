@@ -25,7 +25,8 @@ type fakeConverseAPI struct {
 	converseOut *bedrockruntime.ConverseOutput
 	converseErr error
 
-	stream converseStream
+	stream    converseStream
+	streamErr error
 	// capture the last request passed in, for assertions on translation.
 	lastConverseInput       *bedrockruntime.ConverseInput
 	lastConverseStreamInput *bedrockruntime.ConverseStreamInput
@@ -41,6 +42,9 @@ func (f *fakeConverseAPI) Converse(_ context.Context, params *bedrockruntime.Con
 
 func (f *fakeConverseAPI) ConverseStream(_ context.Context, params *bedrockruntime.ConverseStreamInput, _ ...func(*bedrockruntime.Options)) (converseStream, error) {
 	f.lastConverseStreamInput = params
+	if f.streamErr != nil {
+		return nil, f.streamErr
+	}
 	if f.stream == nil {
 		return nil, errors.New("fakeConverseAPI: no stream configured")
 	}

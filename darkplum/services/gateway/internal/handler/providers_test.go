@@ -37,7 +37,7 @@ type fakeVendorVerifier struct {
 	discErr   error
 }
 
-func (f fakeVendorVerifier) VerifyKey(_ context.Context, _ string) ([]string, error) {
+func (f fakeVendorVerifier) VerifyKey(_ context.Context, _, _ string) ([]string, error) {
 	return f.verifyIDs, f.verifyErr
 }
 func (f fakeVendorVerifier) DiscoverModels(_ context.Context) (map[string]bool, error) {
@@ -263,7 +263,9 @@ func TestHandleVerify_WithKey_AuthFailedClassification(t *testing.T) {
 }
 
 func TestHandleVerify_WithKey_UnreachableClassification(t *testing.T) {
-	upstreamErr := provider.TranslateVendorHTTPStatus("openai", http.StatusBadGateway, 0, nil, errors.New("boom"))
+	// A transport failure never produced a vendor response (VendorStatus 0).
+	upstreamErr := provider.NewVendorAPIError("openai", http.StatusGatewayTimeout, "upstream_error", "upstream_timeout",
+		"the model provider timed out", 0, errors.New("boom"))
 	h := NewProvidersHandler(context.Background(), &fakeRefreshManager{}, map[string]ProviderVendorConfig{
 		"openai": {Verifier: fakeVendorVerifier{verifyErr: upstreamErr}, Creds: fakeVendorCreds{}},
 	})

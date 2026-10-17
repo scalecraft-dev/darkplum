@@ -2,10 +2,13 @@ package handler
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"net/http"
 	"sort"
 	"sync"
@@ -46,7 +49,9 @@ type vendorKeyVerifier interface {
 	// VerifyKey checks key directly against the vendor, returning the raw
 	// reachable model ids or a closed-vocabulary *provider.VendorAPIError
 	// (see provider.IsAuthFailedError).
-	VerifyKey(ctx context.Context, key string) ([]string, error)
+	// workspaceID is the submitted Anthropic workspace id ("" for none);
+	// the openai provider ignores it.
+	VerifyKey(ctx context.Context, key, workspaceID string) ([]string, error)
 	// DiscoverModels is the installed-credential path used when no key is
 	// submitted (see HandleVerify) — the SAME method routing.Manager's
 	// discovery tick calls, so "verify the installed key" always agrees with
@@ -106,6 +111,10 @@ type ProviderVendorConfig struct {
 	// provider.IsAuthFailedError (which classifies VerifyKey's ALREADY
 	// translated error instead). anthropic.IsAuthError / openai.IsAuthError.
 	IsAuthError func(error) bool
+	// IsWorkspaceRequired classifies a RAW DiscoverModels failure on the
+	// installed-key path as Anthropic's "key not scoped to a workspace" 400
+	// (workspace_required). nil for openai.
+	IsWorkspaceRequired func(error) bool
 	// PostFilter is applied after the submitted/glob-filtered id list,
 	// exactly mirroring routing.vendorSourceConfig.postFilter — nil for
 	// anthropic; openai.FilterChatModels for openai.
@@ -194,6 +203,12 @@ func requireServiceKey(c *gin.Context, route string) bool {
 type verifyRequest struct {
 	Key         string   `json:"key"`
 	ModelFilter []string `json:"model_filter"`
+	// WorkspaceID scopes a SUBMITTED key's check to an Anthropic workspace
+	// (anthropic-workspace-id header); with key omitted it overrides the
+	// effective workspace id for the installed-key check. Ignored for openai.
+	// A pointer so "absent" (installed path: use the effective workspace id)
+	// differs from "" (installed path: check with NO workspace id).
+	WorkspaceID *string `json:"workspace_id"`
 }
 
 type verifyResponse struct {
@@ -206,9 +221,25 @@ type verifyResponse struct {
 // vendor-supplied text (a vendor's raw 401 body can echo back part of the
 // submitted key) — always one of these three static strings.
 var vendorVerifyErrorMessages = map[string]string{
-	"auth_failed":  "the vendor rejected this key",
-	"unreachable":  "the vendor could not be reached to verify this key",
-	"key_required": "no key was submitted and no vendor key is currently installed",
+	"auth_failed":        "the vendor rejected this key",
+	"vendor_error":       "the vendor answered the key check with an error",
+	"unreachable":        "the vendor could not be reached to verify this key",
+	"workspace_required": "This key is not scoped to an Anthropic workspace. Enter the workspace ID to use with it, or use a key created inside a workspace.",
+	"key_required":       "no key was submitted and no vendor key is currently installed",
+}
+
+// respondVendorError writes the 422 vendor_error outcome: the vendor ANSWERED
+// (any HTTP status but 401/403). Carries only the numeric status and the
+// sanitised error.type tag, never vendor text.
+func respondVendorError(c *gin.Context, status int, errType string) {
+	c.JSON(http.StatusUnprocessableEntity, gin.H{
+		"error": gin.H{
+			"code":               "vendor_error",
+			"message":            vendorVerifyErrorMessages["vendor_error"],
+			"vendor_http_status": status,
+			"vendor_error_type":  errType,
+		},
+	})
 }
 
 func respondVendorVerifyError(c *gin.Context, code string) {
@@ -260,7 +291,7 @@ func (h *ProvidersHandler) HandleVerify(c *gin.Context) {
 	if !requireServiceKey(c, "POST /v1/providers/:vendor/verify") {
 		return
 	}
-	_, cfg, ok := h.resolveVendor(c)
+	vendor, cfg, ok := h.resolveVendor(c)
 	if !ok {
 		return
 	}
@@ -277,14 +308,45 @@ func (h *ProvidersHandler) HandleVerify(c *gin.Context) {
 		return
 	}
 
+	workspaceID := ""
+	if req.WorkspaceID != nil {
+		workspaceID = *req.WorkspaceID
+		if workspaceID != "" && !provider.ValidWorkspaceID(workspaceID) {
+			c.JSON(http.StatusBadRequest, openAIError{
+				Error: openAIErrorBody{
+					Message: "workspace_id must match ^[A-Za-z0-9_-]{1,64}$",
+					Type:    "invalid_request_error",
+					Code:    "invalid_request",
+				},
+			})
+			return
+		}
+	}
+
 	var reachable []string
 	if req.Key != "" {
-		ids, err := cfg.Verifier.VerifyKey(c.Request.Context(), req.Key)
+		ids, err := cfg.Verifier.VerifyKey(c.Request.Context(), req.Key, workspaceID)
 		if err != nil {
+			var wsErr *provider.VendorAPIError
+			if errors.As(err, &wsErr) && wsErr.WorkspaceRequired {
+				log.Printf("providers: verify %s with a submitted key: outcome=workspace_required %s", vendor, verifyDiagnostic(err))
+				respondVendorVerifyError(c, "workspace_required")
+				return
+			}
+			if vendorErr, ok := provider.VendorResponseError(err); ok {
+				errType := vendorErr.VendorErrorType
+				if errType == "" {
+					errType = "unknown"
+				}
+				log.Printf("providers: verify %s with a submitted key: outcome=vendor_error %s", vendor, verifyDiagnostic(err))
+				respondVendorError(c, vendorErr.VendorStatus, errType)
+				return
+			}
 			code := "unreachable"
 			if provider.IsAuthFailedError(err) {
 				code = "auth_failed"
 			}
+			log.Printf("providers: verify %s with a submitted key: outcome=%s %s", vendor, code, verifyDiagnostic(err))
 			respondVendorVerifyError(c, code)
 			return
 		}
@@ -301,8 +363,17 @@ func (h *ProvidersHandler) HandleVerify(c *gin.Context) {
 			respondVendorVerifyError(c, "auth_failed")
 			return
 		}
-		discovered, err := cfg.Verifier.DiscoverModels(c.Request.Context())
+		discoverCtx := c.Request.Context()
+		if req.WorkspaceID != nil && vendor == "anthropic" {
+			discoverCtx = provider.WithWorkspaceOverride(discoverCtx, workspaceID)
+		}
+		discovered, err := cfg.Verifier.DiscoverModels(discoverCtx)
 		if err != nil {
+			if cfg.IsWorkspaceRequired != nil && cfg.IsWorkspaceRequired(err) {
+				log.Printf("providers: verify %s with the installed key: outcome=workspace_required code=invalid_request vendor_http_status=400", vendor)
+				respondVendorVerifyError(c, "workspace_required")
+				return
+			}
 			code := "unreachable"
 			if cfg.IsAuthError != nil && cfg.IsAuthError(err) {
 				code = "auth_failed"
@@ -416,4 +487,52 @@ func (h *ProvidersHandler) runRefreshHintLoop(vendor string) {
 		case <-ticker.C:
 		}
 	}
+}
+
+// verifyDiagnostic names, in a closed vocabulary, why a vendor-key check
+// failed, for the gateway log: the translated error code and the vendor's own
+// HTTP status when there was a response, or the transport failure class when
+// there was not. It never includes the vendor's text, the request, or the key —
+// "unreachable" on its own has already cost an operator a trip through the
+// runbook with nothing to go on.
+func verifyDiagnostic(err error) string {
+	var vendorErr *provider.VendorAPIError
+	if errors.As(err, &vendorErr) {
+		if vendorErr.VendorStatus != 0 {
+			t := vendorErr.VendorErrorType
+			if t == "" {
+				t = "unknown"
+			}
+			return fmt.Sprintf("code=%s vendor_http_status=%d vendor_error_type=%s", vendorErr.Code, vendorErr.VendorStatus, t)
+		}
+		return "code=" + vendorErr.Code + " " + transportClass(vendorErr.Cause)
+	}
+	return transportClass(err)
+}
+
+func transportClass(err error) string {
+	switch {
+	case err == nil:
+		return "transport=none"
+	case errors.Is(err, context.DeadlineExceeded):
+		return "transport=timeout"
+	}
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return "transport=dns"
+	}
+	var unknownCA x509.UnknownAuthorityError
+	var hostErr x509.HostnameError
+	var certErr x509.CertificateInvalidError
+	if errors.As(err, &unknownCA) || errors.As(err, &hostErr) || errors.As(err, &certErr) {
+		return "transport=tls"
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		if netErr.Timeout() {
+			return "transport=timeout"
+		}
+		return "transport=network"
+	}
+	return "transport=other"
 }

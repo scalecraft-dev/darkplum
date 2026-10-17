@@ -27,10 +27,6 @@ export interface Conversation {
   /** The model the conversation was last sent on. '' when none was chosen. For
    *  a routed alias this is the alias, which is what the picker shows. */
   model: string
-  /** The concrete model a routed alias resolved to on the first reply. Later
-   *  turns go straight there, so a thread does not change model mid-answer.
-   *  null while the alias is free to choose again. */
-  pinnedModel: string | null
   /** Empty until the conversation is opened — the list endpoint sends no bodies. */
   messages: ChatMessage[]
   createdAt: string
@@ -92,7 +88,6 @@ function fromSummary(s: ConversationSummary): Conversation {
     id: s.id,
     title: s.title,
     model: s.model ?? '',
-    pinnedModel: s.pinned_model ?? null,
     messages: stillFresh ? existing.messages : [],
     createdAt: s.created_at,
     updatedAt: s.updated_at,
@@ -115,7 +110,6 @@ function fromFull(full: ConversationFull): Conversation {
     id: full.id,
     title: full.title,
     model: full.model ?? '',
-    pinnedModel: full.pinned_model ?? null,
     messages,
     createdAt: full.created_at,
     updatedAt: full.updated_at,
@@ -174,7 +168,6 @@ export function createDraft(model: string): Conversation {
     id: DRAFT_ID,
     title: NEW_CONVERSATION_TITLE,
     model,
-    pinnedModel: null,
     messages: [],
     createdAt: now,
     updatedAt: now,
@@ -260,20 +253,6 @@ export async function setConversationModel(id: string, model: string): Promise<v
   await updateConversation(id, { model })
   const cached = cache.get(id)
   if (cached) cache.set(id, { ...cached, model })
-}
-
-/**
- * Records the concrete model a routed alias resolved to, so the rest of this
- * conversation goes to the same one. Passing null lets the alias choose again —
- * which is what happens the moment someone picks a different entry.
- */
-export async function setConversationPinnedModel(
-  id: string,
-  pinnedModel: string | null,
-): Promise<void> {
-  await updateConversation(id, { pinned_model: pinnedModel })
-  const cached = cache.get(id)
-  if (cached) cache.set(id, { ...cached, pinnedModel })
 }
 
 export async function deleteConversation(id: string): Promise<void> {

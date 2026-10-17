@@ -105,8 +105,12 @@ read -s ANTHROPIC_API_KEY && export ANTHROPIC_API_KEY
 make set-anthropic-key MODELS='claude-*'
 ```
 
-1. Create the key at the vendor **scoped and capped first**: an Anthropic
-   workspace key with a workspace spend limit; an OpenAI project key with a model
+1. Create the key at the vendor **scoped and capped first**: an Anthropic key
+   created *inside* a workspace, with a workspace spend limit (a key created at
+   organisation level works too, but Anthropic then requires a workspace ID on
+   every request — give it on the install form or with `WORKSPACE=wrkspc_…`;
+   the key check says "not scoped to an Anthropic workspace" when it is
+   missing); an OpenAI project key with a model
    allowlist and a project budget. Darkplum has no spend cap and cannot see what
    the key is scoped to. This is the only control beneath the gateway.
 2. `MODELS` is the catalog filter. Name a family (`claude-*`, `gpt-*`). A bare
@@ -147,14 +151,21 @@ Model vendors** shows the same state:
 | `filter_missing` | key present, no catalog filter | re-run `make set-…-key MODELS=…`. A hand-edited ConfigMap does nothing until the gateway restarts: `kubectl rollout restart -n darkplum-system deploy/darkplum-gateway` |
 | `filter_matched_nothing` | the filter admits none of the models the key can reach | widen `MODELS`, or widen the key's scope at the vendor |
 | `auth_failed` | the vendor rejected the key, or the key file is empty/unreadable | rotate (section 3) |
+| *key check:* `workspace_required` | an organisation-level Anthropic key with no workspace ID | enter the workspace ID (Anthropic console > Workspaces), or use a key created inside a workspace |
+| *key check:* `vendor_error` | the vendor answered the check with a non-auth HTTP error (status and error type shown) | the vendor's answer to this key: check its organisation, billing and permissions in the vendor console |
 | `unreachable` | network, DNS, proxy or vendor outage | check egress (`gateway-egress` allows `:443`), `HTTPS_PROXY`, the vendor's status page |
 | `ok` | discovery succeeded | — |
 
 **"I installed a key in the UI and nothing happened."** Work down the path:
 
-1. The form said *Nothing was stored* — verification failed; the message names
-   which of `auth_failed` / `unreachable` it was. The gateway, not the api, makes
-   that call, so check the gateway's egress and `HTTPS_PROXY`.
+1. The form said *Nothing was stored* — verification failed, and the message
+   says which way: *rejected this key* (auth), *not scoped to an Anthropic
+   workspace* (add the workspace ID), *answered HTTP nnn* (the vendor's own
+   objection to this key or organisation — billing, permissions), or *could not
+   be reached* (a real transport failure: the gateway, not the api, makes that
+   call, so check its egress, DNS and `HTTPS_PROXY`). The gateway log carries the
+   same outcome with the vendor's HTTP status and a transport class, never the
+   vendor's text or the key.
 2. `503` "This cluster was deployed before keys could be installed from here" —
    the Secret, ConfigMap or the api's Role do not exist yet. Run
    `make deploy-platform` once. `503` "Darkplum is not permitted to write the
@@ -185,6 +196,51 @@ Answering "did anything leave our cloud account?": Admin > Activity, *Where it
 ran* = *Outside your cloud account*, or `GET /api/v1/usage?backend_class=external_api`
 (the CSV export takes the same filter and carries `provider` and
 `backend_class` columns). Refused requests carry the class too.
+
+## 4b. Bedrock models that need an AWS opt-in (data retention)
+
+Amazon Bedrock refuses some models — today Claude Fable 5 and Fable 5.1 — unless
+the AWS account's **data-retention mode** for that region is `aws_review` (or the
+legacy `provider_data_share`). Darkplum can list such a model (the account can
+*see* it) while every request to it fails. What you see:
+
+- **Admin > Models** marks the row **Needs AWS opt-in** with the account's
+  current mode and the one the model needs. The gateway reads the mode each
+  discovery tick (`bedrock:GetAccountDataRetention`, granted read-only to its
+  role) and knows the families that require it; a model outside that list
+  self-reports the same way after its first refused request.
+- **Chat** answers "*<model> on Bedrock requires your AWS account's Bedrock
+  data-retention mode to be raised*" — no retry — naming the route when the
+  message came through a routed alias. Admin > Activity filters on *Needs AWS
+  opt-in* (`denial_code = model_requires_data_retention`).
+
+What the opt-in means: for models that require it, AWS retains prompts and
+outputs **inside the AWS boundary for up to 30 days and may review them** to meet
+the model provider's access condition; the model provider does not receive them,
+and models that do not require review are unaffected whatever the setting. It is
+per region, account-wide (projects exist only on the bedrock-mantle endpoint),
+and there is no console UI for it. Darkplum never changes it — the gateway's
+role cannot write it — because it is a data-handling decision for the account
+owner. To opt in, with your own credentials, in the gateway's Bedrock region:
+
+```bash
+# read the current mode (`inherit` resolves to each model's default)
+curl --aws-sigv4 "aws:amz:us-east-1:bedrock" --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" \
+  -H "x-amz-security-token: $AWS_SESSION_TOKEN" https://bedrock.us-east-1.amazonaws.com/data-retention
+# opt in
+curl -X PUT --aws-sigv4 "aws:amz:us-east-1:bedrock" --user "$AWS_ACCESS_KEY_ID:$AWS_SECRET_ACCESS_KEY" \
+  -H "x-amz-security-token: $AWS_SESSION_TOKEN" -H "Content-Type: application/json" \
+  -d '{"mode":"aws_review"}' https://bedrock.us-east-1.amazonaws.com/data-retention
+```
+
+(`aws configure export-credentials --format env` prints those three variables for
+an SSO profile; a current AWS CLI exposes the same as `aws bedrock
+put-account-data-retention`.) The change applies immediately; the badge clears
+on the next discovery tick. If your organisation's policy is zero or default
+retention, the alternative is to route around these models: point the alias's
+routes at models that do not require review, or do not enable them. An SCP
+denying `bedrock:PutAccountDataRetention` unless the mode is `none` enforces that
+organisation-wide — see the AWS data-retention documentation.
 
 ## 5. Turning a vendor off
 

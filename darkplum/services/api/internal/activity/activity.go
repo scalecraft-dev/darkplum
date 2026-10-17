@@ -59,6 +59,8 @@ const (
 	// model_filter_after}: key_last4 is computed from the SUBMITTED body
 	// (never read back from storage, which never holds it anyway -- the key
 	// itself is never stored in Postgres, only in the cluster Secret).
+	// Anthropic only: workspace_id_before / workspace_id_after (not secret),
+	// omitted when both are empty -- same on provider.filter_changed.
 	ProviderKeyInstalled EventType = "provider.key_installed"
 	ProviderKeyRotated   EventType = "provider.key_rotated"
 	// ProviderKeyRemoved is recorded on a successful DELETE

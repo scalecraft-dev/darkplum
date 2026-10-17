@@ -71,6 +71,16 @@ func translateVendorError(statusCode int, header http.Header, status authFailure
 // if absent/unparseable/negative — seconds only, matching every vendor's
 // actual behaviour (mirrors internal/provider/anthropic's identical helper,
 // which reads the same header off the SDK-wrapped response instead).
+// translateVendorErrorBody is translateVendorError plus the vendor's
+// sanitised error.type, extracted from body (never the message).
+func translateVendorErrorBody(statusCode int, header http.Header, status authFailureReporter, body []byte) error {
+	err := translateVendorError(statusCode, header, status)
+	if apiErr, ok := err.(*APIError); ok {
+		apiErr.VendorErrorType = provider.SanitizeVendorErrorType(body)
+	}
+	return err
+}
+
 func retryAfterSeconds(h http.Header) int {
 	raw := strings.TrimSpace(h.Get("Retry-After"))
 	if raw == "" {

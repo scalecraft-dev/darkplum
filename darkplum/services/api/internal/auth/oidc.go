@@ -254,21 +254,30 @@ func RotateRefreshToken(ctx context.Context, db *pgxpool.Pool, oldToken string, 
 	newHash := HashString(newToken)
 	newExpiry := time.Now().Add(refreshTTL)
 
-	var userID, email, name, role string
+	var sessionUser string
 	err = db.QueryRow(ctx, `
 		UPDATE sessions SET refresh_token_hash = $2, expires_at = $3
 		WHERE refresh_token_hash = $1 AND expires_at > now()
-		RETURNING (SELECT u.id FROM users u WHERE u.id = sessions.user_id),
-		          (SELECT u.email FROM users u WHERE u.id = sessions.user_id),
-		          (SELECT u.name FROM users u WHERE u.id = sessions.user_id),
-		          (SELECT u.role FROM users u WHERE u.id = sessions.user_id)
-	`, oldHash, newHash, newExpiry).Scan(&userID, &email, &name, &role)
+		RETURNING user_id::text
+	`, oldHash, newHash, newExpiry).Scan(&sessionUser)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, "", "", errors.New("refresh token expired or already used")
 		}
 		return nil, "", "", err
 	}
+
+	// Same rule as the access-token path: the user row must exist and its
+	// current role wins. Uncached so a rotation always sees fresh state.
+	InvalidateUser(sessionUser)
+	u, err := lookupUser(ctx, db, sessionUser)
+	if err != nil {
+		if errors.Is(err, errUserGone) {
+			_, _ = db.Exec(ctx, `DELETE FROM sessions WHERE refresh_token_hash = $1`, newHash)
+		}
+		return nil, "", "", err
+	}
+	userID, email, name, role := sessionUser, u.email, u.name, u.role
 
 	jwt, err := SignSessionJWT(userID, email, name, role, secret, jwtTTL)
 	if err != nil {

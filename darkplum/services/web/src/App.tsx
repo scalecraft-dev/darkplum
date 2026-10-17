@@ -7,6 +7,7 @@ import { ChatPage } from './pages/ChatPage'
 import { LoginPage } from './pages/LoginPage'
 import { ModelsPage } from './pages/ModelsPage'
 import { ProfilePage } from './pages/ProfilePage'
+import { RoutingPage } from './pages/RoutingPage'
 
 export function App() {
   return (
@@ -16,6 +17,7 @@ export function App() {
       <Route path="/admin" element={<ProtectedRoute requireAdmin><Navigate to="/admin/users" replace /></ProtectedRoute>} />
       <Route path="/admin/users" element={<ProtectedRoute requireAdmin><Layout><AdminPage /></Layout></ProtectedRoute>} />
       <Route path="/admin/models" element={<ProtectedRoute requireAdmin><Layout><ModelsPage /></Layout></ProtectedRoute>} />
+      <Route path="/admin/routing" element={<ProtectedRoute requireAdmin><Layout><RoutingPage /></Layout></ProtectedRoute>} />
       <Route path="/admin/activity" element={<ProtectedRoute requireAdmin><Layout><ActivityPage /></Layout></ProtectedRoute>} />
       <Route path="/chat" element={<ProtectedRoute><Layout><ChatPage /></Layout></ProtectedRoute>} />
       <Route path="/profile" element={<ProtectedRoute><Layout><ProfilePage /></Layout></ProtectedRoute>} />

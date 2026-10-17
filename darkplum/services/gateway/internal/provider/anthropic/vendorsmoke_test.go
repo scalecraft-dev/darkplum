@@ -74,7 +74,7 @@ func TestVendorSmoke_VerifyKey(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	ids, err := p.VerifyKey(ctx, apiKey)
+	ids, err := p.VerifyKey(ctx, apiKey, "")
 	if err != nil {
 		t.Fatalf("VerifyKey: %v", err)
 	}

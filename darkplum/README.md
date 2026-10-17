@@ -302,7 +302,13 @@ bedrock_model_patterns = ["anthropic.claude-*", "meta.llama*"]   # [] = no Bedro
 
 The role is granted the geo inference profiles (`us.anthropic.claude-*`) and the
 underlying models in that geography's regions only — no all-region wildcard and no
-`global.` profiles. `make verify-bedrock-iam` simulates the deployed role and fails
+`global.` profiles. One more thing the role may do is *read* the account's
+Bedrock data-retention mode: some models (Claude Fable 5 and later) are refused
+by Bedrock unless that mode is raised to `aws_review`, and Darkplum uses the
+read to mark such models **Needs AWS opt-in** in Admin > Models before anyone
+sends a prompt. Raising the mode is an account-owner decision made with your
+own credentials — the role cannot write it — and what it means is in
+`docs/RUNBOOK-vendor-apis.md`. `make verify-bedrock-iam` simulates the deployed role and fails
 if anything outside the allowlist would be permitted.
 
 **Anthropic and OpenAI (your own vendor keys).** Install a key from the product
@@ -325,10 +331,20 @@ command line, and checked against the vendor before anything is changed:
 ```bash
 read -s ANTHROPIC_API_KEY && export ANTHROPIC_API_KEY
 make set-anthropic-key MODELS='claude-*'          # MODELS = catalog filter (globs)
+# add WORKSPACE=wrkspc_... if the key was created at organisation level (see below)
 
 read -s OPENAI_API_KEY && export OPENAI_API_KEY
 make set-openai-key MODELS='gpt-*'
 ```
+
+**Create the Anthropic key inside a workspace.** Anthropic requires every request
+made with a key created at *organisation* level to name a workspace
+(`anthropic-workspace-id`); Darkplum sends that header when you give it a
+workspace ID — the optional field on the install form, or `WORKSPACE=wrkspc_…`
+on the make target — and the key check tells you when a key needs one. A key
+created inside a workspace (Anthropic console > Workspaces > API keys) needs
+nothing, and that is the better choice anyway: the workspace is where the spend
+limit lives.
 
 The list you tick in the product and `MODELS` on the command line are the same
 setting — the catalog filter. Whichever was set last is the one in force; after a
@@ -457,7 +473,7 @@ separate cloud IAM role; every principal shares the gateway's role until
 workspaces ship. Groups and workspaces are the next principal types; the schema
 reserves room for them.
 
-**Routing policy and aliases** (Admin > Models):
+**Routing policy** (Admin > Models > Policy) **and aliases** (Admin > Routing):
 
 - *Residency* — a three-step ladder. *Any model, including outside your account*
   permits all three kinds of backend; *Your cloud account only* (the default)
@@ -475,14 +491,19 @@ reserves room for them.
   explainable rules (keywords, code detection, prompt length). The classifier
   chooses among those routes and no others;
   the chosen model still passes the enabled and residency checks, and a route the
-  policy forbids is refused, never swapped. Every request records the route, the
+  policy forbids is refused, never swapped. If the chosen route's model is merely
+  disabled or unreachable, the alias uses its own default route instead — an
+  admin-authored choice inside the same alias that passes the same checks — and
+  the usage log says so (`fallback:route_target_disabled`); only when the default
+  route is unusable too is the request refused. Every request records the route, the
   reason, and every model that saw the prompt — the classifier included — and the
   chat shows which model answered. Regulated intents can stay on in-account
   models while everything else may use the frontier gateway. Test any prompt
-  against a routed alias from the admin page without sending it to a model.
-  Routing happens on the first message of a conversation; later messages in
-  that conversation stay on the model that answered first, so a thread has one
-  voice. A new chat is routed afresh.
+  against a routed alias from Admin > Routing without sending it to a model.
+  Every message is classified on its own: a thread that starts with small talk
+  and turns to code moves to the code route at that turn, and the reply says
+  which model answered it. The whole conversation is sent each time, so a model
+  taking over mid-thread sees everything said before.
 
   Two classifiers are available per routed alias:
   - **Semantic Router** (recommended) — the open-source [vLLM Semantic Router](https://vllm-sr.ai)
@@ -496,7 +517,7 @@ reserves room for them.
     classifier weights in ephemeral storage and re-downloads them (~1-2 GB) on
     every pod start; it needs about 2 GiB of memory, so add a CPU node before
     enabling it on the default 2 x m5.large node group. Until it is installed, a
-    routed alias that names it always uses its default route — the admin page
+    routed alias that names it always uses its default route — Admin > Routing
     warns you.
   - **Rules** — admin keywords plus three built-in signals (`builtin:code`,
     `builtin:long`, `builtin:multimodal`). No model, no added latency, no extra
@@ -509,8 +530,10 @@ reserves room for them.
   non-commercial use only.
 
   Whatever the classifier says, the chosen model still passes the enabled and
-  residency checks; a forbidden pick is refused with the route named, never
-  swapped. Classification runs in-cluster with a 500 ms budget and a circuit
+  residency checks; a pick the policy forbids is refused with the route named,
+  never swapped, while a pick whose model is disabled or unreachable falls back
+  to the alias's default route. Disabling a model that aliases route to asks for
+  confirmation and says what each alias will do. Classification runs in-cluster with a 500 ms budget and a circuit
   breaker; on timeout or breaker-open the alias falls back to its default route
   and the reason is recorded. Neither classifier is a model invocation, so the
   audit trail's "which models saw this prompt" is exactly the model that

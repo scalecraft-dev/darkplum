@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/scalecraft/darkplum/gateway/internal/provider"
 	"github.com/scalecraft/darkplum/gateway/internal/provider/bedrock"
@@ -22,6 +23,13 @@ type bedrockDiscoverer interface {
 // without this package (or the bedrock package) needing to know about the
 // other.
 var _ bedrockDiscoverer = (*bedrock.BedrockProvider)(nil)
+
+// dataRetentionRefresher is optionally implemented by the Bedrock provider:
+// it reads the account's data-retention mode once per discovery tick. It has no
+// error return by design — a failure must never affect discovery or readiness.
+type dataRetentionRefresher interface {
+	RefreshAccountDataRetention(ctx context.Context)
+}
 
 // bedrockSourceState holds the lazily-initialised Bedrock client and retry
 // state behind a Source's Discover closure.
@@ -92,6 +100,15 @@ func (s *bedrockSourceState) discover(ctx context.Context) ([]string, error) {
 		if s.onReady != nil {
 			s.onReady(p)
 		}
+	}
+
+	// Account data-retention mode, same credentials as discovery. Best effort
+	// and bounded: it swallows its own errors (AccessDenied until the IAM role
+	// gains bedrock:GetAccountDataRetention is expected) and cannot fail the tick.
+	if r, ok := prov.(dataRetentionRefresher); ok {
+		rctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		r.RefreshAccountDataRetention(rctx)
+		cancel()
 	}
 
 	discovered, err := prov.DiscoverModels(ctx)

@@ -274,11 +274,11 @@ export function validateRouteName(name: string): string | null {
   return null
 }
 
-/** Routing is decided once per conversation. Administrators write routes without
- *  seeing the chat, so this fact is repeated wherever routes are written or
- *  tested rather than left for them to discover from a transcript. */
-export const STICKINESS_HINT =
-  'Routing happens on the first message of a conversation; later messages in that conversation stay on the model that answered first. Users can start a new chat to be routed again.'
+/** Routing is decided per message, not per conversation. Administrators write
+ *  routes without seeing the chat, so this fact is repeated wherever routes are
+ *  written or tested rather than left for them to discover from a transcript. */
+export const PER_MESSAGE_ROUTING_HINT =
+  'Every message is classified on its own, so a thread may be answered by different models as its questions change; the reply says which one answered.'
 
 export const MAX_KEYWORDS_PER_ROUTE = 32
 export const MAX_KEYWORD_LENGTH = 64
@@ -368,8 +368,131 @@ export function routerReasonText(reason: string | null | undefined): string {
     case 'fallback:unknown_category':
       return 'Classifier returned a category no route is named after — default route'
   }
+  const fallback = routeFallbackOf(reason)
+  if (fallback) {
+    return `Fell back to the default route — the model on route '${fallback.route}' ${
+      fallback.state === 'disabled' ? 'is disabled' : 'is not reachable'
+    }`
+  }
   if (reason.startsWith('semantic:')) return 'Classified by the semantic router'
   return reason
+}
+
+const ROUTE_FALLBACK_RE = /^fallback:route_target_(disabled|unreachable):(.+)$/
+
+/**
+ * A routed alias whose picked route cannot answer — its target is disabled, or
+ * the gateway has no backend for it — is answered on the alias's own default
+ * route instead, and the gateway records which route was skipped. Policy
+ * refusals never land here: those still refuse with the route named.
+ */
+export function routeFallbackOf(
+  reason: string | null | undefined,
+): { route: string; state: 'disabled' | 'unreachable' } | null {
+  const m = reason ? ROUTE_FALLBACK_RE.exec(reason) : null
+  return m ? { state: m[1] as 'disabled' | 'unreachable', route: m[2] } : null
+}
+
+/** Why a non-default route is not answering itself, as Admin > Routing sees it. */
+export type RouteFallbackState = 'missing' | 'disabled' | 'unreachable'
+
+/** The one sentence under a non-default route whose target cannot answer while
+ *  the default route can. Said in the editor and on the alias row alike. */
+export function routeFallbackHint(state: RouteFallbackState, defaultRoute: string): string {
+  const lead =
+    state === 'missing'
+      ? 'No model has this ID'
+      : state === 'disabled'
+        ? 'This model is turned off'
+        : 'This model is not reachable right now'
+  return `${lead}, so messages that take this route fall back to the default route ${defaultRoute} until it is fixed.`
+}
+
+/**
+ * The gateway's sentence for a routed pick that cannot answer and has nowhere
+ * to fall back to: the picked route is the default, or the default cannot
+ * answer either. It names both models and is relayed verbatim; this only
+ * recognises it so chat can offer the right next step.
+ */
+export function isRouteTargetRefusal(code: string | null | undefined, message: string): boolean {
+  return (
+    (code === 'model_not_enabled' || code === 'model_not_found') &&
+    message.includes("the alias's default route")
+  )
+}
+
+/** One place a model is used by an alias, and what disabling it does there. */
+export interface AliasReference {
+  alias: string
+  /** null for a static alias. */
+  route: string | null
+  isDefault: boolean
+  /** The alias's default route and its target, for a routed alias. */
+  defaultRoute: string | null
+  defaultTarget: string | null
+  /** 'fallback': messages on this route move to the default route.
+   *  'refused': messages that land here are refused. */
+  outcome: 'fallback' | 'refused'
+}
+
+/**
+ * Every alias and route that targets `modelId`, with what turning the model off
+ * would do to each. A non-default route falls back to its alias's default
+ * route — unless that default also targets this model, or cannot answer as
+ * things stand, in which case it is refused too.
+ */
+export function aliasReferencesTo(modelId: string, aliases: ModelAlias[]): AliasReference[] {
+  const refs: AliasReference[] = []
+  for (const a of aliases) {
+    if (!isRoutedAlias(a)) {
+      if (a.target_model_id === modelId) {
+        refs.push({
+          alias: a.alias,
+          route: null,
+          isDefault: false,
+          defaultRoute: null,
+          defaultTarget: null,
+          outcome: 'refused',
+        })
+      }
+      continue
+    }
+    const routes = a.routes ?? []
+    const def = routes.find((r) => r.route_name === a.default_route) ?? null
+    const defaultUsable =
+      def !== null &&
+      def.target_model_id !== modelId &&
+      def.target_exists !== false &&
+      def.target_enabled !== false &&
+      def.target_available !== false
+    for (const r of routes) {
+      if (r.target_model_id !== modelId) continue
+      const isDefault = def !== null && r.route_name === def.route_name
+      refs.push({
+        alias: a.alias,
+        route: r.route_name,
+        isDefault,
+        defaultRoute: def?.route_name ?? null,
+        defaultTarget: def?.target_model_id ?? null,
+        outcome: !isDefault && defaultUsable ? 'fallback' : 'refused',
+      })
+    }
+  }
+  return refs
+}
+
+/** What follows the alias and route in the disable confirmation. */
+export function aliasReferenceConsequence(r: AliasReference): string {
+  if (r.route === null) return 'refused until it is retargeted or the model is re-enabled'
+  if (r.isDefault) {
+    return 'messages that land here will be refused until it is retargeted or re-enabled'
+  }
+  if (r.outcome === 'fallback') {
+    return `messages will use its default route ${r.defaultRoute} (${r.defaultTarget}) instead`
+  }
+  return r.defaultRoute
+    ? `messages will be refused — its default route ${r.defaultRoute} cannot answer either`
+    : 'messages will be refused — the alias has no default route to fall back to'
 }
 
 /** Every target a routed alias can reach, or the single target of a static one. */
@@ -395,6 +518,7 @@ export const DENIAL_CODES = [
   'invalid_request',
   'policy_unavailable',
   'request_canceled',
+  'model_requires_data_retention',
 ] as const
 
 const DENIAL_LABELS: Record<string, string> = {
@@ -405,6 +529,9 @@ const DENIAL_LABELS: Record<string, string> = {
   invalid_request: 'Invalid request',
   policy_unavailable: 'Policy unavailable',
   request_canceled: 'Request cancelled',
+  // Same phrase as the Models badge (lib/dataRetention AWS_OPT_IN_LABEL);
+  // written out here because check-policy pins the two to each other.
+  model_requires_data_retention: 'Needs AWS opt-in',
   // Recorded on a refused request (gateway chat.go sets it before route
   // resolution) but deliberately NOT in DENIAL_CODES above: the api's
   // validDenialCodeFilter does not accept it, so offering it as a filter

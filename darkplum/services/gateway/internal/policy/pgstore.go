@@ -317,7 +317,14 @@ func (s *PgStore) loadFromDB(ctx context.Context) (Snapshot, error) {
 // raw error (including an undefined-table 42P01) for loadFromDB to classify
 // — this function performs I/O only, mirroring loadPrincipalPolicyRows.
 func (s *PgStore) loadVendorFilters(ctx context.Context) (map[string]VendorFilterRow, error) {
-	rows, err := s.pool.Query(ctx, `SELECT vendor, model_filter, filter_set_at FROM vendor_provider_settings`)
+	rows, err := s.pool.Query(ctx, `SELECT vendor, model_filter, filter_set_at, workspace_id FROM vendor_provider_settings`)
+	hasWorkspace := true
+	if isUndefinedColumnError(err) {
+		// Migration 019 (workspace_id) not applied yet on this database:
+		// read the pre-019 shape; workspace ids are simply absent.
+		hasWorkspace = false
+		rows, err = s.pool.Query(ctx, `SELECT vendor, model_filter, filter_set_at FROM vendor_provider_settings`)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -328,10 +335,20 @@ func (s *PgStore) loadVendorFilters(ctx context.Context) (map[string]VendorFilte
 		var vendor string
 		var filter []string
 		var setAt time.Time
-		if err := rows.Scan(&vendor, &filter, &setAt); err != nil {
+		var workspaceID *string
+		if hasWorkspace {
+			err = rows.Scan(&vendor, &filter, &setAt, &workspaceID)
+		} else {
+			err = rows.Scan(&vendor, &filter, &setAt)
+		}
+		if err != nil {
 			return nil, fmt.Errorf("scan vendor_provider_settings row: %w", err)
 		}
-		out[vendor] = VendorFilterRow{Filter: filter, SetAt: setAt}
+		row := VendorFilterRow{Filter: filter, SetAt: setAt}
+		if workspaceID != nil {
+			row.WorkspaceID = *workspaceID
+		}
+		out[vendor] = row
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("read vendor_provider_settings rows: %w", err)
@@ -376,6 +393,11 @@ const undefinedTableErrorCode = "42P01"
 // isUndefinedTableError reports whether err is a Postgres "undefined_table"
 // error (SQLSTATE 42P01) — the signature of principal_routing_policies not
 // existing yet on a customer database that hasn't run migration 015.
+func isUndefinedColumnError(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "42703"
+}
+
 func isUndefinedTableError(err error) bool {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {

@@ -31,7 +31,7 @@ func (p *Provider) DiscoverModels(ctx context.Context) (map[string]bool, error) 
 	ids := make(map[string]bool)
 	maxTokens := make(map[string]int64)
 
-	iter := client.Models.ListAutoPaging(discoverCtx, sdk.ModelListParams{})
+	iter := client.Models.ListAutoPaging(discoverCtx, sdk.ModelListParams{}, p.requestOptions(ctx)...)
 	for iter.Next() {
 		m := iter.Current()
 		if m.ID == "" {
@@ -67,6 +67,10 @@ func (p *Provider) DiscoverModels(ctx context.Context) (map[string]bool, error) 
 // write, or otherwise disturb that cache, and must never touch p.creds
 // (credsource) at all. Nothing about key is retained once this call returns.
 //
+// workspaceID is the SUBMITTED workspace to scope the check to (sent as
+// anthropic-workspace-id when non-empty); it is not defaulted from the
+// effective workspace, so verifying a candidate never borrows installed config.
+//
 // Bounded by its own timeout, independent of discoveryTimeout (which governs
 // the credential-driven DiscoverModels path) and of whatever timeout the
 // caller already applies.
@@ -76,7 +80,7 @@ func (p *Provider) DiscoverModels(ctx context.Context) (map[string]bool, error) 
 // response body plus Request-ID/Workspace-ID headers verbatim) — status is
 // passed as nil so a failed verification of a CANDIDATE key never reports
 // auth_failed into this provider's real (credsource-backed) status.
-func (p *Provider) VerifyKey(ctx context.Context, key string) ([]string, error) {
+func (p *Provider) VerifyKey(ctx context.Context, key, workspaceID string) ([]string, error) {
 	opts := []option.RequestOption{
 		option.WithoutEnvironmentDefaults(),
 		option.WithAPIKey(key),
@@ -92,7 +96,7 @@ func (p *Provider) VerifyKey(ctx context.Context, key string) ([]string, error) 
 	defer cancel()
 
 	ids := make([]string, 0)
-	iter := client.Models.ListAutoPaging(verifyCtx, sdk.ModelListParams{})
+	iter := client.Models.ListAutoPaging(verifyCtx, sdk.ModelListParams{}, workspaceOptions(workspaceID)...)
 	for iter.Next() {
 		m := iter.Current()
 		if m.ID == "" {

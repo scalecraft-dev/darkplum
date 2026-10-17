@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path"
 	"strconv"
@@ -113,6 +114,13 @@ type Config struct {
 	// unset or unparseable: an unstamped env filter loses to ANY stamped DB
 	// row, but still wins over no DB row at all.
 	AnthropicModelFilterSetAt time.Time
+	// AnthropicWorkspaceID is the ANTHROPIC_WORKSPACE_ID env fallback (sent as
+	// the anthropic-workspace-id header), needed only for an API key created
+	// at org level rather than inside a workspace. It rides with the
+	// ANTHROPIC_MODEL_FILTER/_SET_AT pair under the same last-writer-wins
+	// rule. "" if unset or malformed (^[A-Za-z0-9_-]{1,64}$): a bad value
+	// never fails Load.
+	AnthropicWorkspaceID string
 	// AnthropicDefaultMaxTokens is used when a chat request doesn't set
 	// max_tokens. ANTHROPIC_DEFAULT_MAX_TOKENS, default 8192.
 	AnthropicDefaultMaxTokens int
@@ -302,6 +310,12 @@ func Load() (*Config, error) {
 	anthropicModelFilter := parseVendorGlobList(os.Getenv("ANTHROPIC_MODEL_FILTER"))
 	anthropicModelFilterSetAt := parseVendorFilterSetAt(os.Getenv("ANTHROPIC_MODEL_FILTER_SET_AT"))
 
+	anthropicWorkspaceID := strings.TrimSpace(os.Getenv("ANTHROPIC_WORKSPACE_ID"))
+	if anthropicWorkspaceID != "" && !provider.ValidWorkspaceID(anthropicWorkspaceID) {
+		log.Printf("config: WARNING ignoring malformed ANTHROPIC_WORKSPACE_ID (want ^[A-Za-z0-9_-]{1,64}$)")
+		anthropicWorkspaceID = ""
+	}
+
 	anthropicDefaultMaxTokens := 8192
 	if v := os.Getenv("ANTHROPIC_DEFAULT_MAX_TOKENS"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -349,6 +363,7 @@ func Load() (*Config, error) {
 		ProviderKeysDir:           providerKeysDir,
 		AnthropicModelFilter:      anthropicModelFilter,
 		AnthropicModelFilterSetAt: anthropicModelFilterSetAt,
+		AnthropicWorkspaceID:      anthropicWorkspaceID,
 		AnthropicDefaultMaxTokens: anthropicDefaultMaxTokens,
 		AnthropicBaseURL:          anthropicBaseURL,
 		OpenAIModelFilter:         openAIModelFilter,

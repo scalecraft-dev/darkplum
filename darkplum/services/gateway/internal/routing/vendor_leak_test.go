@@ -153,7 +153,7 @@ func TestVendorDiscoveryAndChatRequest_NeverLeakVendorErrorText(t *testing.T) {
 	anthropicForVerify := anthropic.New(installedCreds, anthropic.Config{BaseURL: anthropicSrv.URL, DefaultMaxTokens: 512})
 	openaiForVerify := openai.New(installedCreds, openai.Config{BaseURL: openaiSrv.URL})
 
-	_, err = anthropicForVerify.VerifyKey(context.Background(), sentinelKeyFragment)
+	_, err = anthropicForVerify.VerifyKey(context.Background(), sentinelKeyFragment, "")
 	if err == nil {
 		t.Fatal("expected an error from the sentinel anthropic server")
 	}
@@ -164,7 +164,7 @@ func TestVendorDiscoveryAndChatRequest_NeverLeakVendorErrorText(t *testing.T) {
 		t.Error("expected anthropic VerifyKey's error to be a provider.APIError")
 	}
 
-	_, err = openaiForVerify.VerifyKey(context.Background(), sentinelKeyFragment)
+	_, err = openaiForVerify.VerifyKey(context.Background(), sentinelKeyFragment, "")
 	if err == nil {
 		t.Fatal("expected an error from the sentinel openai server")
 	}

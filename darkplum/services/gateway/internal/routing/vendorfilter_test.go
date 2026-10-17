@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -98,13 +99,14 @@ func TestSameGlobSet(t *testing.T) {
 
 // fakeVendorFilterPolicySource is a vendorFilterPolicySource test double.
 type fakeVendorFilterPolicySource struct {
-	filter map[string][]string
-	setAt  map[string]time.Time
-	ok     map[string]bool
+	filter    map[string][]string
+	setAt     map[string]time.Time
+	ok        map[string]bool
+	workspace map[string]string
 }
 
-func (f fakeVendorFilterPolicySource) VendorFilter(vendor string) ([]string, time.Time, bool) {
-	return f.filter[vendor], f.setAt[vendor], f.ok[vendor]
+func (f fakeVendorFilterPolicySource) VendorFilter(vendor string) ([]string, time.Time, string, bool) {
+	return f.filter[vendor], f.setAt[vendor], f.workspace[vendor], f.ok[vendor]
 }
 
 func TestNewVendorFilterFunc_ReadsLiveSnapshotEveryCall(t *testing.T) {
@@ -113,7 +115,7 @@ func TestNewVendorFilterFunc_ReadsLiveSnapshotEveryCall(t *testing.T) {
 		setAt:  map[string]time.Time{"anthropic": time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)},
 		ok:     map[string]bool{"anthropic": true},
 	}
-	fn := NewVendorFilterFunc("anthropic", nil, time.Time{}, src)
+	fn := NewVendorFilterFunc("anthropic", nil, time.Time{}, "", src)
 
 	got := fn()
 	if got.Source != "db" || len(got.Patterns) != 1 || got.Patterns[0] != "claude-*" {
@@ -139,7 +141,7 @@ func TestNewVendorFilterFunc_LogsHandEditedConfigMapWarningOncePerChange(t *test
 	}
 	// Env carries the SAME timestamp but a DIFFERENT value — only possible
 	// via a hand-edited ConfigMap (see the type's doc comment).
-	fn := NewVendorFilterFunc("openai", []string{"o1*"}, setAt, src)
+	fn := NewVendorFilterFunc("openai", []string{"o1*"}, setAt, "", src)
 
 	buf := captureLog(t)
 
@@ -170,7 +172,7 @@ func TestNewVendorFilterFunc_NoWarningWhenStampsDiffer(t *testing.T) {
 		setAt:  map[string]time.Time{"anthropic": dbSetAt},
 		ok:     map[string]bool{"anthropic": true},
 	}
-	fn := NewVendorFilterFunc("anthropic", []string{"different-value*"}, envSetAt, src)
+	fn := NewVendorFilterFunc("anthropic", []string{"different-value*"}, envSetAt, "", src)
 
 	buf := captureLog(t)
 	fn()
@@ -188,11 +190,66 @@ func TestNewVendorFilterFunc_NoWarningWhenValuesAgree(t *testing.T) {
 	}
 	// Same values, different slice order — sameGlobSet must treat these as
 	// equal, so no false-positive warning.
-	fn := NewVendorFilterFunc("anthropic", []string{"claude-opus-*", "claude-*"}, setAt, src)
+	fn := NewVendorFilterFunc("anthropic", []string{"claude-opus-*", "claude-*"}, setAt, "", src)
 
 	buf := captureLog(t)
 	fn()
 	if strings.Contains(buf.String(), "hand-edited ConfigMap") {
 		t.Errorf("expected no warning when the values agree (order-independent), got log:\n%s", buf.String())
+	}
+}
+
+// Workspace id rides on the same last-writer-wins winner as the filter.
+func TestNewVendorFilterFunc_WorkspaceIDFollowsFilterWinner(t *testing.T) {
+	envAt := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	newer := envAt.Add(time.Hour)
+	older := envAt.Add(-time.Hour)
+
+	mk := func(dbAt time.Time, dbOK bool, dbWS string) vendorFilterFunc {
+		src := fakeVendorFilterPolicySource{
+			filter:    map[string][]string{"anthropic": {"claude-*"}},
+			setAt:     map[string]time.Time{"anthropic": dbAt},
+			ok:        map[string]bool{"anthropic": dbOK},
+			workspace: map[string]string{"anthropic": dbWS},
+		}
+		return NewVendorFilterFunc("anthropic", []string{"claude-env-*"}, envAt, "wrkspc_env", src)
+	}
+
+	if got := mk(newer, true, "wrkspc_db")(); got.Source != "db" || got.WorkspaceID != "wrkspc_db" {
+		t.Errorf("newer DB row must win with its workspace: %+v", got)
+	}
+	// Explicitly cleared on the winning DB row: empty, NOT the env fallback.
+	if got := mk(newer, true, "")(); got.Source != "db" || got.WorkspaceID != "" {
+		t.Errorf("cleared DB workspace must not fall back to env: %+v", got)
+	}
+	if got := mk(envAt, true, "wrkspc_db")(); got.Source != "db" || got.WorkspaceID != "wrkspc_db" {
+		t.Errorf("equal stamp: DB wins: %+v", got)
+	}
+	if got := mk(older, true, "wrkspc_db")(); got.Source != "env" || got.WorkspaceID != "wrkspc_env" {
+		t.Errorf("older DB row loses to env, incl. workspace: %+v", got)
+	}
+	if got := mk(time.Time{}, false, "")(); got.Source != "env" || got.WorkspaceID != "wrkspc_env" {
+		t.Errorf("no DB row: env workspace: %+v", got)
+	}
+
+	none := NewVendorFilterFunc("anthropic", nil, time.Time{}, "", fakeVendorFilterPolicySource{})()
+	if none.Source != "none" || none.WorkspaceID != "" {
+		t.Errorf("nothing configured: %+v", none)
+	}
+}
+
+func TestVendorSource_ReportsWorkspaceID(t *testing.T) {
+	status := &fakeStatusReporter{}
+	creds := &fakeAnthropicCreds{key: "k", version: 1}
+	disc := &fakeAnthropicDiscoverer{models: map[string]bool{"claude-haiku-4-5": true}}
+	filter := func() vendorFilterResult {
+		return vendorFilterResult{Patterns: []string{"claude-*"}, Source: "db", WorkspaceID: "wrkspc_01"}
+	}
+	src := NewAnthropicSource(creds, disc, filter, status)
+	if _, err := src.Discover(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := status.last().WorkspaceID; got != "wrkspc_01" {
+		t.Errorf("status workspace_id = %q", got)
 	}
 }

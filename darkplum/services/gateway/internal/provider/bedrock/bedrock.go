@@ -35,6 +35,7 @@ type BedrockProvider struct {
 	client        converseAPI
 	controlClient controlAPI
 	region        string
+	retention     dataRetentionState
 }
 
 // New creates a BedrockProvider for the given AWS region, loading credentials
@@ -134,8 +135,9 @@ func (p *BedrockProvider) Complete(ctx context.Context, req provider.ChatRequest
 		InferenceConfig: inferenceConfig,
 	})
 	if err != nil {
-		return nil, wrapBedrockError(err)
+		return nil, p.wrapError(req.Model, err)
 	}
+	p.retention.setRefused(req.Model, false)
 
 	return translateResponse(out, req.Model)
 }
@@ -167,8 +169,9 @@ func (p *BedrockProvider) Stream(ctx context.Context, req provider.ChatRequest, 
 		InferenceConfig: inferenceConfig,
 	})
 	if err != nil {
-		return nil, wrapBedrockError(err)
+		return nil, p.wrapError(req.Model, err)
 	}
+	p.retention.setRefused(req.Model, false)
 	defer out.Close()
 
 	flusher, canFlush := w.(http.Flusher)
@@ -215,7 +218,7 @@ loop:
 	// surfaces via Err() after the events channel closes, not as an event —
 	// must not be swallowed.
 	if err := out.Err(); err != nil {
-		return stats, wrapBedrockError(err)
+		return stats, p.wrapError(req.Model, err)
 	}
 	if streamErr != nil {
 		return stats, fmt.Errorf("bedrock: translate error: %w", streamErr)
@@ -229,6 +232,21 @@ loop:
 	}
 
 	return stats, nil
+}
+
+// wrapError classifies the data-retention refusal (a typed, scrubbed error and
+// a per-model flag for GET /v1/models availability) and otherwise defers to
+// wrapBedrockError.
+func (p *BedrockProvider) wrapError(model string, err error) error {
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) && isDataRetentionValidation(apiErr.ErrorCode(), apiErr.ErrorMessage()) {
+		mode, _ := p.retention.accountMode()
+		p.retention.setRefused(model, true)
+		slog.Warn("bedrock: model refused: account data-retention mode too low",
+			"model", model, "account_mode", mode, "required_mode", provider.RequiredDataRetentionMode)
+		return &DataRetentionError{Model: model, AccountMode: mode, RequiredMode: provider.RequiredDataRetentionMode, Cause: err}
+	}
+	return wrapBedrockError(err)
 }
 
 // wrapBedrockError converts a Bedrock SDK error into a BedrockAPIError that

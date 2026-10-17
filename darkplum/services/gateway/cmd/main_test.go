@@ -94,7 +94,7 @@ type fakeVerifier struct {
 	discErr   error
 }
 
-func (f fakeVerifier) VerifyKey(_ context.Context, _ string) ([]string, error) {
+func (f fakeVerifier) VerifyKey(_ context.Context, _, _ string) ([]string, error) {
 	return f.verifyIDs, f.verifyErr
 }
 func (f fakeVerifier) DiscoverModels(_ context.Context) (map[string]bool, error) {
@@ -291,7 +291,7 @@ func TestNewHealthHandler_IncludesRoutingAndPolicyStatus(t *testing.T) {
 
 	upstreamChecker := health.NewChecker(nil)
 	semanticClassifier := router.NewSemanticRouterClassifier("", 0.6, time.Second, 5, 30*time.Second)
-	h := newHealthHandler(upstreamChecker, routeMgr, polStore, semanticClassifier, nil)
+	h := newHealthHandler(upstreamChecker, routeMgr, polStore, semanticClassifier, nil, nil)
 
 	router := gin.New()
 	router.GET("/health", h)
@@ -434,7 +434,7 @@ func TestNewHealthHandler_ReportsLoadedPrincipalCounts(t *testing.T) {
 	routeMgr := routing.NewManager(nil, 0)
 	upstreamChecker := health.NewChecker(nil)
 	semanticClassifier := router.NewSemanticRouterClassifier("", 0.6, time.Second, 5, 30*time.Second)
-	h := newHealthHandler(upstreamChecker, routeMgr, fake, semanticClassifier, nil)
+	h := newHealthHandler(upstreamChecker, routeMgr, fake, semanticClassifier, nil, nil)
 
 	router := gin.New()
 	router.GET("/health", h)
@@ -470,7 +470,7 @@ func TestNewHealthHandler_NilProviderStatusOmitsNothingButEmptyArray(t *testing.
 	upstreamChecker := health.NewChecker(nil)
 	polStore := policy.NewPgStore(nil, 900*time.Second)
 	semanticClassifier := router.NewSemanticRouterClassifier("", 0.6, time.Second, 5, 30*time.Second)
-	h := newHealthHandler(upstreamChecker, routeMgr, polStore, semanticClassifier, nil)
+	h := newHealthHandler(upstreamChecker, routeMgr, polStore, semanticClassifier, nil, nil)
 
 	router := gin.New()
 	router.GET("/health", h)
@@ -509,7 +509,7 @@ func TestNewHealthHandler_IncludesProviders(t *testing.T) {
 	upstreamChecker := health.NewChecker(nil)
 	polStore := policy.NewPgStore(nil, 900*time.Second)
 	semanticClassifier := router.NewSemanticRouterClassifier("", 0.6, time.Second, 5, 30*time.Second)
-	h := newHealthHandler(upstreamChecker, routeMgr, polStore, semanticClassifier, reg)
+	h := newHealthHandler(upstreamChecker, routeMgr, polStore, semanticClassifier, reg, nil)
 
 	router := gin.New()
 	router.GET("/health", h)
@@ -587,7 +587,7 @@ func TestNewHealthHandler_ProvidersOmitsFilterFields(t *testing.T) {
 	upstreamChecker := health.NewChecker(nil)
 	polStore := policy.NewPgStore(nil, 900*time.Second)
 	semanticClassifier := router.NewSemanticRouterClassifier("", 0.6, time.Second, 5, 30*time.Second)
-	h := newHealthHandler(upstreamChecker, routeMgr, polStore, semanticClassifier, reg)
+	h := newHealthHandler(upstreamChecker, routeMgr, polStore, semanticClassifier, reg, nil)
 
 	router := gin.New()
 	router.GET("/health", h)
@@ -635,5 +635,38 @@ func TestBuildRouter_NonV1UnknownPath_GenericJSON404(t *testing.T) {
 
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+// TestHealthHandler_BedrockDataRetention: the routing block carries the closed
+// bedrock_data_retention field, "unknown"/null until the mode has been read.
+func TestHealthHandler_BedrockDataRetention(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	checkedAt := time.Date(2026, 10, 17, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name string
+		fn   func() (string, *time.Time)
+		want string
+	}{
+		{"nil source", nil, `{"checked_at":null,"mode":"unknown"}`},
+		{"known", func() (string, *time.Time) { return "aws_review", &checkedAt }, `{"checked_at":"2026-10-17T12:00:00Z","mode":"aws_review"}`},
+	} {
+		h := newHealthHandler(health.NewChecker(nil), routing.NewManager(nil, 0), policy.NewPgStore(nil, 900*time.Second),
+			router.NewSemanticRouterClassifier("", 0.6, time.Second, 5, 30*time.Second), nil, tc.fn)
+		r := gin.New()
+		r.GET("/health", h)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/health", nil))
+		var body struct {
+			Routing struct {
+				DR json.RawMessage `json:"bedrock_data_retention"`
+			} `json:"routing"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		if string(body.Routing.DR) != tc.want {
+			t.Errorf("%s: bedrock_data_retention = %s, want %s", tc.name, body.Routing.DR, tc.want)
+		}
 	}
 }

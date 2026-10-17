@@ -167,3 +167,42 @@ func TestMigration018_AddsRemovingUntilToAnOlderTable(t *testing.T) {
 		t.Fatal("removing_until is still missing after 018 ran against the older table")
 	}
 }
+
+// TestMigration019_AddsWorkspaceID covers the nullable workspace_id column:
+// existing rows read NULL, a value round-trips, and the file is re-runnable.
+func TestMigration019_AddsWorkspaceID(t *testing.T) {
+	pool := setupSchemaUpTo(t, "018_vendor_provider_removing_until.sql")
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `INSERT INTO vendor_provider_settings (vendor, model_filter, filter_set_at)
+		VALUES ('anthropic', '{claude-*}', now())`); err != nil {
+		t.Fatalf("seed pre-019 row: %v", err)
+	}
+	if err := RunMigrations(ctx, pool); err != nil {
+		t.Fatalf("RunMigrations: %v", err)
+	}
+
+	var ws *string
+	if err := pool.QueryRow(ctx, `SELECT workspace_id FROM vendor_provider_settings WHERE vendor = 'anthropic'`).Scan(&ws); err != nil {
+		t.Fatalf("read workspace_id: %v", err)
+	}
+	if ws != nil {
+		t.Fatalf("existing row must read NULL workspace_id, got %q", *ws)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE vendor_provider_settings SET workspace_id = 'wrkspc_01' WHERE vendor = 'anthropic'`); err != nil {
+		t.Fatalf("set workspace_id: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT workspace_id FROM vendor_provider_settings WHERE vendor = 'anthropic'`).Scan(&ws); err != nil || ws == nil || *ws != "wrkspc_01" {
+		t.Fatalf("workspace_id did not round-trip: %v %v", ws, err)
+	}
+
+	data, err := migrationsFS.ReadFile("migrations/019_vendor_provider_workspace_id.sql")
+	if err != nil {
+		t.Fatalf("read migration file: %v", err)
+	}
+	if _, err := pool.Exec(ctx, string(data)); err != nil {
+		t.Fatalf("re-apply migration 019 by hand: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `SELECT workspace_id FROM vendor_provider_settings WHERE vendor = 'anthropic'`).Scan(&ws); err != nil || ws == nil || *ws != "wrkspc_01" {
+		t.Fatalf("re-apply must keep the value: %v %v", ws, err)
+	}
+}

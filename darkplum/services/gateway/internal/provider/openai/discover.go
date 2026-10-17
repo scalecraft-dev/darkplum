@@ -99,7 +99,7 @@ func (p *Provider) DiscoverModels(ctx context.Context) (map[string]bool, error) 
 // back part of the submitted key) — status is passed as nil so a failed
 // verification of a CANDIDATE key never reports auth_failed into this
 // provider's real (credsource-backed) status.
-func (p *Provider) VerifyKey(ctx context.Context, key string) ([]string, error) {
+func (p *Provider) VerifyKey(ctx context.Context, key, _ string) ([]string, error) {
 	verifyCtx, cancel := context.WithTimeout(ctx, discoveryTimeout)
 	defer cancel()
 
@@ -125,7 +125,7 @@ func (p *Provider) VerifyKey(ctx context.Context, key string) ([]string, error) 
 		// The vendor's response body is deliberately discarded — see
 		// discoveryError's doc comment on why a 401 body (which can echo
 		// back part of the submitted key) must never be retained anywhere.
-		return nil, translateVendorError(resp.StatusCode, resp.Header, nil)
+		return nil, translateVendorErrorBody(resp.StatusCode, resp.Header, nil, body)
 	}
 
 	var listResp modelsListResponse

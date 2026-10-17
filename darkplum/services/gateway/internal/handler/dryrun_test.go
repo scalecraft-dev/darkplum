@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -160,5 +161,58 @@ func TestHandleRoutingDryrun_MissingFields(t *testing.T) {
 	w2, _ := doDryrun(t, h, "smart-chat", "")
 	if w2.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 for missing text, got %d", w2.Code)
+	}
+}
+
+// TestHandleRoutingDryrun_ReportsFallbackDecision: the dryrun reports the
+// same decision a real completion would take for a disabled/unreachable pick.
+func TestHandleRoutingDryrun_ReportsFallbackDecision(t *testing.T) {
+	cases := []struct {
+		name    string
+		table   map[string]routing.Route
+		enabled map[string]bool
+		reason  string
+	}{
+		{"disabled", map[string]routing.Route{
+			"qwen-coder": {ProviderKey: "vllm-default", Kind: "vllm", Class: routing.ClassSelfHosted},
+			"llama-3-8b": {ProviderKey: "vllm-default", Kind: "vllm", Class: routing.ClassSelfHosted},
+		}, map[string]bool{"qwen-coder": false, "llama-3-8b": true}, "fallback:route_target_disabled:code"},
+		{"unreachable", map[string]routing.Route{
+			"llama-3-8b": {ProviderKey: "vllm-default", Kind: "vllm", Class: routing.ClassSelfHosted},
+		}, map[string]bool{"llama-3-8b": true}, "fallback:route_target_unreachable:code"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newRoutedTestHandler(fakeProviders{}, tc.table, policy.Snapshot{
+				Enabled:   tc.enabled,
+				Aliases:   map[string]policy.AliasDef{"smart-chat": routedAlias},
+				Residency: policy.ResidencyAny,
+			}, &fakeClassifier{decisions: []router.Decision{{RouteName: "code", Reason: "rules:code:x"}}})
+			w, resp := doDryrun(t, h, "smart-chat", "fix this")
+			if w.Code != http.StatusOK {
+				t.Fatalf("got %d: %s", w.Code, w.Body.String())
+			}
+			if resp.RouteName != "general" || resp.TargetModelID != "llama-3-8b" || resp.Reason != tc.reason || resp.WouldBeRefused != nil {
+				t.Errorf("got %+v", resp)
+			}
+		})
+	}
+}
+
+func TestHandleRoutingDryrun_BothDisabled_ReportsTwoModelRefusal(t *testing.T) {
+	h := newRoutedTestHandler(fakeProviders{}, map[string]routing.Route{
+		"qwen-coder": {ProviderKey: "vllm-default", Kind: "vllm", Class: routing.ClassSelfHosted},
+		"llama-3-8b": {ProviderKey: "vllm-default", Kind: "vllm", Class: routing.ClassSelfHosted},
+	}, policy.Snapshot{
+		Enabled:   map[string]bool{},
+		Aliases:   map[string]policy.AliasDef{"smart-chat": routedAlias},
+		Residency: policy.ResidencyAny,
+	}, &fakeClassifier{decisions: []router.Decision{{RouteName: "code", Reason: "rules:code:x"}}})
+	_, resp := doDryrun(t, h, "smart-chat", "fix this")
+	if resp.RouteName != "code" || resp.Reason != "rules:code:x" || resp.WouldBeRefused == nil || resp.WouldBeRefused.Code != "model_not_enabled" {
+		t.Fatalf("got %+v", resp)
+	}
+	if !strings.Contains(resp.WouldBeRefused.Message, `default route "general" selects "llama-3-8b", which is also disabled`) {
+		t.Errorf("message = %q", resp.WouldBeRefused.Message)
 	}
 }

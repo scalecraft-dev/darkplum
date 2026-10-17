@@ -17,7 +17,12 @@ import {
   keyFingerprint,
   seedTickedModels,
   serialiseModelFilter,
+  vendorErrorCopy,
   vendorKeyProblem,
+  vendorTakesWorkspaceId,
+  workspaceIdProblem,
+  workspaceIdToSend,
+  workspaceRequiredCopy,
   type AdmittedDiff,
   type KeyTransportHelp,
 } from '../lib/vendorKeys'
@@ -62,6 +67,9 @@ interface Props {
   /** Of those, the ones that are enabled. Named in the remove flow, which the
    *  api refuses while any of them are on. */
   enabledModelIds: string[]
+  /** The Anthropic workspace id stored now, or null. Prefills the workspace
+   *  field; read once per opening so a poll cannot overwrite what is typed. */
+  currentWorkspaceId: string | null
   /** False when the api would refuse a key over this page's transport (plain
    *  HTTP off loopback). The key form is not offered at all in that case — a
    *  disabled field would still read as "type it here". */
@@ -96,6 +104,7 @@ export function VendorInstallModal({
   currentModelIds,
   currentFilter,
   enabledModelIds,
+  currentWorkspaceId,
   transportOk,
   transportHelp,
   onClose,
@@ -103,6 +112,19 @@ export function VendorInstallModal({
 }: Props) {
   const vendorName = vendorLabel(vendor)
   const needsKey = mode === 'install' || mode === 'replace'
+  /** Anthropic's workspace field, on the three modes that talk to the vendor
+   *  with a key. Remove sends nothing to the vendor, so it is not asked. */
+  const takesWorkspace = vendorTakesWorkspaceId(vendor) && mode !== 'remove'
+
+  /** The workspace id. A controlled input like any other: it is a name, not a
+   *  secret, and it is shown on the card once stored. */
+  const [workspaceId, setWorkspaceId] = useState(currentWorkspaceId ?? '')
+  const workspaceRef = useRef<HTMLInputElement>(null)
+  const [workspaceError, setWorkspaceError] = useState<string | null>(null)
+  /** Focus belongs on the workspace field after a `workspace_required`, but the
+   *  field is disabled while the request that earned it is in flight. Asked
+   *  for here and honoured once the field is enabled again. */
+  const [focusWorkspace, setFocusWorkspace] = useState(false)
 
   /** The key field. Uncontrolled and read by ref, so the value has one home
    *  and clearing it is one assignment rather than a state update that leaves
@@ -173,12 +195,13 @@ export function VendorInstallModal({
 
   /** Verification with the installed key, for the two modes that do not ask
    *  for one. Its own function so "Try again" is the same call. */
-  const verifyInstalled = useCallback(async () => {
+  const verifyInstalled = useCallback(async (workspace: string) => {
     setStep('checking')
     setModalError(null)
     setOldGateway(false)
     try {
-      const result = await verifyVendorKey(vendor)
+      const ws = workspaceIdToSend(vendor, workspace, currentWorkspaceId)
+      const result = await verifyVendorKey(vendor, ws === undefined ? {} : { workspace_id: ws })
       setVerification(result)
       // Start from what is on offer today, so the checklist opens on the
       // current answer and a change is something someone did deliberately.
@@ -202,7 +225,7 @@ export function VendorInstallModal({
     // applyError is stable for the life of the modal; listing it would mean
     // rebuilding this callback on every error state change.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [vendor, vendorName, currentModelIds, currentFilter])
+  }, [vendor, vendorName, currentModelIds, currentFilter, currentWorkspaceId])
 
   // Opening resets everything. A modal that reopens holding the last run's
   // error — or the last run's ticks — is describing a request nobody made.
@@ -214,6 +237,9 @@ export function VendorInstallModal({
     setKeyError(null)
     setFilterError(null)
     setModalError(null)
+    setWorkspaceId(currentWorkspaceId ?? '')
+    setWorkspaceError(null)
+    setFocusWorkspace(false)
     setOldGateway(false)
     setRefusedTransport(false)
     setPartial(null)
@@ -224,12 +250,18 @@ export function VendorInstallModal({
     setAskDiscard(false)
     setClearedAfterFailure(false)
     setAnnouncement('')
-    if (mode === 'change-models') void verifyInstalled()
+    if (mode === 'change-models') void verifyInstalled(currentWorkspaceId ?? '')
     else setStep('entry')
     // verifyInstalled changes with the catalogue, which must not restart a
     // check that is already running.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, mode, vendor])
+
+  useEffect(() => {
+    if (!focusWorkspace || step !== 'entry') return
+    workspaceRef.current?.focus()
+    setFocusWorkspace(false)
+  }, [focusWorkspace, step])
 
   // The 429 countdown. One interval, cleared when it reaches zero or the modal
   // goes away, so a refused submit re-arms itself rather than staying dead.
@@ -250,6 +282,7 @@ export function VendorInstallModal({
     setKeyError(null)
     setFilterError(null)
     setModalError(null)
+    setWorkspaceError(null)
     if (!(err instanceof ApiError)) {
       setModalError(err instanceof Error ? err.message : 'The request could not be completed.')
       setAnnouncement('The request could not be completed.')
@@ -270,6 +303,32 @@ export function VendorInstallModal({
         else setKeyError(message)
         setStep((s) => (needsKey && s !== 'entry' ? 'entry' : s))
         break
+      // The vendor answered; this is its verdict on the key, not a network
+      // fault. Placed like auth_failed, beside the key field, key preserved.
+      case 'vendor_error': {
+        const v = err.vendorError()
+        const copy = vendorErrorCopy(vendorName, message, v?.status ?? null, v?.type ?? null)
+        if (where === 'filter') setModalError(copy)
+        else setKeyError(copy)
+        setStep((s) => (needsKey && s !== 'entry' ? 'entry' : s))
+        setAnnouncement(copy)
+        return
+      }
+      // An organisation-level Anthropic key with no workspace named. The
+      // answer is the workspace field, so that is where it is said and where
+      // focus goes; the key field is left exactly as it was.
+      case 'workspace_required': {
+        const copy = workspaceRequiredCopy(message)
+        if (takesWorkspace) {
+          setWorkspaceError(copy)
+          setFocusWorkspace(true)
+        } else {
+          setModalError(copy)
+        }
+        setStep('entry')
+        setAnnouncement(copy)
+        return
+      }
       case 'unreachable':
         setModalError(message)
         break
@@ -345,6 +404,20 @@ export function VendorInstallModal({
 
   // --- the four submissions ---------------------------------------------------
 
+  /** The workspace field's verdict before anything is sent. True when it is
+   *  fine (or not asked for); otherwise the error is placed and focused. */
+  const workspaceOk = (): boolean => {
+    if (!takesWorkspace) return true
+    const problem = workspaceIdProblem(workspaceId)
+    if (!problem) return true
+    setWorkspaceError(problem)
+    setAnnouncement(problem)
+    workspaceRef.current?.focus()
+    return false
+  }
+  const workspaceToSend = () =>
+    takesWorkspace ? workspaceIdToSend(vendor, workspaceId, currentWorkspaceId) : undefined
+
   const check = async () => {
     const raw = keyRef.current?.value ?? ''
     const problem = vendorKeyProblem(raw)
@@ -354,12 +427,17 @@ export function VendorInstallModal({
       keyRef.current?.focus()
       return
     }
+    if (!workspaceOk()) return
     setKeyError(null)
+    setWorkspaceError(null)
     setModalError(null)
     setClearedAfterFailure(false)
     setStep('checking')
     try {
-      const result = await verifyVendorKey(vendor, { key: raw.trim() })
+      const result = await verifyVendorKey(vendor, {
+        key: raw.trim(),
+        workspace_id: workspaceToSend(),
+      })
       setVerification(result)
       // Everything is ticked on a first check of an INSTALL: someone who opened
       // "Install" wants this vendor, and the list is here to be trimmed rather
@@ -398,6 +476,10 @@ export function VendorInstallModal({
       setKeyError('The key field is empty. Paste the key again.')
       return
     }
+    if (!workspaceOk()) {
+      setStep('entry')
+      return
+    }
     setStep('saving')
     setModalError(null)
     setFilterError(null)
@@ -406,6 +488,7 @@ export function VendorInstallModal({
       const result = await installVendorKey(vendor, {
         key: raw.trim(),
         model_filter: patterns,
+        workspace_id: workspaceToSend(),
       })
       onDone({
         kind: 'installed',
@@ -430,21 +513,30 @@ export function VendorInstallModal({
   }
 
   const saveFilter = async () => {
+    if (!workspaceOk()) return
     setStep('saving')
     setFilterError(null)
     setModalError(null)
     setAnnouncement('Saving the model selection.')
     try {
       const before = admitted.filter((id) => currentModelIds.includes(id))
-      const result = await setVendorFilter(vendor, patterns)
+      const result = await setVendorFilter(vendor, patterns, workspaceToSend())
       setDiff(admittedDiff(before, result.admitted))
       setStep('result')
       onDone({ kind: 'filter', admitted: result.admitted })
       setAnnouncement('Model selection saved.')
     } catch (err) {
       applyError(err, 'filter')
-      setStep('checked')
+      // A missing workspace sends the field back to being editable, and the
+      // checklist with it: the models on offer may differ under another one.
+      setStep(err instanceof ApiError && err.code() === 'workspace_required' ? 'entry' : 'checked')
     }
+  }
+
+  /** Change models' check again, for after a workspace was entered. */
+  const recheckInstalled = () => {
+    if (!workspaceOk()) return
+    void verifyInstalled(workspaceId)
   }
 
   const remove = async (disableModels: boolean) => {
@@ -685,6 +777,47 @@ export function VendorInstallModal({
           </>
         )}
 
+        {/* --- the workspace field ----------------------------------------
+            Anthropic only, and optional: an organisation-level key is refused
+            unless every request names a workspace. Disabled past the check
+            for the same reason the key field is — what the vendor said was
+            said about this key in this workspace. */}
+        {takesWorkspace &&
+          !partial &&
+          !diff &&
+          !oldGateway &&
+          !keyBlockedByTransport && (
+            <>
+              <Input
+                ref={workspaceRef}
+                label="Workspace ID (optional)"
+                name="vendor-workspace-id"
+                value={workspaceId}
+                autoComplete="off"
+                autoCorrect="off"
+                autoCapitalize="off"
+                spellCheck={false}
+                maxLength={64}
+                disabled={busy || step === 'checked'}
+                error={workspaceError ?? undefined}
+                aria-invalid={workspaceError ? true : undefined}
+                aria-describedby={`${vendor}-workspace-help`}
+                onChange={(e) => setWorkspaceId(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key !== 'Enter') return
+                  e.preventDefault()
+                  if (needsKey) void check()
+                  else if (step === 'entry') recheckInstalled()
+                }}
+              />
+              <p className={styles.hint} id={`${vendor}-workspace-help`}>
+                Only needed when the key was created at organisation level rather than inside a
+                workspace. Find it under Workspaces in {vendorName}'s console (
+                <code className={styles.itemId}>wrkspc_…</code>).
+              </p>
+            </>
+          )}
+
         {/* --- the checklist --------------------------------------------- */}
         {step === 'checking' && (
           <p className={styles.text}>Checking with {vendorName}…</p>
@@ -910,10 +1043,46 @@ export function VendorInstallModal({
                     setTicked(new Set())
                     setFilterError(null)
                     setStep('entry')
-                    setAnnouncement('Editing the key. Check it again before installing.')
+                    setAnnouncement(
+                      takesWorkspace
+                        ? 'Editing the key and workspace. Check again before installing.'
+                        : 'Editing the key. Check it again before installing.',
+                    )
                   }}
                 >
-                  Use a different key
+                  {takesWorkspace ? 'Change key or workspace' : 'Use a different key'}
+                </Button>
+              )}
+
+              {/* Change models has no key to re-enter, but a workspace can be
+                  wrong or missing: these two are the way back to the field and
+                  the check after it. */}
+              {mode === 'change-models' && takesWorkspace && step === 'checked' && (
+                <Button
+                  type="button"
+                  variant="ghost"
+                  onClick={() => {
+                    setVerification(null)
+                    setFilterError(null)
+                    setStep('entry')
+                    setAnnouncement('Editing the workspace. Check again before saving.')
+                  }}
+                >
+                  Change workspace
+                </Button>
+              )}
+
+              {mode === 'change-models' && (step === 'entry' || step === 'checking') && (
+                <Button
+                  type="button"
+                  onClick={recheckInstalled}
+                  disabled={busy || retrySeconds > 0}
+                >
+                  {step === 'checking'
+                    ? 'Checking…'
+                    : retrySeconds > 0
+                      ? `Try again in ${formatRetryCountdown(retrySeconds)}`
+                      : 'Check again'}
                 </Button>
               )}
 

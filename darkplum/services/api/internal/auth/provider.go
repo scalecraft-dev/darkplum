@@ -71,12 +71,26 @@ func (s *SessionManager) CreateSession(c *gin.Context, userID, email, name, role
 	return nil
 }
 
+// ValidateSession returns the caller's claims, with the DB authoritative: the
+// user row must still exist, and its role/email/name replace the JWT's. A
+// session for a vanished user (wiped DB, deleted account) yields errUserGone
+// and the session cookies are cleared so the browser falls back to login or
+// first-run setup.
 func (s *SessionManager) ValidateSession(c *gin.Context) (*SessionClaims, error) {
+	claims, err := s.validateSession(c)
+	if errors.Is(err, errUserGone) {
+		s.ClearCookie(c, sessionCookieName, "/")
+		s.ClearCookie(c, refreshCookieName, "/")
+	}
+	return claims, err
+}
+
+func (s *SessionManager) validateSession(c *gin.Context) (*SessionClaims, error) {
 	tokenStr, err := c.Cookie(sessionCookieName)
 	if err == nil && tokenStr != "" {
 		claims, err := VerifySessionJWT(tokenStr, s.Secret)
 		if err == nil {
-			return claims, nil
+			return reconcileClaims(c.Request.Context(), s.DB, claims)
 		}
 	}
 

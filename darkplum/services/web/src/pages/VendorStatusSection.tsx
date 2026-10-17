@@ -8,9 +8,10 @@ import {
   installProgress,
   removingDetail,
   supportsUiKeyInstall,
+  vendorTakesWorkspaceId,
 } from '../lib/vendorKeys'
 import type { KeyTransportHelp } from '../lib/vendorKeys'
-import { Badge, Button, CodeBlock } from '../components/ui'
+import { Badge, Button, CodeBlock, CopyButton } from '../components/ui'
 import type { VendorInstallMode } from './VendorInstallModal'
 import styles from './VendorStatusSection.module.css'
 
@@ -490,6 +491,17 @@ function VendorRow({
             <p className={styles.filter}>
               <span className={styles.filterLabel}>{p.configured ? 'Offering' : 'Will offer'}</span>
               <code className={styles.filterValue}>{p.filter.join(', ')}</code>
+            </p>
+          )}
+
+          {/* The Anthropic workspace every request with this key names. Said
+              only when one is set: a key created inside a workspace needs
+              none, and "Workspace: none" would read as something missing. */}
+          {!loading && vendorTakesWorkspaceId(p.name) && p.workspace_id && (
+            <p className={styles.filter}>
+              <span className={styles.filterLabel}>Workspace</span>
+              <code className={styles.filterValue}>{p.workspace_id}</code>
+              <CopyButton value={p.workspace_id} label="Copy" />
             </p>
           )}
 

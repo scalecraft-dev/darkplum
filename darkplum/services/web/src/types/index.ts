@@ -40,9 +40,6 @@ export interface ChatMessage {
   /** The vendor that served it, from the gateway's response header — the
    *  provider kind (anthropic, openai, bedrock, vllm…). Display only. */
   provider?: string | null
-  /** The model this conversation was pinned to had gone, so the alias chose
-   *  again for this turn. Display only. */
-  rerouted?: boolean
 }
 
 /** A conversation as the list endpoint returns it: no message bodies. */
@@ -51,9 +48,9 @@ export interface ConversationSummary {
   title: string
   /** The model the conversation was last used with. '' when none was chosen. */
   model: string
-  /** When the picked entry is a routed alias, the concrete model its first
-   *  reply came from. Later turns in the same conversation go straight to that
-   *  model, so a thread does not change model mid-answer. Absent on older APIs. */
+  /** Still part of the API's shape, but no longer read or written here: a
+   *  routed alias classifies every message, so a stored pin from before that
+   *  is ignored rather than honoured. */
   pinned_model?: string | null
   message_count: number
   created_at: string
@@ -160,6 +157,9 @@ export interface ProviderStatus {
    *  while nothing of the sort is true any more — the card reads this first.
    *  Null when no removal is in flight, and on an api that predates it. */
   removing_until: string | null
+  /** The Anthropic workspace every request with this key names, or null when
+   *  none is set. Not a secret. Absent on an api that predates it. */
+  workspace_id?: string | null
 }
 
 /** A route the administrator wrote, as the chat-facing model list exposes it:
@@ -172,6 +172,23 @@ export interface ModelRouteSummary {
    *  belongs to the admin alias endpoints (ModelAliasRoute). A route without a
    *  class is treated as unknown, never as self-hosted. */
   backend_class?: BackendClass
+}
+
+/**
+ * Whether the account a model runs in will let it answer at all, as distinct
+ * from whether the gateway can reach it. Only Bedrock reports one today:
+ * some models are refused unless the AWS account's Bedrock data-retention
+ * mode (set per region) is raised to `aws_review`. Null or absent for every
+ * other provider, and on an api that predates it. 'unknown' says nothing —
+ * the UI shows no badge for it rather than guessing either way.
+ */
+export interface ModelAvailability {
+  state: 'ok' | 'needs_aws_opt_in' | 'unknown'
+  reason: 'data_retention'
+  /** The mode the account is in now, verbatim: default | none | inherit |
+   *  aws_review | provider_data_share | unknown. */
+  account_mode: string
+  required_mode: 'aws_review'
 }
 
 export interface Model {
@@ -193,6 +210,8 @@ export interface Model {
   alias_kind?: AliasKind
   /** Routed aliases only: the routes an administrator wrote for this alias. */
   routes?: ModelRouteSummary[]
+  /** Bedrock only — see ModelAvailability. Read it through needsAwsOptIn(). */
+  availability?: ModelAvailability | null
 }
 
 export interface AdminModel {
@@ -210,6 +229,8 @@ export interface AdminModel {
   /** False when the gateway has not seen this model for 3+ minutes. The row
    *  stays configured either way. Absent on older APIs — treat as reachable. */
   available?: boolean
+  /** Bedrock only — see ModelAvailability. Read it through needsAwsOptIn(). */
+  availability?: ModelAvailability | null
 }
 
 /**

@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"encoding/json"
 	"strings"
 	"time"
 )
@@ -189,6 +190,7 @@ type modelDBRow struct {
 	Provider     string
 	BackendClass string
 	DiscoveredAt time.Time
+	Availability json.RawMessage // models.availability_detail; nil = NULL
 }
 
 // aliasDBRow is one model_aliases row joined against its (enabled) target
@@ -199,6 +201,7 @@ type aliasDBRow struct {
 	OwnedBy            string // copied from the target model's provider
 	BackendClass       string // copied from the target model's backend_class
 	TargetDiscoveredAt time.Time
+	Availability       json.RawMessage // target's availability_detail; nil = NULL
 }
 
 // routedAliasRouteDBRow is one model_alias_routes row, left-joined against
@@ -214,6 +217,7 @@ type routedAliasRouteDBRow struct {
 	TargetProvider     string
 	TargetBackendClass string
 	TargetDiscoveredAt time.Time
+	TargetAvailability json.RawMessage
 }
 
 // routedAliasDBRow is one routed model_aliases row plus its ordered routes,
@@ -283,6 +287,7 @@ func buildModelsList(models []modelDBRow, aliases []aliasDBRow, routedAliases []
 			Created:      created,
 			OwnedBy:      m.Provider,
 			BackendClass: m.BackendClass,
+			Availability: m.Availability,
 		})
 	}
 
@@ -305,12 +310,14 @@ func buildModelsList(models []modelDBRow, aliases []aliasDBRow, routedAliases []
 			BackendClass: a.BackendClass,
 			AliasOf:      &target,
 			AliasKind:    aliasKindStatic,
+			Availability: a.Availability,
 		})
 	}
 
 	for _, ra := range routedAliases {
 		var viable bool
 		var defaultTarget, defaultOwner, defaultBackendClass string
+		var defaultAvailability json.RawMessage
 		routes := make([]routeSummary, 0, len(ra.Routes))
 		for _, rt := range ra.Routes {
 			routes = append(routes, routeSummary{RouteName: rt.RouteName, Description: rt.Description, BackendClass: rt.TargetBackendClass})
@@ -318,6 +325,7 @@ func buildModelsList(models []modelDBRow, aliases []aliasDBRow, routedAliases []
 				defaultTarget = rt.TargetModelID
 				defaultOwner = rt.TargetProvider
 				defaultBackendClass = rt.TargetBackendClass
+				defaultAvailability = rt.TargetAvailability
 			}
 			if !rt.TargetExists || !rt.TargetEnabled {
 				continue
@@ -350,6 +358,7 @@ func buildModelsList(models []modelDBRow, aliases []aliasDBRow, routedAliases []
 			AliasOf:      &target,
 			AliasKind:    aliasKindRouted,
 			Routes:       routes,
+			Availability: defaultAvailability,
 		})
 	}
 
@@ -363,6 +372,32 @@ type normalizedModel struct {
 	ID           string
 	Provider     string
 	BackendClass string
+	// AvailabilityState / AvailabilityDetail are the gateway's per-model
+	// availability (state, and the whole object as JSON text); both nil when
+	// the gateway omitted it, which the upsert writes as NULL.
+	AvailabilityState  *string
+	AvailabilityDetail *string
+}
+
+// normalizeAvailability extracts the state and verbatim JSON text of a
+// gateway "availability" value. Absent, null, non-object, or state-less
+// values yield (nil, nil) -- stored as NULL rather than guessed at.
+func normalizeAvailability(raw json.RawMessage) (state, detail *string) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var obj struct {
+		State string `json:"state"`
+	}
+	var probe map[string]json.RawMessage
+	if json.Unmarshal(raw, &probe) != nil || probe == nil {
+		return nil, nil
+	}
+	if json.Unmarshal(raw, &obj) != nil || obj.State == "" {
+		return nil, nil
+	}
+	d := string(raw)
+	return &obj.State, &d
 }
 
 // normalizeGatewayModels applies field defaulting (empty owned_by -> "vllm",
@@ -393,6 +428,7 @@ func normalizeGatewayModels(entries []openAIModelEntry) []normalizedModel {
 			Provider:     providerName,
 			BackendClass: normalizeBackendClass(e.BackendClass),
 		}
+		nm.AvailabilityState, nm.AvailabilityDetail = normalizeAvailability(e.Availability)
 		if idx, ok := seen[e.ID]; ok {
 			normalized[idx] = nm
 			continue

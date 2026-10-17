@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -178,41 +179,212 @@ func TestHandleChatCompletions_RoutedAlias_HeadersPresentOnStream(t *testing.T) 
 // Forbidden pick: never swapped for default_route or any other route
 // ---------------------------------------------------------------------------
 
-func TestHandleChatCompletions_RoutedAlias_ForbiddenPick_NotEnabled(t *testing.T) {
+// fallbackFixture builds a handler for the disabled/unreachable-target
+// fallback tests. table lists the models present in the route table; enabled
+// the enabled flags.
+func fallbackFixture(pickRoute string, table []string, enabled map[string]bool, residency string) (*ChatHandler, *fakeKindProvider) {
 	vllm := &fakeKindProvider{name: "vllm-default", kind: "vllm"}
-	classifier := &fakeClassifier{decisions: []router.Decision{{RouteName: "code", Reason: "rules:code:debug"}}}
+	routes := map[string]routing.Route{}
+	for _, m := range table {
+		routes[m] = routing.Route{ProviderKey: "vllm-default", Kind: "vllm", Class: routing.ClassSelfHosted}
+	}
+	classifier := &fakeClassifier{decisions: []router.Decision{{RouteName: pickRoute, Reason: "rules:" + pickRoute + ":x"}}}
 	h := newRoutedTestHandler(
 		fakeProviders{"vllm-default": vllm},
-		map[string]routing.Route{
-			"qwen-coder": {ProviderKey: "vllm-default", Kind: "vllm", Class: routing.ClassSelfHosted},
-			"llama-3-8b": {ProviderKey: "vllm-default", Kind: "vllm", Class: routing.ClassSelfHosted},
-		},
+		routes,
 		policy.Snapshot{
-			// "code"'s target is NOT enabled; "general"'s target (the
-			// default_route) IS enabled — the pick must still be refused,
-			// never silently swapped to the allowed default.
-			Enabled:   map[string]bool{"qwen-coder": false, "llama-3-8b": true},
+			Enabled:   enabled,
 			Aliases:   map[string]policy.AliasDef{"smart-chat": routedAlias},
-			Residency: policy.ResidencyAny,
+			Residency: residency,
 		},
 		classifier,
 	)
+	return h, vllm
+}
+
+func TestHandleChatCompletions_RoutedAlias_DisabledPick_FallsBackToDefault(t *testing.T) {
+	h, vllm := fallbackFixture("code", []string{"qwen-coder", "llama-3-8b"},
+		map[string]bool{"qwen-coder": false, "llama-3-8b": true}, policy.ResidencyAny)
+
+	w, c := doChat(t, h, "smart-chat")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body=%s", w.Code, w.Body.String())
+	}
+	if vllm.completeCalls != 1 {
+		t.Errorf("expected one dispatch, got %d", vllm.completeCalls)
+	}
+	const wantReason = "fallback:route_target_disabled:code"
+	if rn, _ := c.Get("route_name"); rn != "general" {
+		t.Errorf("route_name = %v, want general", rn)
+	}
+	if rr, _ := c.Get("router_reason"); rr != wantReason {
+		t.Errorf("router_reason = %v, want %s", rr, wantReason)
+	}
+	if rm, _ := c.Get("resolved_model"); rm != "llama-3-8b" {
+		t.Errorf("resolved_model = %v, want llama-3-8b", rm)
+	}
+	if _, ok := c.Get("router_latency_ms"); !ok {
+		t.Error("router_latency_ms must still be set")
+	}
+	if got := w.Header().Get("X-Darkplum-Route"); got != "general" {
+		t.Errorf("X-Darkplum-Route = %q", got)
+	}
+	if got := w.Header().Get("X-Darkplum-Router-Reason"); got != wantReason {
+		t.Errorf("X-Darkplum-Router-Reason = %q", got)
+	}
+	if got := w.Header().Get("X-Darkplum-Model"); got != "llama-3-8b" {
+		t.Errorf("X-Darkplum-Model = %q", got)
+	}
+}
+
+func TestHandleChatCompletions_RoutedAlias_UnreachablePick_FallsBackToDefault(t *testing.T) {
+	h, vllm := fallbackFixture("code", []string{"llama-3-8b"}, // qwen-coder not in table
+		map[string]bool{"llama-3-8b": true}, policy.ResidencyAny)
+
+	w, c := doChat(t, h, "smart-chat")
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d; body=%s", w.Code, w.Body.String())
+	}
+	if vllm.completeCalls != 1 {
+		t.Errorf("expected one dispatch, got %d", vllm.completeCalls)
+	}
+	const wantReason = "fallback:route_target_unreachable:code"
+	if rn, _ := c.Get("route_name"); rn != "general" {
+		t.Errorf("route_name = %v, want general", rn)
+	}
+	if rr, _ := c.Get("router_reason"); rr != wantReason {
+		t.Errorf("router_reason = %v, want %s", rr, wantReason)
+	}
+	if got := w.Header().Get("X-Darkplum-Router-Reason"); got != wantReason {
+		t.Errorf("X-Darkplum-Router-Reason = %q", got)
+	}
+}
+
+// The default route reached by fallback is still subject to residency like
+// any pick: the refusal names the default route and its model.
+func TestHandleChatCompletions_RoutedAlias_FallbackTargetStillResidencyChecked(t *testing.T) {
+	vllm := &fakeKindProvider{name: "vllm-default", kind: "vllm"}
+	h := newRoutedTestHandler(
+		fakeProviders{"vllm-default": vllm},
+		map[string]routing.Route{
+			"llama-3-8b": {ProviderKey: "vllm-default", Kind: "vllm", Class: routing.ClassCloudManaged},
+		},
+		policy.Snapshot{
+			Enabled:   map[string]bool{"llama-3-8b": true},
+			Aliases:   map[string]policy.AliasDef{"smart-chat": routedAlias},
+			Residency: policy.ResidencySelfHostedOnly,
+		},
+		&fakeClassifier{decisions: []router.Decision{{RouteName: "code", Reason: "rules:code:x"}}},
+	)
+	w, _ := doChat(t, h, "smart-chat")
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d; body=%s", w.Code, w.Body.String())
+	}
+	e := decodeError(t, w.Body.Bytes())
+	if e.Error.Code != "model_residency_violation" {
+		t.Errorf("code = %q", e.Error.Code)
+	}
+	if want := `route "general" of alias "smart-chat" selects model "llama-3-8b"`; !strings.Contains(e.Error.Message, want) {
+		t.Errorf("message %q should name the default route: %q", e.Error.Message, want)
+	}
+	if vllm.completeCalls != 0 {
+		t.Errorf("provider must not be called, got %d", vllm.completeCalls)
+	}
+}
+
+func TestHandleChatCompletions_RoutedAlias_DisabledPickIsDefault_Refused(t *testing.T) {
+	h, vllm := fallbackFixture("general", []string{"qwen-coder", "llama-3-8b"},
+		map[string]bool{"qwen-coder": true, "llama-3-8b": false}, policy.ResidencyAny)
 
 	w, _ := doChat(t, h, "smart-chat")
-
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("expected 403, got %d; body=%s", w.Code, w.Body.String())
 	}
 	e := decodeError(t, w.Body.Bytes())
 	if e.Error.Code != "model_not_enabled" {
-		t.Errorf("expected code model_not_enabled, got %q", e.Error.Code)
+		t.Errorf("code = %q", e.Error.Code)
 	}
-	wantMsg := `route "code" of alias "smart-chat" selects model "qwen-coder", which is not enabled/allowed by residency`
-	if e.Error.Message != wantMsg {
-		t.Errorf("message = %q, want %q", e.Error.Message, wantMsg)
+	want := `route "general" of alias "smart-chat" is the alias's default route and selects model "llama-3-8b", which is disabled. Enable it on the Models page or retarget the route.`
+	if e.Error.Message != want {
+		t.Errorf("message = %q, want %q", e.Error.Message, want)
 	}
 	if vllm.completeCalls != 0 {
-		t.Errorf("provider must never be called for a forbidden pick, got %d calls", vllm.completeCalls)
+		t.Errorf("provider must not be called, got %d", vllm.completeCalls)
+	}
+}
+
+func TestHandleChatCompletions_RoutedAlias_DisabledPickAndDefaultDisabled_Refused(t *testing.T) {
+	h, vllm := fallbackFixture("code", []string{"qwen-coder", "llama-3-8b"},
+		map[string]bool{"qwen-coder": false, "llama-3-8b": false}, policy.ResidencyAny)
+
+	w, _ := doChat(t, h, "smart-chat")
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d; body=%s", w.Code, w.Body.String())
+	}
+	e := decodeError(t, w.Body.Bytes())
+	if e.Error.Code != "model_not_enabled" {
+		t.Errorf("code = %q", e.Error.Code)
+	}
+	want := `route "code" of alias "smart-chat" selects model "qwen-coder", which is disabled, and the alias's default route "general" selects "llama-3-8b", which is also disabled. Enable one of them on the Models page or retarget the route.`
+	if e.Error.Message != want {
+		t.Errorf("message = %q, want %q", e.Error.Message, want)
+	}
+	if got := w.Header().Get("X-Darkplum-Route"); got != "code" {
+		t.Errorf("X-Darkplum-Route = %q, want code (the picked route)", got)
+	}
+	if vllm.completeCalls != 0 {
+		t.Errorf("provider must not be called, got %d", vllm.completeCalls)
+	}
+}
+
+func TestHandleChatCompletions_RoutedAlias_UnreachablePickAndDefaultUnreachable_Refused(t *testing.T) {
+	h, _ := fallbackFixture("code", nil, map[string]bool{}, policy.ResidencyAny)
+	w, _ := doChat(t, h, "smart-chat")
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d; body=%s", w.Code, w.Body.String())
+	}
+	e := decodeError(t, w.Body.Bytes())
+	if e.Error.Code != "model_not_found" {
+		t.Errorf("code = %q", e.Error.Code)
+	}
+	want := `route "code" of alias "smart-chat" selects model "qwen-coder", which is not available on this gateway, and the alias's default route "general" selects "llama-3-8b", which is also not available on this gateway. Enable one of them on the Models page or retarget the route.`
+	if e.Error.Message != want {
+		t.Errorf("message = %q, want %q", e.Error.Message, want)
+	}
+}
+
+// Policy refusals are not fallback cases: a residency-forbidden pick is
+// refused naming the picked route even though the default route is usable.
+func TestHandleChatCompletions_RoutedAlias_PolicyForbiddenPick_NoFallback(t *testing.T) {
+	vllm := &fakeKindProvider{name: "vllm-default", kind: "vllm"}
+	h := newRoutedTestHandler(
+		fakeProviders{"vllm-default": vllm},
+		map[string]routing.Route{
+			"us.anthropic.claude-3-5-sonnet": {ProviderKey: "vllm-default", Kind: "bedrock", Class: routing.ClassCloudManaged},
+			"llama-3-8b":                     {ProviderKey: "vllm-default", Kind: "vllm", Class: routing.ClassSelfHosted},
+		},
+		policy.Snapshot{
+			Enabled:   map[string]bool{"us.anthropic.claude-3-5-sonnet": true, "llama-3-8b": true},
+			Aliases:   map[string]policy.AliasDef{"smart-chat": routedAlias},
+			Residency: policy.ResidencySelfHostedOnly,
+		},
+		&fakeClassifier{decisions: []router.Decision{{RouteName: "cloud-only", Reason: "rules:cloud-only:x"}}},
+	)
+	w, c := doChat(t, h, "smart-chat")
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d; body=%s", w.Code, w.Body.String())
+	}
+	if e := decodeError(t, w.Body.Bytes()); e.Error.Code != "model_residency_violation" {
+		t.Errorf("code = %q", e.Error.Code)
+	}
+	if rn, _ := c.Get("route_name"); rn != "cloud-only" {
+		t.Errorf("route_name = %v, want cloud-only (no fallback)", rn)
+	}
+	if rr, _ := c.Get("router_reason"); rr != "rules:cloud-only:x" {
+		t.Errorf("router_reason = %v, want unchanged", rr)
+	}
+	if vllm.completeCalls != 0 {
+		t.Errorf("provider must not be called, got %d", vllm.completeCalls)
 	}
 }
 

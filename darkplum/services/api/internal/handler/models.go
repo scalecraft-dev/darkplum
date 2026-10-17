@@ -156,6 +156,10 @@ type modelRow struct {
 	Available    bool      `json:"available"`
 	DiscoveredAt time.Time `json:"discovered_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
+	// Availability is the gateway's per-model availability object, passed
+	// through verbatim (models.availability_detail); JSON null when the
+	// gateway omitted it (every non-Bedrock model).
+	Availability json.RawMessage `json:"availability"`
 }
 
 // routeSummary is the chat-facing (non-admin) shape of one route on a routed
@@ -183,6 +187,10 @@ type openAIModelEntry struct {
 	AliasOf      *string        `json:"alias_of,omitempty"`
 	AliasKind    string         `json:"alias_kind,omitempty"`
 	Routes       []routeSummary `json:"routes,omitempty"`
+	// Availability is the gateway's availability object for this model
+	// ({"state","reason","account_mode","required_mode"}), passed through
+	// verbatim; null when absent. Alias entries carry their (default) target's.
+	Availability json.RawMessage `json:"availability"`
 }
 
 // openAIModelsResponse is the OpenAI-compatible envelope for the models list.
@@ -345,7 +353,7 @@ func (h *ModelHandler) ListModels(c *gin.Context) {
 	}
 
 	modelRows, err := h.pool.Query(ctx, `
-		SELECT model_id, provider, backend_class, discovered_at
+		SELECT model_id, provider, backend_class, discovered_at, availability_detail
 		FROM models
 		WHERE enabled = true
 		ORDER BY provider, model_id
@@ -360,7 +368,7 @@ func (h *ModelHandler) ListModels(c *gin.Context) {
 	var models []modelDBRow
 	for modelRows.Next() {
 		var m modelDBRow
-		if err := modelRows.Scan(&m.ModelID, &m.Provider, &m.BackendClass, &m.DiscoveredAt); err != nil {
+		if err := modelRows.Scan(&m.ModelID, &m.Provider, &m.BackendClass, &m.DiscoveredAt, &m.Availability); err != nil {
 			slog.ErrorContext(ctx, "scan model row failed", "err", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "scan models failed"})
 			return
@@ -374,7 +382,7 @@ func (h *ModelHandler) ListModels(c *gin.Context) {
 	}
 
 	aliasRows, err := h.pool.Query(ctx, `
-		SELECT a.alias, a.target_model_id, m.provider, m.backend_class, m.discovered_at
+		SELECT a.alias, a.target_model_id, m.provider, m.backend_class, m.discovered_at, m.availability_detail
 		FROM model_aliases a
 		JOIN models m ON m.model_id = a.target_model_id
 		WHERE m.enabled = true
@@ -390,7 +398,7 @@ func (h *ModelHandler) ListModels(c *gin.Context) {
 	var aliases []aliasDBRow
 	for aliasRows.Next() {
 		var a aliasDBRow
-		if err := aliasRows.Scan(&a.Alias, &a.TargetModelID, &a.OwnedBy, &a.BackendClass, &a.TargetDiscoveredAt); err != nil {
+		if err := aliasRows.Scan(&a.Alias, &a.TargetModelID, &a.OwnedBy, &a.BackendClass, &a.TargetDiscoveredAt, &a.Availability); err != nil {
 			slog.ErrorContext(ctx, "scan model alias row failed", "err", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "scan models failed"})
 			return
@@ -415,7 +423,7 @@ func (h *ModelHandler) ListModels(c *gin.Context) {
 			(m.model_id IS NOT NULL) AS target_exists,
 			COALESCE(m.enabled, false) AS target_enabled,
 			COALESCE(m.provider, ''), COALESCE(m.backend_class, ''),
-			m.discovered_at
+			m.discovered_at, m.availability_detail
 		FROM model_aliases a
 		JOIN model_alias_routes r ON r.alias = a.alias
 		LEFT JOIN models m ON m.model_id = r.target_model_id
@@ -436,7 +444,7 @@ func (h *ModelHandler) ListModels(c *gin.Context) {
 		var rt routedAliasRouteDBRow
 		var discoveredAt *time.Time
 		if err := routedRows.Scan(&aliasName, &defaultRoute, &rt.RouteName, &rt.Description, &rt.TargetModelID,
-			&rt.TargetExists, &rt.TargetEnabled, &rt.TargetProvider, &rt.TargetBackendClass, &discoveredAt); err != nil {
+			&rt.TargetExists, &rt.TargetEnabled, &rt.TargetProvider, &rt.TargetBackendClass, &discoveredAt, &rt.TargetAvailability); err != nil {
 			slog.ErrorContext(ctx, "scan routed model alias row failed", "err", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "scan models failed"})
 			return
@@ -648,7 +656,7 @@ func (h *ModelHandler) ListAdminModels(c *gin.Context) {
 	permitExternalAPI := requestPermitsExternalAPI(c.GetHeader(darkplumClassesHeader))
 
 	rows, err := h.pool.Query(c.Request.Context(), `
-		SELECT id, model_id, provider, display_name, enabled, backend_class, discovered_at, updated_at
+		SELECT id, model_id, provider, display_name, enabled, backend_class, discovered_at, updated_at, availability_detail
 		FROM models
 		ORDER BY provider, model_id
 	`)
@@ -663,7 +671,7 @@ func (h *ModelHandler) ListAdminModels(c *gin.Context) {
 	models := make([]modelRow, 0)
 	for rows.Next() {
 		var m modelRow
-		if err := rows.Scan(&m.ID, &m.ModelID, &m.Provider, &m.DisplayName, &m.Enabled, &m.BackendClass, &m.DiscoveredAt, &m.UpdatedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.ModelID, &m.Provider, &m.DisplayName, &m.Enabled, &m.BackendClass, &m.DiscoveredAt, &m.UpdatedAt, &m.Availability); err != nil {
 			slog.ErrorContext(c.Request.Context(), "scan admin model row failed", "err", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "scan models failed"})
 			return
@@ -810,9 +818,9 @@ func (h *ModelHandler) ToggleModel(c *gin.Context) {
 	// separate GET.
 	var m modelRow
 	if err := h.pool.QueryRow(c.Request.Context(), `
-		SELECT id, model_id, provider, display_name, enabled, backend_class, discovered_at, updated_at
+		SELECT id, model_id, provider, display_name, enabled, backend_class, discovered_at, updated_at, availability_detail
 		FROM models WHERE id = $1
-	`, id).Scan(&m.ID, &m.ModelID, &m.Provider, &m.DisplayName, &m.Enabled, &m.BackendClass, &m.DiscoveredAt, &m.UpdatedAt); err != nil {
+	`, id).Scan(&m.ID, &m.ModelID, &m.Provider, &m.DisplayName, &m.Enabled, &m.BackendClass, &m.DiscoveredAt, &m.UpdatedAt, &m.Availability); err != nil {
 		slog.ErrorContext(c.Request.Context(), "fetch updated model failed", "id", id, "err", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "fetch updated model failed"})
 		return
@@ -849,14 +857,17 @@ func (h *ModelHandler) ToggleModel(c *gin.Context) {
 // existing omitempty behavior (left as-is; changing an already-shipped
 // field's shape is out of scope here).
 type gatewayProviderStatus struct {
-	Name            string     `json:"name"`
-	Configured      bool       `json:"configured"`
-	State           string     `json:"state"`
-	ModelCount      int        `json:"model_count"`
-	LastSyncAt      *time.Time `json:"last_sync_at"`
-	FilterSource    string     `json:"filter_source,omitempty"`
-	Filter          []string   `json:"filter,omitempty"`
-	EnvFilterSetAt  *time.Time `json:"env_filter_set_at,omitempty"`
+	Name           string     `json:"name"`
+	Configured     bool       `json:"configured"`
+	State          string     `json:"state"`
+	ModelCount     int        `json:"model_count"`
+	LastSyncAt     *time.Time `json:"last_sync_at"`
+	FilterSource   string     `json:"filter_source,omitempty"`
+	Filter         []string   `json:"filter,omitempty"`
+	EnvFilterSetAt *time.Time `json:"env_filter_set_at,omitempty"`
+	// WorkspaceID is the gateway's effective Anthropic workspace id (not a
+	// secret), null when none (the gateway's "" is normalised to nil on sync).
+	WorkspaceID     *string    `json:"workspace_id"`
 	InstallingUntil *time.Time `json:"installing_until,omitempty"`
 	RemovingUntil   *time.Time `json:"removing_until"`
 }
@@ -883,8 +894,9 @@ const modelPurgeAfter = 7 * 24 * time.Hour
 
 // SyncModels fetches the model list from the gateway and upserts each model
 // into the models table. Re-discovered models do not have their enabled flag
-// or display_name overwritten — only discovered_at, backend_class and
-// provider are refreshed, so admin settings survive a resync while a model
+// or display_name overwritten — only discovered_at, backend_class, provider
+// and availability_state/availability_detail (gateway facts: NULL when the
+// gateway omits them) are refreshed, so admin settings survive a resync while a model
 // that changes backend (e.g. a Bedrock filter change) is reclassified. New
 // models default to enabled = false per the schema.
 //
@@ -933,6 +945,11 @@ func (h *ModelHandler) SyncModels(ctx context.Context) {
 	// "passed through from the last sync" means the LAST sync, not the last
 	// non-empty one.
 	h.providersMu.Lock()
+	for i := range gwResp.Providers {
+		if ws := gwResp.Providers[i].WorkspaceID; ws != nil && *ws == "" {
+			gwResp.Providers[i].WorkspaceID = nil
+		}
+	}
 	h.providers = gwResp.Providers
 	h.providerFeatures = gwResp.ProviderFeatures
 	h.providersMu.Unlock()
@@ -1079,7 +1096,11 @@ func (h *ModelHandler) syncModelsBatch(ctx context.Context, tx pgx.Tx, models []
 	ids := make([]string, len(models))
 	providers := make([]string, len(models))
 	backendClasses := make([]string, len(models))
+	availStates := make([]*string, len(models))
+	availDetails := make([]*string, len(models))
 	for i, m := range models {
+		availStates[i] = m.AvailabilityState
+		availDetails[i] = m.AvailabilityDetail
 		ids[i] = m.ID
 		providers[i] = m.Provider
 		backendClasses[i] = m.BackendClass
@@ -1092,15 +1113,17 @@ func (h *ModelHandler) syncModelsBatch(ctx context.Context, tx pgx.Tx, models []
 	defer sp.Rollback(ctx) // no-op once committed
 
 	rows, err := sp.Query(ctx, `
-		INSERT INTO models (model_id, provider, backend_class, discovered_at, updated_at)
-		SELECT id, provider, backend_class, now(), now()
-		FROM unnest($1::text[], $2::text[], $3::text[]) AS t(id, provider, backend_class)
+		INSERT INTO models (model_id, provider, backend_class, availability_state, availability_detail, discovered_at, updated_at)
+		SELECT id, provider, backend_class, avail_state, avail_detail::jsonb, now(), now()
+		FROM unnest($1::text[], $2::text[], $3::text[], $4::text[], $5::text[]) AS t(id, provider, backend_class, avail_state, avail_detail)
 		ON CONFLICT (model_id) DO UPDATE
 			SET discovered_at = now(),
 				backend_class = EXCLUDED.backend_class,
-				provider = EXCLUDED.provider
+				provider = EXCLUDED.provider,
+				availability_state = EXCLUDED.availability_state,
+				availability_detail = EXCLUDED.availability_detail
 		RETURNING model_id, (xmax = 0)
-	`, ids, providers, backendClasses)
+	`, ids, providers, backendClasses, availStates, availDetails)
 	if err != nil {
 		return 0, 0, nil, fmt.Errorf("batch upsert: %w", err)
 	}
@@ -1153,14 +1176,16 @@ func (h *ModelHandler) syncModelsPerRow(ctx context.Context, tx pgx.Tx, models [
 			return inserted, updated, discoveredIDs, fmt.Errorf("savepoint failed for model_id %s: %w", m.ID, err)
 		}
 		err = sp.QueryRow(ctx, `
-			INSERT INTO models (model_id, provider, backend_class, discovered_at, updated_at)
-			VALUES ($1, $2, $3, now(), now())
+			INSERT INTO models (model_id, provider, backend_class, availability_state, availability_detail, discovered_at, updated_at)
+			VALUES ($1, $2, $3, $4, $5::text::jsonb, now(), now())
 			ON CONFLICT (model_id) DO UPDATE
 				SET discovered_at = now(),
 					backend_class = EXCLUDED.backend_class,
-					provider = EXCLUDED.provider
+					provider = EXCLUDED.provider,
+					availability_state = EXCLUDED.availability_state,
+					availability_detail = EXCLUDED.availability_detail
 			RETURNING (xmax = 0)
-		`, m.ID, m.Provider, m.BackendClass).Scan(&wasInsert)
+		`, m.ID, m.Provider, m.BackendClass, m.AvailabilityState, m.AvailabilityDetail).Scan(&wasInsert)
 		if err != nil {
 			slog.ErrorContext(ctx, "sync models: upsert failed", "model_id", m.ID, "err", err)
 			_ = sp.Rollback(ctx)

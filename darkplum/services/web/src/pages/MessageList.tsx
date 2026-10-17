@@ -11,9 +11,12 @@ import {
   failedVendorLabel,
   formatRetryCountdown,
   isEgress,
+  isRouteTargetRefusal,
+  routeFallbackOf,
   routerReasonText,
   vendorLabel,
 } from '../lib/modelRouting'
+import { DATA_RETENTION_CODE, dataRetentionFailureCopy } from '../lib/dataRetention'
 import { CodeBlock } from '../components/ui/CodeBlock'
 import { CopyButton } from '../components/ui/CopyButton'
 import { EgressGlyph } from '../components/ui'
@@ -40,6 +43,12 @@ export interface ChatFailure {
   /** provider_rate_limited only: the vendor's own Retry-After, in seconds.
    *  Null when it sent none and the fixed wait applies instead. */
   retryAfterSeconds?: number | null
+  /** model_requires_data_retention only: the concrete model AWS refused —
+   *  for a routed alias, not the entry that was picked. */
+  refusedModel?: string | null
+  /** model_requires_data_retention only: the route that picked it, when the
+   *  gateway named one. */
+  route?: string | null
 }
 
 interface Props {
@@ -79,6 +88,17 @@ function failureCopy(
   // Opens every vendor-failure title, so it is a capitalised phrase rather
   // than a bare name, and is never dropped mid-sentence into a hint.
   const vendor = failedVendorLabel(failure.vendor)
+  // A routed alias whose picked route — and the default it would fall back
+  // to — cannot answer. The gateway's sentence names both models and is
+  // printed verbatim above; this only says what the reader can do.
+  if (isRouteTargetRefusal(failure.code, failure.message)) {
+    return {
+      title: 'This route cannot answer right now',
+      hint: isAdmin
+        ? 'Pick another model, or retarget the route under Routing.'
+        : 'Pick another model, or ask an administrator to retarget the route.',
+    }
+  }
   switch (failure.code) {
     case 'model_not_found':
       return {
@@ -113,6 +133,17 @@ function failureCopy(
           ? 'Pick a model the policy permits, or change where requests may run under Models → Policy. Nothing is sent to a different model instead.'
           : 'Your organisation limits where models may run. Pick another model from the list at the top of the page.',
       }
+    case DATA_RETENTION_CODE: {
+      // The gateway's sentence (printed above, verbatim) already says what
+      // happened and who fixes it. Retrying cannot help — AWS will refuse
+      // again until the account changes — so no Try again is offered.
+      const refused = failure.refusedModel ?? failure.model ?? ''
+      return dataRetentionFailureCopy({
+        modelName: refused ? formatModelName(refused) : 'This model',
+        route: failure.route,
+        alias: failure.route ? failure.model : null,
+      })
+    }
     case 'policy_unavailable':
       return {
         title: 'Chat is paused for safety',
@@ -193,8 +224,11 @@ const FailureNotice = ({
     return () => window.clearTimeout(timer)
   }, [waiting])
   // Fixed in the catalogue: the model is missing from it, or switched off in it.
+  // Fixed on the alias, under Admin > Routing: a routed pick with no usable
+  // route to fall back to.
+  const aliasRelated = isRouteTargetRefusal(failure.code, failure.message)
   const catalogueRelated =
-    failure.code === 'model_not_found' || failure.code === 'model_not_enabled'
+    !aliasRelated && (failure.code === 'model_not_found' || failure.code === 'model_not_enabled')
   // Fixed in the organisation's routing policy, which is its own tab on the
   // Models page — the model is enabled, the policy is what refuses it.
   const orgPolicyRelated = failure.code === 'model_residency_violation'
@@ -204,6 +238,9 @@ const FailureNotice = ({
   // Fixed by setting the organisation's key again, which is the vendor block
   // of the Models page rather than the catalogue or any policy.
   const vendorKeyRelated = failure.code === 'provider_auth_failed'
+  // Fixed in AWS, not here: a retry is refused again until the account's
+  // Bedrock data-retention mode changes. The Models page names the mode.
+  const awsOptInRelated = failure.code === DATA_RETENTION_CODE
 
   return (
     <div className={styles.failure} role="alert">
@@ -239,7 +276,7 @@ const FailureNotice = ({
         </p>
       )}
       <div className={styles.failureActions}>
-        {onRetry && (
+        {onRetry && !awsOptInRelated && (
           /* aria-disabled rather than disabled: pressing Try again into a rate
              limit refuses the send again and starts a fresh wait, and a real
              `disabled` at that moment would drop the focus the person was
@@ -266,6 +303,11 @@ const FailureNotice = ({
             )}
           </button>
         )}
+        {isAdmin && aliasRelated && (
+          <Link to="/admin/routing" className={styles.failureLink}>
+            Open Routing
+          </Link>
+        )}
         {isAdmin && catalogueRelated && (
           <Link to="/admin/models" className={styles.failureLink}>
             Open Models
@@ -284,6 +326,11 @@ const FailureNotice = ({
         {isAdmin && vendorKeyRelated && (
           <Link to="/admin/models" className={styles.failureLink}>
             Open Model vendors
+          </Link>
+        )}
+        {isAdmin && awsOptInRelated && (
+          <Link to="/admin/models" className={styles.failureLink}>
+            Open Models
           </Link>
         )}
         {failure.model && (
@@ -343,9 +390,9 @@ const Provenance = ({
   model,
   route,
   reason,
+  fellBack,
   backendClass,
   provider,
-  rerouted,
   reasonId,
   reasonOpen,
   onToggleReason,
@@ -354,11 +401,14 @@ const Provenance = ({
   route?: string | null
   /** Already in plain language. Empty when the gateway sent no reason. */
   reason: string
+  /** The picked route could not answer and the alias's default route did.
+   *  Said on the line itself rather than behind "Why this route?": the reply
+   *  came from a model the route was not written for. */
+  fellBack: boolean
   /** Where this reply ran, from the gateway's header. Absent after a reload:
    *  history stores the model, not the class. */
   backendClass?: BackendClass | null
   provider?: string | null
-  rerouted?: boolean
   reasonId: string
   reasonOpen: boolean
   onToggleReason: () => void
@@ -379,8 +429,8 @@ const Provenance = ({
   const spoken = [
     `Answered by ${formatModelName(model)}`,
     egress ? `sent to ${vendor}, which is outside your cloud account` : '',
+    fellBack ? reason : '',
     route ? `route ${route}` : '',
-    rerouted ? 'the model this conversation had been using was no longer available' : '',
   ]
     .filter(Boolean)
     .join('. ')
@@ -399,24 +449,17 @@ const Provenance = ({
               sent to {vendor}
             </span>
           )}
+          {fellBack && ` · ${reason.charAt(0).toLowerCase()}${reason.slice(1)}`}
           {route && (
             <>
               {' · route '}
               <span className={styles.provenanceId}>{route}</span>
             </>
           )}
-          {rerouted && (
-            <span
-              className={styles.provenanceNote}
-              title="The model this conversation had been using is no longer available, so the alias chose again."
-            >
-              re-routed
-            </span>
-          )}
         </span>
         <span className={styles.srOnly}>{spoken}</span>
       </span>
-      {reason && (
+      {reason && !fellBack && (
         <button
           type="button"
           className={styles.reasonToggle}
@@ -452,7 +495,6 @@ const AssistantBubble = memo(({
   routerReason,
   backendClass,
   provider,
-  rerouted,
   isStreaming,
   isLast,
   onRegenerate,
@@ -468,7 +510,6 @@ const AssistantBubble = memo(({
   /** Where it ran, and who served it. Same lifetime as `route`. */
   backendClass?: BackendClass | null
   provider?: string | null
-  rerouted?: boolean
   isStreaming: boolean
   isLast: boolean
   onRegenerate?: () => void
@@ -503,9 +544,9 @@ const AssistantBubble = memo(({
                       model={model}
                       route={route}
                       reason={reason}
+                      fellBack={routeFallbackOf(routerReason) !== null}
                       backendClass={backendClass}
                       provider={provider}
-                      rerouted={rerouted}
                       reasonId={reasonId}
                       reasonOpen={reasonOpen}
                       onToggleReason={() => setReasonOpen((prev) => !prev)}
@@ -588,7 +629,6 @@ export function MessageList({
                 routerReason={msg.routerReason}
                 backendClass={msg.backendClass}
                 provider={msg.provider}
-                rerouted={msg.rerouted}
                 isStreaming={isLast && streaming}
                 isLast={isLast}
                 onRegenerate={onRegenerate}

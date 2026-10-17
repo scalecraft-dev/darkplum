@@ -1,4 +1,4 @@
-import type { ProviderState, ProviderStatus } from '../types'
+import type { ProviderState, ProviderStatus, VendorName } from '../types'
 
 /**
  * Installing a vendor key from the UI: the decisions that have to be the same
@@ -421,6 +421,30 @@ export function admittedDiff(
 const KEY_RE = /^[A-Za-z0-9_-]{20,512}$/
 
 /**
+ * What an admin reads when the vendor ANSWERED the key check with something
+ * other than 401/403 (code `vendor_error`).
+ *
+ * The api's own closed sentence is used verbatim when present; the pointer
+ * after it is ours, and exists because this is the one failure that is not a
+ * network problem and must not send anyone to the network runbook. Status and
+ * type arrive from the api already validated, and are re-checked here so a
+ * malformed body falls back to a sentence that claims nothing it cannot back.
+ */
+export function vendorErrorCopy(
+  vendorName: string,
+  serverMessage: string,
+  status: number | null,
+  errorType: string | null,
+): string {
+  const type = errorType && /^[a-z_]{1,40}$/.test(errorType) ? errorType : 'unknown'
+  const statusText = status !== null && Number.isInteger(status) && status >= 100 && status <= 599 ? `HTTP ${status}` : 'an HTTP error'
+  const lead = serverMessage.trim()
+    ? serverMessage.trim()
+    : `${vendorName} answered ${statusText} (${type}) to the key check. Nothing was stored.`
+  return `${lead} This is ${vendorName}'s answer to this key, not a network problem \u2014 check the key's organisation and permissions in ${vendorName}'s console.`
+}
+
+/**
  * Why this key cannot be sent, or null when it can.
  *
  * The messages describe the key without ever quoting it: what is wrong with a
@@ -439,6 +463,70 @@ export function vendorKeyProblem(key: string): string | null {
     return 'A vendor key is letters, numbers, dashes and underscores only. Quotation marks picked up with the paste are the usual cause.'
   }
   return null
+}
+
+// ---------------------------------------------------------------------------
+// The Anthropic workspace id
+// ---------------------------------------------------------------------------
+
+/**
+ * Whether a vendor's key form asks for a workspace id.
+ *
+ * Anthropic refuses an organisation-level key unless every request names the
+ * workspace it is to be billed and scoped to (`anthropic-workspace-id`). A key
+ * created inside a workspace needs nothing. OpenAI's organisation and project
+ * headers are a different mechanism and are not asked for here.
+ */
+export function vendorTakesWorkspaceId(vendor: VendorName): boolean {
+  return vendor === 'anthropic'
+}
+
+/** The api's own rule for the id, mirrored so a typo is caught before a
+ *  request is spent on it. Not a secret: it is a name, shown on the card. */
+export const WORKSPACE_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
+
+/** Why this workspace id cannot be sent, or null when it can. Empty is valid:
+ *  the field is optional, and an empty value clears a stored one. */
+export function workspaceIdProblem(raw: string): string | null {
+  const w = raw.trim()
+  if (w === '') return null
+  if (/\s/.test(w)) return 'There is a space inside this workspace ID. Copy it again from the console.'
+  if (w.length > 64) return 'A workspace ID is at most 64 characters.'
+  if (!WORKSPACE_ID_RE.test(w)) {
+    return 'A workspace ID is letters, numbers, dashes and underscores only, like wrkspc_01AbC.'
+  }
+  return null
+}
+
+/**
+ * The `workspace_id` to put on a request, or undefined to leave it off.
+ *
+ * The api reads absent as "keep what is stored" and "" as "clear it". Left off
+ * only when there is nothing to say either way — a vendor that takes no
+ * workspace, or an empty field over nothing stored. Otherwise the field's value
+ * is sent as it stands, so a check is made against exactly what is on screen.
+ */
+export function workspaceIdToSend(
+  vendor: VendorName,
+  raw: string,
+  current: string | null | undefined,
+): string | undefined {
+  if (!vendorTakesWorkspaceId(vendor)) return undefined
+  const w = raw.trim()
+  if (w === '' && !current) return undefined
+  return w
+}
+
+/** The fallback for a `workspace_required` body with no message — the api's
+ *  own sentence, so the screen reads the same either way. */
+export const WORKSPACE_REQUIRED_MESSAGE =
+  'This key is not scoped to an Anthropic workspace. Enter the workspace ID to use with it, or use a key created inside a workspace.'
+
+/** What is shown under the workspace field on a `workspace_required` 422: the
+ *  server's sentence verbatim, then the way out that needs no workspace id. */
+export function workspaceRequiredCopy(serverMessage: string): string {
+  const lead = serverMessage.trim() || WORKSPACE_REQUIRED_MESSAGE
+  return `${lead} Keys created inside a workspace don't need this.`
 }
 
 /** How many characters of a key are shown at the end of the fingerprint line.

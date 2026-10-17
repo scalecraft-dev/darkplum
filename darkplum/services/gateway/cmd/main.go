@@ -166,13 +166,17 @@ func main() {
 	// before: not_configured, zero models, zero vendor HTTP calls.
 	anthropicKeyPath := filepath.Join(cfg.ProviderKeysDir, "anthropic-api-key")
 	anthropicCreds := credsource.New(anthropicKeyPath)
+	// The filter func is built first: it also resolves the effective
+	// workspace id (same last-writer-wins row), which the provider reads per
+	// request.
+	anthropicFilter := routing.NewVendorFilterFunc("anthropic", cfg.AnthropicModelFilter, cfg.AnthropicModelFilterSetAt, cfg.AnthropicWorkspaceID, policyVendorFilterLookup{polStore})
 	anthropicProv := anthropic.New(anthropicCreds, anthropic.Config{
 		DefaultMaxTokens: cfg.AnthropicDefaultMaxTokens,
 		BaseURL:          cfg.AnthropicBaseURL,
 		Status:           providerStatus,
+		WorkspaceID:      func() string { return routing.EffectiveWorkspaceID(anthropicFilter) },
 	})
 	reg.Set("anthropic", anthropicProv)
-	anthropicFilter := routing.NewVendorFilterFunc("anthropic", cfg.AnthropicModelFilter, cfg.AnthropicModelFilterSetAt, policyVendorFilterLookup{polStore})
 	sources = append(sources, routing.NewAnthropicSource(anthropicCreds, anthropicProv, anthropicFilter, providerStatus))
 
 	// OpenAI. Same unconditional-construction reasoning as Anthropic above —
@@ -186,7 +190,7 @@ func main() {
 		Status:  providerStatus,
 	})
 	reg.Set("openai", openAIProv)
-	openAIFilter := routing.NewVendorFilterFunc("openai", cfg.OpenAIModelFilter, cfg.OpenAIModelFilterSetAt, policyVendorFilterLookup{polStore})
+	openAIFilter := routing.NewVendorFilterFunc("openai", cfg.OpenAIModelFilter, cfg.OpenAIModelFilterSetAt, "", policyVendorFilterLookup{polStore})
 	sources = append(sources, routing.NewOpenAISource(openAICreds, openAIProv, openAIFilter, providerStatus))
 
 	sourceDescriptions := make([]string, 0, len(sources))
@@ -261,11 +265,12 @@ func main() {
 	// cleanly on shutdown.
 	providersHandler := handler.NewProvidersHandler(ctx, routeMgr, map[string]handler.ProviderVendorConfig{
 		"anthropic": {
-			Verifier:    anthropicProv,
-			Creds:       anthropicCreds,
-			Recheck:     anthropicCreds,
-			EnvVar:      "ANTHROPIC_MODEL_FILTER",
-			IsAuthError: anthropic.IsAuthError,
+			Verifier:            anthropicProv,
+			Creds:               anthropicCreds,
+			Recheck:             anthropicCreds,
+			EnvVar:              "ANTHROPIC_MODEL_FILTER",
+			IsAuthError:         anthropic.IsAuthError,
+			IsWorkspaceRequired: anthropic.IsWorkspaceRequiredError,
 		},
 		"openai": {
 			Verifier:    openAIProv,
@@ -278,7 +283,7 @@ func main() {
 	})
 
 	gin.SetMode(gin.ReleaseMode)
-	healthHandler := newHealthHandler(upstreamChecker, routeMgr, polStore, semanticClassifier, providerStatus)
+	healthHandler := newHealthHandler(upstreamChecker, routeMgr, polStore, semanticClassifier, providerStatus, bedrockRetentionFn(reg))
 	httpRouter := buildRouter(chatHandler, providersHandler, middleware.APIKey(dbPool), middleware.Recording(rec), healthHandler)
 
 	addr := ":" + cfg.Port
@@ -418,6 +423,20 @@ type policyHealthStatus interface {
 	Current() (policy.Snapshot, bool)
 }
 
+// bedrockRetentionFn adapts the provider registry to /health's
+// bedrock_data_retention field. The Bedrock provider registers lazily, so the
+// lookup happens per request; before it exists the mode is "unknown".
+func bedrockRetentionFn(reg *provider.Registry) func() (string, *time.Time) {
+	return func() (string, *time.Time) {
+		if p, ok := reg.Get("bedrock"); ok {
+			if r, ok := p.(provider.DataRetentionReporter); ok {
+				return r.AccountDataRetention()
+			}
+		}
+		return provider.DataRetentionModeUnknown, nil
+	}
+}
+
 // vendorProviderHealthStatus is the subset of *provider.StatusRegistry that
 // newHealthHandler needs — just Snapshot, mirroring the same interface
 // internal/handler/chat.go's providerStatusSource already uses for GET
@@ -494,7 +513,7 @@ func reduceProviderStatusForHealth(full []provider.ProviderStatus) []healthProvi
 // affects the response status: a vendor in auth_failed or unreachable state
 // is still just an observability fact, not a reason to fail liveness/
 // readiness.
-func newHealthHandler(upstreamChecker *health.Checker, routeMgr *routing.Manager, polStore policyHealthStatus, semanticClassifier semanticRouterHealthStatus, providerStatus vendorProviderHealthStatus) gin.HandlerFunc {
+func newHealthHandler(upstreamChecker *health.Checker, routeMgr *routing.Manager, polStore policyHealthStatus, semanticClassifier semanticRouterHealthStatus, providerStatus vendorProviderHealthStatus, bedrockRetention func() (string, *time.Time)) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		upstreams := upstreamChecker.Check(c.Request.Context())
 		upstreamBody := make(map[string]string, len(upstreams))
@@ -539,12 +558,20 @@ func newHealthHandler(upstreamChecker *health.Checker, routeMgr *routing.Manager
 			providers = reduceProviderStatusForHealth(providerStatus.Snapshot())
 		}
 
+		// bedrock_data_retention: closed vocabulary only (the mode name and a
+		// timestamp). "unknown" until the account mode has been read once.
+		drMode, drCheckedAt := provider.DataRetentionModeUnknown, (*time.Time)(nil)
+		if bedrockRetention != nil {
+			drMode, drCheckedAt = bedrockRetention()
+		}
+
 		c.JSON(http.StatusOK, gin.H{
 			"status":    "ok",
 			"upstreams": upstreamBody,
 			"routing": gin.H{
-				"models":  routingStatus.Models,
-				"sources": sourcesBody,
+				"models":                 routingStatus.Models,
+				"bedrock_data_retention": gin.H{"mode": drMode, "checked_at": drCheckedAt},
+				"sources":                sourcesBody,
 				"classifier": gin.H{
 					"semantic_router": gin.H{
 						"status":               srHealthStatus,
@@ -574,13 +601,13 @@ type policyVendorFilterLookup struct {
 	store *policy.PgStore
 }
 
-func (p policyVendorFilterLookup) VendorFilter(vendor string) (filter []string, setAt time.Time, ok bool) {
+func (p policyVendorFilterLookup) VendorFilter(vendor string) (filter []string, setAt time.Time, workspaceID string, ok bool) {
 	snap, loaded := p.store.Current()
 	if !loaded {
-		return nil, time.Time{}, false
+		return nil, time.Time{}, "", false
 	}
 	row, ok := snap.VendorFilters[vendor]
-	return row.Filter, row.SetAt, ok
+	return row.Filter, row.SetAt, row.WorkspaceID, ok
 }
 
 // nullableString returns nil for an empty string so it serialises as JSON

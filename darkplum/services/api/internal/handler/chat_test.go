@@ -30,6 +30,7 @@ func TestProxyChat_GatewayErrorPassthrough(t *testing.T) {
 		{http.StatusNotFound, `{"error":{"message":"model \"x\" is not available on this gateway","type":"invalid_request_error","code":"model_not_found"}}`},
 		{http.StatusForbidden, `{"error":{"message":"model \"x\" is not enabled","type":"permission_error","code":"model_not_enabled"}}`},
 		{http.StatusForbidden, `{"error":{"message":"residency policy forbids this model","type":"permission_error","code":"model_residency_violation"}}`},
+		{http.StatusUnprocessableEntity, `{"error":{"message":"model needs Bedrock data retention raised","type":"invalid_request_error","code":"model_requires_data_retention","model":"fable-5","route":"smart","account_mode":"none","required_mode":"aws_review"}}`},
 		{http.StatusServiceUnavailable, `{"error":{"message":"policy snapshot unavailable","type":"service_unavailable","code":"policy_unavailable"}}`},
 	} {
 		for _, stream := range []bool{false, true} {

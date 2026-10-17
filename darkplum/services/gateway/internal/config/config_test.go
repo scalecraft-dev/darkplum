@@ -1,6 +1,7 @@
 package config
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -478,5 +479,27 @@ func TestLoad_OpenAIBaseURLEmptyByDefault(t *testing.T) {
 	}
 	if cfg.OpenAIBaseURL != "" {
 		t.Errorf("OpenAIBaseURL = %q, want empty by default", cfg.OpenAIBaseURL)
+	}
+}
+
+func TestLoad_AnthropicWorkspaceID(t *testing.T) {
+	for name, tc := range map[string]struct{ in, want string }{
+		"unset":     {"", ""},
+		"valid":     {"wrkspc_01AbC-d9", "wrkspc_01AbC-d9"},
+		"trimmed":   {"  wrkspc_x  ", "wrkspc_x"},
+		"malformed": {"bad id!", ""},
+		"too_long":  {strings.Repeat("a", 65), ""},
+	} {
+		t.Run(name, func(t *testing.T) {
+			baseEnv(t)
+			t.Setenv("ANTHROPIC_WORKSPACE_ID", tc.in)
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("a bad workspace id must never fail Load: %v", err)
+			}
+			if cfg.AnthropicWorkspaceID != tc.want {
+				t.Errorf("AnthropicWorkspaceID = %q, want %q", cfg.AnthropicWorkspaceID, tc.want)
+			}
+		})
 	}
 }

@@ -181,6 +181,10 @@ type Snapshot struct {
 type VendorFilterRow struct {
 	Filter []string
 	SetAt  time.Time
+	// WorkspaceID is vendor_provider_settings.workspace_id (migration 019),
+	// "" when NULL/unset. Rides on the same row (and so the same SetAt
+	// last-writer-wins stamp) as Filter. Anthropic only.
+	WorkspaceID string
 }
 
 // ChainFor returns the raw, unmerged policy chain for a principal in the

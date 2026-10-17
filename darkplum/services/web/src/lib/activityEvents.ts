@@ -136,6 +136,9 @@ const DETAIL_KEY_LABELS: Record<string, string> = {
   filter_source: 'selection set from',
   disabled_models: 'models turned off',
   admitted_count: 'models admitted',
+  // The Anthropic workspace a key is scoped to. A name, not a secret.
+  workspace_id_before: 'workspace before',
+  workspace_id_after: 'workspace after',
 }
 
 /** Beyond this, a list of model ids is noise in a table cell. The drawer and

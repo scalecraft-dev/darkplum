@@ -72,6 +72,16 @@ spec:
                   name: darkplum-provider-config
                   key: ANTHROPIC_MODEL_FILTER_SET_AT
                   optional: true
+            # Sent as anthropic-workspace-id on every Anthropic request. Needed
+            # only for a key created at organisation level rather than inside a
+            # workspace; set from Admin > Models or `make set-anthropic-key
+            # WORKSPACE=...`, same last-writer rule as the filter.
+            - name: ANTHROPIC_WORKSPACE_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: darkplum-provider-config
+                  key: ANTHROPIC_WORKSPACE_ID
+                  optional: true
             - name: OPENAI_MODEL_FILTER
               valueFrom:
                 configMapKeyRef:

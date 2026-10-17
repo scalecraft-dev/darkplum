@@ -849,3 +849,136 @@ func TestListModels_BearerCallerSeesExternalAPIWhenPolicyAndHeaderPermit(t *test
 		t.Fatalf("expected the vendor model hidden when the INBOUND request didn't send the classes header, got %v", ids)
 	}
 }
+
+const optInAvailability = `{"state":"needs_aws_opt_in","reason":"data_retention","account_mode":"none","required_mode":"aws_review"}`
+
+// TestSyncModels_WritesAndClearsAvailability: availability is a gateway fact,
+// so every sync overwrites it -- written when present, NULLed when omitted
+// (unlike enabled/display_name).
+func TestSyncModels_WritesAndClearsAvailability(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+
+	withAvail := true
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		e := openAIModelEntry{ID: "fable-5", Object: "model", OwnedBy: "bedrock", BackendClass: backendClassCloudManaged}
+		if withAvail {
+			e.Availability = json.RawMessage(optInAvailability)
+		}
+		_ = json.NewEncoder(w).Encode(gatewayModelsResponse{Object: "list", Data: []openAIModelEntry{
+			e,
+			{ID: "llama3", Object: "model", OwnedBy: "vllm", BackendClass: backendClassSelfHosted, Availability: json.RawMessage(`null`)},
+		}})
+	}))
+	defer gw.Close()
+	h := NewModelHandler(gw.URL, "unused", pool)
+
+	read := func(id string) (*string, *string) {
+		var st, det *string
+		if err := pool.QueryRow(ctx, `SELECT availability_state, availability_detail::text FROM models WHERE model_id = $1`, id).Scan(&st, &det); err != nil {
+			t.Fatalf("read %s: %v", id, err)
+		}
+		return st, det
+	}
+
+	h.SyncModels(ctx)
+	st, det := read("fable-5")
+	if st == nil || *st != "needs_aws_opt_in" || det == nil {
+		t.Fatalf("availability not written: %v %v", st, det)
+	}
+	var got map[string]string
+	if err := json.Unmarshal([]byte(*det), &got); err != nil || got["required_mode"] != "aws_review" || got["account_mode"] != "none" {
+		t.Fatalf("detail not verbatim: %v %v", got, err)
+	}
+	if st, det := read("llama3"); st != nil || det != nil {
+		t.Fatalf("null availability must store NULL, got %v %v", st, det)
+	}
+
+	withAvail = false
+	h.SyncModels(ctx)
+	if st, det := read("fable-5"); st != nil || det != nil {
+		t.Fatalf("availability must clear when the gateway omits it, got %v %v", st, det)
+	}
+}
+
+// TestListModels_AndAdminList_CarryAvailability: the chat-facing list (model
+// and its alias) and the admin list pass availability through, null when absent.
+func TestListModels_AndAdminList_CarryAvailability(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	insertModel(t, ctx, pool, "llama3", backendClassSelfHosted, true)
+	insertModel(t, ctx, pool, "fable-5", backendClassCloudManaged, true)
+	if _, err := pool.Exec(ctx, `UPDATE models SET availability_state = 'needs_aws_opt_in', availability_detail = $1::jsonb WHERE model_id = 'fable-5'`, optInAvailability); err != nil {
+		t.Fatalf("set availability: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO model_aliases (alias, target_model_id) VALUES ('smart', 'fable-5')`); err != nil {
+		t.Fatalf("alias: %v", err)
+	}
+
+	// Bearer path: a fake gateway returns the key's allowed ids.
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"llama3"},{"id":"fable-5"}]}`))
+	}))
+	defer gw.Close()
+	h := NewModelHandler(gw.URL, "unused", pool)
+
+	check := func(name string, req *http.Request) {
+		resp := httptest.NewRecorder()
+		newModelsTestRouter(h).ServeHTTP(resp, req)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d, body = %s", name, resp.Code, resp.Body.String())
+		}
+		var raw struct {
+			Data []map[string]json.RawMessage `json:"data"`
+		}
+		if err := json.Unmarshal(resp.Body.Bytes(), &raw); err != nil {
+			t.Fatalf("%s decode: %v", name, err)
+		}
+		byID := map[string]json.RawMessage{}
+		for _, e := range raw.Data {
+			a, ok := e["availability"]
+			if !ok {
+				t.Fatalf("%s: entry missing availability key: %v", name, e)
+			}
+			var id string
+			_ = json.Unmarshal(e["id"], &id)
+			byID[id] = a
+		}
+		for _, id := range []string{"fable-5", "smart"} {
+			var a map[string]string
+			if err := json.Unmarshal(byID[id], &a); err != nil || a["state"] != "needs_aws_opt_in" || a["required_mode"] != "aws_review" {
+				t.Fatalf("%s: %s availability = %s (%v)", name, id, byID[id], err)
+			}
+		}
+		if string(byID["llama3"]) != "null" {
+			t.Fatalf("%s: llama3 availability = %s, want null", name, byID["llama3"])
+		}
+	}
+	check("session/unfiltered", httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	bearer := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	bearer.Header.Set("Authorization", "Bearer dp_whatever")
+	check("bearer", bearer)
+
+	adminRouter := gin.New()
+	adminRouter.GET("/api/v1/models", h.ListAdminModels)
+	resp := doJSON(t, adminRouter, http.MethodGet, "/api/v1/models", nil)
+	var models []map[string]json.RawMessage
+	if err := json.Unmarshal(resp.Body.Bytes(), &models); err != nil {
+		t.Fatalf("admin decode: %v (%s)", err, resp.Body.String())
+	}
+	for _, m := range models {
+		var id string
+		_ = json.Unmarshal(m["model_id"], &id)
+		a, ok := m["availability"]
+		if !ok {
+			t.Fatalf("admin row %s missing availability", id)
+		}
+		if id == "llama3" && string(a) != "null" {
+			t.Fatalf("admin llama3 availability = %s", a)
+		}
+		if id == "fable-5" && !strings.Contains(string(a), `"needs_aws_opt_in"`) {
+			t.Fatalf("admin fable-5 availability = %s", a)
+		}
+	}
+}

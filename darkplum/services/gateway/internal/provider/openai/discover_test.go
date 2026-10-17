@@ -87,7 +87,7 @@ func TestVerifyKey_HappyPath(t *testing.T) {
 	srv.modelsResponse = modelsPage("gpt-5", "gpt-5-mini")
 	p := newTestProvider(t, srv, nil, Config{})
 
-	ids, err := p.VerifyKey(context.Background(), "sk-candidate")
+	ids, err := p.VerifyKey(context.Background(), "sk-candidate", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -110,7 +110,7 @@ func TestVerifyKey_UsesTheSubmittedKeyNotTheInstalledOne(t *testing.T) {
 	installed := &fakeCreds{key: "sk-installed", version: 1}
 	p := New(installed, Config{BaseURL: srv.URL})
 
-	if _, err := p.VerifyKey(context.Background(), "sk-candidate"); err != nil {
+	if _, err := p.VerifyKey(context.Background(), "sk-candidate", ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if gotAuth != "Bearer sk-candidate" {
@@ -125,7 +125,7 @@ func TestVerifyKey_AuthFailureClassifiesAsAuthFailed(t *testing.T) {
 	})
 	p := newTestProvider(t, srv, nil, Config{})
 
-	_, err := p.VerifyKey(context.Background(), "sk-bad-key")
+	_, err := p.VerifyKey(context.Background(), "sk-bad-key", "")
 	if err == nil {
 		t.Fatal("expected an error")
 	}
@@ -139,7 +139,7 @@ func TestVerifyKey_NetworkFailureIsNotAuthFailed(t *testing.T) {
 	srv.Server.Close()
 	p := newTestProvider(t, srv, nil, Config{})
 
-	_, err := p.VerifyKey(context.Background(), "sk-x")
+	_, err := p.VerifyKey(context.Background(), "sk-x", "")
 	if err == nil {
 		t.Fatal("expected an error")
 	}
@@ -157,7 +157,7 @@ func TestVerifyKey_NeverTouchesCredsource(t *testing.T) {
 	creds := &callCountingCreds{key: "sk-installed"}
 	p := New(creds, Config{BaseURL: srv.Server.URL})
 
-	if _, err := p.VerifyKey(context.Background(), "sk-candidate"); err != nil {
+	if _, err := p.VerifyKey(context.Background(), "sk-candidate", ""); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if creds.calls != 0 {

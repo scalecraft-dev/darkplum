@@ -41,6 +41,7 @@ type converseAPI interface {
 // or network involvement. *bedrock.Client satisfies this structurally.
 type controlAPI interface {
 	ListInferenceProfiles(ctx context.Context, params *bedrock.ListInferenceProfilesInput, optFns ...func(*bedrock.Options)) (*bedrock.ListInferenceProfilesOutput, error)
+	GetAccountDataRetention(ctx context.Context, params *bedrock.GetAccountDataRetentionInput, optFns ...func(*bedrock.Options)) (*bedrock.GetAccountDataRetentionOutput, error)
 }
 
 // runtimeClient adapts *bedrockruntime.Client to the converseAPI interface.

@@ -19,6 +19,19 @@ type fakeControlAPI struct {
 
 	calls          int
 	lastNextTokens []*string
+
+	// GetAccountDataRetention script.
+	drMode  bedrocktypes.DataRetentionMode
+	drErr   error
+	drCalls int
+}
+
+func (f *fakeControlAPI) GetAccountDataRetention(_ context.Context, _ *bedrock.GetAccountDataRetentionInput, _ ...func(*bedrock.Options)) (*bedrock.GetAccountDataRetentionOutput, error) {
+	f.drCalls++
+	if f.drErr != nil {
+		return nil, f.drErr
+	}
+	return &bedrock.GetAccountDataRetentionOutput{Mode: f.drMode}, nil
 }
 
 func (f *fakeControlAPI) ListInferenceProfiles(_ context.Context, params *bedrock.ListInferenceProfilesInput, _ ...func(*bedrock.Options)) (*bedrock.ListInferenceProfilesOutput, error) {

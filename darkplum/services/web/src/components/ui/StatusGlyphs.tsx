@@ -44,6 +44,30 @@ export function LockGlyph({ size = 11, className }: GlyphProps) {
   )
 }
 
+/** Waiting on a setting outside darkplum — today, the AWS account's Bedrock
+ *  data-retention mode. A switch in its off position: nothing is refusing on
+ *  policy grounds (that is the lock) and the backend is reachable (that is the
+ *  struck circle); something in the account has not been turned on yet. */
+export function OptInGlyph({ size = 11, className }: GlyphProps) {
+  return (
+    <svg
+      width={size}
+      height={size}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.5"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+      className={glyphClass(className)}
+    >
+      <rect x="1" y="6" width="22" height="12" rx="6" ry="6" />
+      <circle cx="8" cy="12" r="2" />
+    </svg>
+  )
+}
+
 /** Configured, but its backend has not been seen for a few minutes. */
 export function UnreachableGlyph({ size = 11, className }: GlyphProps) {
   return (

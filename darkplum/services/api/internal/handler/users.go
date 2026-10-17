@@ -177,6 +177,8 @@ func (h *UserHandler) UpdateRole(c *gin.Context) {
 		return
 	}
 
+	auth.InvalidateUser(id)
+
 	evt := activity.FromContext(c, activity.UserRoleChanged)
 	evt.TargetType = activity.StrPtr("user")
 	evt.TargetID = activity.StrPtr(id)
@@ -226,6 +228,8 @@ func (h *UserHandler) ResetPassword(c *gin.Context) {
 		return
 	}
 
+	auth.InvalidateUser(id)
+
 	evt := activity.FromContext(c, activity.UserPasswordReset)
 	evt.TargetType = activity.StrPtr("user")
 	evt.TargetID = activity.StrPtr(id)
@@ -253,6 +257,8 @@ func (h *UserHandler) DeleteUser(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "user not found"})
 		return
 	}
+
+	auth.InvalidateUser(id)
 
 	evt := activity.FromContext(c, activity.UserDeleted)
 	evt.TargetType = activity.StrPtr("user")

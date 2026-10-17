@@ -17,8 +17,9 @@ import styles from './VendorEnableModal.module.css'
  *
  * So this is one modal and one confirmation. It states the boundary being
  * crossed first — that is the decision; the checkboxes are the details — and
- * it never links to another tab, because a link inside a modal is a way out of
- * a decision that has not been made yet.
+ * it never links to another tab or another page (Admin > Routing included),
+ * because a link inside a modal is a way out of a decision that has not been
+ * made yet.
  */
 
 /** Where the run got to. Kept as data rather than as three booleans so a
