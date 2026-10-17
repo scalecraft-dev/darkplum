@@ -60,11 +60,13 @@ export function billingStateCopy(vendor: ReconciliationVendor, state: BillingSta
   const bedrock = vendor === 'bedrock'
   switch (state) {
     case 'ok':
+      // "Connected", not "Reconciling": the healthy state is a finished pull,
+      // and a word ending in -ing reads as work still under way.
       return {
-        label: 'Reconciling',
+        label: 'Connected',
         variant: 'success',
         detail: bedrock
-          ? "Cost Explorer answered the api's AWS role on the last pull."
+          ? "Cost Explorer answered the api's AWS role on the last pull; figures lag up to a day."
           : `${name}'s reports answered the billing key on the last pull.`,
       }
     case 'pulling':
