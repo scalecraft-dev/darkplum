@@ -215,8 +215,8 @@ type inferenceEvent struct {
 	// policy fire, and on whom".
 	DenialCode       *string `json:"denial_code"`
 	LatencyMS        int     `json:"latency_ms"`
-	PromptTokens     *int    `json:"prompt_tokens,omitempty"`
-	CompletionTokens *int    `json:"completion_tokens,omitempty"`
+	PromptTokens     *int    `json:"prompt_tokens"`
+	CompletionTokens *int    `json:"completion_tokens"`
 	// CacheReadTokens / CacheCreationTokens: NULL = backend reported no usage;
 	// 0 = usage reported without cache fields.
 	CacheReadTokens     *int `json:"cache_read_tokens"`

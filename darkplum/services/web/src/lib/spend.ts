@@ -374,16 +374,21 @@ export function spendCsv(group: Exclude<SpendGroupBy, 'day'>, rows: readonly Spe
  * backend reported no usage.
  */
 export function tokenSplitText(e: {
-  prompt_tokens: number | null
-  completion_tokens: number | null
+  prompt_tokens?: number | null
+  completion_tokens?: number | null
   cache_read_tokens?: number | null
   cache_creation_tokens?: number | null
 }): string | null {
-  if (e.prompt_tokens === null && e.completion_tokens === null) return null
-  const fmt = (n: number | null) => (n === null ? '—' : n.toLocaleString('en-US'))
+  // A request that reported no usage (a refusal, an upstream failure) carries
+  // null tokens — and from an api that omits empty fields, no key at all. Both
+  // mean "unknown", never 0.
+  const prompt = e.prompt_tokens ?? null
+  const completion = e.completion_tokens ?? null
+  if (prompt === null && completion === null) return null
+  const fmt = (n: number | null | undefined) => (n == null ? '—' : n.toLocaleString('en-US'))
   const parts: string[] = []
   if (e.cache_read_tokens) parts.push(`${fmt(e.cache_read_tokens)} cache read`)
   if (e.cache_creation_tokens) parts.push(`${fmt(e.cache_creation_tokens)} cache write`)
   const split = parts.length ? ` (${parts.join(', ')})` : ''
-  return `${fmt(e.prompt_tokens)} in${split} / ${fmt(e.completion_tokens)} out`
+  return `${fmt(prompt)} in${split} / ${fmt(completion)} out`
 }

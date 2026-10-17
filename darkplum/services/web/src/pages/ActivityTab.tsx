@@ -301,7 +301,7 @@ function inferenceEventToUnified(e: InferenceEvent): UnifiedEvent {
         ? vendorLabel(e.provider)
         : null,
     tokens:
-      e.prompt_tokens === null && e.completion_tokens === null
+      e.prompt_tokens == null && e.completion_tokens == null
         ? null
         : `${(e.prompt_tokens ?? 0).toLocaleString()} → ${(e.completion_tokens ?? 0).toLocaleString()}`,
     tokens_detail:  tokenSplitText(e),

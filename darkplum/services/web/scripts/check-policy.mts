@@ -1475,7 +1475,12 @@ if (!WEB_PORT_FORWARD_COMMAND.startsWith('kubectl port-forward -n darkplum-syste
   )
 
   // one request
-  check(
+  // A refused request reports no tokens; an api that omits empty fields sends no
+// key at all. Found live: the Requests table crashed on "i is undefined".
+check('tokenSplitText(fields absent) is null', tokenSplitText({}), null)
+check('tokenSplitText(null usage) is null', tokenSplitText({ prompt_tokens: null, completion_tokens: null }), null)
+check('tokenSplitText(prompt only, completion absent)', tokenSplitText({ prompt_tokens: 12 }), '12 in / — out')
+check(
     'tokenSplitText with cache',
     tokenSplitText({ prompt_tokens: 1200, completion_tokens: 80, cache_read_tokens: 1000, cache_creation_tokens: 50 }),
     '1,200 in (1,000 cache read, 50 cache write) / 80 out',
