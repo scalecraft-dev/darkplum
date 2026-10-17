@@ -64,6 +64,12 @@ export const EVENT_LABELS: Record<string, { label: string; variant: EventVariant
   'provider.key_installed': { label: 'Vendor Key Installed', variant: 'warning' },
   'provider.key_rotated':   { label: 'Vendor Key Rotated',   variant: 'warning' },
   'provider.key_removed':   { label: 'Vendor Key Removed',   variant: 'warning' },
+  // The billing key is its own credential (an admin key that can list the
+  // organisation's workspaces and keys), so it gets its own three rows rather
+  // than sharing the inference key's. Amber for the same reason.
+  'provider.billing_key_installed': { label: 'Vendor Billing Key Installed', variant: 'warning' },
+  'provider.billing_key_rotated':   { label: 'Vendor Billing Key Rotated',   variant: 'warning' },
+  'provider.billing_key_removed':   { label: 'Vendor Billing Key Removed',   variant: 'warning' },
   // Not amber: this changes which of a vendor's models are catalogued, which
   // is a configuration change and not a credential one.
   'provider.filter_changed': { label: 'Vendor Models Changed', variant: 'info' },

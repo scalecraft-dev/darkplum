@@ -705,7 +705,11 @@ func (h *ModelHandler) ListAdminModels(c *gin.Context) {
 	if err != nil {
 		slog.WarnContext(c.Request.Context(), "list admin models: read hint windows failed", "err", err)
 	}
+	billings := billingSummaries(c.Request.Context(), h.pool)
 	for i := range providers {
+		if b, ok := billings[providers[i].Name]; ok {
+			providers[i].Billing = &b
+		}
 		if until, ok := installing[providers[i].Name]; ok {
 			providers[i].InstallingUntil = until
 		}
@@ -870,6 +874,9 @@ type gatewayProviderStatus struct {
 	WorkspaceID     *string    `json:"workspace_id"`
 	InstallingUntil *time.Time `json:"installing_until,omitempty"`
 	RemovingUntil   *time.Time `json:"removing_until"`
+	// Billing is the vendor usage-report (reconciliation) status, merged in
+	// by ListAdminModels from vendor_billing_status; never sent by the gateway.
+	Billing *billingSummary `json:"billing,omitempty"`
 }
 
 // gatewayModelsResponse is the shape we expect from GET {gatewayURL}/v1/models.

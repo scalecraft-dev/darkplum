@@ -1,4 +1,4 @@
-import type { User, ApiKey, ChatMessage, ActivityEvent, AliasRouteTest, BackendClass, InferenceEvent, InferencePurpose, UsageBucket, UsageSummary, UserUsageSummary, KeyUsageSummary, Model, AdminModel, AdminModelsResult, ModelAlias, ModelAliasInput, ProviderStatus, Residency, RoutingPolicy, PrincipalPolicy, EffectivePolicy, PolicyPreview, PolicyPrincipalsPage, ConversationSummary, ConversationFull, ConversationMessage, ConversationMessageInput, VendorName } from '../types'
+import type { User, ApiKey, ChatMessage, ActivityEvent, AliasRouteTest, BackendClass, InferenceEvent, InferencePurpose, UsageBucket, UsageSummary, UserUsageSummary, KeyUsageSummary, Model, AdminModel, AdminModelsResult, ModelAlias, ModelAliasInput, ProviderStatus, Residency, RoutingPolicy, PrincipalPolicy, EffectivePolicy, PolicyPreview, PolicyPrincipalsPage, ConversationSummary, ConversationFull, ConversationMessage, ConversationMessageInput, VendorName, SpendGroupBy, SpendReport, SpendTimelineGroupBy, ProviderBilling, ReconciliationGroupBy, ReconciliationReport, ModelPricesResult, ModelPrice, ModelPriceInput } from '../types'
 import { parseRetryAfter } from './modelRouting'
 import { ROUTES, buildPath, type QueryValue, type Route } from './routes'
 
@@ -336,6 +336,61 @@ export function getKeySummary(params: { since: string; until: string }): Promise
   return request<KeyUsageSummary[]>(ROUTES.usageKeySummary, { query: params })
 }
 
+/** Estimated spend at list price, grouped one way. Every amount in the reply
+ *  is an estimate from Darkplum's own records, not a vendor invoice. */
+export function getSpend(params: {
+  group_by: SpendGroupBy
+  since: string
+  until: string
+  limit?: number
+}): Promise<SpendReport> {
+  return request<SpendReport>(ROUTES.usageSpend, { query: params })
+}
+
+/** Spend per time bucket × backend class in one read — the chart's data and,
+ *  in `totals`, the whole period's tiles. Rows are chronological; `key` is
+ *  the RFC3339 UTC bucket start, `backend_class` the class. `limit` counts
+ *  buckets, not rows. */
+export function getSpendTimeline(params: {
+  group_by: SpendTimelineGroupBy
+  since: string
+  until: string
+  limit?: number
+}): Promise<SpendReport> {
+  return request<SpendReport>(ROUTES.usageSpend, { query: params })
+}
+
+/** Darkplum's estimate beside each vendor's own usage and cost reports, plus
+ *  where each vendor's pull stands. */
+export function getReconciliation(params: {
+  since: string
+  until: string
+  group_by: ReconciliationGroupBy
+}): Promise<ReconciliationReport> {
+  return request<ReconciliationReport>(ROUTES.usageReconciliation, { query: params })
+}
+
+/** Asks the api to pull every configured vendor's reports now (202). */
+export function refreshReconciliation(): Promise<void> {
+  return request<void>(ROUTES.refreshUsageReconciliation, { body: {} })
+}
+
+// Model prices
+
+export function listModelPrices(): Promise<ModelPricesResult> {
+  return request<ModelPricesResult>(ROUTES.listModelPrices)
+}
+
+/** Adds a row (no id) or replaces one going forward (with id). */
+export function putModelPrice(row: ModelPriceInput): Promise<ModelPrice> {
+  return request<ModelPrice>(ROUTES.putModelPrice, { body: row })
+}
+
+/** Retires a row from now on. Past estimates keep the price they were made at. */
+export function deleteModelPrice(id: string): Promise<void> {
+  return request<void>(ROUTES.deleteModelPrice, { params: { id } })
+}
+
 // Models
 
 /** The chat-facing list, already filtered to what this person's policy allows.
@@ -388,6 +443,7 @@ function normaliseProviders(raw: unknown): ProviderStatus[] {
         // answer as "nothing is being removed" — never inferred from anything
         // else, because inferring it would hide a card's actions.
         removing_until: typeof p.removing_until === 'string' ? p.removing_until : null,
+        billing: normaliseBilling((entry as { billing?: unknown }).billing),
       })
     }
   }
@@ -405,6 +461,19 @@ function normaliseProviders(raw: unknown): ProviderStatus[] {
         removing_until: null,
       },
   )
+}
+
+/** The billing block, or undefined when the api did not send one (it predates
+ *  billing keys). A state this bundle does not know is kept as-is; the card
+ *  names it as unrecognised rather than guessing. */
+function normaliseBilling(raw: unknown): ProviderBilling | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined
+  const b = raw as Partial<ProviderBilling>
+  return {
+    configured: b.configured === true,
+    state: typeof b.state === 'string' ? b.state : 'not_configured',
+    last_pulled_at: typeof b.last_pulled_at === 'string' ? b.last_pulled_at : null,
+  }
 }
 
 /** A list of ids from a response, with anything that is not a string dropped.
@@ -563,6 +632,34 @@ export async function removeVendorKey(
     body: { confirm: vendor, ...(opts.disableModels ? { disable_models: true } : {}) },
   })
   return { warnings: stringList(body?.warnings) }
+}
+
+// Vendor billing keys (admin session only)
+//
+// A different credential from the inference key above, with the same rules:
+// the key is passed straight through on the body and never kept, echoed or
+// logged here. Nothing a 422 says about it ever contains it.
+
+/** One day of the vendor's own report, fetched with the candidate key and
+ *  thrown away — proof the key can read what the job needs. */
+export interface BillingKeyVerification {
+  state: 'ok'
+  sample: { day: string; buckets: unknown }
+}
+
+export function verifyBillingKey(vendor: VendorName, key: string): Promise<BillingKeyVerification> {
+  return request<BillingKeyVerification>(ROUTES.verifyProviderBillingKey, {
+    params: { vendor },
+    body: { key },
+  })
+}
+
+export function installBillingKey(vendor: VendorName, key: string): Promise<{ state: string }> {
+  return request<{ state: string }>(ROUTES.putProviderBillingKey, { params: { vendor }, body: { key } })
+}
+
+export function removeBillingKey(vendor: VendorName): Promise<void> {
+  return request<void>(ROUTES.deleteProviderBillingKey, { params: { vendor } })
 }
 
 // Model aliases (admin)

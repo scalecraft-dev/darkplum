@@ -327,10 +327,12 @@ func (p *Provider) Stream(ctx context.Context, req provider.ChatRequest, w io.Wr
 
 	finishReason := mapFinishReason(acc.StopReason)
 	stats := &provider.StreamStats{
-		Model:            model,
-		PromptTokens:     int(acc.Usage.InputTokens + acc.Usage.CacheCreationInputTokens + acc.Usage.CacheReadInputTokens),
-		CompletionTokens: int(acc.Usage.OutputTokens),
-		FinishReason:     finishReason,
+		Model:               model,
+		PromptTokens:        int(acc.Usage.InputTokens + acc.Usage.CacheCreationInputTokens + acc.Usage.CacheReadInputTokens),
+		CompletionTokens:    int(acc.Usage.OutputTokens),
+		CacheReadTokens:     int(acc.Usage.CacheReadInputTokens),
+		CacheCreationTokens: int(acc.Usage.CacheCreationInputTokens),
+		FinishReason:        finishReason,
 	}
 
 	finalChunk, err := provider.BuildFinalChunkSSE(completionID, model, finishReason, stats)
@@ -407,12 +409,14 @@ func toChatResponse(msg *sdk.Message) *provider.ChatResponse {
 
 	usage := msg.Usage
 	return &provider.ChatResponse{
-		ID:               msg.ID,
-		Model:            string(msg.Model),
-		Content:          content.String(),
-		PromptTokens:     int(usage.InputTokens + usage.CacheCreationInputTokens + usage.CacheReadInputTokens),
-		CompletionTokens: int(usage.OutputTokens),
-		FinishReason:     mapFinishReason(msg.StopReason),
+		ID:                  msg.ID,
+		Model:               string(msg.Model),
+		Content:             content.String(),
+		PromptTokens:        int(usage.InputTokens + usage.CacheCreationInputTokens + usage.CacheReadInputTokens),
+		CompletionTokens:    int(usage.OutputTokens),
+		CacheReadTokens:     int(usage.CacheReadInputTokens),
+		CacheCreationTokens: int(usage.CacheCreationInputTokens),
+		FinishReason:        mapFinishReason(msg.StopReason),
 	}
 }
 

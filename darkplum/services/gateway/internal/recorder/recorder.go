@@ -33,8 +33,14 @@ type InferenceEvent struct {
 	LatencyMS        int
 	PromptTokens     *int
 	CompletionTokens *int
-	Stream           bool
-	IP               string
+	// CacheReadTokens / CacheCreationTokens are inference_events.
+	// cache_read_tokens / cache_creation_tokens (migration 021): the cached
+	// split of PromptTokens. nil (NULL) when the backend reported no usage;
+	// 0 when usage was reported without cache fields.
+	CacheReadTokens     *int
+	CacheCreationTokens *int
+	Stream              bool
+	IP                  string
 	// Provider identifies the backend that served the request ("vllm", "lmstudio", or "bedrock").
 	Provider string
 	// Region is the cloud region for the backend. Populated for Bedrock, empty for vLLM.
@@ -165,6 +171,9 @@ type schema struct {
 // first and walks forward through the slice on an undefined-column error
 // until one succeeds (or the list is exhausted).
 var schemas = []schema{
+	// cache_tokens: migration 021 (cache_read_tokens, cache_creation_tokens)
+	// plus everything below.
+	{name: "cache_tokens", queue: queueCacheTokensSchema},
 	// backend_class: migration 016 (inference_events.backend_class) plus
 	// everything below. A gateway new enough to know about external_api
 	// routes must still record correctly against a DB that hasn't run 016
@@ -190,6 +199,39 @@ func purposeOrDefault(p string) string {
 		return "inference"
 	}
 	return p
+}
+
+func queueCacheTokensSchema(b *pgx.Batch, evt InferenceEvent) {
+	b.Queue(`
+		INSERT INTO inference_events
+			(request_id, api_key_id, user_id, model, requested_model, status_code, latency_ms,
+			 prompt_tokens, completion_tokens, stream, ip_address,
+			 provider, region, denial_code, purpose, route_name, router_reason, router_latency_ms,
+			 backend_class, cache_read_tokens, cache_creation_tokens)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::inet, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+	`,
+		evt.RequestID,
+		nullableStr(evt.APIKeyID),
+		nullableStr(evt.UserID),
+		evt.Model,
+		nullableStr(evt.RequestedModel),
+		evt.StatusCode,
+		evt.LatencyMS,
+		evt.PromptTokens,
+		evt.CompletionTokens,
+		evt.Stream,
+		nullableStr(evt.IP),
+		evt.Provider,
+		nullableStr(evt.Region),
+		nullableStr(evt.DenialCode),
+		purposeOrDefault(evt.Purpose),
+		nullableStr(evt.RouteName),
+		nullableStr(evt.RouterReason),
+		evt.RouterLatencyMS,
+		nullableStr(evt.BackendClass),
+		evt.CacheReadTokens,
+		evt.CacheCreationTokens,
+	)
 }
 
 func queueBackendClassSchema(b *pgx.Batch, evt InferenceEvent) {

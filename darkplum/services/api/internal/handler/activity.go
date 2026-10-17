@@ -4,6 +4,7 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"net/http"
 	"strconv"
 	"strings"
@@ -11,7 +12,36 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/scalecraft/darkplum/api/internal/pricing"
 )
+
+// eventCostCents prices one event against an in-memory price snapshot.
+// Refused requests cost "0.0000"; no matching price yields nil (unpriced).
+func eventCostCents(prices []pricing.Price, provider, model string, region *string, at time.Time,
+	refused bool, prompt, completion, cacheRead, cacheCreate *int) *string {
+	if refused {
+		z := pricing.FormatCents(new(big.Rat))
+		return &z
+	}
+	p := pricing.Match(prices, provider, model, region, at)
+	if p == nil {
+		return nil
+	}
+	v := func(n *int) int64 {
+		if n == nil {
+			return 0
+		}
+		return int64(*n)
+	}
+	s := pricing.FormatCents(p.CostCents(pricing.Usage{
+		Uncached:    pricing.UncachedPrompt(v(prompt), v(cacheRead), v(cacheCreate)),
+		CacheRead:   v(cacheRead),
+		CacheCreate: v(cacheCreate),
+		Completion:  v(completion),
+	}))
+	return &s
+}
 
 // ActivityHandler serves read-only endpoints for activity_events and inference_events.
 type ActivityHandler struct {
@@ -183,13 +213,20 @@ type inferenceEvent struct {
 	// model_requires_data_retention.
 	// Null on a request that reached a model. This is the admin's answer to "did my
 	// policy fire, and on whom".
-	DenialCode       *string   `json:"denial_code"`
-	LatencyMS        int       `json:"latency_ms"`
-	PromptTokens     *int      `json:"prompt_tokens,omitempty"`
-	CompletionTokens *int      `json:"completion_tokens,omitempty"`
-	Stream           bool      `json:"stream"`
-	IPAddress        *string   `json:"ip_address,omitempty"`
-	CreatedAt        time.Time `json:"created_at"`
+	DenialCode       *string `json:"denial_code"`
+	LatencyMS        int     `json:"latency_ms"`
+	PromptTokens     *int    `json:"prompt_tokens,omitempty"`
+	CompletionTokens *int    `json:"completion_tokens,omitempty"`
+	// CacheReadTokens / CacheCreationTokens: NULL = backend reported no usage;
+	// 0 = usage reported without cache fields.
+	CacheReadTokens     *int `json:"cache_read_tokens"`
+	CacheCreationTokens *int `json:"cache_creation_tokens"`
+	// CostCents is the list-price estimate (4 dp decimal string), computed at
+	// query time from model_prices. null = unpriced; "0.0000" for a refusal.
+	CostCents *string   `json:"cost_cents"`
+	Stream    bool      `json:"stream"`
+	IPAddress *string   `json:"ip_address,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
 	// BackendClass is self_hosted, cloud_managed, or external_api -- set on
 	// the gin context (and hence this row) the moment the gateway resolves a
 	// route's class, so even a DENIED request carries it when the denial
@@ -417,7 +454,8 @@ func (h *ActivityHandler) ListUsage(c *gin.Context) {
 			u.name, u.email,
 			ie.model, ie.requested_model, ie.provider, ie.purpose, ie.route_name, ie.router_reason,
 			ie.status_code, ie.denial_code, ie.latency_ms, ie.prompt_tokens, ie.completion_tokens,
-			ie.stream, ie.ip_address::text, ie.created_at, ie.backend_class
+			ie.stream, ie.ip_address::text, ie.created_at, ie.backend_class,
+			ie.cache_read_tokens, ie.cache_creation_tokens, ie.region
 		FROM inference_events ie
 		LEFT JOIN users u ON u.id = ie.user_id
 		%s
@@ -432,18 +470,27 @@ func (h *ActivityHandler) ListUsage(c *gin.Context) {
 	}
 	defer rows.Close()
 
+	prices, err := pricing.LoadAll(c.Request.Context(), h.db)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "load model prices failed"})
+		return
+	}
 	events := make([]inferenceEvent, 0)
 	for rows.Next() {
 		var ie inferenceEvent
+		var region *string
 		if err := rows.Scan(
 			&ie.ID, &ie.RequestID, &ie.APIKeyID, &ie.UserID, &ie.UserName, &ie.UserEmail,
 			&ie.Model, &ie.RequestedModel, &ie.Provider, &ie.Purpose, &ie.RouteName, &ie.RouterReason,
 			&ie.StatusCode, &ie.DenialCode, &ie.LatencyMS, &ie.PromptTokens, &ie.CompletionTokens,
 			&ie.Stream, &ie.IPAddress, &ie.CreatedAt, &ie.BackendClass,
+			&ie.CacheReadTokens, &ie.CacheCreationTokens, &region,
 		); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "scan usage failed"})
 			return
 		}
+		ie.CostCents = eventCostCents(prices, ie.Provider, ie.Model, region, ie.CreatedAt,
+			ie.DenialCode != nil, ie.PromptTokens, ie.CompletionTokens, ie.CacheReadTokens, ie.CacheCreationTokens)
 		events = append(events, ie)
 	}
 	if err := rows.Err(); err != nil {
@@ -843,7 +890,10 @@ func (h *ActivityHandler) ExportUsage(c *gin.Context) {
 			ie.completion_tokens,
 			ie.stream,
 			ie.ip_address::text,
-			ie.backend_class
+			ie.backend_class,
+			ie.cache_read_tokens,
+			ie.cache_creation_tokens,
+			ie.region
 		FROM inference_events ie
 		LEFT JOIN users u ON u.id = ie.user_id
 		%s
@@ -862,8 +912,12 @@ func (h *ActivityHandler) ExportUsage(c *gin.Context) {
 	c.Header("Content-Disposition", `attachment; filename="inference_events.csv"`)
 
 	w := csv.NewWriter(c.Writer)
-	_ = w.Write([]string{"timestamp", "request_id", "user_id", "user_name", "user_email", "api_key_id", "model", "requested_model", "provider", "purpose", "route_name", "router_reason", "status_code", "denial_code", "latency_ms", "prompt_tokens", "completion_tokens", "stream", "ip_address", "backend_class"})
+	_ = w.Write([]string{"timestamp", "request_id", "user_id", "user_name", "user_email", "api_key_id", "model", "requested_model", "provider", "purpose", "route_name", "router_reason", "status_code", "denial_code", "latency_ms", "prompt_tokens", "completion_tokens", "stream", "ip_address", "backend_class", "cache_read_tokens", "cache_creation_tokens", "cost_cents"})
 
+	prices, err := pricing.LoadAll(c.Request.Context(), h.db)
+	if err != nil {
+		prices = nil // degrade: cost column blank rather than abort the export
+	}
 	for rows.Next() {
 		var (
 			createdAt        time.Time
@@ -886,16 +940,21 @@ func (h *ActivityHandler) ExportUsage(c *gin.Context) {
 			stream           bool
 			ipAddress        *string
 			backendClass     *string
+			cacheRead        *int
+			cacheCreate      *int
+			region           *string
 		)
 		if err := rows.Scan(
 			&createdAt, &requestID, &userID, &userName, &userEmail, &apiKeyID, &model, &requestedModel, &provider,
 			&purpose, &routeName, &routerReason,
 			&statusCode, &denialCode, &latencyMS, &promptTokens, &completionTokens, &stream, &ipAddress,
-			&backendClass,
+			&backendClass, &cacheRead, &cacheCreate, &region,
 		); err != nil {
 			w.Flush()
 			return
 		}
+		costCents := eventCostCents(prices, provider, model, region, createdAt,
+			denialCode != nil, promptTokens, completionTokens, cacheRead, cacheCreate)
 		_ = w.Write([]string{
 			createdAt.UTC().Format(time.RFC3339),
 			requestID,
@@ -917,6 +976,9 @@ func (h *ActivityHandler) ExportUsage(c *gin.Context) {
 			strconv.FormatBool(stream),
 			derefStr(ipAddress),
 			derefStr(backendClass),
+			derefInt(cacheRead),
+			derefInt(cacheCreate),
+			derefStr(costCents),
 		})
 	}
 	w.Flush()

@@ -319,25 +319,49 @@ func netJoinHostPort(host, port string) string {
 // SetSecretKey merge-patches {"data":{name: base64(value)}} into the
 // provider-keys Secret.
 func (w *Writer) SetSecretKey(ctx context.Context, name string, value []byte) error {
+	return w.SetNamedSecretKey(ctx, secretName, name, value)
+}
+
+// BillingKeysSecret is the optional Secret holding the vendor billing
+// (admin-scope) keys, mounted read-only into the api as files.
+const BillingKeysSecret = "darkplum-billing-keys"
+
+// BillingSecrets is the narrow interface the billing-key routes depend on,
+// satisfied by *Writer and fakeable without an apiserver.
+type BillingSecrets interface {
+	Available() bool
+	SetNamedSecretKey(ctx context.Context, secret, name string, value []byte) error
+	RemoveNamedSecretKey(ctx context.Context, secret, name string) error
+}
+
+// SetNamedSecretKey merge-patches {"data":{name: base64(value)}} into the
+// named Secret. The api's Role only grants patch on the specific Secret names
+// it manages, so an unknown secret fails ErrForbidden.
+func (w *Writer) SetNamedSecretKey(ctx context.Context, secret, name string, value []byte) error {
 	body, err := json.Marshal(map[string]any{
 		"data": map[string]any{name: base64.StdEncoding.EncodeToString(value)},
 	})
 	if err != nil {
 		return fmt.Errorf("%w: encode patch body", ErrUnavailable)
 	}
-	return w.patch(ctx, "secrets/"+secretName, body)
+	return w.patch(ctx, "secrets/"+secret, body)
 }
 
 // RemoveSecretKey merge-patches {"data":{name: null}} into the provider-keys
 // Secret, deleting that one data key.
 func (w *Writer) RemoveSecretKey(ctx context.Context, name string) error {
+	return w.RemoveNamedSecretKey(ctx, secretName, name)
+}
+
+// RemoveNamedSecretKey deletes one data key of the named Secret.
+func (w *Writer) RemoveNamedSecretKey(ctx context.Context, secret, name string) error {
 	body, err := json.Marshal(map[string]any{
 		"data": map[string]any{name: nil},
 	})
 	if err != nil {
 		return fmt.Errorf("%w: encode patch body", ErrUnavailable)
 	}
-	return w.patch(ctx, "secrets/"+secretName, body)
+	return w.patch(ctx, "secrets/"+secret, body)
 }
 
 // SetConfig merge-patches {"data": kv} into the provider-config ConfigMap.

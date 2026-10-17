@@ -109,7 +109,11 @@ type ChatResponse struct {
 	Content          string
 	PromptTokens     int
 	CompletionTokens int
-	FinishReason     string
+	// Invariant: prompt_tokens includes cache tokens; cache_* are its split
+	// (priced differently per vendor); 0 when the backend reports none.
+	CacheReadTokens     int
+	CacheCreationTokens int
+	FinishReason        string
 }
 
 // StreamStats holds the token-count and finish metadata extracted from the
@@ -119,7 +123,10 @@ type StreamStats struct {
 	Model            string
 	PromptTokens     int
 	CompletionTokens int
-	FinishReason     string
+	// Invariant: prompt_tokens includes cache tokens; cache_* are its split.
+	CacheReadTokens     int
+	CacheCreationTokens int
+	FinishReason        string
 }
 
 // ---------------------------------------------------------------------------

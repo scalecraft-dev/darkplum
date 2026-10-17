@@ -54,6 +54,16 @@ export const ROUTES = {
   usageSummary:   { method: 'GET', path: '/api/v1/usage/summary' },
   usageUserSummary: { method: 'GET', path: '/api/v1/usage/user-summary' },
   usageKeySummary:  { method: 'GET', path: '/api/v1/usage/key-summary' },
+  /** Estimated cost at list price, grouped one way (group_by). */
+  usageSpend:       { method: 'GET', path: '/api/v1/usage/spend' },
+  /** Darkplum's estimate beside each vendor's own reported usage and cost. */
+  usageReconciliation:        { method: 'GET',  path: '/api/v1/usage/reconciliation' },
+  refreshUsageReconciliation: { method: 'POST', path: '/api/v1/usage/reconciliation/refresh' },
+
+  // --- Model prices (the list-price table spend is estimated from) ---
+  listModelPrices:  { method: 'GET',    path: '/api/v1/model-prices' },
+  putModelPrice:    { method: 'PUT',    path: '/api/v1/model-prices' },
+  deleteModelPrice: { method: 'DELETE', path: '/api/v1/model-prices/:id' },
 
   // --- Models ---
   listChatModels:  { method: 'GET',   path: '/v1/models' },
@@ -70,6 +80,12 @@ export const ROUTES = {
   putProviderKey:    { method: 'PUT',    path: '/api/v1/providers/:vendor/key' },
   putProviderFilter: { method: 'PUT',    path: '/api/v1/providers/:vendor/filter' },
   deleteProviderKey: { method: 'DELETE', path: '/api/v1/providers/:vendor/key' },
+  // The vendor BILLING key — a separate, broader credential (it can list the
+  // organisation's workspaces and keys), held by the api for its daily
+  // reconciliation job and never by the gateway. Same rule: key on the body.
+  verifyProviderBillingKey: { method: 'POST',   path: '/api/v1/providers/:vendor/billing-key/verify' },
+  putProviderBillingKey:    { method: 'PUT',    path: '/api/v1/providers/:vendor/billing-key' },
+  deleteProviderBillingKey: { method: 'DELETE', path: '/api/v1/providers/:vendor/billing-key' },
 
   // --- Model aliases ---
   listModelAliases: { method: 'GET',    path: '/api/v1/model-aliases' },

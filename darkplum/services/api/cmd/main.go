@@ -23,9 +23,11 @@ import (
 
 	"github.com/scalecraft/darkplum/api/internal/activity"
 	"github.com/scalecraft/darkplum/api/internal/auth"
+	"github.com/scalecraft/darkplum/api/internal/billing"
 	"github.com/scalecraft/darkplum/api/internal/db"
 	"github.com/scalecraft/darkplum/api/internal/handler"
 	"github.com/scalecraft/darkplum/api/internal/kube"
+	"github.com/scalecraft/darkplum/api/internal/pricing"
 )
 
 func main() {
@@ -232,6 +234,34 @@ func run() error {
 	conversations := handler.NewConversationHandler(pool, activityRecorder)
 	providers := handler.NewProvidersHandler(pool, activityRecorder, gatewayURL, serviceKey, kube.NewWriter(), modelHandler, authCfg.SecureCookie)
 
+	prices := handler.NewPricingHandler(pool, activityRecorder)
+
+	// Vendor usage/cost reconciliation (separate billing keys; see
+	// internal/billing). The poller starts after the price seed below.
+	billingSvc := billing.NewService(&billing.Store{DB: pool},
+		billing.KeyReader{Dir: envOr("BILLING_KEYS_DIR", "/var/run/darkplum/billing-keys")},
+		map[string]billing.Vendor{
+			billing.Anthropic: billing.NewAnthropicClient(billing.AnthropicBaseURL, nil),
+			billing.OpenAI:    billing.NewOpenAIClient(billing.OpenAIBaseURL, nil),
+		}, nil, nil)
+	billingH := handler.NewBillingHandler(pool, activityRecorder, billingSvc, kube.NewWriter(), authCfg.SecureCookie)
+	if n, err := pricing.Seed(ctx, pool); err != nil {
+		slog.Error("seed model prices failed; spend will be unpriced until fixed", "err", err)
+	} else if n > 0 {
+		slog.Info("seeded model prices", "rows", n)
+	}
+
+	go func() {
+		// Bedrock spend comes from Cost Explorer via the default credential
+		// chain; failing to build the client just leaves Bedrock unconfigured.
+		if src, err := billing.NewAWSBedrockSource(ctx); err != nil {
+			slog.Warn("billing: AWS config unavailable; Bedrock reconciliation disabled")
+		} else {
+			billingSvc.Bedrock = src
+		}
+		billingSvc.Run(ctx)
+	}()
+
 	r := buildRouter(routerDeps{
 		pool:          pool,
 		authCfg:       authCfg,
@@ -247,6 +277,8 @@ func run() error {
 		modelHandler:  modelHandler,
 		conversations: conversations,
 		providers:     providers,
+		prices:        prices,
+		billing:       billingH,
 	})
 
 	srv := &http.Server{
@@ -302,6 +334,8 @@ type routerDeps struct {
 	modelHandler  *handler.ModelHandler
 	conversations *handler.ConversationHandler
 	providers     *handler.ProvidersHandler
+	prices        *handler.PricingHandler
+	billing       *handler.BillingHandler
 }
 
 // buildRouter registers every route the api serves. See routerDeps' doc
@@ -425,6 +459,13 @@ func buildRouter(d routerDeps) *gin.Engine {
 			adminOnly.GET("/usage/summary", d.activityH.UsageSummary)
 			adminOnly.GET("/usage/user-summary", d.activityH.UserSummary)
 			adminOnly.GET("/usage/key-summary", d.activityH.KeySummary)
+			adminOnly.GET("/usage/spend", d.activityH.UsageSpend)
+
+			// Versioned price book behind the spend estimates. PUT with an id
+			// closes the old row and inserts a new one; DELETE retires.
+			adminOnly.GET("/model-prices", d.prices.ListPrices)
+			adminOnly.PUT("/model-prices", d.prices.PutPrice)
+			adminOnly.DELETE("/model-prices/:id", d.prices.DeletePrice)
 
 			// Vendor key install/rotate/remove (PLAN-UI). Rate-limited on
 			// every route that calls out to the vendor through the gateway's
@@ -452,6 +493,17 @@ func buildRouter(d routerDeps) *gin.Engine {
 			adminOnly.PUT("/providers/:vendor/key", providerActorRL, providerProcessRL, d.providers.PutKey)
 			adminOnly.PUT("/providers/:vendor/filter", providerActorRL, providerProcessRL, d.providers.PutFilter)
 			adminOnly.DELETE("/providers/:vendor/key", d.providers.DeleteKey)
+
+			// Vendor billing (admin-scope) keys for usage/cost reconciliation:
+			// same limiters as the inference-key routes (verify calls the
+			// vendor); DELETE only edits the Secret.
+			adminOnly.POST("/providers/:vendor/billing-key/verify", providerActorRL, providerProcessRL, d.billing.PostVerify)
+			adminOnly.PUT("/providers/:vendor/billing-key", providerActorRL, providerProcessRL, d.billing.PutKey)
+			adminOnly.DELETE("/providers/:vendor/billing-key", d.billing.DeleteKey)
+			adminOnly.GET("/usage/reconciliation", d.billing.GetReconciliation)
+			// 1/min process-wide: vendors ask for polling no faster than that.
+			adminOnly.POST("/usage/reconciliation/refresh",
+				auth.KeyedRateLimit(1.0/60.0, 1, func(c *gin.Context) string { return "org" }), d.billing.PostRefresh)
 		}
 	}
 
@@ -680,6 +732,9 @@ func corsMiddleware() gin.HandlerFunc {
 // providerRoutesPrefix is every route ProvidersHandler serves.
 const providerRoutesPrefix = "/api/v1/providers/"
 
+// reconRefreshPath triggers vendor report pulls; interactive admins only.
+const reconRefreshPath = "/api/v1/usage/reconciliation/refresh"
+
 // rejectBearerOnProviderRoutes refuses any request under
 // providerRoutesPrefix that carries an Authorization: Bearer header with
 // 403, before session auth, CSRF, or anything else in the chain runs (see
@@ -691,7 +746,7 @@ const providerRoutesPrefix = "/api/v1/providers/"
 // extend to this one.
 func rejectBearerOnProviderRoutes() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if strings.HasPrefix(c.Request.URL.Path, providerRoutesPrefix) &&
+		if (strings.HasPrefix(c.Request.URL.Path, providerRoutesPrefix) || c.Request.URL.Path == reconRefreshPath) &&
 			strings.HasPrefix(c.GetHeader("Authorization"), "Bearer ") {
 			// Structured {code,message} like every other error these routes
 			// return (internal/handler/providers.go's apiErrorBody) -- the

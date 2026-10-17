@@ -13,6 +13,8 @@ import {
 import type { KeyTransportHelp } from '../lib/vendorKeys'
 import { Badge, Button, CodeBlock, CopyButton } from '../components/ui'
 import type { VendorInstallMode } from './VendorInstallModal'
+import type { BillingKeyMode } from './VendorBillingKeyModal'
+import { BILLING_TRANSPORT_HELP, billingKeyExplanation, billingStateCopy, lastPulledText } from '../lib/billing'
 import styles from './VendorStatusSection.module.css'
 
 /**
@@ -66,6 +68,8 @@ interface Props {
   /** Stores the filter the command line set, so the UI becomes the writer of
    *  record for it. Rejects with the api's own message. */
   onAdoptFilter: (vendor: VendorName, filter: string[]) => Promise<void>
+  /** Opens the separate billing-key modal. */
+  onManageBilling: (vendor: VendorName, mode: BillingKeyMode) => void
 }
 
 interface StateCopy {
@@ -182,6 +186,7 @@ export function VendorStatusSection({
   onReviewAndEnable,
   onCheckAgain,
   onAdoptFilter,
+  onManageBilling,
 }: Props) {
   const canInstall = supportsUiKeyInstall(providerFeatures)
 
@@ -256,6 +261,7 @@ export function VendorStatusSection({
             onReviewAndEnable={onReviewAndEnable}
             onCheckAgain={onCheckAgain}
             onAdoptFilter={onAdoptFilter}
+            onManageBilling={onManageBilling}
           />
         ))}
       </div>
@@ -280,6 +286,7 @@ interface RowProps {
   onReviewAndEnable: (vendor: VendorName) => void
   onCheckAgain: () => void
   onAdoptFilter: (vendor: VendorName, filter: string[]) => Promise<void>
+  onManageBilling: (vendor: VendorName, mode: BillingKeyMode) => void
 }
 
 function VendorRow({
@@ -295,6 +302,7 @@ function VendorRow({
   onReviewAndEnable,
   onCheckAgain,
   onAdoptFilter,
+  onManageBilling,
 }: RowProps) {
   const vendor = vendorLabel(p.name)
   const phase = loading ? 'settled' : installPhase(p, now)
@@ -617,6 +625,97 @@ function VendorRow({
             </div>
           )}
         </>
+      )}
+
+      {/* --- billing key --------------------------------------------------
+          A different credential, in its own block under its own heading, and
+          never folded into the inference key's actions above. Rendered only
+          when the api sends a billing block: an api that predates billing keys
+          would 404 every action here. */}
+      {!loading && p.billing && (
+        <BillingKeyBlock
+          vendor={p.name}
+          billing={p.billing}
+          canInstallKey={transportOk}
+          onManage={onManageBilling}
+        />
+      )}
+    </div>
+  )
+}
+
+function BillingKeyBlock({
+  vendor,
+  billing,
+  canInstallKey,
+  onManage,
+}: {
+  vendor: VendorName
+  billing: NonNullable<ProviderStatus['billing']>
+  /** The billing key travels over the same transport rule as the inference
+   *  key. Without it, Install and Replace go (the port-forward is offered in
+   *  their place, as on the inference key); Remove carries no key and stays. */
+  canInstallKey: boolean
+  onManage: (vendor: VendorName, mode: BillingKeyMode) => void
+}) {
+  const copy = billingStateCopy(vendor, billing.state)
+  const headingId = `${vendor}-billing-heading`
+  return (
+    <div className={styles.billing} role="group" aria-labelledby={headingId}>
+      <div className={styles.rowHead}>
+        <h3 id={headingId} className={styles.billingTitle}>Billing key (optional)</h3>
+        <Badge variant={copy.variant} bordered dashed={copy.dashed}>{copy.label}</Badge>
+        {billing.configured && <span className={styles.sync}>{lastPulledText(billing.last_pulled_at)}</span>}
+      </div>
+      <p className={styles.next}>{billingKeyExplanation(vendor)}</p>
+      {billing.state !== 'ok' && billing.state !== 'not_configured' && (
+        <p className={styles.detail}>{copy.detail}</p>
+      )}
+      {!canInstallKey && (
+        <>
+          <p className={styles.next}>{BILLING_TRANSPORT_HELP}</p>
+          <div className={styles.command}>
+            <CodeBlock>
+              <code>{WEB_PORT_FORWARD_COMMAND}</code>
+            </CodeBlock>
+          </div>
+        </>
+      )}
+      {(canInstallKey || billing.configured) && (
+        <div className={styles.actions}>
+          {!billing.configured ? (
+            <Button
+              type="button"
+              size="sm"
+              variant="secondary"
+              onClick={() => onManage(vendor, 'install')}
+            >
+              Install billing key
+            </Button>
+          ) : (
+            <>
+              {canInstallKey && (
+                <Button
+                  type="button"
+                  size="sm"
+                  variant={billing.state === 'auth_failed' || billing.state === 'wrong_key_type' ? 'primary' : 'secondary'}
+                  onClick={() => onManage(vendor, 'replace')}
+                >
+                  Replace billing key
+                </Button>
+              )}
+              <Button
+                type="button"
+                size="sm"
+                variant="ghost"
+                className={styles.remove}
+                onClick={() => onManage(vendor, 'remove')}
+              >
+                Remove billing key
+              </Button>
+            </>
+          )}
+        </div>
       )}
     </div>
   )

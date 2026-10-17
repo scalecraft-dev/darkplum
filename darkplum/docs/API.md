@@ -46,6 +46,20 @@ Four routes let an admin install, rotate, change the catalogued models for, or r
 - `DELETE /api/v1/providers/:vendor/key {confirm: "<vendor>", disable_models?: bool}` — remove the vendor's key. `confirm` must equal the vendor name (not rate-limited; never calls the vendor). `409` code `models_enabled` plus `models: [ids]` when the vendor has enabled models and `disable_models` isn't set; with it, they're disabled in the same transaction as the removal. `200 {disabled_models?: [ids], warnings?: [string]}`. The stored `model_filter` is kept (so reinstalling recalls the previous selection); `installing_until` is cleared.
 - Audit events (`GET /api/v1/activity`): `provider.key_installed` / `provider.key_rotated` (by the gateway's last-known `configured` state for that vendor before the write) on `PUT key`, `provider.filter_changed` on `PUT filter`, `provider.key_removed` on `DELETE key`. `detail` always carries `vendor`, `model_filter_before`, `model_filter_after`, and for Anthropic `workspace_id_before` / `workspace_id_after` (omitted when both are empty); `PUT key`'s event additionally carries `key_last4` (from the submitted body — never read back from storage, which never holds it); `DELETE key`'s event additionally carries `disabled_models` (the model ids turned off in the same transaction) but only when at least one was — it is omitted entirely, not an empty array, otherwise.
 
+### Spend over time by backend class
+
+`GET /api/v1/usage/spend?group_by=day,backend_class` (or `hour,backend_class` for a 24h view) returns one row per (time bucket, backend class) instead of one per group: `{"key": "<bucket start, RFC3339 UTC>", "label": <same>, "backend_class": "self_hosted|cloud_managed|external_api|unrecorded", requests, prompt_tokens, completion_tokens, cache_read_tokens, cache_creation_tokens, cost_cents, unpriced_requests}`, chronological (bucket, then class). `limit` counts time buckets (the newest N are kept), not rows. Totals, `priced_coverage`, `currency` and `basis` are as for the single-dimension forms, which are unchanged.
+
+### Vendor usage reconciliation (billing keys)
+
+Estimates (price book x recorded tokens) are compared with what the vendor says it billed. Reading the vendor's reports needs a SEPARATE billing key per vendor: an Anthropic Admin API key (`sk-ant-admin01-…`) or an OpenAI organization admin key (`sk-admin-…`); inference keys are refused by those endpoints. Bedrock has no key: its status derives from the api's own AWS credential chain (Cost Explorer `ce:GetCostAndUsage`). The key is stored only in the cluster Secret `darkplum-billing-keys` (file `<vendor>-billing-key`), never in Postgres, logs or responses.
+
+- `POST /api/v1/providers/:vendor/billing-key/verify {key}` — `:vendor` is `anthropic` or `openai` (`404` otherwise). `200 {"state": "ok", "sample": {"day": "YYYY-MM-DD", "buckets": <integer>}}`. `422 {"error": {code, message, vendor_http_status?}}` with `code` one of `auth_failed`, `wrong_key_type`, `unreachable`, `vendor_error` (`message` is closed text, never vendor text). `400 invalid_key_format`, `403 insecure_transport`. Rate-limited like the inference-key routes.
+- `PUT /api/v1/providers/:vendor/billing-key {key}` — verify, store in the Secret, audit, then pull in the background. `200 {"state": "installed"}`; `422` as above (nothing stored); `503` `not_in_cluster|object_missing|forbidden|unavailable`. Audit: `provider.billing_key_installed` / `provider.billing_key_rotated` with `{vendor, key_last4}`.
+- `DELETE /api/v1/providers/:vendor/billing-key` — no body. `200 {"state": "not_configured"}`; audit `provider.billing_key_removed`. Already-pulled report rows are kept.
+- `POST /api/v1/usage/reconciliation/refresh` — pull every configured vendor now. `202 {"state": "pulling"}`; rate-limited to 1/min. The api also pulls at start, daily at 03:00 UTC, and after a key install (last 31 UTC days, both reports).
+- `GET /api/v1/usage/reconciliation?since&until&group_by=day|model|vendor` — `{"vendors": [{vendor, configured, state, last_pulled_at, key_last4}], "rows": [{key, label, vendor, estimated_cents, reported_cents, reported_tokens: {input, cached, output} | null, delta_cents}], "currency": "USD"}`. `state` is `not_configured|ok|auth_failed|wrong_key_type|unreachable|pulling`; cents are decimal strings (4 places), `null` when unknown; `delta_cents = reported - estimated` only when both exist. Estimates cover the billable vendors (anthropic, openai, bedrock) for all request purposes. `reported_tokens.input` is uncached + cache-creation tokens and `cached` is cache reads. For `group_by=model`, Anthropic/OpenAI model ids map 1:1; report lines without a model are keyed by their description, and Bedrock Cost Explorer usage types are mapped best-effort (`USE1-ClaudeHaiku45-input-tokens` -> family `claudehaiku45`, prefix-matched against recorded Bedrock model ids; ambiguous or unknown stays keyed by the usage type and labelled `unmapped`). Admin models list `providers[]` gains `billing: {configured, state, last_pulled_at}`.
+
 ### Refusals
 
 - `400 {"error": "..."}` — a body that does not validate (unknown model id, an alias in `allowed_models`, a `default_model` outside the effective allowlist).
@@ -113,6 +127,15 @@ Four routes let an admin install, rotate, change the catalogued models for, or r
 - `GET /api/v1/usage/summary` — auth: admin, surface: ui — filters: since, until
 - `GET /api/v1/usage/user-summary` — auth: admin, surface: ui — filters: since, until
 - `GET /api/v1/usage/key-summary` — auth: admin, surface: ui — filters: since, until
+- `GET /api/v1/usage/spend` — auth: admin, surface: ui — filters: group_by (required: user, api_key, model, provider, backend_class, alias, route, day, or the two-dimensional `day,backend_class` / `hour,backend_class`), user_id, api_key_id, model, purpose, denial_code, backend_class, since, until, limit (default 50, max 500; for the two-dimensional forms: number of time buckets, default 31 days / 24 hours, max 744)
+- `POST /api/v1/providers/:vendor/billing-key/verify` — auth: admin, surface: ui
+- `PUT /api/v1/providers/:vendor/billing-key` — auth: admin, surface: ui
+- `DELETE /api/v1/providers/:vendor/billing-key` — auth: admin, surface: ui
+- `GET /api/v1/usage/reconciliation` — auth: admin, surface: ui — filters: group_by (day, model, vendor; default day), since, until (RFC3339; default the last 30 days)
+- `POST /api/v1/usage/reconciliation/refresh` — auth: admin, surface: ui
+- `GET /api/v1/model-prices` — auth: admin, surface: ui
+- `PUT /api/v1/model-prices` — auth: admin, surface: ui
+- `DELETE /api/v1/model-prices/:id` — auth: admin, surface: ui
 - `GET /v1/models` — auth: api_key|session, surface: ui
 - `POST /v1/chat/completions` — auth: api_key|session, surface: ui
 

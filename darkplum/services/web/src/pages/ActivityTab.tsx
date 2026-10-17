@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useSearchParams } from 'react-router-dom'
 import { useTheme } from '../context/ThemeContext'
 import {
   Area,
@@ -54,8 +55,10 @@ import {
   vendorLabel,
 } from '../lib/modelRouting'
 import { useToast } from '../components/Toast'
-import { Badge, Button, EgressGlyph, Skeleton, Table, TableEmpty } from '../components/ui'
+import { Badge, Button, EgressGlyph, Skeleton, Tab, TabList, TabPanel, Table, TableEmpty } from '../components/ui'
+import { UNPRICED_HINT, formatCost, tokenSplitText } from '../lib/spend'
 import { ActivityDrawer } from './ActivityDrawer'
+import { SpendView } from './SpendView'
 import styles from './ActivityTab.module.css'
 
 // ---------------------------------------------------------------------------
@@ -77,6 +80,11 @@ const TIME_RANGES: { label: string; value: TimeRange }[] = [
   { label: '7d',  value: '7d'  },
   { label: '30d', value: '30d' },
 ]
+
+/** The two things this page answers: what happened (Requests) and what it
+ *  cost (Spend). `?view=` names the open one so either can be linked to. */
+type ActivityView = 'requests' | 'spend'
+const VIEW_SCOPE = 'activity-page'
 
 const LOG_VIEWS: { label: string; value: 'admin' | 'api' | 'all' }[] = [
   { label: 'Admin Events', value: 'admin' },
@@ -154,6 +162,12 @@ interface UnifiedEvent {
   /** Requests only, and only when the class was recorded: this one left the
    *  organisation's cloud account, to the vendor named here. */
   egress: string | null
+  /** Requests only: total tokens as "in → out", the full split (cache
+   *  included) for its tooltip, and the estimated cost. A null cost on a row
+   *  that has tokens is an unpriced model, not a free one. */
+  tokens: string | null
+  tokens_detail: string | null
+  cost: string | null
 }
 
 // ---------------------------------------------------------------------------
@@ -228,6 +242,9 @@ function adminEventToUnified(e: ActivityEvent): UnifiedEvent {
     route:          null,
     reason:         null,
     egress:         null,
+    tokens:         null,
+    tokens_detail:  null,
+    cost:           null,
   }
 }
 
@@ -283,6 +300,12 @@ function inferenceEventToUnified(e: InferenceEvent): UnifiedEvent {
       cls !== null && isEgress(displayClassOf({ backend_class: cls }))
         ? vendorLabel(e.provider)
         : null,
+    tokens:
+      e.prompt_tokens === null && e.completion_tokens === null
+        ? null
+        : `${(e.prompt_tokens ?? 0).toLocaleString()} → ${(e.completion_tokens ?? 0).toLocaleString()}`,
+    tokens_detail:  tokenSplitText(e),
+    cost:           formatCost(e.cost_cents ?? null),
   }
 }
 
@@ -324,6 +347,19 @@ export function ActivityTab() {
   const { toast } = useToast()
   const { theme } = useTheme()
   const chartColors = CHART_COLORS[theme]
+
+  const [searchParams, setSearchParams] = useSearchParams()
+  const view: ActivityView = searchParams.get('view') === 'spend' ? 'spend' : 'requests'
+  const selectView = useCallback(
+    (next: ActivityView) => {
+      const params = new URLSearchParams(searchParams)
+      if (next === 'requests') params.delete('view')
+      else params.set('view', next)
+      // Replace: a view switch is not somewhere Back should walk through.
+      setSearchParams(params, { replace: true })
+    },
+    [searchParams, setSearchParams],
+  )
 
   const [timeRange, setTimeRange] = useState<TimeRange>('24h')
   const [logView, setLogView]     = useState<'admin' | 'api' | 'all'>('all')
@@ -559,7 +595,10 @@ export function ActivityTab() {
   // Routing columns appear only when this page of events has routing to show:
   // two empty columns on every ordinary request would be clutter.
   const showRouting = unifiedEvents.some((e) => e.route || e.reason)
-  const columnCount = showRouting ? 7 : 5
+  // Tokens and cost belong to requests; on the admin-events log they would be
+  // two columns of dashes.
+  const showUsage = logView !== 'admin'
+  const columnCount = 5 + (showRouting ? 2 : 0) + (showUsage ? 2 : 0)
 
   // ---------------------------------------------------------------------------
   // Render
@@ -567,28 +606,39 @@ export function ActivityTab() {
 
   return (
     <div>
-      {/* Toolbar */}
+      <TabList label="Activity views" scope={VIEW_SCOPE}>
+        <Tab id="requests" active={view === 'requests'} onClick={() => selectView('requests')}>
+          Requests
+        </Tab>
+        <Tab id="spend" active={view === 'spend'} onClick={() => selectView('spend')}>
+          Spend
+        </Tab>
+      </TabList>
+
+      {/* Toolbar — the period applies to both views */}
       <div className={styles.toolbar}>
         <div className={styles.exportGroup}>
-          {(logView === 'admin' || logView === 'all') && (
+          {view === 'requests' && (logView === 'admin' || logView === 'all') && (
             <Button variant="secondary" size="sm" onClick={() => void handleExport('events')} disabled={exporting !== null}>
               <ExportIcon />
               {exporting === 'events' ? 'Preparing…' : 'Export admin events CSV'}
             </Button>
           )}
-          {(logView === 'api' || logView === 'all') && (
+          {view === 'requests' && (logView === 'api' || logView === 'all') && (
             <Button variant="secondary" size="sm" onClick={() => void handleExport('requests')} disabled={exporting !== null}>
               <ExportIcon />
               {exporting === 'requests' ? 'Preparing…' : 'Export requests CSV'}
             </Button>
           )}
         </div>
-        <div className={styles.timeRange}>
+        <div className={styles.timeRange} role="group" aria-label="Time period">
           {TIME_RANGES.map((r) => (
             <button
               key={r.value}
+              type="button"
               className={`${styles.timeRangeBtn} ${timeRange === r.value ? styles.timeRangeActive : ''}`}
               onClick={() => setTimeRange(r.value)}
+              aria-pressed={timeRange === r.value}
             >
               {r.label}
             </button>
@@ -596,6 +646,11 @@ export function ActivityTab() {
         </div>
       </div>
 
+      <TabPanel id="spend" scope={VIEW_SCOPE} active={view === 'spend'}>
+        <SpendView timeRange={timeRange} active={view === 'spend'} />
+      </TabPanel>
+
+      <TabPanel id="requests" scope={VIEW_SCOPE} active={view === 'requests'}>
       {/* Stat cards */}
       <div className={styles.statCards}>
         {/* Total Requests */}
@@ -944,6 +999,8 @@ export function ActivityTab() {
               <th>Details</th>
               {showRouting && <th>Route</th>}
               {showRouting && <th>Why</th>}
+              {showUsage && <th className={styles.numCol}>Tokens</th>}
+              {showUsage && <th className={styles.numCol}>Est. cost</th>}
               <th>IP</th>
             </tr>
           </thead>
@@ -1033,6 +1090,28 @@ export function ActivityTab() {
                         )}
                       </td>
                     )}
+                    {showUsage && (
+                      <td className={styles.numCol}>
+                        {e.tokens ? (
+                          <span className={styles.tokens} title={e.tokens_detail ?? undefined}>
+                            {e.tokens}
+                          </span>
+                        ) : (
+                          <span className={styles.muted}>—</span>
+                        )}
+                      </td>
+                    )}
+                    {showUsage && (
+                      <td className={styles.numCol}>
+                        {e.cost ? (
+                          e.cost
+                        ) : e.source === 'api' && e.tokens ? (
+                          <span className={styles.muted} title={UNPRICED_HINT} aria-label={UNPRICED_HINT}>—</span>
+                        ) : (
+                          <span className={styles.muted}>—</span>
+                        )}
+                      </td>
+                    )}
                     <td className={styles.muted}>{e.ip_address ?? '—'}</td>
                   </tr>
                 )
@@ -1058,8 +1137,9 @@ export function ActivityTab() {
           </div>
         )}
       </div>
+      </TabPanel>
 
-      {/* Drill-down drawer */}
+      {/* Drill-down drawer — outside both panels; it portals to <body>. */}
       <ActivityDrawer
         open={drawerUser !== null || drawerKey !== null}
         onClose={() => { setDrawerUser(null); setDrawerKey(null) }}

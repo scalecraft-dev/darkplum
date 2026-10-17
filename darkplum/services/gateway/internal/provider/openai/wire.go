@@ -63,8 +63,22 @@ type completionMessage struct {
 }
 
 type completionUsage struct {
-	PromptTokens     int `json:"prompt_tokens"`
-	CompletionTokens int `json:"completion_tokens"`
+	PromptTokens        int                 `json:"prompt_tokens"`
+	CompletionTokens    int                 `json:"completion_tokens"`
+	PromptTokensDetails *promptTokenDetails `json:"prompt_tokens_details,omitempty"`
+}
+
+// promptTokenDetails carries usage.prompt_tokens_details; cached_tokens is
+// the cache-read share of prompt_tokens (OpenAI has no cache-creation charge).
+type promptTokenDetails struct {
+	CachedTokens int `json:"cached_tokens"`
+}
+
+func (u *completionUsage) cachedTokens() int {
+	if u == nil || u.PromptTokensDetails == nil {
+		return 0
+	}
+	return u.PromptTokensDetails.CachedTokens
 }
 
 // ---------------------------------------------------------------------------

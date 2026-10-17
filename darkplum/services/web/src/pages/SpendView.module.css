@@ -1,0 +1,191 @@
+/* Activity > Spend. Tiles, chart card and table card reuse ActivityTab's
+   classes so the two views cannot drift apart; this file holds only what
+   Spend has and Requests does not. */
+
+/* The estimate framing, said once above everything it applies to. Same
+   measure and weight as the standing notes on the Models page. */
+.basisNote {
+  margin-bottom: var(--space-4);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-normal);
+  color: var(--fg-muted);
+  max-width: 68ch;
+}
+
+.unpricedSub {
+  color: var(--warning-fg);
+}
+
+.inlineLink {
+  color: var(--brand-fg);
+  font-weight: var(--fw-medium);
+  text-decoration: none;
+  border-radius: var(--radius-sm);
+}
+
+.inlineLink:hover {
+  text-decoration: underline;
+}
+
+.inlineLink:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
+/* --- Chart --- */
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.legendItem {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: var(--fs-xs);
+  color: var(--fg-muted);
+}
+
+.swatch {
+  flex-shrink: 0;
+  margin-right: var(--space-1);
+}
+
+.chartEmpty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  height: 240px;
+  font-size: var(--fs-sm);
+  color: var(--fg-muted);
+  text-align: center;
+}
+
+.tooltipList {
+  margin: var(--space-1) 0 0;
+  display: grid;
+  gap: var(--space-1);
+}
+
+.tooltipRow {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-4);
+  font-size: var(--fs-xs);
+  color: var(--fg-muted);
+}
+
+.tooltipRow dt {
+  display: inline-flex;
+  align-items: center;
+}
+
+.tooltipRow dd {
+  margin: 0;
+  color: var(--fg-default);
+  font-variant-numeric: tabular-nums;
+}
+
+.tooltipTotal {
+  padding-top: var(--space-1);
+  border-top: 1px solid var(--border-default);
+  font-weight: var(--fw-medium);
+}
+
+/* --- Table --- */
+
+.tableHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  margin-bottom: var(--space-3);
+}
+
+.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.mutedNum {
+  color: var(--fg-subtle);
+}
+
+.sortBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+}
+
+.sortBtn:hover {
+  color: var(--fg-default);
+}
+
+.sortBtn:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
+/* Reserves its width so the header does not shift when the arrow appears. */
+.sortMark {
+  display: inline-block;
+  width: 1ch;
+}
+
+.labelCell {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--fg-default);
+  white-space: nowrap;
+}
+
+.unpriced {
+  color: var(--fg-subtle);
+  cursor: help;
+  border-radius: var(--radius-sm);
+}
+
+.unpriced:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
+.unpricedCount {
+  color: var(--warning-fg);
+}
+
+.tableFoot {
+  padding: var(--space-3) var(--space-5);
+  border-top: 1px solid var(--border-muted);
+  font-size: var(--fs-xs);
+  color: var(--fg-muted);
+}
+
+/* Table.module.css left-aligns every header at (0,1,2); a numeric column's
+   header has to sit over its right-aligned figures. */
+th.num.num {
+  text-align: right;
+}

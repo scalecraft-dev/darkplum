@@ -38,7 +38,7 @@ export DOCKER_CLI_HINTS = false
 export DOCKER_CLI_HOOKS = 0
 
 .PHONY: help check-prereqs _require-outputs _deploy-vllm deploy deploy-infra deploy-k8s deploy-platform build-images push-images configure-sso test status destroy \
-       deploy-model remove-model list-models verify-bedrock-iam expose-web unexpose-web set-hf-token set-anthropic-key set-openai-key remove-anthropic-key remove-openai-key deploy-semantic-router remove-semantic-router \
+       deploy-model remove-model list-models verify-bedrock-iam expose-web unexpose-web set-hf-token set-anthropic-key set-openai-key remove-anthropic-key remove-openai-key set-anthropic-billing-key set-openai-billing-key remove-anthropic-billing-key remove-openai-billing-key deploy-semantic-router remove-semantic-router \
        dev-up dev-down dev-build-gateway dev-build-api dev-build-web dev-status dev-logs dev-test
 
 help: ## Show this help
@@ -689,6 +689,57 @@ set-anthropic-key set-openai-key:
 	echo "Nothing can answer yet. New models start disabled, and the organisation's routing policy keeps prompts"; \
 	echo "inside your cloud account until an administrator allows otherwise:"; \
 	echo "  Open Admin > Models$(if $(DEV), at http://localhost:$(DEV_PORT)/admin/models,) and choose \"Review and enable\"."
+
+# -----------------------------------------------------------------------------
+# Vendor BILLING keys (optional): an Anthropic Admin API key / OpenAI admin key
+# used ONLY by the api's daily usage-and-cost reconciliation. Deliberately a
+# different credential and a different Secret (darkplum-billing-keys) from the
+# inference key: an admin-scope key can list the organisation's workspaces and
+# keys, so it never goes near the gateway. Same handling rules as above: read
+# from the environment, never argv, checked against the vendor before storing.
+# -----------------------------------------------------------------------------
+set-anthropic-billing-key remove-anthropic-billing-key: BK_VENDOR := Anthropic
+set-anthropic-billing-key remove-anthropic-billing-key: BK_ENV := ANTHROPIC_ADMIN_KEY
+set-anthropic-billing-key remove-anthropic-billing-key: BK_FILE := anthropic-billing-key
+set-anthropic-billing-key: BK_AUTH := x-api-key: 
+set-anthropic-billing-key: BK_EXTRA := header = "anthropic-version: 2023-06-01"
+set-anthropic-billing-key: BK_URL := https://api.anthropic.com/v1/organizations/usage_report/messages?starting_at=$$(date -u -v-1d +%Y-%m-%dT00:00:00Z 2>/dev/null || date -u -d yesterday +%Y-%m-%dT00:00:00Z)&ending_at=$$(date -u +%Y-%m-%dT00:00:00Z)&bucket_width=1d
+set-anthropic-billing-key: BK_HINT := an Admin API key (sk-ant-admin01-...) from console.anthropic.com > Settings > Admin keys; an inference key is refused by the usage endpoint
+
+set-openai-billing-key remove-openai-billing-key: BK_VENDOR := OpenAI
+set-openai-billing-key remove-openai-billing-key: BK_ENV := OPENAI_ADMIN_KEY
+set-openai-billing-key remove-openai-billing-key: BK_FILE := openai-billing-key
+set-openai-billing-key: BK_AUTH := Authorization: Bearer 
+set-openai-billing-key: BK_EXTRA :=
+set-openai-billing-key: BK_URL := https://api.openai.com/v1/organization/costs?start_time=$$(( $$(date +%s) - 86400 ))&limit=1
+set-openai-billing-key: BK_HINT := an organisation admin key from platform.openai.com > Settings > Organization > Admin keys; a project key is refused by the costs endpoint
+
+set-anthropic-billing-key: ## Install or rotate the Anthropic BILLING (Admin API) key for cost reconciliation: read -s ANTHROPIC_ADMIN_KEY && export ANTHROPIC_ADMIN_KEY && make set-anthropic-billing-key [DEV=1]
+set-openai-billing-key: ## Install or rotate the OpenAI BILLING (admin) key for cost reconciliation: read -s OPENAI_ADMIN_KEY && export OPENAI_ADMIN_KEY && make set-openai-billing-key [DEV=1]
+set-anthropic-billing-key set-openai-billing-key:
+	@KEY="$${$(BK_ENV)}"; \
+	[ -n "$$KEY" ] || { echo "ERROR: set $(BK_ENV) in the environment first, e.g.  read -s $(BK_ENV) && export $(BK_ENV)"; exit 1; }; \
+	[[ "$$KEY" =~ ^[A-Za-z0-9_-]+$$ ]] || { echo "ERROR: $(BK_ENV) contains characters no $(BK_VENDOR) key has. Nothing was changed."; exit 1; }; \
+	K="$(_PK_KUBECTL)"; NS=darkplum-system; \
+	echo "Checking that the key can read $(BK_VENDOR) usage (admin scope)..."; \
+	RESP=$$(printf 'header = "$(BK_AUTH)%s"\n$(BK_EXTRA)\n' "$$KEY" | curl -sS --max-time 30 -K - -w '\n%{http_code}' "$(BK_URL)") || { echo "ERROR: could not reach $(BK_VENDOR). Nothing was changed."; exit 1; }; \
+	CODE=$$(echo "$$RESP" | tail -1); \
+	[ "$$CODE" = "200" ] || { echo "ERROR: $(BK_VENDOR) answered HTTP $$CODE to a usage query with this key. It needs $(BK_HINT). Nothing was changed."; exit 1; }; \
+	$$K get secret darkplum-billing-keys -n $$NS >/dev/null 2>&1 || $$K create secret generic darkplum-billing-keys -n $$NS >/dev/null; \
+	printf '{"data":{"$(BK_FILE)":"%s"}}' "$$(printf '%s' "$$KEY" | base64 | tr -d '\n')" | \
+		$$K patch secret darkplum-billing-keys -n $$NS --type merge --patch-file /dev/stdin >/dev/null; \
+	echo ""; \
+	echo "$(BK_VENDOR) billing key stored in $$NS/darkplum-billing-keys. The api picks it up within about two minutes and"; \
+	echo "pulls $(BK_VENDOR)'s usage and cost reports once a day (and now); see Admin > Activity > Spend."; \
+	echo "This key can read your organisation's workspaces and keys: keep it separate from the inference key, and revoke it at"; \
+	echo "$(BK_VENDOR) if you remove it here."
+
+remove-anthropic-billing-key: ## Remove the Anthropic billing key (reconciliation stops; estimates continue) [DEV=1]
+remove-openai-billing-key: ## Remove the OpenAI billing key (reconciliation stops; estimates continue) [DEV=1]
+remove-anthropic-billing-key remove-openai-billing-key:
+	@K="$(_PK_KUBECTL)"; NS=darkplum-system; \
+	$$K patch secret darkplum-billing-keys -n $$NS --type json -p '[{"op":"remove","path":"/data/$(BK_FILE)"}]' >/dev/null 2>&1 || true; \
+	echo "$(BK_VENDOR) billing key removed. Estimated spend keeps working; vendor-reported figures stop updating. Revoke the key at $(BK_VENDOR) too."
 
 remove-anthropic-key: ## Remove the org's Anthropic key and catalog filter (its models stop answering) [DEV=1]
 remove-openai-key: ## Remove the org's OpenAI key and catalog filter (its models stop answering) [DEV=1]

@@ -398,6 +398,69 @@
   {
     "service": "api",
     "method": "GET",
+    "path": "/api/v1/usage/spend",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "POST",
+    "path": "/api/v1/providers/:vendor/billing-key/verify",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "PUT",
+    "path": "/api/v1/providers/:vendor/billing-key",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "DELETE",
+    "path": "/api/v1/providers/:vendor/billing-key",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/api/v1/usage/reconciliation",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "POST",
+    "path": "/api/v1/usage/reconciliation/refresh",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/api/v1/model-prices",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "PUT",
+    "path": "/api/v1/model-prices",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "DELETE",
+    "path": "/api/v1/model-prices/:id",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
     "path": "/v1/models",
     "auth": "api_key|session",
     "surface": "ui"

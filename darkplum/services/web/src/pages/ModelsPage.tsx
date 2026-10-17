@@ -79,7 +79,9 @@ import { RoutingPolicyCard, type OrgPolicyDraft } from './RoutingPolicyCard'
 import { VendorEnableModal } from './VendorEnableModal'
 import { VendorInstallModal, type Outcome, type VendorInstallMode } from './VendorInstallModal'
 import { VendorStatusSection } from './VendorStatusSection'
+import { VendorBillingKeyModal, type BillingKeyMode } from './VendorBillingKeyModal'
 import pageStyles from './PageLayout.module.css'
+import { PricesTab } from './PricesTab'
 import styles from './ModelsPage.module.css'
 
 /** Access overview page size. The API caps a page at 200; a smaller first
@@ -102,13 +104,13 @@ type Filter = 'all' | 'enabled' | 'disabled'
  *  which of it anyone actually reaches. Each is a tab; `?tab=` names the open
  *  one so either can be linked to. Aliases and routed aliases have their own
  *  page, Admin > Routing; `?tab=aliases` is redirected there so old links land. */
-type TabKey = 'models' | 'policy'
+type TabKey = 'models' | 'policy' | 'prices'
 /** Prefix for this page's tab/panel DOM ids, so another tab set on the same
  *  page could never share an id with these. */
 const TAB_SCOPE = 'models-page'
 
 function tabFromParam(value: string | null): TabKey {
-  return value === 'policy' ? value : 'models'
+  return value === 'policy' || value === 'prices' ? value : 'models'
 }
 
 /** Extract the vendor from a Bedrock inference profile ID.
@@ -684,6 +686,10 @@ function ModelsPageBody() {
   const [managing, setManaging] = useState<{ vendor: VendorName; mode: VendorInstallMode } | null>(
     null,
   )
+  /** The billing-key modal: a separate credential, a separate modal. */
+  const [managingBilling, setManagingBilling] = useState<
+    { vendor: VendorName; mode: BillingKeyMode } | null
+  >(null)
   /** Which vendor's "Review and enable" is open, or null. One at a time: it
    *  writes the organisation's policy, and two of those racing is not a state
    *  worth supporting. */
@@ -1196,6 +1202,13 @@ function ModelsPageBody() {
           </svg>
           Policy
         </Tab>
+        <Tab id="prices" active={tab === 'prices'} onClick={() => selectTab('prices')}>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <line x1="12" y1="1" x2="12" y2="23" />
+            <path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" />
+          </svg>
+          Prices
+        </Tab>
       </TabList>
 
       <TabPanel id="models" scope={TAB_SCOPE} active={tab === 'models'}>
@@ -1227,6 +1240,7 @@ function ModelsPageBody() {
           onRename={handleRename}
           onReviewAndEnable={setEnablingVendor}
           onManageVendor={(vendor, mode) => setManaging({ vendor, mode })}
+          onManageBilling={(vendor, mode) => setManagingBilling({ vendor, mode })}
           onCheckAgain={() => void loadModels()}
           onAdoptFilter={handleAdoptFilter}
         />
@@ -1254,6 +1268,13 @@ function ModelsPageBody() {
           onRetry={() => void loadPrincipals()}
           onLoadMore={() => void loadMorePrincipals()}
         />
+      </TabPanel>
+
+      {/* Self-contained: its own reads and its two small modals. Those portal
+          to <body>; the Tabs seam note applies (a modal's focus trap blocks
+          every way of switching tabs while it is open). */}
+      <TabPanel id="prices" scope={TAB_SCOPE} active={tab === 'prices'}>
+        <PricesTab />
       </TabPanel>
 
       {/* Outside every TabPanel. A modal renders into a portal, so putting it
@@ -1346,6 +1367,27 @@ function ModelsPageBody() {
           onDone={handleVendorOutcome}
         />
       )}
+
+      {/* Same placement rule as the key modal above. */}
+      {managingBilling !== null && (
+        <VendorBillingKeyModal
+          open
+          vendor={managingBilling.vendor}
+          mode={managingBilling.mode}
+          transportOk={keyTransportAllowed}
+          onClose={() => setManagingBilling(null)}
+          onDone={(kind) => {
+            const name = vendorLabel(managingBilling.vendor)
+            toast(
+              kind === 'installed'
+                ? `${name} billing key stored — reports are pulled on the next daily run, or with Pull now under Activity > Spend`
+                : `${name} billing key removed — revoke it in ${name}'s console too`,
+              'success',
+            )
+            void loadModels()
+          }}
+        />
+      )}
     </div>
   )
 }
@@ -1384,6 +1426,7 @@ interface ModelsTabProps {
   onRename: (model: AdminModel, displayName: string | null) => Promise<void>
   onReviewAndEnable: (vendor: VendorName) => void
   onManageVendor: (vendor: VendorName, mode: VendorInstallMode) => void
+  onManageBilling: (vendor: VendorName, mode: BillingKeyMode) => void
   onCheckAgain: () => void
   onAdoptFilter: (vendor: VendorName, filter: string[]) => Promise<void>
 }
@@ -1416,6 +1459,7 @@ function ModelsTab({
   onRename,
   onReviewAndEnable,
   onManageVendor,
+  onManageBilling,
   onCheckAgain,
   onAdoptFilter,
 }: ModelsTabProps) {
@@ -1465,6 +1509,7 @@ function ModelsTab({
         onReviewAndEnable={onReviewAndEnable}
         onCheckAgain={onCheckAgain}
         onAdoptFilter={onAdoptFilter}
+        onManageBilling={onManageBilling}
       />
 
       {/* Named for anyone navigating by heading, like the other two tabs; the

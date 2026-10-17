@@ -160,6 +160,58 @@ export interface ProviderStatus {
   /** The Anthropic workspace every request with this key names, or null when
    *  none is set. Not a secret. Absent on an api that predates it. */
   workspace_id?: string | null
+  /** The vendor billing key: a separate, broader credential (Anthropic Admin
+   *  API key / OpenAI organisation admin key) held by the api alone for the
+   *  daily reconciliation job. Undefined on an api that predates it — the card
+   *  then offers nothing for it rather than a form whose routes would 404. */
+  billing?: ProviderBilling
+}
+
+/** What the reconciliation job last managed to do with a vendor's billing
+ *  key (or, for Bedrock, with the api's AWS role). Closed vocabulary. */
+export type BillingState =
+  | 'not_configured'
+  | 'ok'
+  | 'auth_failed'
+  | 'wrong_key_type'
+  | 'unreachable'
+  | 'pulling'
+
+export interface ProviderBilling {
+  configured: boolean
+  state: BillingState
+  last_pulled_at: string | null
+}
+
+/** A vendor whose own usage and cost reports Darkplum can pull. */
+export type ReconciliationVendor = 'anthropic' | 'openai' | 'bedrock'
+
+export interface ReconciliationVendorStatus {
+  vendor: ReconciliationVendor
+  configured: boolean
+  state: BillingState
+  last_pulled_at: string | null
+  key_last4: string | null
+}
+
+export type ReconciliationGroupBy = 'day' | 'model' | 'vendor'
+
+export interface ReconciliationRow {
+  key: string
+  label: string
+  vendor: ReconciliationVendor | string
+  /** US cents as decimal strings. null when that side has no figure. */
+  estimated_cents: string | null
+  reported_cents: string | null
+  reported_tokens: { input: number; cached: number; output: number } | null
+  /** reported − estimated, signed. null unless both sides exist. */
+  delta_cents: string | null
+}
+
+export interface ReconciliationReport {
+  vendors: ReconciliationVendorStatus[]
+  rows: ReconciliationRow[]
+  currency: 'USD' | string
 }
 
 /** A route the administrator wrote, as the chat-facing model list exposes it:
@@ -544,6 +596,13 @@ export interface InferenceEvent {
   latency_ms: number
   prompt_tokens: number | null
   completion_tokens: number | null
+  /** The cached split of prompt_tokens — never in addition to it. null when
+   *  the backend reported no usage; absent on an older api. */
+  cache_read_tokens?: number | null
+  cache_creation_tokens?: number | null
+  /** Estimated cost at list price, in US cents, as a decimal string so no
+   *  precision is lost on the way. null when no price row matched. */
+  cost_cents?: string | null
   stream: boolean
   ip_address: string | null
   created_at: string
@@ -590,4 +649,93 @@ export interface KeyUsageSummary {
   request_count: number
   avg_latency_ms: number
   last_active: string
+}
+
+// ---------------------------------------------------------------------------
+// Spend (estimated, at list price) and the price table behind it
+// ---------------------------------------------------------------------------
+
+export type SpendGroupBy =
+  | 'user'
+  | 'api_key'
+  | 'model'
+  | 'provider'
+  | 'backend_class'
+  | 'alias'
+  | 'route'
+  | 'day'
+
+export interface SpendTotals {
+  requests: number
+  prompt_tokens: number
+  completion_tokens: number
+  cache_read_tokens: number
+  cache_creation_tokens: number
+  /** US cents as a decimal string; null when nothing in the set was priced. */
+  cost_cents: string | null
+  unpriced_requests: number
+}
+
+export interface SpendRow extends SpendTotals {
+  /** The grouping value (a user id, a model id, a class…). Empty or null when
+   *  the request carried none — an unrouted request has no route. */
+  key: string | null
+  label: string | null
+  /** Present only on the two-dimensional groupings (day|hour,backend_class),
+   *  where `key` is the RFC3339 UTC bucket start and this is the class
+   *  ('unrecorded' when none was recorded). */
+  backend_class?: string
+}
+
+/** The chart's one read: every time bucket × backend class, chronological. */
+export type SpendTimelineGroupBy = 'day,backend_class' | 'hour,backend_class'
+
+export interface SpendReport {
+  totals: SpendTotals
+  rows: SpendRow[]
+  /** Share of requests that matched a price row, 0..1. */
+  priced_coverage: number
+  currency: 'USD' | string
+  basis: 'list_price_estimate' | string
+}
+
+/** Decimal values arrive as strings (no float rounding on money); a number is
+ *  tolerated so a server that sends one still renders. */
+export type Decimal = string | number
+
+export interface ModelPrice {
+  id: string
+  provider: string
+  /** Glob over model ids, e.g. claude-sonnet-4*. */
+  model_pattern: string
+  /** null or '' = any region. */
+  region: string | null
+  input_per_mtok: Decimal
+  output_per_mtok: Decimal
+  cache_read_per_mtok: Decimal | null
+  cache_write_per_mtok: Decimal | null
+  effective_from: string
+  /** null while the row is in force. */
+  effective_to: string | null
+  source: 'seed' | 'admin'
+  notes: string | null
+}
+
+export interface ModelPricesResult {
+  rows: ModelPrice[]
+  seed_generated_at: string | null
+}
+
+/** A PUT body. Without id: a new admin row. With id: replaces that row from
+ *  now on; the old row is kept, closed, so past estimates do not move. */
+export interface ModelPriceInput {
+  id?: string
+  provider: string
+  model_pattern: string
+  region: string | null
+  input_per_mtok: string
+  output_per_mtok: string
+  cache_read_per_mtok: string | null
+  cache_write_per_mtok: string | null
+  notes: string | null
 }

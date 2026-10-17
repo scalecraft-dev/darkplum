@@ -72,6 +72,20 @@ const (
 	// /api/v1/providers/:vendor/filter. Detail carries {vendor,
 	// model_filter_before, model_filter_after} -- no key_last4.
 	ProviderFilterChanged EventType = "provider.filter_changed"
+
+	// ProviderBillingKeyInstalled / Rotated / Removed are recorded on PUT /
+	// DELETE /api/v1/providers/:vendor/billing-key (the separate admin-scope
+	// key used only to read the vendor's usage and cost reports). Detail
+	// carries {vendor, key_last4} (no key_last4 on removal); the key itself
+	// is never stored anywhere but the cluster Secret.
+	ProviderBillingKeyInstalled EventType = "provider.billing_key_installed"
+	ProviderBillingKeyRotated   EventType = "provider.billing_key_rotated"
+	ProviderBillingKeyRemoved   EventType = "provider.billing_key_removed"
+
+	// ModelPriceChanged is recorded on every PUT/DELETE /api/v1/model-prices.
+	// Detail carries {action: created|replaced|retired, before, after}
+	// (price-row objects; null where not applicable).
+	ModelPriceChanged EventType = "model_price.changed"
 )
 
 // Event is the input to Recorder.Record.

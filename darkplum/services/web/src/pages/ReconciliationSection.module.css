@@ -1,0 +1,160 @@
+/* Activity > Spend > Reconciliation. The table, toggle and empty state reuse
+   ActivityTab's and SpendView's classes; this file holds the section frame and
+   the vendor chips, which use the Model vendors card's vocabulary (same row
+   surface, same head row, same muted detail) so a state read on one screen
+   reads the same on the other. */
+
+.section {
+  margin-top: var(--space-8);
+  padding-top: var(--space-6);
+  border-top: 1px solid var(--border-default);
+}
+
+.head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  margin-bottom: var(--space-4);
+}
+
+.title {
+  font-size: var(--fs-md);
+  font-weight: var(--fw-semibold);
+  color: var(--fg-default);
+  letter-spacing: -0.01em;
+}
+
+.subtitle {
+  margin-top: 2px;
+  font-size: var(--fs-sm);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-muted);
+  max-width: 68ch;
+}
+
+/* --- vendor chips --- */
+
+.chips {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--space-3);
+  list-style: none;
+  margin: 0 0 var(--space-3);
+  padding: 0;
+}
+
+.chip {
+  padding: var(--space-3) var(--space-4);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  min-width: 0;
+}
+
+.chipHead {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.chipName {
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+  color: var(--fg-default);
+}
+
+.chipMeta {
+  margin-top: var(--space-1);
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+}
+
+.chipDetail {
+  margin-top: var(--space-1);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-muted);
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--fg-default);
+}
+
+/* Standing sentences: the Bedrock line and the expected-deltas line. Same
+   measure and weight as SpendView's basis note. */
+.note {
+  margin-bottom: var(--space-3);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-muted);
+  max-width: 76ch;
+}
+
+/* The error and empty states sit in a table card's frame so the section does
+   not change shape between "nothing to compare" and the table. */
+.placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-5);
+  font-size: var(--fs-sm);
+  color: var(--fg-muted);
+  text-align: center;
+}
+
+.emptyHint {
+  max-width: 64ch;
+  line-height: var(--lh-relaxed);
+}
+
+/* --- the difference column ---
+   Colour is never the only cue: each direction carries a glyph and a sign,
+   and a screen reader hears the sentence instead. Over (the vendor billed more
+   than estimated) is amber because it is the one worth a look; under is the
+   ordinary contract-discount case and stays quiet. */
+
+.delta {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.deltaGlyph {
+  font-size: var(--fs-xs);
+}
+
+.over {
+  color: var(--warning-fg);
+}
+
+.under {
+  color: var(--info-fg);
+}
+
+.even {
+  color: var(--fg-subtle);
+}
+
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (max-width: 767px) {
+  .chips {
+    grid-template-columns: 1fr;
+  }
+}

@@ -169,6 +169,20 @@
   white-space: nowrap;
 }
 
+/* Per-request tokens and estimated cost: numbers, so right-aligned and
+   tabular. The full token split (cache read / write) is on the tooltip. */
+.numCol {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  font-size: var(--fs-xs);
+}
+
+.tokens {
+  color: var(--fg-muted);
+  cursor: help;
+}
+
 /* --- Empty state --- */
 
 .empty {
@@ -517,4 +531,9 @@
   .clearFilters {
     transition-duration: 0.01ms !important;
   }
+}
+
+/* See SpendView.module.css: beats Table's (0,1,2) header alignment. */
+th.numCol.numCol {
+  text-align: right;
 }

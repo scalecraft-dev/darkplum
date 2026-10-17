@@ -259,3 +259,23 @@
     margin-left: 0;
   }
 }
+
+/* --- billing key ---
+   Inside the vendor's row, under everything about the inference key, and set
+   apart by a rule and its own heading: the same vendor, a different and
+   broader credential. Not a nested card — a second frame inside the row would
+   read as a second vendor. */
+
+.billing {
+  margin-top: var(--space-4);
+  padding-top: var(--space-3);
+  border-top: 1px dashed var(--border-default);
+}
+
+.billingTitle {
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--fg-subtle);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}

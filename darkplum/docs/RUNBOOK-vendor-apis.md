@@ -242,6 +242,51 @@ routes at models that do not require review, or do not enable them. An SCP
 denying `bedrock:PutAccountDataRetention` unless the mode is `none` enforces that
 organisation-wide — see the AWS data-retention documentation.
 
+## 4c. Usage, cost and the billing key
+
+Darkplum records every request's tokens with who sent it, which key, model,
+alias, route and backend. **Admin > Activity > Spend** turns that into an
+estimated cost at the vendors' published list prices (**Admin > Models >
+Prices** holds the price list: seeded from the vendors' pricing pages on the
+date shown, versioned, editable — replace a row when a vendor changes a price).
+Estimates are per person, key, model, alias, route and backend; that
+attribution exists nowhere else, because vendors only report by workspace,
+project, key and model.
+
+**Reconciling against the vendor's own numbers is optional and uses a separate
+credential.** Anthropic's usage and cost reports need an **Admin API key**
+(`sk-ant-admin01-…`, Console > Settings > Admin keys); the inference key —
+even the organisation-level one — is refused, and a workspace key cannot read
+them at all. OpenAI's `/organization/usage` and `/organization/costs` need an
+organisation **admin key**, not a project key. These keys can list your
+organisation's workspaces, projects and keys, so Darkplum treats them as a
+different thing from the inference key:
+
+- They live in their own Secret (`darkplum-system/darkplum-billing-keys`),
+  mounted into the **api** only — the gateway never has them.
+- They are used by one daily job (and once on install) that pulls the last 31
+  days of usage and cost reports; nothing else reads them.
+- Install from Admin > Models (the *Billing key* section on each vendor card,
+  visibly apart from the inference key) or:
+
+```bash
+read -s ANTHROPIC_ADMIN_KEY && export ANTHROPIC_ADMIN_KEY
+make set-anthropic-billing-key            # checks it can read usage first
+read -s OPENAI_ADMIN_KEY && export OPENAI_ADMIN_KEY
+make set-openai-billing-key
+```
+
+Spend then shows *vendor-reported* beside *estimated*, per day and per model,
+with the difference. Expect small deltas: list price versus your contract,
+rounding, and up to a day of reporting lag (Anthropic says usage appears within
+about five minutes; cost reports are daily). Bedrock spend comes from AWS Cost
+Explorer (`ce:GetCostAndUsage`, the api's own read-only Pod Identity role; a
+local stack uses the developer's credentials with `DEV_AWS=1`), which lags up
+to 24 hours and reports by usage type rather than model id.
+
+Removing a billing key (`make remove-…-billing-key` or the card) stops the
+pulls; estimates keep working. Revoke it at the vendor as well.
+
 ## 5. Turning a vendor off
 
 *Remove key* on the vendor's card (it asks you to type the vendor's name, and

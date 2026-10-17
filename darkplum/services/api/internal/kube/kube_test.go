@@ -392,3 +392,20 @@ func TestNetJoinHostPort(t *testing.T) {
 		})
 	}
 }
+
+func TestWriter_NamedSecretKey(t *testing.T) {
+	f := newFakeAPIServer(t)
+	w, _ := writerFor(t, f, "tok-1", "darkplum-system")
+	if err := w.SetNamedSecretKey(context.Background(), BillingKeysSecret, "anthropic-billing-key", []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	if f.lastPath != "/api/v1/namespaces/darkplum-system/secrets/darkplum-billing-keys" {
+		t.Fatalf("path = %s", f.lastPath)
+	}
+	if err := w.RemoveNamedSecretKey(context.Background(), BillingKeysSecret, "anthropic-billing-key"); err != nil {
+		t.Fatal(err)
+	}
+	if f.lastPath != "/api/v1/namespaces/darkplum-system/secrets/darkplum-billing-keys" || string(f.lastBody) != `{"data":{"anthropic-billing-key":null}}` {
+		t.Fatalf("remove: %s %s", f.lastPath, f.lastBody)
+	}
+}

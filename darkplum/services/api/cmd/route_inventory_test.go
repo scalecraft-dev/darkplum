@@ -35,6 +35,7 @@ import (
 
 	"github.com/scalecraft/darkplum/api/internal/activity"
 	"github.com/scalecraft/darkplum/api/internal/auth"
+	"github.com/scalecraft/darkplum/api/internal/billing"
 	"github.com/scalecraft/darkplum/api/internal/db"
 	"github.com/scalecraft/darkplum/api/internal/handler"
 	"github.com/scalecraft/darkplum/api/internal/kube"
@@ -175,12 +176,14 @@ func TestRouteInventoryMatchesGolden(t *testing.T) {
 	policy := handler.NewPolicyHandler(pool, activityRecorder, "http://unused.invalid", "unused")
 	modelHandler := handler.NewModelHandler("http://unused.invalid", "unused", pool)
 	conversations := handler.NewConversationHandler(pool, activityRecorder)
+	prices := handler.NewPricingHandler(pool, activityRecorder)
 	providers := handler.NewProvidersHandler(pool, activityRecorder, "http://unused.invalid", "unused", kube.NewWriter(), modelHandler, true)
 
 	baseDeps := routerDeps{
 		pool: pool, authCfg: authCfg, sessionMW: sessionMW, localProvider: localProvider,
 		users: users, keys: keys, chat: chat, activityH: activityH, routing: routing,
-		policy: policy, modelHandler: modelHandler, conversations: conversations, providers: providers,
+		policy: policy, modelHandler: modelHandler, conversations: conversations, providers: providers, prices: prices,
+		billing: handler.NewBillingHandler(pool, activityRecorder, billing.NewService(&billing.Store{DB: pool}, billing.KeyReader{}, nil, nil, nil), kube.NewWriter(), true),
 	}
 
 	// Branch 1: local auth only (oidcProvider nil) — the default install.

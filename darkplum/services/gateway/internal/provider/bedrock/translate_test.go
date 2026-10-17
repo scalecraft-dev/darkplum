@@ -796,3 +796,39 @@ func assertErrorResponse(t *testing.T, code int, body []byte, wantCode int, want
 }
 
 func strPtr(s string) *string { return &s }
+
+func TestTranslateResponse_CacheTokens(t *testing.T) {
+	out := converseOutput("hi", types.StopReasonEndTurn, 10, 5)
+	read, write := int32(70), int32(20)
+	out.Usage.CacheReadInputTokens = &read
+	out.Usage.CacheWriteInputTokens = &write
+
+	resp, err := translateResponse(out, "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.PromptTokens != 100 || resp.CacheReadTokens != 70 || resp.CacheCreationTokens != 20 {
+		t.Errorf("prompt=%d read=%d create=%d, want 100/70/20 (input+read+write)", resp.PromptTokens, resp.CacheReadTokens, resp.CacheCreationTokens)
+	}
+
+	resp, _ = translateResponse(converseOutput("hi", types.StopReasonEndTurn, 10, 5), "m")
+	if resp.CacheReadTokens != 0 || resp.CacheCreationTokens != 0 {
+		t.Errorf("absent cache fields must be 0, got %d/%d", resp.CacheReadTokens, resp.CacheCreationTokens)
+	}
+}
+
+func TestTranslateStreamEvent_MetadataCapturesCacheTokens(t *testing.T) {
+	input, output, read, write := int32(42), int32(17), int32(30), int32(8)
+	event := &types.ConverseStreamOutputMemberMetadata{
+		Value: types.ConverseStreamMetadataEvent{
+			Usage: &types.TokenUsage{InputTokens: &input, OutputTokens: &output, CacheReadInputTokens: &read, CacheWriteInputTokens: &write},
+		},
+	}
+	stats := &provider.StreamStats{}
+	if _, err := translateStreamEvent(event, "id", "model", stats, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if stats.PromptTokens != 80 || stats.CacheReadTokens != 30 || stats.CacheCreationTokens != 8 {
+		t.Errorf("prompt=%d read=%d create=%d, want 80/30/8 (input+read+write)", stats.PromptTokens, stats.CacheReadTokens, stats.CacheCreationTokens)
+	}
+}

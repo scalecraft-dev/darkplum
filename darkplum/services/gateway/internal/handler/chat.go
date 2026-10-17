@@ -766,6 +766,8 @@ func (h *ChatHandler) handleStream(c *gin.Context, prov provider.Provider, chatR
 	if stats != nil {
 		c.Set("prompt_tokens", stats.PromptTokens)
 		c.Set("completion_tokens", stats.CompletionTokens)
+		c.Set("cache_read_tokens", stats.CacheReadTokens)
+		c.Set("cache_creation_tokens", stats.CacheCreationTokens)
 	}
 }
 
@@ -791,6 +793,8 @@ func (h *ChatHandler) handleComplete(c *gin.Context, prov provider.Provider, cha
 
 	c.Set("prompt_tokens", resp.PromptTokens)
 	c.Set("completion_tokens", resp.CompletionTokens)
+	c.Set("cache_read_tokens", resp.CacheReadTokens)
+	c.Set("cache_creation_tokens", resp.CacheCreationTokens)
 
 	c.Data(http.StatusOK, "application/json", body)
 }

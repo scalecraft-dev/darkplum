@@ -82,6 +82,9 @@ spec:
                   name: darkplum-auth
                   key: SECURE_COOKIES
                   optional: true
+            # Where the optional vendor billing keys are mounted (see volumes).
+            - name: BILLING_KEYS_DIR
+              value: /var/run/darkplum/billing-keys
           readinessProbe:
             httpGet:
               path: /health
@@ -96,7 +99,19 @@ spec:
             initialDelaySeconds: 15
             periodSeconds: 20
             failureThreshold: 3
+          volumeMounts:
+            # Vendor billing (admin-scope) keys, one file per vendor
+            # (anthropic-billing-key, openai-billing-key). File mount so a
+            # rotation needs no rollout; optional so the api starts without any.
+            - name: billing-keys
+              mountPath: /var/run/darkplum/billing-keys
+              readOnly: true
           resources:
             requests:
               memory: 128Mi
               cpu: 100m
+      volumes:
+        - name: billing-keys
+          secret:
+            secretName: darkplum-billing-keys
+            optional: true

@@ -264,6 +264,7 @@ func toChatResponse(cr *chatCompletionResponse) (*provider.ChatResponse, error) 
 	if cr.Usage != nil {
 		resp.PromptTokens = cr.Usage.PromptTokens
 		resp.CompletionTokens = cr.Usage.CompletionTokens
+		resp.CacheReadTokens = cr.Usage.cachedTokens()
 	}
 	return resp, nil
 }

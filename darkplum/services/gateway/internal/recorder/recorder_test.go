@@ -129,8 +129,8 @@ func TestWriteBatch_FallsBackThenRecoversAcrossSchemaLevels(t *testing.T) {
 	if n != 1 {
 		t.Fatalf("event must be written exactly once via the legacy insert, got %d rows", n)
 	}
-	if r.schemaLevel != 3 {
-		t.Fatalf("expected the recorder to settle on the legacy schema (level 3), got %d", r.schemaLevel)
+	if r.schemaLevel != 4 {
+		t.Fatalf("expected the recorder to settle on the legacy schema (level 4), got %d", r.schemaLevel)
 	}
 	if !r.nextSchemaProbe.After(time.Now()) {
 		t.Fatal("recorder should schedule a future re-probe of newer schemas")
@@ -171,8 +171,8 @@ func TestWriteBatch_FallsBackThenRecoversAcrossSchemaLevels(t *testing.T) {
 		denial == nil || *denial != "model_not_enabled" || status != 403 {
 		t.Fatalf("audit row wrong: model=%q requested=%v denial=%v status=%d", model, requested, denial, status)
 	}
-	if r.schemaLevel != 2 {
-		t.Fatalf("expected the recorder to settle on the requested_model schema (level 2), got %d", r.schemaLevel)
+	if r.schemaLevel != 3 {
+		t.Fatalf("expected the recorder to settle on the requested_model schema (level 3), got %d", r.schemaLevel)
 	}
 
 	// Migration 013 lands, but not yet 016 (backend_class). The next
@@ -207,8 +207,8 @@ func TestWriteBatch_FallsBackThenRecoversAcrossSchemaLevels(t *testing.T) {
 		routerReason == nil || *routerReason != "rules:default" || routerLatency == nil || *routerLatency != 42 {
 		t.Fatalf("got purpose=%q route_name=%v router_reason=%v router_latency_ms=%v", purpose, routeName, routerReason, routerLatency)
 	}
-	if r.schemaLevel != 1 {
-		t.Fatalf("expected the recorder to settle on the routing schema (level 1) with backend_class still missing, got %d", r.schemaLevel)
+	if r.schemaLevel != 2 {
+		t.Fatalf("expected the recorder to settle on the routing schema (level 2) with backend_class still missing, got %d", r.schemaLevel)
 	}
 
 	// Migration 016 lands (backend_class). The next re-probe recovers all
@@ -230,8 +230,46 @@ func TestWriteBatch_FallsBackThenRecoversAcrossSchemaLevels(t *testing.T) {
 	if backendClass == nil || *backendClass != "cloud_managed" {
 		t.Fatalf("backend_class = %v, want cloud_managed", backendClass)
 	}
+	if r.schemaLevel != 1 {
+		t.Fatalf("expected the recorder to recover to the backend_class schema (level 1), got %d", r.schemaLevel)
+	}
+
+	// Migration 021 lands (cache_read_tokens, cache_creation_tokens). The
+	// next re-probe recovers to the newest schema and stores the split.
+	if _, err := pool.Exec(ctx, `ALTER TABLE inference_events ADD COLUMN cache_read_tokens INT, ADD COLUMN cache_creation_tokens INT`); err != nil {
+		t.Fatalf("alter: %v", err)
+	}
+	r.nextSchemaProbe = time.Now().Add(-time.Second)
+	pt, ct, cr, cc := 100, 5, 60, 30
+	r.writeBatch([]InferenceEvent{{
+		RequestID: "after-021", Model: "claude", StatusCode: 200, LatencyMS: 5,
+		PromptTokens: &pt, CompletionTokens: &ct, CacheReadTokens: &cr, CacheCreationTokens: &cc,
+	}})
+	var gotPT, gotRead, gotCreate *int
+	if err := pool.QueryRow(ctx, `SELECT prompt_tokens, cache_read_tokens, cache_creation_tokens FROM inference_events WHERE request_id = 'after-021'`).Scan(&gotPT, &gotRead, &gotCreate); err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	if gotPT == nil || *gotPT != 100 || gotRead == nil || *gotRead != 60 || gotCreate == nil || *gotCreate != 30 {
+		t.Fatalf("got prompt=%v read=%v create=%v, want 100/60/30", gotPT, gotRead, gotCreate)
+	}
 	if r.schemaLevel != 0 {
-		t.Fatalf("expected the recorder to recover to the backend_class schema (level 0), got %d", r.schemaLevel)
+		t.Fatalf("expected the recorder to recover to the cache_tokens schema (level 0), got %d", r.schemaLevel)
+	}
+
+	// Usage reported with no cache fields stores 0; no usage stores NULL.
+	zero := 0
+	r.writeBatch([]InferenceEvent{
+		{RequestID: "usage-no-cache", Model: "m", StatusCode: 200, PromptTokens: &pt, CacheReadTokens: &zero, CacheCreationTokens: &zero},
+		{RequestID: "no-usage", Model: "m", StatusCode: 200},
+	})
+	for id, wantNull := range map[string]bool{"usage-no-cache": false, "no-usage": true} {
+		var a, b *int
+		if err := pool.QueryRow(ctx, `SELECT cache_read_tokens, cache_creation_tokens FROM inference_events WHERE request_id = $1`, id).Scan(&a, &b); err != nil {
+			t.Fatalf("select %s: %v", id, err)
+		}
+		if wantNull != (a == nil && b == nil) || (!wantNull && (*a != 0 || *b != 0)) {
+			t.Fatalf("%s: cache cols = %v/%v, wantNull=%v", id, a, b, wantNull)
+		}
 	}
 }
 

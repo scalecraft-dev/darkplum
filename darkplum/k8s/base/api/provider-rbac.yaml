@@ -27,7 +27,11 @@ metadata:
 rules:
   - apiGroups: [""]
     resources: ["secrets"]
-    resourceNames: ["darkplum-provider-keys"]
+    # darkplum-billing-keys holds the OPTIONAL vendor billing (admin-scope) keys
+    # that the api's daily reconciliation job reads back through its own file
+    # mount — a deliberately separate object from the inference keys, which the
+    # api can only write.
+    resourceNames: ["darkplum-provider-keys", "darkplum-billing-keys"]
     verbs: ["patch"]
   - apiGroups: [""]
     resources: ["configmaps"]

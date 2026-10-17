@@ -131,6 +131,34 @@ module "pod_identity_gateway" {
   tags = local.tags
 }
 
+# The api's own identity. Its only cloud permission is reading Bedrock spend
+# from Cost Explorer for the optional usage/cost reconciliation view — a
+# read-only, account-level billing query, no model access of any kind. Kept
+# separate from the gateway role on purpose: the gateway never reads billing
+# and the api never invokes models.
+module "pod_identity_api" {
+  source = "./modules/pod-identity"
+
+  role_name            = "${var.cluster_name}-api"
+  cluster_name         = module.eks.cluster_name
+  namespace            = "darkplum-system"
+  service_account_name = "darkplum-api"
+  inline_policies = {
+    cost-explorer-read = jsonencode({
+      Version = "2012-10-17"
+      Statement = [
+        {
+          Sid      = "ReadBedrockSpend"
+          Effect   = "Allow"
+          Action   = ["ce:GetCostAndUsage"]
+          Resource = "*"
+        }
+      ]
+    })
+  }
+  tags = local.tags
+}
+
 module "rds" {
   source = "./modules/rds"
 

@@ -172,6 +172,18 @@ type compatUsage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
 	TotalTokens      int `json:"total_tokens"`
+	// PromptTokensDetails.CachedTokens is passed through when the upstream
+	// sends it (cache-read share of PromptTokens); 0 otherwise.
+	PromptTokensDetails *struct {
+		CachedTokens int `json:"cached_tokens"`
+	} `json:"prompt_tokens_details,omitempty"`
+}
+
+func (u *compatUsage) cachedTokens() int {
+	if u == nil || u.PromptTokensDetails == nil {
+		return 0
+	}
+	return u.PromptTokensDetails.CachedTokens
 }
 
 type compatError struct {
@@ -245,6 +257,7 @@ func (p *OpenAICompatProvider) Complete(ctx context.Context, req provider.ChatRe
 	if cr.Usage != nil {
 		chatResp.PromptTokens = cr.Usage.PromptTokens
 		chatResp.CompletionTokens = cr.Usage.CompletionTokens
+		chatResp.CacheReadTokens = cr.Usage.cachedTokens()
 	}
 
 	return chatResp, nil
@@ -402,6 +415,7 @@ func (p *OpenAICompatProvider) Stream(ctx context.Context, req provider.ChatRequ
 		if chunk.Usage != nil {
 			stats.PromptTokens = chunk.Usage.PromptTokens
 			stats.CompletionTokens = chunk.Usage.CompletionTokens
+			stats.CacheReadTokens = chunk.Usage.cachedTokens()
 		}
 	}
 
@@ -470,6 +484,7 @@ func (p *OpenAICompatProvider) adaptNonStreamingResponse(resp *http.Response, w 
 	if cr.Usage != nil {
 		stats.PromptTokens = cr.Usage.PromptTokens
 		stats.CompletionTokens = cr.Usage.CompletionTokens
+		stats.CacheReadTokens = cr.Usage.cachedTokens()
 	}
 
 	deltaChunk, err := provider.BuildStreamingChunkSSE(cr.ID, cr.Model, content)

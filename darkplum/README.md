@@ -430,6 +430,15 @@ Limits to know, because this backend is different in kind from the other two:
   naming the field, on every backend — previously they were silently dropped.
   `top_p` and `stop` are forwarded.
 
+**Usage and cost.** Admin > Activity > Spend attributes estimated cost — at the
+vendors' published list prices, kept in Admin > Models > Prices — to people,
+API keys, models, aliases, routes and backends, from Darkplum's own records.
+Optionally, a separate **billing key** per vendor (an Anthropic *Admin API key*
+or OpenAI *admin key*, not the inference key, held by the api only and used by
+one daily job) reconciles those estimates against the vendor's own usage and
+cost reports; Bedrock reconciles through AWS Cost Explorer. Details and the
+honest caveats are in `docs/RUNBOOK-vendor-apis.md`.
+
 What is *not* configurable from the product: deploying self-hosted models
 (`make deploy-model`) and the Bedrock model patterns (Terraform) are still set at
 deploy time.

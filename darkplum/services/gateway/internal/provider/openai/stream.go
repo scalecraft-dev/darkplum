@@ -117,6 +117,7 @@ func (p *Provider) Stream(ctx context.Context, req provider.ChatRequest, w io.Wr
 		if chunk.Usage != nil {
 			stats.PromptTokens = chunk.Usage.PromptTokens
 			stats.CompletionTokens = chunk.Usage.CompletionTokens
+			stats.CacheReadTokens = chunk.Usage.cachedTokens()
 		}
 
 		if len(chunk.Choices) == 0 {

@@ -105,6 +105,38 @@ import {
   needsAwsOptIn,
 } from '../src/lib/dataRetention.ts'
 import type { DisplayClass, ModelAlias, ModelAliasRoute } from '../src/types/index.ts'
+import {
+  SPEND_GROUPS,
+  UNPRICED_HINT,
+  cachedShare,
+  centsToDollarString,
+  classSpendPoint,
+  classTimeline,
+  csvCell,
+  formatAxisDollars,
+  formatCost,
+  formatPerMtok,
+  formatShare,
+  parsePriceInput,
+  seedNote,
+  spendCsv,
+  spendRowLabel,
+  timeBuckets,
+  tokenSplitText,
+  unpricedCaption,
+} from '../src/lib/spend.ts'
+import { EVENT_LABELS } from '../src/lib/activityEvents.ts'
+import {
+  BILLING_KEY_NAME,
+  PULL_COOLDOWN_MS,
+  RECONCILIATION_DELTA_NOTE,
+  billingKeyExplanation,
+  billingStateCopy,
+  billingVerifyErrorCopy,
+  formatDelta,
+  lastPulledText,
+  pullCooldownSeconds,
+} from '../src/lib/billing.ts'
 
 const failures: string[] = []
 
@@ -1311,6 +1343,280 @@ if (!WEB_PORT_FORWARD_COMMAND.startsWith('kubectl port-forward -n darkplum-syste
   check('aliasReferencesTo(unused).length', aliasReferencesTo('nothing', aliases).length, 0)
 }
 
+// --- estimated spend: money, shares, labels, CSV ------------------------------
+//
+// Every amount on Activity > Spend is a list-price estimate. These pin the
+// three ways that framing can quietly break: a missing price shown as $0.00
+// (it must be null → "—"), a sub-cent cost rounded to $0.00 (it must keep up
+// to four places), and a CSV that rounds what the screen merely displays.
+{
+  const same = (what: string, actual: unknown, expected: unknown) =>
+    check(what, JSON.stringify(actual), JSON.stringify(expected))
+
+  // cents → display
+  check('formatCost(null) is unpriced, not $0', formatCost(null), null)
+  check('formatCost(garbage) is unpriced', formatCost('abc'), null)
+  check('formatCost("0")', formatCost('0'), '$0.00')
+  check('formatCost("123456.7")', formatCost('123456.7'), '$1,234.57')
+  check('formatCost("1")', formatCost('1'), '$0.01')
+  check('formatCost sub-cent keeps 4dp', formatCost('0.42'), '$0.0042')
+  check('formatCost sub-cent trims zeros', formatCost('0.5'), '$0.005')
+  check('formatCost below 4dp', formatCost('0.001'), '<$0.0001')
+  check('formatCost(number)', formatCost(250), '$2.50')
+
+  // exact dollars for the CSV
+  check('centsToDollarString("1234.5678")', centsToDollarString('1234.5678'), '12.345678')
+  check('centsToDollarString("5")', centsToDollarString('5'), '0.05')
+  check('centsToDollarString("0.0042")', centsToDollarString('0.0042'), '0.000042')
+  check('centsToDollarString("100")', centsToDollarString('100'), '1')
+  check('centsToDollarString("-250")', centsToDollarString('-250'), '-2.5')
+  check('centsToDollarString("0")', centsToDollarString('0'), '0')
+  check('centsToDollarString(null)', centsToDollarString(null), null)
+
+  // $/MTok
+  check('formatPerMtok("3")', formatPerMtok('3'), '$3.00')
+  check('formatPerMtok("0.075")', formatPerMtok('0.075'), '$0.075')
+  check('formatPerMtok("1.23456")', formatPerMtok('1.23456'), '$1.2346')
+  check('formatPerMtok("15.0000")', formatPerMtok('15.0000'), '$15.00')
+  check('formatPerMtok(null)', formatPerMtok(null), null)
+
+  check('formatAxisDollars(0)', formatAxisDollars(0), '$0')
+  check('formatAxisDollars(0.5)', formatAxisDollars(0.5), '$0.50')
+  check('formatAxisDollars(2.5)', formatAxisDollars(2.5), '$2.5')
+  check('formatAxisDollars(1200)', formatAxisDollars(1200), '$1.2k')
+
+  // price form input
+  check('parsePriceInput required empty', parsePriceInput('', false).ok, false)
+  same('parsePriceInput optional empty', parsePriceInput(' ', true), { ok: true, value: null })
+  same('parsePriceInput "$3.00"', parsePriceInput('$3.00', false), { ok: true, value: '3.00' })
+  check('parsePriceInput negative', parsePriceInput('-1', false).ok, false)
+  check('parsePriceInput 7dp', parsePriceInput('0.0000001', false).ok, false)
+  check('parsePriceInput words', parsePriceInput('three', false).ok, false)
+
+  // shares
+  check('formatShare(null)', formatShare(null), '—')
+  check('formatShare(0)', formatShare(0), '0%')
+  check('formatShare(0.004) never 0%', formatShare(0.004), '<1%')
+  check('formatShare(0.996) never 100%', formatShare(0.996), '>99%')
+  check('formatShare(0.25)', formatShare(0.25), '25%')
+  check('cachedShare no input', cachedShare({ prompt_tokens: 0, cache_read_tokens: 0 }), null)
+  check('cachedShare is a split of input', cachedShare({ prompt_tokens: 1000, cache_read_tokens: 250 }), 0.25)
+
+  // coverage caption
+  check('unpricedCaption full coverage', unpricedCaption({ requests: 10, unpriced_requests: 0 }, 1), null)
+  check('unpricedCaption no requests', unpricedCaption({ requests: 0, unpriced_requests: 0 }, 0), null)
+  check(
+    'unpricedCaption partial',
+    unpricedCaption({ requests: 200, unpriced_requests: 30 }, 0.85),
+    '15% of requests unpriced (30) — not included',
+  )
+
+  // grouping labels
+  check(
+    'SPEND_GROUPS order',
+    SPEND_GROUPS.map((g) => g.label).join(','),
+    'People,API keys,Models,Aliases,Routes,Backends,Providers',
+  )
+  check('label: class', spendRowLabel('backend_class', { key: 'external_api', label: null }), 'Outside your cloud account')
+  check('label: class, own infra', spendRowLabel('backend_class', { key: 'self_hosted', label: 'x' }), 'Your infrastructure')
+  check(
+    'label: class unrecorded',
+    spendRowLabel('backend_class', { key: null, label: null }),
+    'Not recorded — refused early, or pre-upgrade',
+  )
+  check('label: provider', spendRowLabel('provider', { key: 'bedrock', label: null }), 'AWS Bedrock')
+  check('label: user prefers server label', spendRowLabel('user', { key: 'u1', label: 'Ada Lovelace' }), 'Ada Lovelace')
+  check('label: user falls back to key', spendRowLabel('user', { key: 'u1', label: '' }), 'u1')
+  check('label: no route', spendRowLabel('route', { key: '', label: null }), 'Not routed')
+
+  // chart buckets: UTC-aligned, partial ends, contiguous
+  const T0 = Date.parse('2026-10-10T15:30:00Z')
+  const T1 = Date.parse('2026-10-13T09:00:00Z')
+  const days = timeBuckets(T0, T1, 'day')
+  check('timeBuckets day count', days.length, 4)
+  check('timeBuckets first starts at since', days[0]?.start, T0)
+  check('timeBuckets first ends at UTC midnight', days[0]?.end, Date.parse('2026-10-11T00:00:00Z'))
+  check('timeBuckets last ends at until', days[days.length - 1]?.end, T1)
+  check('timeBuckets contiguous', days.every((b, i) => i === 0 || b.start === days[i - 1].end), true)
+  check('timeBuckets empty range', timeBuckets(T1, T0, 'day').length, 0)
+  check('timeBuckets 24h hourly', timeBuckets(T0, T0 + 24 * 3_600_000, 'hour').length, 25)
+
+  same(
+    'classSpendPoint',
+    classSpendPoint([
+      { key: 'self_hosted', cost_cents: '150' },
+      { key: 'external_api', cost_cents: '25.5' },
+      { key: 'cloud_managed', cost_cents: null },
+      { key: null, cost_cents: '10' },
+    ]),
+    { self_hosted: 1.5, cloud_managed: 0, external_api: 0.255, other: 0.1 },
+  )
+
+  // CSV: quoting, formula guard, exact cost, unpriced empty
+  check('csvCell quote', csvCell('a,"b"', true), '"a,""b"""')
+  check('csvCell formula guard', csvCell('=HYPERLINK("x")', true), `"'=HYPERLINK(""x"")"`)
+  check('csvCell numbers untouched', csvCell(-5), '-5')
+  const csv = spendCsv('user', [
+    {
+      key: 'u1', label: 'Ada, L.', requests: 3, prompt_tokens: 100, completion_tokens: 20,
+      cache_read_tokens: 40, cache_creation_tokens: 0, cost_cents: '1234.5678', unpriced_requests: 0,
+    },
+    {
+      key: 'u2', label: 'Bob', requests: 1, prompt_tokens: 5, completion_tokens: 1,
+      cache_read_tokens: 0, cache_creation_tokens: 0, cost_cents: null, unpriced_requests: 1,
+    },
+  ])
+  check(
+    'spendCsv',
+    csv,
+    'Person,key,requests,prompt_tokens,completion_tokens,cache_read_tokens,cache_creation_tokens,estimated_cost_usd_at_list_price,unpriced_requests\r\n' +
+      '"Ada, L.",u1,3,100,20,40,0,12.345678,0\r\n' +
+      'Bob,u2,1,5,1,0,0,,1\r\n',
+  )
+
+  // one request
+  check(
+    'tokenSplitText with cache',
+    tokenSplitText({ prompt_tokens: 1200, completion_tokens: 80, cache_read_tokens: 1000, cache_creation_tokens: 50 }),
+    '1,200 in (1,000 cache read, 50 cache write) / 80 out',
+  )
+  check(
+    'tokenSplitText no cache',
+    tokenSplitText({ prompt_tokens: 12, completion_tokens: 3, cache_read_tokens: 0, cache_creation_tokens: null }),
+    '12 in / 3 out',
+  )
+  check('tokenSplitText no usage', tokenSplitText({ prompt_tokens: null, completion_tokens: null }), null)
+
+  check('UNPRICED_HINT', UNPRICED_HINT, 'No price for this model; add one under Prices.')
+  check(
+    'seedNote',
+    seedNote('2026-09-30T00:00:00Z'),
+    'List prices as published on September 30, 2026; vendors change them — replace a row when they do.',
+  )
+}
+
+// --- the chart's one read: bucket × class -----------------------------------
+//
+// One group_by=day,backend_class read replaces a request per bucket. Pinned:
+// empty buckets still get a point, the partial first bucket matches its
+// aligned day, 'unrecorded' lands in "other", and a row outside the period or
+// with an unparseable key is dropped rather than added to a neighbour.
+{
+  const same = (what: string, actual: unknown, expected: unknown) =>
+    check(what, JSON.stringify(actual), JSON.stringify(expected))
+  const T0 = Date.parse('2026-10-10T15:30:00Z')
+  const T1 = Date.parse('2026-10-12T09:00:00Z')
+  const buckets = timeBuckets(T0, T1, 'day')
+  const zero = { self_hosted: 0, cloud_managed: 0, external_api: 0, other: 0 }
+  same(
+    'classTimeline',
+    classTimeline(
+      buckets,
+      [
+        { key: '2026-10-10T00:00:00Z', backend_class: 'self_hosted', cost_cents: '150' },
+        { key: '2026-10-10T00:00:00Z', backend_class: 'unrecorded', cost_cents: '10' },
+        { key: '2026-10-12T00:00:00Z', backend_class: 'external_api', cost_cents: '25.5' },
+        { key: '2026-10-09T00:00:00Z', backend_class: 'self_hosted', cost_cents: '999' },
+        { key: 'garbage', backend_class: 'self_hosted', cost_cents: '999' },
+      ],
+      'day',
+    ),
+    [{ ...zero, self_hosted: 1.5, other: 0.1 }, zero, { ...zero, external_api: 0.255 }],
+  )
+  const hours = timeBuckets(T0, T0 + 2 * 3_600_000, 'hour')
+  same(
+    'classTimeline hourly',
+    classTimeline(hours, [{ key: '2026-10-10T16:00:00Z', backend_class: 'cloud_managed', cost_cents: '100' }], 'hour'),
+    [zero, { ...zero, cloud_managed: 1 }, zero],
+  )
+}
+
+// --- vendor billing keys and reconciliation ----------------------------------
+//
+// The billing key is a separate, broader credential. These pin the sentences
+// that keep that visible, the state copy (above all wrong_key_type, the one
+// mistake everybody makes first), the signed difference column with its
+// non-colour cue, and the Pull now cooldown.
+{
+  check('billing key name anthropic', BILLING_KEY_NAME.anthropic, 'Admin API key')
+  check('billing key name openai', BILLING_KEY_NAME.openai, 'organisation admin key')
+  check(
+    'billingKeyExplanation anthropic',
+    billingKeyExplanation('anthropic'),
+    "Reconciles Darkplum's estimates against Anthropic's own usage and cost reports. Needs an Admin API key — a different, broader credential than the inference key above: it can list your organisation's workspaces and keys. It is held by Darkplum's api only, used by one daily job, and never by the gateway.",
+  )
+  check(
+    'billingKeyExplanation openai names the org admin key',
+    billingKeyExplanation('openai').includes('Needs an organisation admin key'),
+    true,
+  )
+  check(
+    'wrong_key_type copy (anthropic)',
+    billingStateCopy('anthropic', 'wrong_key_type').detail,
+    'This is an inference key. The reports need an Admin API key created under Settings > Admin keys.',
+  )
+  check('wrong_key_type is danger', billingStateCopy('anthropic', 'wrong_key_type').variant, 'danger')
+  check('openai wrong_key_type names a project key', billingStateCopy('openai', 'wrong_key_type').detail.startsWith('This is a project key.'), true)
+  check('ok badge', billingStateCopy('openai', 'ok').label, 'Reconciling')
+  check('not_configured is dashed neutral', billingStateCopy('anthropic', 'not_configured').dashed, true)
+  check('bedrock not_configured mentions Cost Explorer', billingStateCopy('bedrock', 'not_configured').detail.includes('Cost Explorer'), true)
+  check('bedrock auth_failed names the IAM action', billingStateCopy('bedrock', 'auth_failed').detail.includes('ce:GetCostAndUsage'), true)
+  check('unknown state named, not dropped', billingStateCopy('openai', 'mystery').label, 'Unrecognised state')
+  check(
+    'verify wrong_key_type reuses state copy',
+    billingVerifyErrorCopy('anthropic', 'wrong_key_type', 'server words', null),
+    billingStateCopy('anthropic', 'wrong_key_type').detail,
+  )
+  check(
+    'verify vendor_error with status',
+    billingVerifyErrorCopy('openai', 'vendor_error', 'x', 503),
+    'OpenAI answered with an error (HTTP 503). Nothing was stored.',
+  )
+  check('verify unknown code uses server message', billingVerifyErrorCopy('openai', 'new_code', 'Server said so.', null), 'Server said so.')
+  check('lastPulledText null', lastPulledText(null), 'Never pulled')
+  check('lastPulledText garbage', lastPulledText('nope'), 'Never pulled')
+
+  // the difference column: signed, real minus, a glyph as well as a colour
+  check('formatDelta null', formatDelta(null), null)
+  check('formatDelta garbage', formatDelta('x'), null)
+  check('formatDelta over text', formatDelta('123')?.text, '+$1.23')
+  check('formatDelta over glyph', formatDelta('123')?.glyph, '▲')
+  check('formatDelta over spoken', formatDelta('123')?.spoken, '$1.23 more than the estimate')
+  check('formatDelta under text (U+2212)', formatDelta('-50')?.text, '\u2212$0.50')
+  check('formatDelta under direction', formatDelta('-50')?.direction, 'under')
+  check('formatDelta under glyph', formatDelta('-50')?.glyph, '▼')
+  check('formatDelta sub-half-cent is even', formatDelta('0.4')?.direction, 'even')
+  check('formatDelta even text', formatDelta('-0.2')?.text, '$0.00')
+  check('formatDelta sub-cent keeps places', formatDelta('0.5')?.text, '+$0.005')
+
+  // Pull now
+  check('PULL_COOLDOWN_MS', PULL_COOLDOWN_MS, 60_000)
+  check('cooldown never pressed', pullCooldownSeconds(null, 1_000), 0)
+  check('cooldown just pressed', pullCooldownSeconds(1_000, 1_000), 60)
+  check('cooldown rounds up', pullCooldownSeconds(1_000, 1_500), 60)
+  check('cooldown mid-way', pullCooldownSeconds(0, 30_000), 30)
+  check('cooldown last ms', pullCooldownSeconds(0, 59_999), 1)
+  check('cooldown over', pullCooldownSeconds(0, 60_000), 0)
+  check('cooldown clock went backwards stays bounded', pullCooldownSeconds(10_000, 0), 60)
+  check('cooldown custom window (429)', pullCooldownSeconds(0, 0, 120_000), 120)
+
+  check(
+    'delta note names the three causes and Bedrock',
+    ['list price', 'round', 'up to a day', 'usage type'].every((w) => RECONCILIATION_DELTA_NOTE.includes(w)),
+    true,
+  )
+
+  // the audit log
+  check('event billing installed', EVENT_LABELS['provider.billing_key_installed']?.label, 'Vendor Billing Key Installed')
+  check('event billing rotated', EVENT_LABELS['provider.billing_key_rotated']?.label, 'Vendor Billing Key Rotated')
+  check('event billing removed', EVENT_LABELS['provider.billing_key_removed']?.label, 'Vendor Billing Key Removed')
+  check(
+    'billing events are amber',
+    ['installed', 'rotated', 'removed'].every((k) => EVENT_LABELS[`provider.billing_key_${k}`]?.variant === 'warning'),
+    true,
+  )
+}
+
 // --- report ------------------------------------------------------------------
 
 if (failures.length > 0) {
@@ -1323,5 +1629,5 @@ if (failures.length > 0) {
 }
 
 console.log(
-  `Residency truth table holds (${table.cells.length} cells from ${RESIDENCY_TRUTH_TABLE_PATH} + ladder order + restricted rule + class rank, model fallback, empty-state claim, vendor rate-limit wait, who a vendor failure names, and the vendor-key helpers: glob matching, filter serialisation over every subset of a catalogue, the checklist's headings, what a Replace opens on, the key entry line, the installing and removing windows, the transport gate, which of the two transport faults each refusal names, the admitted diff, the Bedrock data-retention opt-in copy, and the routed-alias fallback: reason text, route hints, the no-fallback refusal, and which aliases a disable affects).`,
+  `Residency truth table holds (${table.cells.length} cells from ${RESIDENCY_TRUTH_TABLE_PATH} + ladder order + restricted rule + class rank, model fallback, empty-state claim, vendor rate-limit wait, who a vendor failure names, and the vendor-key helpers: glob matching, filter serialisation over every subset of a catalogue, the checklist's headings, what a Replace opens on, the key entry line, the installing and removing windows, the transport gate, which of the two transport faults each refusal names, the admitted diff, the Bedrock data-retention opt-in copy, and the routed-alias fallback: reason text, route hints, the no-fallback refusal, and which aliases a disable affects; and the spend helpers: cost display, exact CSV dollars, $/MTok, price input, shares, coverage caption, grouping labels, chart buckets, the one-read class timeline; and the billing-key helpers: state copy, verify errors, the signed difference, the Pull now cooldown, the audit labels).`,
 )

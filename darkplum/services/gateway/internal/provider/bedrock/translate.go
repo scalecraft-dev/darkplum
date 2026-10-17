@@ -161,8 +161,14 @@ func translateResponse(out *bedrockruntime.ConverseOutput, modelID string) (*pro
 		}
 	}
 
-	var promptTokens, completionTokens int
+	var promptTokens, completionTokens, cacheRead, cacheWrite int
 	if out.Usage != nil {
+		if out.Usage.CacheReadInputTokens != nil {
+			cacheRead = int(*out.Usage.CacheReadInputTokens)
+		}
+		if out.Usage.CacheWriteInputTokens != nil {
+			cacheWrite = int(*out.Usage.CacheWriteInputTokens)
+		}
 		if out.Usage.InputTokens != nil {
 			promptTokens = int(*out.Usage.InputTokens)
 		}
@@ -174,12 +180,14 @@ func translateResponse(out *bedrockruntime.ConverseOutput, modelID string) (*pro
 	return &provider.ChatResponse{
 		// Converse does not return a completion ID; the gateway assigns one at
 		// a higher layer if needed.
-		ID:               "",
-		Model:            modelID,
-		Content:          content,
-		PromptTokens:     promptTokens,
-		CompletionTokens: completionTokens,
-		FinishReason:     convertFinishReason(string(out.StopReason)),
+		ID:                  "",
+		Model:               modelID,
+		Content:             content,
+		PromptTokens:        promptTokens + cacheRead + cacheWrite,
+		CompletionTokens:    completionTokens,
+		CacheReadTokens:     cacheRead,
+		CacheCreationTokens: cacheWrite,
+		FinishReason:        convertFinishReason(string(out.StopReason)),
 	}, nil
 }
 
@@ -228,8 +236,20 @@ func translateStreamEvent(
 
 	case *types.ConverseStreamOutputMemberMetadata:
 		if ev.Value.Usage != nil {
+			if ev.Value.Usage.CacheReadInputTokens != nil {
+				stats.CacheReadTokens = int(*ev.Value.Usage.CacheReadInputTokens)
+			}
+			if ev.Value.Usage.CacheWriteInputTokens != nil {
+				stats.CacheCreationTokens = int(*ev.Value.Usage.CacheWriteInputTokens)
+			}
+			// AWS InputTokens excludes cache tokens; fold them in so
+			// prompt_tokens = all billed input, as for every provider.
+			var input int
 			if ev.Value.Usage.InputTokens != nil {
-				stats.PromptTokens = int(*ev.Value.Usage.InputTokens)
+				input = int(*ev.Value.Usage.InputTokens)
+			}
+			if ev.Value.Usage.InputTokens != nil || stats.CacheReadTokens != 0 || stats.CacheCreationTokens != 0 {
+				stats.PromptTokens = input + stats.CacheReadTokens + stats.CacheCreationTokens
 			}
 			if ev.Value.Usage.OutputTokens != nil {
 				stats.CompletionTokens = int(*ev.Value.Usage.OutputTokens)

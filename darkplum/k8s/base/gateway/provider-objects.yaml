@@ -17,6 +17,19 @@ metadata:
     app.kubernetes.io/part-of: darkplum
 type: Opaque
 ---
+# Vendor BILLING keys (Anthropic Admin API key, OpenAI admin key): optional,
+# used only by the api's daily usage/cost reconciliation, never by the gateway.
+# Same no-`data` rule as above.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: darkplum-billing-keys
+  namespace: darkplum-system
+  labels:
+    app.kubernetes.io/name: darkplum-api
+    app.kubernetes.io/part-of: darkplum
+type: Opaque
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:

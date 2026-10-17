@@ -10,3 +10,4 @@ resources:
 
 patches:
   - path: patches/gateway-aws-credentials.yaml
+  - path: patches/api-aws-credentials.yaml

@@ -130,6 +130,8 @@ func Recording(rec *recorder.Recorder) gin.HandlerFunc {
 			completionTokens = &ct
 		}
 
+		cacheReadTokens, cacheCreationTokens := cacheTokenPointers(c, promptTokens, completionTokens)
+
 		// route_name/router_reason/router_latency_ms are set by
 		// handler.ChatHandler only when a routed alias was resolved (see
 		// HandleChatCompletions) — empty/nil otherwise, which is correct:
@@ -154,24 +156,26 @@ func Recording(rec *recorder.Recorder) gin.HandlerFunc {
 		backendClass := c.GetString("backend_class")
 
 		main := recorder.InferenceEvent{
-			RequestID:        requestID,
-			APIKeyID:         keyID,
-			UserID:           userID,
-			Model:            model,
-			RequestedModel:   requestedModel,
-			DenialCode:       c.GetString("denial_code"),
-			StatusCode:       statusCode,
-			LatencyMS:        latencyMS,
-			Stream:           fields.Stream,
-			IP:               c.ClientIP(),
-			Provider:         providerName,
-			Region:           providerRegion,
-			PromptTokens:     promptTokens,
-			CompletionTokens: completionTokens,
-			RouteName:        routeName,
-			RouterReason:     routerReason,
-			RouterLatencyMS:  routerLatencyMS,
-			BackendClass:     backendClass,
+			RequestID:           requestID,
+			APIKeyID:            keyID,
+			UserID:              userID,
+			Model:               model,
+			RequestedModel:      requestedModel,
+			DenialCode:          c.GetString("denial_code"),
+			StatusCode:          statusCode,
+			LatencyMS:           latencyMS,
+			Stream:              fields.Stream,
+			IP:                  c.ClientIP(),
+			Provider:            providerName,
+			Region:              providerRegion,
+			PromptTokens:        promptTokens,
+			CompletionTokens:    completionTokens,
+			CacheReadTokens:     cacheReadTokens,
+			CacheCreationTokens: cacheCreationTokens,
+			RouteName:           routeName,
+			RouterReason:        routerReason,
+			RouterLatencyMS:     routerLatencyMS,
+			BackendClass:        backendClass,
 		}
 
 		// A routed alias's classifier decision never produces a second audit
@@ -195,4 +199,16 @@ func resolveAttributedUserID(keyType, keyUserID, headerUserID string) string {
 		return headerUserID
 	}
 	return keyUserID
+}
+
+// cacheTokenPointers returns the cached-token split for inference_events.
+// NULL (nil, nil) when the backend reported no usage at all (neither prompt
+// nor completion count present); otherwise the reported values, which are 0
+// when usage arrived without cache fields.
+func cacheTokenPointers(c *gin.Context, promptTokens, completionTokens *int) (read, creation *int) {
+	if promptTokens == nil && completionTokens == nil {
+		return nil, nil
+	}
+	cr, cc := c.GetInt("cache_read_tokens"), c.GetInt("cache_creation_tokens")
+	return &cr, &cc
 }

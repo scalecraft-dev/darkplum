@@ -22,6 +22,7 @@ import {
   routerReasonText,
   vendorLabel,
 } from '../lib/modelRouting'
+import { formatCost, tokenSplitText } from '../lib/spend'
 import { useToast } from '../components/Toast'
 import { Avatar, Badge, EgressGlyph, Skeleton } from '../components/ui'
 import styles from './ActivityDrawer.module.css'
@@ -93,6 +94,8 @@ function inferenceToRow(e: InferenceEvent): {
   const { label, variant } = inferenceEventLabel(e)
   const cls = e.backend_class ?? null
   const display = cls ? displayClassOf({ backend_class: cls }) : null
+  const tokens = tokenSplitText(e)
+  const cost = formatCost(e.cost_cents ?? null)
   const detail = [
     e.denial_code ? `${denialLabel(e.denial_code)} (${e.denial_code})` : '',
     // Named as a place and a company. A drawer opened on one person is where
@@ -103,6 +106,11 @@ function inferenceToRow(e: InferenceEvent): {
     e.router_reason ? routerReasonText(e.router_reason).toLowerCase() : '',
     `${e.latency_ms}ms`,
     `status: ${e.status_code}`,
+    // The cache split rides inside the token figure, since cached tokens are
+    // part of the input count rather than in addition to it.
+    tokens ? `tokens: ${tokens}` : '',
+    // Only when priced. An unpriced row says nothing here rather than "$0".
+    cost ? `est. ${cost}` : '',
   ]
     .filter(Boolean)
     .join(', ')
