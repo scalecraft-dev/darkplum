@@ -1,10 +1,25 @@
 package policy
 
 import (
+	"bytes"
+	"log"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgconn"
 )
+
+// captureLog redirects the standard logger's output for the duration of the
+// test and restores it afterwards. Mirrors internal/routing's helper of the
+// same name.
+func captureLog(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	orig := log.Writer()
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(orig) })
+	return &buf
+}
 
 // ---------------------------------------------------------------------------
 // isUndefinedTableError
@@ -61,6 +76,41 @@ func TestBuildPrincipalPolicies_ZeroRowsWithAnyResidencyFallback(t *testing.T) {
 	built := buildPrincipalPolicies(nil, ResidencyAny)
 	if built.OrgPolicy.Residency != ResidencyAny {
 		t.Errorf("org Residency = %q, want %q", built.OrgPolicy.Residency, ResidencyAny)
+	}
+}
+
+// TestBuildPrincipalPolicies_ZeroRowsWithCloudAccountOnlyFallback guards the
+// generalised org fallback (no longer a binary == self_hosted_only check):
+// a cloud_account_only routing_policy value must carry over identically to
+// self_hosted_only's existing behaviour, not be silently dropped to "any".
+func TestBuildPrincipalPolicies_ZeroRowsWithCloudAccountOnlyFallback(t *testing.T) {
+	built := buildPrincipalPolicies(nil, ResidencyCloudAccountOnly)
+	if built.OrgPolicy.Residency != ResidencyCloudAccountOnly {
+		t.Errorf("org Residency = %q, want %q (from routing_policy fallback)", built.OrgPolicy.Residency, ResidencyCloudAccountOnly)
+	}
+}
+
+// TestBuildPrincipalPolicies_UnknownResidencyLogsOnceAndTightens guards the
+// "unknown residency value -> strictest, log once" rule: a row carrying a
+// value outside {any, cloud_account_only, self_hosted_only} still enforces
+// as self_hosted_only (via Effective/residencyRankOf), and the snapshot load
+// logs exactly one WARNING naming the situation, not one per row.
+func TestBuildPrincipalPolicies_UnknownResidencyLogsOnceAndTightens(t *testing.T) {
+	weird := "quantum_residency"
+	rows := []rawPrincipalPolicyRow{
+		{PrincipalType: PrincipalTypeUser, UserID: strP("user-1"), Residency: &weird},
+		{PrincipalType: PrincipalTypeAPIKey, APIKeyID: strP("key-1"), Residency: &weird, KeyOwnerUserID: strP("user-1")},
+	}
+
+	buf := captureLog(t)
+	built := buildPrincipalPolicies(rows, ResidencyAny)
+
+	if built.UserPolicies["user-1"].Residency != ResidencySelfHostedOnly {
+		t.Errorf("user-1 Residency = %q, want %q (unknown value tightened)", built.UserPolicies["user-1"].Residency, ResidencySelfHostedOnly)
+	}
+	logged := buf.String()
+	if strings.Count(logged, "WARNING one or more residency values") != 1 {
+		t.Errorf("expected exactly one unknown-residency WARNING, got log:\n%s", logged)
 	}
 }
 

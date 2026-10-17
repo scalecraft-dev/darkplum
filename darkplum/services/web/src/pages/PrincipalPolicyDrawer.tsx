@@ -15,6 +15,7 @@ import {
   INHERIT_ALL,
   POLICY_RULE,
   POLICY_TIMING,
+  PRINCIPAL_RESIDENCIES,
   aliasTargetIds,
   isInheritAll,
   modelLabel,
@@ -22,6 +23,7 @@ import {
   samePolicy,
   sourceChip,
 } from '../lib/policy'
+import { residencyRank } from '../lib/policy'
 import type {
   AdminModel,
   ModelAlias,
@@ -29,11 +31,14 @@ import type {
   PolicySource,
   PreviewEffectivePolicy,
   PrincipalPolicy,
+  PrincipalResidency,
+  Residency,
 } from '../types'
 import { useToast } from '../components/Toast'
 import { Button } from '../components/ui'
 import { Skeleton } from '../components/ui/Skeleton'
 import { ModelAllowlistPicker } from './ModelAllowlistPicker'
+import { ResidencyLadder, type LadderRung } from './ResidencyLadder'
 import styles from './PrincipalPolicyDrawer.module.css'
 
 /** Who is being edited. The drawer is identical for both; only the endpoints
@@ -222,6 +227,11 @@ export function PrincipalPolicyDrawer({ principal, models, aliases, onClose, onS
   const isUser = principal?.type === 'user'
   const endpoints = principal ? ENDPOINTS[principal.type] : null
 
+  /** Who this principal inherits from, named the same way in every sentence on
+   *  the drawer — mid-sentence and at the start of one. */
+  const inheritFrom = isUser ? 'the organisation' : "this key's owner"
+  const inheritFromCapitalised = isUser ? 'The organisation' : "This key's owner"
+
   // --- load -----------------------------------------------------------------
 
   const loadSeqRef = useRef(0)
@@ -325,6 +335,29 @@ export function PrincipalPolicyDrawer({ principal, models, aliases, onClose, onS
     [keyImpacts],
   )
 
+  /**
+   * The rungs this principal may stand on.
+   *
+   * A principal only ever narrows, so a rung at or below what it already
+   * inherits does nothing — it is offered, disabled, with the reason attached,
+   * rather than hidden. Hiding it makes the rule invisible and leaves the
+   * administrator wondering whether this screen can do what the other one did;
+   * showing it dead states the rule at the moment it applies.
+   *
+   * The loosest rung is never offered: it is a widening by definition, and no
+   * principal-level row can grant it.
+   */
+  const residencyRungs: LadderRung[] = useMemo(() => {
+    const inherited = effective?.residency
+    return PRINCIPAL_RESIDENCIES.map((value) => {
+      const dead =
+        inherited !== undefined && residencyRank(value) <= residencyRank(inherited)
+          ? `${inheritFromCapitalised} already limits this to ${residencyLabel(inherited).toLowerCase()}, which is the same or tighter. A policy here can only narrow further.`
+          : null
+      return { value: value as Residency, deadReason: dead }
+    })
+  }, [effective?.residency, inheritFromCapitalised])
+
   /** What the default-model control may offer. A default outside the allowlist
    *  is refused by the API, so it is never on the menu here. */
   const defaultChoices = useMemo(() => {
@@ -390,7 +423,6 @@ export function PrincipalPolicyDrawer({ principal, models, aliases, onClose, onS
     }
   }
 
-  const inheritFrom = isUser ? 'the organisation' : "this key's owner"
   const dialogTitle = principal ? `Routing policy for ${principal.title}` : 'Routing policy'
 
   return (
@@ -436,29 +468,22 @@ export function PrincipalPolicyDrawer({ principal, models, aliases, onClose, onS
             <>
               <div className={styles.body}>
                 {/* --- Residency --- */}
-                <fieldset className={styles.field}>
-                  <legend className={styles.legend}>Where requests may run</legend>
-                  <div className={styles.choices}>
-                    <FieldChoice
-                      name="policy-residency"
-                      checked={draft.residency === null}
-                      onSelect={() => setDraft((p) => ({ ...p, residency: null }))}
-                      label={`Inherit from ${inheritFrom}`}
-                      hint={
-                        effective
-                          ? `Currently ${residencyLabel(effective.residency).toLowerCase()}.`
-                          : undefined
-                      }
-                    />
-                    <FieldChoice
-                      name="policy-residency"
-                      checked={draft.residency === 'self_hosted_only'}
-                      onSelect={() => setDraft((p) => ({ ...p, residency: 'self_hosted_only' }))}
-                      label="Self-hosted only"
-                      hint="Cloud-managed models such as AWS Bedrock are refused, even when they are enabled and allowed."
-                    />
-                  </div>
-                </fieldset>
+                <ResidencyLadder
+                  legend="Where requests may run"
+                  name="policy-residency"
+                  value={draft.residency}
+                  rungs={residencyRungs}
+                  disabled={saving || resetting}
+                  inherit={{
+                    label: `Inherit from ${inheritFrom}`,
+                    hint: effective
+                      ? `Currently ${residencyLabel(effective.residency).toLowerCase()}.`
+                      : undefined,
+                  }}
+                  onChange={(next) =>
+                    setDraft((p) => ({ ...p, residency: next as PrincipalResidency | null }))
+                  }
+                />
 
                 {/* --- Allowed models --- */}
                 <fieldset className={styles.field}>

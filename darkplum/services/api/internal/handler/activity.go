@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -164,10 +165,18 @@ type inferenceEvent struct {
 	// RequestedModel is what the caller asked for when it differs from Model
 	// (an alias, or a request refused before any model resolved).
 	RequestedModel *string `json:"requested_model,omitempty"`
-	Purpose        string  `json:"purpose"`
-	RouteName      *string `json:"route_name,omitempty"`
-	RouterReason   *string `json:"router_reason,omitempty"`
-	StatusCode     int     `json:"status_code"`
+	// Provider is the resolved model's backend kind (vllm|lmstudio|bedrock|
+	// anthropic|openai|mock; migration 007_inference_events_provider.sql),
+	// alongside BackendClass below -- BackendClass says WHERE a request ran
+	// relative to the account boundary (self_hosted|cloud_managed|
+	// external_api), Provider says WHICH concrete backend/vendor served it,
+	// so the audit trail can name the vendor (e.g. "anthropic") and not just
+	// its class. NOT NULL, defaulted to 'vllm' at the column level.
+	Provider     string  `json:"provider"`
+	Purpose      string  `json:"purpose"`
+	RouteName    *string `json:"route_name,omitempty"`
+	RouterReason *string `json:"router_reason,omitempty"`
+	StatusCode   int     `json:"status_code"`
 	// DenialCode is why the gateway refused this request, when it did:
 	// model_not_found, model_not_enabled, model_residency_violation,
 	// model_not_allowed, invalid_request, policy_unavailable, request_canceled.
@@ -180,6 +189,13 @@ type inferenceEvent struct {
 	Stream           bool      `json:"stream"`
 	IPAddress        *string   `json:"ip_address,omitempty"`
 	CreatedAt        time.Time `json:"created_at"`
+	// BackendClass is self_hosted, cloud_managed, or external_api -- set on
+	// the gin context (and hence this row) the moment the gateway resolves a
+	// route's class, so even a DENIED request carries it when the denial
+	// happened after class resolution. Null ("unrecorded") on a request
+	// refused before any route resolved (e.g. model_not_found) or on a row
+	// written before migration 016 added the column.
+	BackendClass *string `json:"backend_class,omitempty"`
 }
 
 // validUsagePurposeFilter mirrors inference_events.purpose's CHECK constraint
@@ -227,6 +243,63 @@ func appendDenialCodeFilter(c *gin.Context, where string, args []any, argN int) 
 		where += fmt.Sprintf(" AND ie.denial_code = $%d", argN)
 		args = append(args, v)
 		argN++
+	}
+	return where, args, argN, nil
+}
+
+// backendClassFilterUnrecorded is the sentinel token for the ?backend_class=
+// query param that means "backend_class IS NULL" -- a request refused before
+// any route resolved a class -- since NULL is not itself a value that can
+// appear in a comma-separated list of literal strings.
+const backendClassFilterUnrecorded = "unrecorded"
+
+// validBackendClassFilterToken accepts one token of the comma-separated
+// ?backend_class= query param: a known backend_class, or the
+// backendClassFilterUnrecorded sentinel.
+func validBackendClassFilterToken(v string) bool {
+	switch v {
+	case backendClassSelfHosted, backendClassCloudManaged, backendClassExternalAPI, backendClassFilterUnrecorded:
+		return true
+	default:
+		return false
+	}
+}
+
+// appendBackendClassFilter adds the ?backend_class= clause to a usage WHERE:
+// a comma-separated list of self_hosted, cloud_managed, external_api,
+// unrecorded. Empty = no filter. "unrecorded" and concrete classes combine
+// via OR so `?backend_class=external_api,unrecorded` (say) matches either.
+func appendBackendClassFilter(c *gin.Context, where string, args []any, argN int) (string, []any, int, error) {
+	v := c.Query("backend_class")
+	if v == "" {
+		return where, args, argN, nil
+	}
+
+	var classes []string
+	includeUnrecorded := false
+	for _, tok := range strings.Split(v, ",") {
+		tok = strings.TrimSpace(tok)
+		if !validBackendClassFilterToken(tok) {
+			return where, args, argN, fmt.Errorf("backend_class must be a comma-separated list of self_hosted, cloud_managed, external_api, unrecorded")
+		}
+		if tok == backendClassFilterUnrecorded {
+			includeUnrecorded = true
+			continue
+		}
+		classes = append(classes, tok)
+	}
+
+	var clauses []string
+	if len(classes) > 0 {
+		clauses = append(clauses, fmt.Sprintf("ie.backend_class = ANY($%d)", argN))
+		args = append(args, classes)
+		argN++
+	}
+	if includeUnrecorded {
+		clauses = append(clauses, "ie.backend_class IS NULL")
+	}
+	if len(clauses) > 0 {
+		where += " AND (" + strings.Join(clauses, " OR ") + ")"
 	}
 	return where, args, argN, nil
 }
@@ -299,6 +372,10 @@ func (h *ActivityHandler) ListUsage(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": filterErr.Error()})
 		return
 	}
+	if where, args, argN, filterErr = appendBackendClassFilter(c, where, args, argN); filterErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": filterErr.Error()})
+		return
+	}
 
 	if v := c.Query("since"); v != "" {
 		t, err := time.Parse(time.RFC3339, v)
@@ -336,9 +413,9 @@ func (h *ActivityHandler) ListUsage(c *gin.Context) {
 		SELECT
 			ie.id::text, ie.request_id, ie.api_key_id::text, ie.user_id::text,
 			u.name, u.email,
-			ie.model, ie.requested_model, ie.purpose, ie.route_name, ie.router_reason,
+			ie.model, ie.requested_model, ie.provider, ie.purpose, ie.route_name, ie.router_reason,
 			ie.status_code, ie.denial_code, ie.latency_ms, ie.prompt_tokens, ie.completion_tokens,
-			ie.stream, ie.ip_address::text, ie.created_at
+			ie.stream, ie.ip_address::text, ie.created_at, ie.backend_class
 		FROM inference_events ie
 		LEFT JOIN users u ON u.id = ie.user_id
 		%s
@@ -358,9 +435,9 @@ func (h *ActivityHandler) ListUsage(c *gin.Context) {
 		var ie inferenceEvent
 		if err := rows.Scan(
 			&ie.ID, &ie.RequestID, &ie.APIKeyID, &ie.UserID, &ie.UserName, &ie.UserEmail,
-			&ie.Model, &ie.RequestedModel, &ie.Purpose, &ie.RouteName, &ie.RouterReason,
+			&ie.Model, &ie.RequestedModel, &ie.Provider, &ie.Purpose, &ie.RouteName, &ie.RouterReason,
 			&ie.StatusCode, &ie.DenialCode, &ie.LatencyMS, &ie.PromptTokens, &ie.CompletionTokens,
-			&ie.Stream, &ie.IPAddress, &ie.CreatedAt,
+			&ie.Stream, &ie.IPAddress, &ie.CreatedAt, &ie.BackendClass,
 		); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "scan usage failed"})
 			return
@@ -715,6 +792,10 @@ func (h *ActivityHandler) ExportUsage(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": filterErr.Error()})
 		return
 	}
+	if where, args, argN, filterErr = appendBackendClassFilter(c, where, args, argN); filterErr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": filterErr.Error()})
+		return
+	}
 
 	if v := c.Query("since"); v != "" {
 		t, err := time.Parse(time.RFC3339, v)
@@ -749,6 +830,7 @@ func (h *ActivityHandler) ExportUsage(c *gin.Context) {
 			ie.api_key_id::text,
 			ie.model,
 			ie.requested_model,
+			ie.provider,
 			ie.purpose,
 			ie.route_name,
 			ie.router_reason,
@@ -758,7 +840,8 @@ func (h *ActivityHandler) ExportUsage(c *gin.Context) {
 			ie.prompt_tokens,
 			ie.completion_tokens,
 			ie.stream,
-			ie.ip_address::text
+			ie.ip_address::text,
+			ie.backend_class
 		FROM inference_events ie
 		LEFT JOIN users u ON u.id = ie.user_id
 		%s
@@ -777,7 +860,7 @@ func (h *ActivityHandler) ExportUsage(c *gin.Context) {
 	c.Header("Content-Disposition", `attachment; filename="inference_events.csv"`)
 
 	w := csv.NewWriter(c.Writer)
-	_ = w.Write([]string{"timestamp", "request_id", "user_id", "user_name", "user_email", "api_key_id", "model", "requested_model", "purpose", "route_name", "router_reason", "status_code", "denial_code", "latency_ms", "prompt_tokens", "completion_tokens", "stream", "ip_address"})
+	_ = w.Write([]string{"timestamp", "request_id", "user_id", "user_name", "user_email", "api_key_id", "model", "requested_model", "provider", "purpose", "route_name", "router_reason", "status_code", "denial_code", "latency_ms", "prompt_tokens", "completion_tokens", "stream", "ip_address", "backend_class"})
 
 	for rows.Next() {
 		var (
@@ -789,6 +872,7 @@ func (h *ActivityHandler) ExportUsage(c *gin.Context) {
 			apiKeyID         *string
 			model            string
 			requestedModel   *string
+			provider         string
 			purpose          string
 			routeName        *string
 			routerReason     *string
@@ -799,11 +883,13 @@ func (h *ActivityHandler) ExportUsage(c *gin.Context) {
 			completionTokens *int
 			stream           bool
 			ipAddress        *string
+			backendClass     *string
 		)
 		if err := rows.Scan(
-			&createdAt, &requestID, &userID, &userName, &userEmail, &apiKeyID, &model, &requestedModel,
+			&createdAt, &requestID, &userID, &userName, &userEmail, &apiKeyID, &model, &requestedModel, &provider,
 			&purpose, &routeName, &routerReason,
 			&statusCode, &denialCode, &latencyMS, &promptTokens, &completionTokens, &stream, &ipAddress,
+			&backendClass,
 		); err != nil {
 			w.Flush()
 			return
@@ -817,6 +903,7 @@ func (h *ActivityHandler) ExportUsage(c *gin.Context) {
 			derefStr(apiKeyID),
 			model,
 			derefStr(requestedModel),
+			provider,
 			purpose,
 			derefStr(routeName),
 			derefStr(routerReason),
@@ -827,6 +914,7 @@ func (h *ActivityHandler) ExportUsage(c *gin.Context) {
 			derefInt(completionTokens),
 			strconv.FormatBool(stream),
 			derefStr(ipAddress),
+			derefStr(backendClass),
 		})
 	}
 	w.Flush()

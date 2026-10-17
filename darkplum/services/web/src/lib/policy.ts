@@ -1,13 +1,7 @@
-import type {
-  AdminModel,
-  EffectivePolicy,
-  ModelAlias,
-  PolicySource,
-  PrincipalPolicy,
-  Residency,
-} from '../types'
+import type { AdminModel, ModelAlias, PolicySource, PrincipalPolicy } from '../types'
 import { formatModelName } from './formatModelName'
 import { aliasTargets } from './modelRouting'
+import { residencyLabel } from './residency'
 
 /**
  * The words used wherever per-principal policy appears — the drawer, the
@@ -30,9 +24,29 @@ export const POLICY_TIMING =
 
 export const INHERIT_LABEL = 'Inherit'
 
-export function residencyLabel(residency: Residency): string {
-  return residency === 'self_hosted_only' ? 'Self-hosted only' : 'Any model'
-}
+// ---------------------------------------------------------------------------
+// Residency
+//
+// The ladder and its predicate live in ./residency, which imports nothing at
+// runtime so scripts/check-policy.mts can load it and assert every cell of the
+// table directly. Re-exported here because this is where every screen already
+// reaches for policy vocabulary, and splitting the import list across two
+// modules would be a change to fifteen files for no gain.
+// ---------------------------------------------------------------------------
+
+export {
+  DEFAULT_RESIDENCY,
+  PRINCIPAL_RESIDENCIES,
+  RESIDENCY_LADDER,
+  RESIDENCY_RANK,
+  orgPolicyRestricted,
+  policyLimits,
+  residencyLabel,
+  residencyLabelForSelf,
+  residencyPermits,
+  residencyRank,
+} from './residency'
+export type { ResidencyRung } from './residency'
 
 /** Where a field's value came from, named as a level rather than a column. */
 export function sourceLabel(source: PolicySource): string {
@@ -116,7 +130,9 @@ export function samePolicy(a: PrincipalPolicy, b: PrincipalPolicy): boolean {
  *  not what it ends up with. The effective set is shown beside it. */
 export function storedSummary(policy: PrincipalPolicy, models: AdminModel[]): string {
   const parts: string[] = []
-  if (policy.residency === 'self_hosted_only') parts.push('Self-hosted only')
+  // A residency row is a narrowing whatever its rung — a principal can only
+  // tighten, so having one at all is the fact worth reporting.
+  if (policy.residency !== null) parts.push(residencyLabel(policy.residency))
   if (policy.allowed_models !== null) {
     const n = policy.allowed_models.length
     parts.push(`${n} ${n === 1 ? 'model' : 'models'} allowed`)
@@ -124,24 +140,6 @@ export function storedSummary(policy: PrincipalPolicy, models: AdminModel[]): st
   if (policy.default_model) parts.push(`Default ${modelLabel(policy.default_model, models)}`)
   // A row with every field null narrows nothing: it inherits, same as no row.
   return parts.length > 0 ? parts.join(' · ') : 'Inherits organisation'
-}
-
-/**
- * Whether an effective policy narrows anything at all. When it does not, chat
- * has nothing to explain and the "why" affordance stays off the header.
- */
-/** Whether the organisation's own policy narrows anything: a residency
- *  tighter than "any", or an allowlist at all. The policy card marks itself
- *  restricted by this, and the catalogue tab says so by the same test. */
-export function orgPolicyRestricted(
-  policy: { residency: Residency; allowed_models?: string[] | null } | null,
-): boolean {
-  return policy !== null && (policy.residency === 'self_hosted_only' || (policy.allowed_models ?? null) !== null)
-}
-
-export function policyLimits(effective: EffectivePolicy | null): boolean {
-  if (!effective) return false
-  return effective.allowed_models !== null || effective.residency === 'self_hosted_only'
 }
 
 /**

@@ -33,12 +33,15 @@ const (
 	// maxIdleConnsPerHost caps idle connections per upstream. 4 is sufficient
 	// for typical single-node in-cluster deployments.
 	maxIdleConnsPerHost = 4
-	// streamIdleTimeout is the maximum duration between consecutive SSE chunks
-	// before the stream is considered wedged and is cancelled. This handles the
-	// case where the TCP connection stays open but the upstream stops sending
-	// tokens (e.g. OOM-killed model process). Legitimate slow generation is not
-	// affected because the timer resets on every received chunk.
-	streamIdleTimeout = 45 * time.Second
+	// defaultStreamIdleTimeout is the maximum duration between consecutive SSE
+	// chunks before the stream is considered wedged and is cancelled. This
+	// handles the case where the TCP connection stays open but the upstream
+	// stops sending tokens (e.g. OOM-killed model process). Legitimate slow
+	// generation is not affected because the timer resets on every received
+	// chunk. See OpenAICompatProvider.StreamIdleTimeout for the (test-only)
+	// override knob — production code never sets it, so this constant is
+	// always what a real deployment uses.
+	defaultStreamIdleTimeout = 45 * time.Second
 	// maxNonStreamAdaptBodyBytes bounds how much of a non-SSE body is buffered
 	// when a stream=true request is answered with a plain JSON chat.completion
 	// (observed with LM Studio and some OpenAI-compatible proxies that ignore
@@ -57,6 +60,13 @@ type OpenAICompatProvider struct {
 	// nonStreamWarnOnce ensures the "upstream does not stream" warning is
 	// logged at most once per provider instance rather than once per request.
 	nonStreamWarnOnce sync.Once
+
+	// StreamIdleTimeout overrides defaultStreamIdleTimeout (45s) for Stream's
+	// idle-read watchdog. Zero (the default returned by New) means "use
+	// defaultStreamIdleTimeout" — production code (cmd/main.go) never sets
+	// this; it exists solely so tests can shorten the idle window instead of
+	// waiting out the real 45s default.
+	StreamIdleTimeout time.Duration
 }
 
 // New creates an OpenAICompatProvider targeting the given upstream URL.
@@ -128,6 +138,8 @@ type compatRequest struct {
 	Stream      bool               `json:"stream"`
 	MaxTokens   int                `json:"max_tokens,omitempty"`
 	Temperature *float64           `json:"temperature,omitempty"`
+	TopP        *float64           `json:"top_p,omitempty"`
+	Stop        []string           `json:"stop,omitempty"`
 }
 
 type compatResponse struct {
@@ -251,18 +263,34 @@ func (p *OpenAICompatProvider) Complete(ctx context.Context, req provider.ChatRe
 // If w implements http.Flusher, it is flushed after each line so streaming
 // clients receive tokens as they are generated rather than buffered.
 //
-// An idle-read watchdog (streamIdleTimeout) cancels the stream if no bytes
-// arrive for longer than that window. The timer resets on every received chunk,
-// so legitimate slow generation is not penalised. If the dial/connect itself
-// fails, Stream returns an error before writing any bytes to w, allowing the
-// caller to serve a clean JSON error response instead of a committed SSE stream.
+// An idle-read watchdog (StreamIdleTimeout, defaulting to
+// defaultStreamIdleTimeout) cancels the stream if no bytes arrive for longer
+// than that window. The timer resets on every received chunk, so legitimate
+// slow generation is not penalised. If the dial/connect itself fails, Stream
+// returns an error before writing any bytes to w, allowing the caller to
+// serve a clean JSON error response instead of a committed SSE stream.
+//
+// idleCtx (a context.WithCancelCause child of ctx) is created BEFORE the
+// upstream request is built, and the request itself is built and issued
+// under idleCtx — not ctx directly. net/http only aborts an in-flight
+// request by cancelling the EXACT context.Context the request was built
+// with (http.NewRequestWithContext); cancelling an unrelated context
+// derived from it does nothing to a request already in flight. Building the
+// request with idleCtx from the start costs nothing before the watchdog
+// exists below (nothing cancels idleCtx early), and means the watchdog
+// constructed once headers arrive can actually abort a blocked
+// resp.Body.Read() instead of leaking the connection and the goroutine
+// blocked on it.
 func (p *OpenAICompatProvider) Stream(ctx context.Context, req provider.ChatRequest, w io.Writer) (*provider.StreamStats, error) {
 	body, err := p.buildRequestBody(req, true)
 	if err != nil {
 		return nil, err
 	}
 
-	httpReq, err := p.newUpstreamRequest(ctx, body)
+	idleCtx, idleCancel := context.WithCancelCause(ctx)
+	defer idleCancel(nil)
+
+	httpReq, err := p.newUpstreamRequest(idleCtx, body)
 	if err != nil {
 		return nil, err
 	}
@@ -295,11 +323,16 @@ func (p *OpenAICompatProvider) Stream(ctx context.Context, req provider.ChatRequ
 	}
 
 	// Wrap the response body with an idle-timeout reader. If no bytes arrive
-	// within streamIdleTimeout between consecutive reads, the context is
-	// cancelled and the scanner receives an error, cleanly terminating the loop.
-	idleCtx, idleCancel := context.WithCancelCause(ctx)
-	defer idleCancel(nil)
-	trackedBody := newIdleTimeoutReader(resp.Body, streamIdleTimeout, idleCancel)
+	// within the idle timeout between consecutive reads, idleCancel fires —
+	// which, because the request above was built with idleCtx, actually
+	// aborts the blocked Read() on trackedBody (see this function's doc
+	// comment) — and the scanner receives an error, cleanly terminating the
+	// loop.
+	idleTimeout := p.StreamIdleTimeout
+	if idleTimeout <= 0 {
+		idleTimeout = defaultStreamIdleTimeout
+	}
+	trackedBody := provider.NewIdleTimeoutReader(resp.Body, idleTimeout, idleCancel)
 
 	flusher, canFlush := w.(http.Flusher)
 
@@ -315,7 +348,7 @@ func (p *OpenAICompatProvider) Stream(ctx context.Context, req provider.ChatRequ
 		// Check whether the idle watchdog fired (context cancelled).
 		if err := idleCtx.Err(); err != nil {
 			cause := context.Cause(idleCtx)
-			return nil, fmt.Errorf("openaicompat(%s): stream idle timeout (%s): %w", p.name, streamIdleTimeout, cause)
+			return nil, fmt.Errorf("openaicompat(%s): stream idle timeout (%s): %w", p.name, idleTimeout, cause)
 		}
 
 		line := scanner.Text()
@@ -376,7 +409,7 @@ func (p *OpenAICompatProvider) Stream(ctx context.Context, req provider.ChatRequ
 		// If the error is due to the idle watchdog, unwrap to a clear message.
 		if idleCtx.Err() != nil {
 			cause := context.Cause(idleCtx)
-			return nil, fmt.Errorf("openaicompat(%s): stream idle timeout (%s): %w", p.name, streamIdleTimeout, cause)
+			return nil, fmt.Errorf("openaicompat(%s): stream idle timeout (%s): %w", p.name, idleTimeout, cause)
 		}
 		return nil, fmt.Errorf("openaicompat(%s): reading stream: %w", p.name, err)
 	}
@@ -478,6 +511,8 @@ func (p *OpenAICompatProvider) buildRequestBody(req provider.ChatRequest, stream
 		Stream:      stream,
 		MaxTokens:   req.MaxTokens,
 		Temperature: req.Temperature,
+		TopP:        req.TopP,
+		Stop:        req.Stop,
 	}
 	b, err := json.Marshal(cr)
 	if err != nil {
@@ -509,63 +544,6 @@ func (p *OpenAICompatProvider) upstreamError(statusCode int, body []byte) error 
 			p.name, statusCode, errResp.Error.Message, errResp.Error.Type)
 	}
 	return fmt.Errorf("openaicompat(%s): upstream returned %d: %s", p.name, statusCode, string(body))
-}
-
-// ---------------------------------------------------------------------------
-// idleTimeoutReader — idle-stream watchdog
-// ---------------------------------------------------------------------------
-
-// idleTimeoutReader wraps an io.Reader and cancels a context if no bytes are
-// received within the configured idle window. The timer is reset on every
-// successful Read call that returns at least one byte, so a slow but active
-// stream (e.g. long generation) is never killed. Only a stream that wedges
-// completely (no bytes for idleTimeout) triggers the cancellation.
-//
-// The cancel function is called with an explanatory error as its cause so that
-// callers can distinguish idle-timeout errors from upstream errors via
-// context.Cause.
-type idleTimeoutReader struct {
-	r           io.Reader
-	idleTimeout time.Duration
-	cancelCause context.CancelCauseFunc
-
-	mu    sync.Mutex
-	timer *time.Timer
-}
-
-// newIdleTimeoutReader wraps r with an idle-timeout watchdog. If no bytes
-// arrive within idleTimeout, cancelCause is called with a descriptive error.
-// The caller is responsible for calling the returned CancelCauseFunc when done
-// (to stop the internal timer and avoid a goroutine leak).
-func newIdleTimeoutReader(r io.Reader, idleTimeout time.Duration, cancelCause context.CancelCauseFunc) *idleTimeoutReader {
-	itr := &idleTimeoutReader{
-		r:           r,
-		idleTimeout: idleTimeout,
-		cancelCause: cancelCause,
-	}
-	itr.timer = time.AfterFunc(idleTimeout, func() {
-		cancelCause(fmt.Errorf("no bytes received from upstream for %s", idleTimeout))
-	})
-	return itr
-}
-
-// Read implements io.Reader. Each call that returns at least one byte resets
-// the idle timer. If the underlying reader returns io.EOF or an error the
-// timer is stopped to avoid a spurious cancellation after the stream ends.
-func (r *idleTimeoutReader) Read(p []byte) (int, error) {
-	n, err := r.r.Read(p)
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if n > 0 {
-		// Activity — reset the watchdog.
-		r.timer.Reset(r.idleTimeout)
-	}
-	if err != nil {
-		// Stream ended or errored — stop the timer so the cancelCause
-		// is not called after the caller has already handled the EOF/error.
-		r.timer.Stop()
-	}
-	return n, err
 }
 
 // compile-time interface check.

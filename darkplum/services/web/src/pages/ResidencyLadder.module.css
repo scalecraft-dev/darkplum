@@ -1,0 +1,149 @@
+/* --- The residency ladder ---
+   Shared by the organisation's policy card and the per-principal drawer. The
+   rung styling is lifted from the two-option control it replaces, so adopting
+   it changes the number of choices and nothing else about how they look.
+
+   One column, not two: with three rungs a grid would either leave a hole or
+   break the loosest-to-strictest reading into a shape. A stack is the ladder. */
+
+.field {
+  border: none;
+  padding: 0;
+  margin: 0 0 var(--space-5);
+  min-width: 0;
+}
+
+.legend {
+  padding: 0;
+  margin-bottom: var(--space-2);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--fg-subtle);
+}
+
+.rungs {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.rung {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-3) var(--space-4);
+  background: var(--bg-base);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  transition: border-color var(--transition-fast), background var(--transition-fast);
+}
+
+.rung:hover {
+  border-color: var(--fg-subtle);
+}
+
+.rung:focus-within {
+  border-color: var(--border-focus);
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
+.rungChecked {
+  background: var(--brand-subtle);
+  border-color: var(--brand-default);
+}
+
+/* A rung this principal may not reach. Dimmed, but the words stay readable —
+   the reason underneath is the point of leaving it on screen at all, and text
+   nobody can read is worse than a rung that was simply hidden. */
+.rungDead {
+  cursor: not-allowed;
+  background: var(--bg-base);
+  border-style: dashed;
+}
+
+.rungDead:hover {
+  border-color: var(--border-default);
+}
+
+.rungDead .rungLabel {
+  color: var(--fg-muted);
+}
+
+.rungTop {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.radio {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--brand-default);
+  flex-shrink: 0;
+}
+
+.rungLabel {
+  display: inline-flex;
+  align-items: center;
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  color: var(--fg-default);
+}
+
+/* The glyph on the two rungs that are not the ordinary case: an arrow leaving
+   the account on the loosest, a lock on the strictest. Body colour, not a
+   semantic one — the rung is a choice being offered, not a state being warned
+   about, and colouring it amber would read as "this one is wrong". */
+.rungGlyph {
+  color: var(--fg-subtle);
+}
+
+.defaultChip {
+  flex-shrink: 0;
+  padding: 0 6px;
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--fg-subtle);
+  background: var(--bg-surface-raised);
+  border-radius: var(--radius-full);
+}
+
+.rungConsequence {
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-muted);
+  max-width: 72ch;
+}
+
+/* Why this rung is unavailable. Indented to the label's text, so it reads as
+   belonging to the rung rather than to the group. */
+.rungDeadReason {
+  margin-left: calc(14px + var(--space-2));
+  font-size: var(--fs-xs);
+  line-height: var(--lh-normal);
+  color: var(--fg-subtle);
+  max-width: 72ch;
+}
+
+/* The chip reads "Default" on screen, where the ladder around it supplies the
+   context. Out of that context it needs the rest of the sentence. */
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rung {
+    transition-duration: 0.01ms !important;
+  }
+}

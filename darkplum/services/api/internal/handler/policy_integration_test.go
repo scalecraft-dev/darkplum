@@ -734,6 +734,37 @@ func TestUserPolicy_ResidencyRejectsAny(t *testing.T) {
 	}
 }
 
+// TestUserPolicy_ResidencyAcceptsCloudAccountOnly covers migration 016's
+// widened principal_routing_policies.residency CHECK: before that migration,
+// this write would have been rejected outright by the CHECK constraint, not
+// just by validPrincipalResidency.
+func TestUserPolicy_ResidencyAcceptsCloudAccountOnly(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	adminID := newPolicyTestUser(t, ctx, pool)
+	targetID := newPolicyTestUser(t, ctx, pool)
+	gw := newFakePolicyGateway(t, pool)
+	ph := NewPolicyHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	rh := NewRoutingHandler(pool, activity.NewRecorder(pool), gw.URL, "testkey")
+	r := newPolicyTestRouter(ph, rh, adminID)
+
+	cloudOnly := residencyCloudAccountOnly
+	resp := doJSON(t, r, http.MethodPut, "/api/v1/users/"+targetID+"/routing-policy", policyObject{Residency: &cloudOnly})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", resp.Code, resp.Body.String())
+	}
+	got := decodeJSON[principalPolicyResponse](t, resp.Body.Bytes())
+	if got.Residency == nil || *got.Residency != residencyCloudAccountOnly {
+		t.Fatalf("expected stored residency cloud_account_only, got %+v", got.Residency)
+	}
+
+	resp = doJSON(t, r, http.MethodGet, "/api/v1/users/"+targetID+"/routing-policy", nil)
+	got = decodeJSON[principalPolicyResponse](t, resp.Body.Bytes())
+	if got.Residency == nil || *got.Residency != residencyCloudAccountOnly {
+		t.Fatalf("expected residency to round-trip as cloud_account_only, got %+v", got.Residency)
+	}
+}
+
 // --- 409 lock-out ------------------------------------------------------------
 
 func TestUserPolicy_EmptyAllowlistLocksOutUser409(t *testing.T) {

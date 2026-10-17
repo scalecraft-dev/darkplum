@@ -61,6 +61,16 @@ export const ROUTES = {
   listAdminModels: { method: 'GET',   path: '/api/v1/models' },
   updateModel:     { method: 'PATCH', path: '/api/v1/models/:id' },
 
+  // --- Vendor provider keys (admin session only) ---
+  // The key travels on the body of the two writes below and on nothing else:
+  // never a path parameter, never a query string, so it cannot reach an access
+  // log, a browser history entry or a Referer header. :vendor is anthropic or
+  // openai; anything else is a 404 from the api.
+  verifyProviderKey: { method: 'POST',   path: '/api/v1/providers/:vendor/verify' },
+  putProviderKey:    { method: 'PUT',    path: '/api/v1/providers/:vendor/key' },
+  putProviderFilter: { method: 'PUT',    path: '/api/v1/providers/:vendor/filter' },
+  deleteProviderKey: { method: 'DELETE', path: '/api/v1/providers/:vendor/key' },
+
   // --- Model aliases ---
   listModelAliases: { method: 'GET',    path: '/api/v1/model-aliases' },
   putModelAlias:    { method: 'PUT',    path: '/api/v1/model-aliases/:alias' },

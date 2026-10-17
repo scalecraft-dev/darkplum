@@ -1,0 +1,95 @@
+{
+  "residency_rank": [
+    "any",
+    "cloud_account_only",
+    "self_hosted_only"
+  ],
+  "known_classes": [
+    "self_hosted",
+    "cloud_managed",
+    "external_api"
+  ],
+  "unknown_token": "<unknown>",
+  "cells": [
+    {
+      "residency": "any",
+      "class": "self_hosted",
+      "permitted": true
+    },
+    {
+      "residency": "any",
+      "class": "cloud_managed",
+      "permitted": true
+    },
+    {
+      "residency": "any",
+      "class": "external_api",
+      "permitted": true
+    },
+    {
+      "residency": "any",
+      "class": "<unknown>",
+      "permitted": false
+    },
+    {
+      "residency": "cloud_account_only",
+      "class": "self_hosted",
+      "permitted": true
+    },
+    {
+      "residency": "cloud_account_only",
+      "class": "cloud_managed",
+      "permitted": true
+    },
+    {
+      "residency": "cloud_account_only",
+      "class": "external_api",
+      "permitted": false
+    },
+    {
+      "residency": "cloud_account_only",
+      "class": "<unknown>",
+      "permitted": false
+    },
+    {
+      "residency": "self_hosted_only",
+      "class": "self_hosted",
+      "permitted": true
+    },
+    {
+      "residency": "self_hosted_only",
+      "class": "cloud_managed",
+      "permitted": false
+    },
+    {
+      "residency": "self_hosted_only",
+      "class": "external_api",
+      "permitted": false
+    },
+    {
+      "residency": "self_hosted_only",
+      "class": "<unknown>",
+      "permitted": false
+    },
+    {
+      "residency": "<unknown>",
+      "class": "self_hosted",
+      "permitted": true
+    },
+    {
+      "residency": "<unknown>",
+      "class": "cloud_managed",
+      "permitted": false
+    },
+    {
+      "residency": "<unknown>",
+      "class": "external_api",
+      "permitted": false
+    },
+    {
+      "residency": "<unknown>",
+      "class": "<unknown>",
+      "permitted": false
+    }
+  ]
+}

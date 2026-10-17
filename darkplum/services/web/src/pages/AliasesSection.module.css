@@ -426,6 +426,24 @@
   color: var(--fg-default);
 }
 
+/* A keyword that is stored but cannot fire. Amber, like every other "this is
+   not doing what it looks like it is doing" state in the product — not danger:
+   nothing is broken, and the rule is still the administrator's to keep. */
+.chipInert {
+  background: var(--warning-bg);
+  border-color: var(--warning-fg);
+}
+
+.chipInert .chipText {
+  color: var(--fg-muted);
+}
+
+.chipInertFlag {
+  font-size: var(--fs-xs);
+  color: var(--warning-fg);
+  white-space: nowrap;
+}
+
 .chipRemove {
   display: inline-flex;
   align-items: center;
@@ -508,13 +526,36 @@
   background: var(--brand-muted);
 }
 
+/* Offered for reading, not for adding: nothing can match it today. */
+.builtinBtnInert {
+  color: var(--fg-subtle);
+  background: transparent;
+  border-color: var(--border-default);
+  cursor: not-allowed;
+}
+
 .builtinText {
   font-size: var(--fs-xs);
   line-height: var(--lh-normal);
   color: var(--fg-muted);
 }
 
+.builtinInert {
+  color: var(--warning-fg);
+}
+
 /* --- Routed alias in the list --- */
+
+/* Where the alias's targets run, under what it reaches. A routed alias can
+   straddle the account boundary, so this wraps to as many chips as it needs
+   rather than truncating the one that matters. */
+.classChips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1);
+  margin-top: var(--space-1);
+}
 
 .reachCell {
   display: flex;

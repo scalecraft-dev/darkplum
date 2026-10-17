@@ -155,9 +155,25 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* Amber, like every other egress marker. It is part of the same sentence as
+   the tally, so it is not a warning box — just the colour, on the clause that
+   needs it. */
+.countEgress {
+  color: var(--warning-fg);
+}
+
 @media (max-width: 767px) {
+  /* The flags used to be dropped wholesale to buy width. They can't be: one of
+     them now says a prompt leaves the organisation's cloud account, and a
+     signal that disappears on a narrow screen is a signal that cannot be
+     relied on. The row wraps instead. */
+  .modelLabel {
+    flex-wrap: wrap;
+  }
+
   .modelFlags {
-    display: none;
+    flex-basis: 100%;
+    padding-left: calc(14px + var(--space-2));
   }
 }
 

@@ -1,0 +1,151 @@
+.body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin-top: var(--space-4);
+}
+
+.text {
+  font-size: var(--fs-sm);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-muted);
+}
+
+/* The account boundary, stated before anything that can be ticked. Amber
+   stripe, no amber text: this is three sentences long and body colour is the
+   only thing that stays legible at that length. */
+.boundary {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  background: var(--warning-bg);
+  border-left: 2px solid var(--warning-fg);
+  border-radius: var(--radius-sm);
+}
+
+.boundaryText {
+  font-size: var(--fs-sm);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-default);
+}
+
+/* The mechanical consequence, said last and said exactly: which setting moves,
+   from what, to what, and how far it reaches. */
+.boundaryChange {
+  font-size: var(--fs-sm);
+  line-height: var(--lh-relaxed);
+  font-weight: var(--fw-medium);
+  color: var(--fg-default);
+}
+
+.picker {
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  padding: var(--space-3);
+  min-width: 0;
+}
+
+.legend {
+  padding: 0 var(--space-1);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--fg-subtle);
+  font-variant-numeric: tabular-nums;
+}
+
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  max-height: 15rem;
+  overflow-y: auto;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.item {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.item:hover {
+  background: var(--bg-surface-hover);
+}
+
+.item:focus-within {
+  outline: 2px solid var(--border-focus);
+  outline-offset: -2px;
+}
+
+.checkbox {
+  width: 14px;
+  height: 14px;
+  margin: 2px 0 0;
+  accent-color: var(--brand-default);
+  flex-shrink: 0;
+}
+
+.itemText {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.itemName {
+  font-size: var(--fs-sm);
+  color: var(--fg-default);
+}
+
+.itemId {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+  word-break: break-all;
+}
+
+/* A second gate this modal does not open. Quiet, but present — it is the
+   difference between "this did not work" and "one more thing to do". */
+.caveat {
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-muted);
+}
+
+.timing {
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+}
+
+.failTitle {
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  color: var(--danger-fg);
+}
+
+.failDetail {
+  font-size: var(--fs-xs);
+  line-height: var(--lh-normal);
+  color: var(--fg-muted);
+}
+
+.failList {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: var(--space-2) 0;
+  padding-left: var(--space-4);
+}
+
+.footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}

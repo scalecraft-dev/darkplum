@@ -50,6 +50,51 @@ spec:
             # Managed by `make deploy-model` / `make remove-model`.
             - name: VLLM_UPSTREAMS
               value: ""
+            # Catalog globs for models called directly at a vendor's own API
+            # (class external_api: prompts leave the cluster AND the cloud
+            # account). Owned by `make set-anthropic-key` / `make set-openai-key`,
+            # which write the darkplum-provider-config ConfigMap — a separate
+            # object, so re-running deploy-platform never resets them. There is no
+            # IAM allowlist below the gateway for a vendor key, so an empty filter
+            # means NO vendor models, not all of them. A filter chosen in Admin >
+            # Models lives in the database and is mirrored here by the api; the
+            # _SET_AT stamps let the gateway use whichever was written last, so the
+            # command line and the UI can never silently disagree.
+            - name: ANTHROPIC_MODEL_FILTER
+              valueFrom:
+                configMapKeyRef:
+                  name: darkplum-provider-config
+                  key: ANTHROPIC_MODEL_FILTER
+                  optional: true
+            - name: ANTHROPIC_MODEL_FILTER_SET_AT
+              valueFrom:
+                configMapKeyRef:
+                  name: darkplum-provider-config
+                  key: ANTHROPIC_MODEL_FILTER_SET_AT
+                  optional: true
+            - name: OPENAI_MODEL_FILTER
+              valueFrom:
+                configMapKeyRef:
+                  name: darkplum-provider-config
+                  key: OPENAI_MODEL_FILTER
+                  optional: true
+            - name: OPENAI_MODEL_FILTER_SET_AT
+              valueFrom:
+                configMapKeyRef:
+                  name: darkplum-provider-config
+                  key: OPENAI_MODEL_FILTER_SET_AT
+                  optional: true
+            - name: PROVIDER_KEYS_DIR
+              value: /var/run/darkplum/provider-keys
+          volumeMounts:
+            # Vendor API keys, one file per vendor (anthropic-api-key,
+            # openai-api-key). A file mount, not env: the kubelet refreshes it in
+            # place (~60-90s) and the gateway re-reads it, so rotating a vendor key
+            # is not a rollout. The image runs as uid 65532 with no
+            # securityContext; the default 0444-equivalent mode is readable.
+            - name: provider-keys
+              mountPath: /var/run/darkplum/provider-keys
+              readOnly: true
           readinessProbe:
             httpGet:
               path: /health
@@ -71,3 +116,10 @@ spec:
             limits:
               memory: 512Mi
               cpu: 500m
+      volumes:
+        # Optional: the gateway starts, and serves self-hosted and Bedrock models,
+        # whether or not any vendor key has been installed.
+        - name: provider-keys
+          secret:
+            secretName: darkplum-provider-keys
+            optional: true

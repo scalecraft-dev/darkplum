@@ -6,6 +6,9 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/scalecraft/darkplum/gateway/internal/provider"
 )
 
 // Config holds all runtime configuration for the gateway, loaded from environment variables.
@@ -85,6 +88,49 @@ type Config struct {
 	// fallback:low_confidence. SEMANTIC_ROUTER_MIN_CONFIDENCE, default 0.6,
 	// clamped to [0, 1].
 	SemanticRouterMinConfidence float64
+
+	// ProviderKeysDir is where the darkplum-provider-keys Secret is mounted
+	// (files "anthropic-api-key", "openai-api-key"). PROVIDER_KEYS_DIR,
+	// default /var/run/darkplum/provider-keys. A vendor whose key file
+	// doesn't exist under this directory is simply not_configured — the
+	// directory itself not existing at all (e.g. the Secret was never
+	// created) is handled the same way, not as a startup error.
+	ProviderKeysDir string
+	// AnthropicModelFilter restricts which discovered Anthropic model ids
+	// enter the route table, as path.Match globs. Unlike
+	// BedrockModelFilter, an EMPTY filter means "no vendor models" (not
+	// "every model") — see the plan's failure-isolation ruling — and an
+	// INVALID glob is deliberately not validated here (see
+	// parseVendorGlobList): a vendor filter typo must never be able to
+	// block the gateway from starting; routing.NewAnthropicSource surfaces
+	// it per-tick as a non-fatal filter_missing-equivalent discovery error
+	// instead.
+	AnthropicModelFilter []string
+	// AnthropicModelFilterSetAt is the parsed ANTHROPIC_MODEL_FILTER_SET_AT
+	// env value (RFC3339) — the "env" side of the last-writer-wins
+	// comparison against a UI-installed vendor_provider_settings row's
+	// filter_set_at (see routing.resolveVendorFilter). The zero time if
+	// unset or unparseable: an unstamped env filter loses to ANY stamped DB
+	// row, but still wins over no DB row at all.
+	AnthropicModelFilterSetAt time.Time
+	// AnthropicDefaultMaxTokens is used when a chat request doesn't set
+	// max_tokens. ANTHROPIC_DEFAULT_MAX_TOKENS, default 8192.
+	AnthropicDefaultMaxTokens int
+	// AnthropicBaseURL overrides the Anthropic SDK's production endpoint —
+	// tests and dev proxies only. ANTHROPIC_BASE_URL, empty by default (use
+	// the SDK's own default). Must be https unless DevMode.
+	AnthropicBaseURL string
+	// OpenAIModelFilter restricts which discovered OpenAI model ids enter
+	// the route table, as path.Match globs. Same "empty means no vendor
+	// models" and "invalid glob is not validated here" semantics as
+	// AnthropicModelFilter — see its doc comment.
+	OpenAIModelFilter []string
+	// OpenAIModelFilterSetAt is the parsed OPENAI_MODEL_FILTER_SET_AT env
+	// value (RFC3339) — same semantics as AnthropicModelFilterSetAt.
+	OpenAIModelFilterSetAt time.Time
+	// OpenAIBaseURL overrides https://api.openai.com — tests and dev proxies
+	// only. OPENAI_BASE_URL, empty by default. Must be https unless DevMode.
+	OpenAIBaseURL string
 }
 
 // Load reads environment variables and returns a populated Config.
@@ -136,7 +182,7 @@ func Load() (*Config, error) {
 		bedrockRegion = "us-east-1"
 	}
 
-	bedrockModelFilter, err := parseGlobList(os.Getenv("BEDROCK_MODEL_FILTER"))
+	bedrockModelFilter, err := parseGlobList("BEDROCK_MODEL_FILTER", os.Getenv("BEDROCK_MODEL_FILTER"))
 	if err != nil {
 		return nil, err
 	}
@@ -248,6 +294,36 @@ func Load() (*Config, error) {
 		semanticRouterMinConfidence = f
 	}
 
+	providerKeysDir := os.Getenv("PROVIDER_KEYS_DIR")
+	if providerKeysDir == "" {
+		providerKeysDir = "/var/run/darkplum/provider-keys"
+	}
+
+	anthropicModelFilter := parseVendorGlobList(os.Getenv("ANTHROPIC_MODEL_FILTER"))
+	anthropicModelFilterSetAt := parseVendorFilterSetAt(os.Getenv("ANTHROPIC_MODEL_FILTER_SET_AT"))
+
+	anthropicDefaultMaxTokens := 8192
+	if v := os.Getenv("ANTHROPIC_DEFAULT_MAX_TOKENS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return nil, fmt.Errorf("ANTHROPIC_DEFAULT_MAX_TOKENS must be a positive integer, got %q", v)
+		}
+		anthropicDefaultMaxTokens = n
+	}
+
+	anthropicBaseURL := strings.TrimSpace(os.Getenv("ANTHROPIC_BASE_URL"))
+	if err := provider.ValidateVendorBaseURL("ANTHROPIC_BASE_URL", anthropicBaseURL, devMode); err != nil {
+		return nil, err
+	}
+
+	openAIModelFilter := parseVendorGlobList(os.Getenv("OPENAI_MODEL_FILTER"))
+	openAIModelFilterSetAt := parseVendorFilterSetAt(os.Getenv("OPENAI_MODEL_FILTER_SET_AT"))
+
+	openAIBaseURL := strings.TrimSpace(os.Getenv("OPENAI_BASE_URL"))
+	if err := provider.ValidateVendorBaseURL("OPENAI_BASE_URL", openAIBaseURL, devMode); err != nil {
+		return nil, err
+	}
+
 	return &Config{
 		Port:                      port,
 		VLLMUpstream:              upstream,
@@ -269,13 +345,71 @@ func Load() (*Config, error) {
 		ClassifierBreakerOpenSeconds: classifierBreakerOpenSeconds,
 		SemanticRouterURL:            semanticRouterURL,
 		SemanticRouterMinConfidence:  semanticRouterMinConfidence,
+
+		ProviderKeysDir:           providerKeysDir,
+		AnthropicModelFilter:      anthropicModelFilter,
+		AnthropicModelFilterSetAt: anthropicModelFilterSetAt,
+		AnthropicDefaultMaxTokens: anthropicDefaultMaxTokens,
+		AnthropicBaseURL:          anthropicBaseURL,
+		OpenAIModelFilter:         openAIModelFilter,
+		OpenAIModelFilterSetAt:    openAIModelFilterSetAt,
+		OpenAIBaseURL:             openAIBaseURL,
 	}, nil
 }
 
+// parseVendorFilterSetAt parses raw (RFC3339) as a <VENDOR>_MODEL_FILTER_SET_AT
+// env value. Empty or unparseable input returns the zero time rather than an
+// error — like parseVendorGlobList, a vendor filter's env configuration must
+// never be able to block the gateway from starting; an unstamped/malformed
+// SET_AT simply loses every last-writer-wins comparison against a DB row
+// (see routing.resolveVendorFilter).
+func parseVendorFilterSetAt(raw string) time.Time {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
+}
+
+// parseVendorGlobList splits a comma-separated list of path.Match glob
+// patterns WITHOUT validating that each one compiles — unlike parseGlobList
+// (used by BEDROCK_MODEL_FILTER), which fails Load outright on a bad
+// pattern. A vendor filter (ANTHROPIC_MODEL_FILTER, OPENAI_MODEL_FILTER)
+// must never be able to block the gateway from starting at all: an invalid
+// pattern here is instead caught per-tick by routing.ApplyGlobFilter, which
+// returns a non-fatal discovery error that the vendor's routing Source
+// reports through the provider status block, in a build that has otherwise
+// started up normally and is still serving every self-hosted/cloud-managed
+// model.
+func parseVendorGlobList(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+
+	var patterns []string
+	for _, p := range strings.Split(raw, ",") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		patterns = append(patterns, p)
+	}
+	return patterns
+}
+
 // parseGlobList splits a comma-separated list of path.Match glob patterns and
-// validates each one compiles, so a typo in BEDROCK_MODEL_FILTER fails at
-// startup instead of silently matching nothing at request time.
-func parseGlobList(raw string) ([]string, error) {
+// validates each one compiles, so a typo in the source env var fails at
+// startup instead of silently matching nothing at request time. name is the
+// env var being parsed (e.g. "BEDROCK_MODEL_FILTER", "ANTHROPIC_MODEL_FILTER",
+// "OPENAI_MODEL_FILTER") — named in the returned error only, so every caller
+// of this shared parser gets an error pointing at the knob it actually needs
+// to fix, not a hardcoded one.
+func parseGlobList(name, raw string) ([]string, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return nil, nil
@@ -288,7 +422,7 @@ func parseGlobList(raw string) ([]string, error) {
 			continue
 		}
 		if _, err := path.Match(p, ""); err != nil {
-			return nil, fmt.Errorf("BEDROCK_MODEL_FILTER: invalid glob %q: %w", p, err)
+			return nil, fmt.Errorf("%s: invalid glob %q: %w", name, p, err)
 		}
 		patterns = append(patterns, p)
 	}

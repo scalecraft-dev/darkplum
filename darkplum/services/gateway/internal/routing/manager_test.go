@@ -7,6 +7,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -30,6 +31,19 @@ func staticSource(name, kind, class, providerKey string, ids []string) Source {
 	}
 }
 
+// staticVendorFilter builds a vendorFilterFunc that returns the same
+// patterns on every tick, reported as Source "env" (or "none" for an empty
+// patterns slice) — a test double for the real per-tick DB/env resolution
+// (see NewVendorFilterFunc) wherever a test only cares about a fixed filter.
+func staticVendorFilter(patterns []string) vendorFilterFunc {
+	return func() vendorFilterResult {
+		if len(patterns) == 0 {
+			return vendorFilterResult{Source: "none"}
+		}
+		return vendorFilterResult{Patterns: patterns, Source: "env"}
+	}
+}
+
 func TestManager_CollisionSelfHostedBeatsCloudManaged(t *testing.T) {
 	vllm := staticSource("vllm-default", "vllm", ClassSelfHosted, "vllm-default", []string{"claude-3-5-sonnet"})
 	brk := staticSource("bedrock", "bedrock", ClassCloudManaged, "bedrock", []string{"claude-3-5-sonnet"})
@@ -48,6 +62,80 @@ func TestManager_CollisionSelfHostedBeatsCloudManaged(t *testing.T) {
 	}
 	if route.Class != ClassSelfHosted {
 		t.Errorf("expected Class self_hosted, got %q", route.Class)
+	}
+}
+
+// TestManager_ThreeWayCollisionSelfHostedBeatsCloudManagedBeatsExternalAPI
+// asserts the full rank order holds when all three classes claim the same id
+// at once, regardless of registration order.
+func TestManager_ThreeWayCollisionSelfHostedBeatsCloudManagedBeatsExternalAPI(t *testing.T) {
+	ext := staticSource("anthropic", "anthropic", ClassExternalAPI, "anthropic", []string{"shared-id"})
+	cloud := staticSource("bedrock", "bedrock", ClassCloudManaged, "bedrock", []string{"shared-id"})
+	local := staticSource("vllm-default", "vllm", ClassSelfHosted, "vllm-default", []string{"shared-id"})
+
+	// Registered in the "worst rank first" order to prove the rule is
+	// class-based, not registration-based.
+	m := NewManager([]Source{ext, cloud, local}, 0)
+	m.Refresh(context.Background())
+
+	route, ok := m.Snapshot().Lookup("shared-id")
+	if !ok {
+		t.Fatal("expected a route for shared-id")
+	}
+	if route.ProviderKey != "vllm-default" || route.Class != ClassSelfHosted {
+		t.Errorf("expected self_hosted to win a three-way collision, got %+v", route)
+	}
+}
+
+// TestManager_CollisionCloudManagedBeatsExternalAPI covers the two-way case
+// between the non-self-hosted classes, independent of the three-way test
+// above.
+func TestManager_CollisionCloudManagedBeatsExternalAPI(t *testing.T) {
+	ext := staticSource("openai", "openai", ClassExternalAPI, "openai", []string{"shared-id"})
+	cloud := staticSource("bedrock", "bedrock", ClassCloudManaged, "bedrock", []string{"shared-id"})
+
+	m := NewManager([]Source{ext, cloud}, 0)
+	m.Refresh(context.Background())
+
+	route, ok := m.Snapshot().Lookup("shared-id")
+	if !ok {
+		t.Fatal("expected a route for shared-id")
+	}
+	if route.ProviderKey != "bedrock" || route.Class != ClassCloudManaged {
+		t.Errorf("expected cloud_managed to beat external_api, got %+v", route)
+	}
+}
+
+// TestManager_CollisionAnthropicOpenAISameRankRegistrationOrderWins asserts
+// that when two external_api sources (anthropic, openai) both claim the same
+// model id, the same-rank tie-break rule applies exactly as it does among
+// self_hosted sources: registration order wins, regardless of which vendor
+// name sorts first, and the collision is logged as a WARNING naming both
+// claimants.
+func TestManager_CollisionAnthropicOpenAISameRankRegistrationOrderWins(t *testing.T) {
+	buf := captureLog(t)
+
+	openaiSrc := staticSource("openai", "openai", ClassExternalAPI, "openai", []string{"shared-vendor-id"})
+	anthropicSrc := staticSource("anthropic", "anthropic", ClassExternalAPI, "anthropic", []string{"shared-vendor-id"})
+
+	// openai registered first: it must win, proving the rule is
+	// registration-order (not name-order: "anthropic" < "openai"
+	// alphabetically, which a name-based tie-break would have picked
+	// instead).
+	m := NewManager([]Source{openaiSrc, anthropicSrc}, 0)
+	m.Refresh(context.Background())
+
+	route, ok := m.Snapshot().Lookup("shared-vendor-id")
+	if !ok {
+		t.Fatal("expected a route for shared-vendor-id")
+	}
+	if route.ProviderKey != "openai" || route.Class != ClassExternalAPI {
+		t.Errorf("expected the first-registered external_api source (openai) to win, got %+v", route)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, `model id "shared-vendor-id" claimed by multiple sources (openai, anthropic); "openai" wins`) {
+		t.Errorf("expected a collision WARNING naming both claimants, got:\n%s", out)
 	}
 }
 
@@ -492,4 +580,150 @@ func TestManager_ConcurrentRefreshAndSnapshot(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+// ---------------------------------------------------------------------------
+// RefreshSource
+// ---------------------------------------------------------------------------
+
+func TestRefreshSource_UpdatesOnlyTheNamedSourceAndTable(t *testing.T) {
+	anthropic := staticSource("anthropic", "anthropic", ClassExternalAPI, "anthropic", []string{"claude-x"})
+	vllm := staticSource("vllm-default", "vllm", ClassSelfHosted, "vllm-default", []string{"llama-3-8b"})
+	m := NewManager([]Source{anthropic, vllm}, 0)
+	m.Refresh(context.Background())
+
+	if _, ok := m.Snapshot().Lookup("claude-x"); !ok {
+		t.Fatal("expected claude-x routable after the initial Refresh")
+	}
+
+	m.RefreshSource(context.Background(), "anthropic")
+
+	if _, ok := m.Snapshot().Lookup("claude-x"); !ok {
+		t.Error("expected claude-x to remain routable after RefreshSource")
+	}
+	if _, ok := m.Snapshot().Lookup("llama-3-8b"); !ok {
+		t.Error("expected the untouched vllm-default source's model to remain routable")
+	}
+}
+
+// TestRefreshSource_UnknownNameIsSafelyIgnored covers a caller (a stale hint
+// loop after a source is removed, or a typo) naming a source that isn't
+// registered — must not panic and must leave the table untouched.
+func TestRefreshSource_UnknownNameIsSafelyIgnored(t *testing.T) {
+	src := staticSource("vllm-default", "vllm", ClassSelfHosted, "vllm-default", []string{"llama-3-8b"})
+	m := NewManager([]Source{src}, 0)
+	m.Refresh(context.Background())
+
+	m.RefreshSource(context.Background(), "does-not-exist")
+
+	if _, ok := m.Snapshot().Lookup("llama-3-8b"); !ok {
+		t.Error("expected the table to be unaffected by an unknown source name")
+	}
+}
+
+// TestRefreshSource_OverlappingCallsForSameNameSkipRatherThanBlock proves the
+// per-source in-flight guard: a second RefreshSource("anthropic") call while
+// the first is still running its Discover is skipped, not queued/blocked.
+func TestRefreshSource_OverlappingCallsForSameNameSkipRatherThanBlock(t *testing.T) {
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+
+	slow := Source{
+		Name: "anthropic", Kind: "anthropic", Class: ClassExternalAPI, ProviderKey: "anthropic",
+		Discover: func(_ context.Context) ([]string, error) {
+			calls.Add(1)
+			close(started)
+			<-release
+			return []string{"claude-x"}, nil
+		},
+	}
+	m := NewManager([]Source{slow}, 0)
+
+	done := make(chan struct{})
+	go func() {
+		m.RefreshSource(context.Background(), "anthropic")
+		close(done)
+	}()
+
+	<-started
+	// A second call while the first is still blocked in Discover must return
+	// immediately (skipped), not wait for the first to finish.
+	m.RefreshSource(context.Background(), "anthropic")
+
+	close(release)
+	<-done
+
+	if got := calls.Load(); got != 1 {
+		t.Errorf("expected exactly 1 Discover call (the second overlapping call skipped), got %d", got)
+	}
+}
+
+// TestRefreshSource_ConcurrentVendorHintsAndPeriodicRefreshNeitherStarves is
+// the v2.1-required regression guard: anthropic and openai hints ticking
+// concurrently with the normal Refresh tick must all keep making progress —
+// none starves another — and the race detector must find nothing (run with
+// -race).
+func TestRefreshSource_ConcurrentVendorHintsAndPeriodicRefreshNeitherStarves(t *testing.T) {
+	var anthropicCalls, openaiCalls, vllmCalls atomic.Int32
+
+	anthropic := Source{
+		Name: "anthropic", Kind: "anthropic", Class: ClassExternalAPI, ProviderKey: "anthropic",
+		Discover: func(_ context.Context) ([]string, error) {
+			anthropicCalls.Add(1)
+			return []string{"claude-x"}, nil
+		},
+	}
+	openai := Source{
+		Name: "openai", Kind: "openai", Class: ClassExternalAPI, ProviderKey: "openai",
+		Discover: func(_ context.Context) ([]string, error) {
+			openaiCalls.Add(1)
+			return []string{"gpt-x"}, nil
+		},
+	}
+	vllm := Source{
+		Name: "vllm-default", Kind: "vllm", Class: ClassSelfHosted, ProviderKey: "vllm-default",
+		Discover: func(_ context.Context) ([]string, error) {
+			vllmCalls.Add(1)
+			return []string{"llama-3-8b"}, nil
+		},
+	}
+	m := NewManager([]Source{anthropic, openai, vllm}, 0)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	hint := func(name string) {
+		defer wg.Done()
+		for ctx.Err() == nil {
+			m.RefreshSource(context.Background(), name)
+		}
+	}
+	wg.Add(3)
+	go hint("anthropic")
+	go hint("openai")
+	go func() {
+		defer wg.Done()
+		for ctx.Err() == nil {
+			m.Refresh(context.Background())
+		}
+	}()
+	wg.Wait()
+
+	if anthropicCalls.Load() == 0 {
+		t.Error("expected the anthropic hint loop to make progress, got 0 calls")
+	}
+	if openaiCalls.Load() == 0 {
+		t.Error("expected the openai hint loop to make progress, got 0 calls")
+	}
+	if vllmCalls.Load() == 0 {
+		t.Error("expected the periodic Refresh tick to make progress, got 0 calls")
+	}
+
+	for _, id := range []string{"claude-x", "gpt-x", "llama-3-8b"} {
+		if _, ok := m.Snapshot().Lookup(id); !ok {
+			t.Errorf("expected %q to be routable after the concurrent run", id)
+		}
+	}
 }

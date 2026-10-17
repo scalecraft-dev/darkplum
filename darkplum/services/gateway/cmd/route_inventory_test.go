@@ -42,7 +42,7 @@ func loadGatewayGolden(t *testing.T) []goldenRoute {
 }
 
 func TestRouteInventoryMatchesGolden(t *testing.T) {
-	router := buildRouter(testChatHandler(), noopMiddleware, noopMiddleware, stubHealthHandler)
+	router := buildRouter(testChatHandler(), testProvidersHandler(), noopMiddleware, noopMiddleware, stubHealthHandler)
 	registered := make(map[string]bool)
 	for _, ri := range router.Routes() {
 		registered[ri.Method+" "+ri.Path] = true

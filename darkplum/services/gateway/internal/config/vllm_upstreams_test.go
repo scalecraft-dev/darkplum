@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestParseVLLMUpstreams_Empty(t *testing.T) {
 	got, err := parseVLLMUpstreams("", false)
@@ -60,7 +63,7 @@ func TestParseVLLMUpstreams_LoopbackAllowedInDevMode(t *testing.T) {
 }
 
 func TestParseGlobList_Empty(t *testing.T) {
-	got, err := parseGlobList("")
+	got, err := parseGlobList("BEDROCK_MODEL_FILTER", "")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -70,7 +73,7 @@ func TestParseGlobList_Empty(t *testing.T) {
 }
 
 func TestParseGlobList_Valid(t *testing.T) {
-	got, err := parseGlobList("us.anthropic.*, us.meta.*")
+	got, err := parseGlobList("BEDROCK_MODEL_FILTER", "us.anthropic.*, us.meta.*")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -80,7 +83,20 @@ func TestParseGlobList_Valid(t *testing.T) {
 }
 
 func TestParseGlobList_InvalidPattern(t *testing.T) {
-	if _, err := parseGlobList("["); err == nil {
+	if _, err := parseGlobList("BEDROCK_MODEL_FILTER", "["); err == nil {
 		t.Error("expected an error for a malformed glob pattern")
+	}
+}
+
+// TestParseGlobList_ErrorNamesTheCallersEnvVar guards the parameterisation
+// added for the future ANTHROPIC_MODEL_FILTER/OPENAI_MODEL_FILTER callers,
+// which will share this parser with BEDROCK_MODEL_FILTER.
+func TestParseGlobList_ErrorNamesTheCallersEnvVar(t *testing.T) {
+	_, err := parseGlobList("OPENAI_MODEL_FILTER", "[")
+	if err == nil {
+		t.Fatal("expected an error for a malformed glob pattern")
+	}
+	if !strings.Contains(err.Error(), "OPENAI_MODEL_FILTER") {
+		t.Errorf("expected the error to name OPENAI_MODEL_FILTER, got %v", err)
 	}
 }

@@ -250,6 +250,9 @@ func TestValidResidency(t *testing.T) {
 	if !validResidency("any") {
 		t.Error(`validResidency("any") = false, want true`)
 	}
+	if !validResidency("cloud_account_only") {
+		t.Error(`validResidency("cloud_account_only") = false, want true`)
+	}
 	if !validResidency("self_hosted_only") {
 		t.Error(`validResidency("self_hosted_only") = false, want true`)
 	}

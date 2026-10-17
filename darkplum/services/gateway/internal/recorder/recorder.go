@@ -57,6 +57,16 @@ type InferenceEvent struct {
 	// RouterLatencyMS is how long the routing decision itself took. nil when
 	// no routing decision was made (a static alias or plain model id).
 	RouterLatencyMS *int
+
+	// BackendClass is routing.Route.Class ("self_hosted", "cloud_managed",
+	// "external_api") for the route that was resolved, written to the Gin
+	// context the moment it is known (see handler.HandleChatCompletions) —
+	// so a DENIED row (model_not_enabled, model_residency_violation,
+	// model_not_allowed) carries it too, not only a dispatched one. Empty
+	// for a denial reached before route resolution (model_not_found,
+	// policy_unavailable, invalid_request, unsupported_parameter,
+	// request_canceled), which nullableStr turns into NULL.
+	BackendClass string
 }
 
 // Recorder buffers InferenceEvents and writes them to Postgres in batches.
@@ -155,6 +165,12 @@ type schema struct {
 // first and walks forward through the slice on an undefined-column error
 // until one succeeds (or the list is exhausted).
 var schemas = []schema{
+	// backend_class: migration 016 (inference_events.backend_class) plus
+	// everything below. A gateway new enough to know about external_api
+	// routes must still record correctly against a DB that hasn't run 016
+	// yet — this rung is what lets it step down to "routing" on a 42703
+	// exactly like every earlier column addition did.
+	{name: "backend_class", queue: queueBackendClassSchema},
 	// routing: migration 013 (purpose, route_name, router_reason,
 	// router_latency_ms) plus everything below.
 	{name: "routing", queue: queueRoutingSchema},
@@ -174,6 +190,37 @@ func purposeOrDefault(p string) string {
 		return "inference"
 	}
 	return p
+}
+
+func queueBackendClassSchema(b *pgx.Batch, evt InferenceEvent) {
+	b.Queue(`
+		INSERT INTO inference_events
+			(request_id, api_key_id, user_id, model, requested_model, status_code, latency_ms,
+			 prompt_tokens, completion_tokens, stream, ip_address,
+			 provider, region, denial_code, purpose, route_name, router_reason, router_latency_ms,
+			 backend_class)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::inet, $12, $13, $14, $15, $16, $17, $18, $19)
+	`,
+		evt.RequestID,
+		nullableStr(evt.APIKeyID),
+		nullableStr(evt.UserID),
+		evt.Model,
+		nullableStr(evt.RequestedModel),
+		evt.StatusCode,
+		evt.LatencyMS,
+		evt.PromptTokens,
+		evt.CompletionTokens,
+		evt.Stream,
+		nullableStr(evt.IP),
+		evt.Provider,
+		nullableStr(evt.Region),
+		nullableStr(evt.DenialCode),
+		purposeOrDefault(evt.Purpose),
+		nullableStr(evt.RouteName),
+		nullableStr(evt.RouterReason),
+		evt.RouterLatencyMS,
+		nullableStr(evt.BackendClass),
+	)
 }
 
 func queueRoutingSchema(b *pgx.Batch, evt InferenceEvent) {
@@ -258,10 +305,11 @@ func queueLegacySchema(b *pgx.Batch, evt InferenceEvent) {
 // until one succeeds. This is the gateway/api independent-deployment
 // fallback: the gateway can start before the api has run whatever migration
 // last touched inference_events (010/011 for requested_model/denial_code,
-// 013 for purpose/route_name/router_reason/router_latency_ms) against a
-// freshly onboarded customer database. Without it, every INSERT in the batch
-// would fail with "undefined_column" and be dropped — inference events
-// silently lost until the pod restarts. Instead, a downgrade sticks for
+// 013 for purpose/route_name/router_reason/router_latency_ms, 016 for
+// backend_class) against a freshly onboarded customer database. Without it,
+// every INSERT in the batch would fail with "undefined_column" and be
+// dropped — inference events silently lost until the pod restarts. Instead,
+// a downgrade sticks for
 // r.schemaLevel until the periodic re-probe (nextSchemaProbe) tries schemas[0]
 // again, so the recorder picks a newly-landed migration back up without a
 // restart.

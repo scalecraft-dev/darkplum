@@ -3,11 +3,20 @@ import { Link } from 'react-router-dom'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
-import type { ChatMessage } from '../types'
+import type { BackendClass, ChatMessage } from '../types'
 import { formatModelName } from '../lib/formatModelName'
-import { routerReasonText } from '../lib/modelRouting'
+import {
+  RETRY_AFTER_DEFAULT_SECONDS,
+  displayClassOf,
+  failedVendorLabel,
+  formatRetryCountdown,
+  isEgress,
+  routerReasonText,
+  vendorLabel,
+} from '../lib/modelRouting'
 import { CodeBlock } from '../components/ui/CodeBlock'
 import { CopyButton } from '../components/ui/CopyButton'
+import { EgressGlyph } from '../components/ui'
 import styles from './MessageList.module.css'
 
 /** A failed send, kept outside the message history so it is never replayed
@@ -22,6 +31,15 @@ export interface ChatFailure {
   /** Set once a fresh read of the model list came back without that model:
    *  the refusal is not a transient blip, the choice has to be made again. */
   modelGone?: boolean
+  /** Who served, or would have served, the turn: the gateway's own provider
+   *  header when it got that far, else the picked entry's owner. Only the two
+   *  vendors with an organisation key are ever named — see failedVendorLabel. */
+  vendor?: string | null
+  /** unsupported_parameter only: the request field the gateway refused. */
+  param?: string | null
+  /** provider_rate_limited only: the vendor's own Retry-After, in seconds.
+   *  Null when it sent none and the fixed wait applies instead. */
+  retryAfterSeconds?: number | null
 }
 
 interface Props {
@@ -49,15 +67,19 @@ const UnsavedNotice = () => (
   </p>
 )
 
-/** Headline and next step for each routing refusal the gateway can return.
+/** Headline and next step for each refusal the gateway can return — a routing
+ *  decision of the organisation's own, or a failure at the vendor.
  *  When a re-read of the list has confirmed the model is gone, the next step is
  *  the same for everyone — choose another one — so it replaces the per-role
  *  advice, which would otherwise point at a model that no longer exists. */
 function failureCopy(
-  code: string | undefined,
+  failure: ChatFailure,
   isAdmin: boolean,
 ): { title: string; hint: string } {
-  switch (code) {
+  // Opens every vendor-failure title, so it is a capitalised phrase rather
+  // than a bare name, and is never dropped mid-sentence into a hint.
+  const vendor = failedVendorLabel(failure.vendor)
+  switch (failure.code) {
     case 'model_not_found':
       return {
         title: 'That model is not available',
@@ -80,11 +102,16 @@ function failureCopy(
           : 'Your organisation limits which models you can use. Pick one from the list at the top of the page.',
       }
     case 'model_residency_violation':
+      // The gateway's own message names the rung in force and the class that
+      // conflicts with it — there are three of each now, so nine ways to land
+      // here and no single sentence that is true for all of them. It is
+      // printed above this hint verbatim; the hint says only what to do, which
+      // is the same whichever combination it was.
       return {
-        title: 'Blocked by the routing policy',
+        title: 'Blocked by where-it-runs policy',
         hint: isAdmin
-          ? 'The policy allows self-hosted models only. Pick a self-hosted model, or change the routing policy under Models → Policy.'
-          : 'Your organization allows self-hosted models only. Pick a self-hosted model from the list.',
+          ? 'Pick a model the policy permits, or change where requests may run under Models → Policy. Nothing is sent to a different model instead.'
+          : 'Your organisation limits where models may run. Pick another model from the list at the top of the page.',
       }
     case 'policy_unavailable':
       return {
@@ -92,6 +119,41 @@ function failureCopy(
         hint: isAdmin
           ? 'The gateway has no routing policy it can trust, so it is temporarily refusing every request rather than guessing. Try again shortly, and check the gateway’s database connectivity if it persists.'
           : 'The service is temporarily refusing requests for safety. Try again shortly.',
+      }
+    // --- Vendor failures. Nothing in the organisation's own configuration is
+    // wrong in any of these, so none of them sends anyone to the Models page
+    // to change a policy — the key, or the vendor, is the subject.
+    case 'provider_rate_limited':
+      return {
+        title: `${vendor} is rate-limiting your organisation’s key`,
+        hint: 'Everyone in your organisation shares this key. Wait a moment before trying again.',
+      }
+    case 'provider_auth_failed':
+      return {
+        title: `${vendor} rejected your organisation’s key`,
+        hint: isAdmin
+          ? 'The key darkplum holds for this vendor is no longer accepted — set it again under Model vendors. Other models still work.'
+          : 'An administrator needs to fix this. Other models still work.',
+      }
+    case 'upstream_error':
+    case 'upstream_timeout':
+      // One headline for both: 502 and 504 differ in what went wrong at the
+      // far end, and in nothing the person reading can act on.
+      return {
+        title: `${vendor} did not answer`,
+        hint: 'Nothing was sent to a different model. Try again, or choose another model.',
+      }
+    case 'invalid_request':
+      // The gateway's own sentence is already scrubbed and is printed above
+      // this. Adding to it would blame the vendor for a request shape it never
+      // saw — this refusal happens before anything leaves.
+      return { title: 'That request could not be sent', hint: '' }
+    case 'unsupported_parameter':
+      return {
+        title: 'That request used an unsupported option',
+        hint: failure.param
+          ? `This request used ‘${failure.param}’, which darkplum does not support yet.`
+          : 'This request used an option darkplum does not support yet.',
       }
     default:
       return {
@@ -110,8 +172,26 @@ const FailureNotice = ({
   isAdmin: boolean
   onRetry?: () => void
 }) => {
-  const { title, hint } = failureCopy(failure.code, isAdmin)
+  const { title, hint } = failureCopy(failure, isAdmin)
   const modelGone = failure.modelGone ?? false
+  // A shared key that has just been rate-limited is made worse by everyone
+  // retrying at once, so the way back is held shut for the interval the vendor
+  // asked for — or a short fixed one when it named none.
+  const cooldown =
+    failure.code === 'provider_rate_limited'
+      ? (failure.retryAfterSeconds ?? RETRY_AFTER_DEFAULT_SECONDS)
+      : 0
+  const [waiting, setWaiting] = useState(cooldown)
+  // Each send makes a new failure object, so a second refusal restarts the
+  // wait rather than inheriting whatever was left of the first.
+  useEffect(() => {
+    setWaiting(cooldown)
+  }, [failure, cooldown])
+  useEffect(() => {
+    if (waiting <= 0) return
+    const timer = window.setTimeout(() => setWaiting((left) => left - 1), 1000)
+    return () => window.clearTimeout(timer)
+  }, [waiting])
   // Fixed in the catalogue: the model is missing from it, or switched off in it.
   const catalogueRelated =
     failure.code === 'model_not_found' || failure.code === 'model_not_enabled'
@@ -121,6 +201,9 @@ const FailureNotice = ({
   // A per-principal refusal is fixed where per-principal policy is written, not
   // on the Models page: the model itself is enabled and allowed for the org.
   const principalPolicyRelated = failure.code === 'model_not_allowed'
+  // Fixed by setting the organisation's key again, which is the vendor block
+  // of the Models page rather than the catalogue or any policy.
+  const vendorKeyRelated = failure.code === 'provider_auth_failed'
 
   return (
     <div className={styles.failure} role="alert">
@@ -145,16 +228,42 @@ const FailureNotice = ({
       </div>
       <p className={styles.failureMessage}>{failure.message}</p>
       {/* A confirmed disappearance overrides the per-role advice: telling an
-          admin to enable a model the gateway no longer discovers is a dead end. */}
-      <p className={styles.failureHint}>
-        {modelGone
-          ? 'This model is no longer available. Choose another model at the top of the page, then try again.'
-          : hint}
-      </p>
+          admin to enable a model the gateway no longer discovers is a dead end.
+          Some refusals say everything in the gateway's own sentence above and
+          have no next step to add; those print no hint rather than padding. */}
+      {(modelGone || hint) && (
+        <p className={styles.failureHint}>
+          {modelGone
+            ? 'This model is no longer available. Choose another model at the top of the page, then try again.'
+            : hint}
+        </p>
+      )}
       <div className={styles.failureActions}>
         {onRetry && (
-          <button type="button" className={styles.failureBtn} onClick={onRetry}>
+          /* aria-disabled rather than disabled: pressing Try again into a rate
+             limit refuses the send again and starts a fresh wait, and a real
+             `disabled` at that moment would drop the focus the person was
+             holding onto the body. This keeps it, and keeps the control
+             reachable so its name can be read. */
+          <button
+            type="button"
+            className={styles.failureBtn}
+            onClick={() => {
+              if (waiting <= 0) onRetry()
+            }}
+            aria-disabled={waiting > 0 || undefined}
+          >
             Try again
+            {/* The button's own name updates as this ticks, which is what a
+                screen reader reads on focus. It is aria-live="off" because the
+                card around it is role="alert": without this, every second of
+                the wait would be announced over whatever else is being read. */}
+            {waiting > 0 && (
+              <span className={styles.failureCountdown} aria-live="off">
+                {' in '}
+                {formatRetryCountdown(waiting)}
+              </span>
+            )}
           </button>
         )}
         {isAdmin && catalogueRelated && (
@@ -170,6 +279,11 @@ const FailureNotice = ({
         {isAdmin && principalPolicyRelated && (
           <Link to="/admin/users" className={styles.failureLink}>
             Open Users &amp; Keys
+          </Link>
+        )}
+        {isAdmin && vendorKeyRelated && (
+          <Link to="/admin/models" className={styles.failureLink}>
+            Open Model vendors
           </Link>
         )}
         {failure.model && (
@@ -229,6 +343,8 @@ const Provenance = ({
   model,
   route,
   reason,
+  backendClass,
+  provider,
   rerouted,
   reasonId,
   reasonOpen,
@@ -238,13 +354,31 @@ const Provenance = ({
   route?: string | null
   /** Already in plain language. Empty when the gateway sent no reason. */
   reason: string
+  /** Where this reply ran, from the gateway's header. Absent after a reload:
+   *  history stores the model, not the class. */
+  backendClass?: BackendClass | null
+  provider?: string | null
   rerouted?: boolean
   reasonId: string
   reasonOpen: boolean
   onToggleReason: () => void
 }) => {
+  /**
+   * Where it went, said only when the gateway told us and only when it left
+   * the account.
+   *
+   * The ordinary case gets nothing: a note under every reply saying it ran
+   * where it always runs is noise, and noise is what makes the one reply that
+   * went somewhere else invisible. A reloaded conversation carries no class at
+   * all, so this is absent rather than guessed — the alternative is a line
+   * that reassures on Tuesday and is wrong on Wednesday.
+   */
+  const egress = backendClass !== null && backendClass !== undefined && isEgress(displayClassOf({ backend_class: backendClass }))
+  const vendor = egress ? vendorLabel(provider) : ''
+
   const spoken = [
     `Answered by ${formatModelName(model)}`,
+    egress ? `sent to ${vendor}, which is outside your cloud account` : '',
     route ? `route ${route}` : '',
     rerouted ? 'the model this conversation had been using was no longer available' : '',
   ]
@@ -256,6 +390,15 @@ const Provenance = ({
       <span className={styles.provenanceLine}>
         <span aria-hidden="true">
           answered by <span className={styles.provenanceId} title={model}>{formatModelName(model)}</span>
+          {egress && (
+            <span
+              className={styles.provenanceEgress}
+              title={`This message was sent to ${vendor}'s API using your organisation's key, and left your cloud account.`}
+            >
+              <EgressGlyph />
+              sent to {vendor}
+            </span>
+          )}
           {route && (
             <>
               {' · route '}
@@ -307,6 +450,8 @@ const AssistantBubble = memo(({
   model,
   route,
   routerReason,
+  backendClass,
+  provider,
   rerouted,
   isStreaming,
   isLast,
@@ -320,6 +465,9 @@ const AssistantBubble = memo(({
    *  Known for the turn that just arrived; history keeps the model only. */
   route?: string | null
   routerReason?: string | null
+  /** Where it ran, and who served it. Same lifetime as `route`. */
+  backendClass?: BackendClass | null
+  provider?: string | null
   rerouted?: boolean
   isStreaming: boolean
   isLast: boolean
@@ -355,6 +503,8 @@ const AssistantBubble = memo(({
                       model={model}
                       route={route}
                       reason={reason}
+                      backendClass={backendClass}
+                      provider={provider}
                       rerouted={rerouted}
                       reasonId={reasonId}
                       reasonOpen={reasonOpen}
@@ -436,6 +586,8 @@ export function MessageList({
                 model={msg.model}
                 route={msg.route}
                 routerReason={msg.routerReason}
+                backendClass={msg.backendClass}
+                provider={msg.provider}
                 rerouted={msg.rerouted}
                 isStreaming={isLast && streaming}
                 isLast={isLast}

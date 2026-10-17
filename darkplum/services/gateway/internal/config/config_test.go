@@ -1,6 +1,9 @@
 package config
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 // baseEnv sets the minimum environment Load needs to succeed, without
 // touching any of the fields under test in this file.
@@ -202,5 +205,278 @@ func TestLoad_ClassifierTimeoutMSRejectsNonInteger(t *testing.T) {
 	t.Setenv("CLASSIFIER_TIMEOUT_MS", "not-a-number")
 	if _, err := Load(); err == nil {
 		t.Fatal("expected an error for a non-integer CLASSIFIER_TIMEOUT_MS")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Vendor provider config (anthropic)
+// ---------------------------------------------------------------------------
+
+func TestLoad_ProviderKeysDirDefault(t *testing.T) {
+	baseEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.ProviderKeysDir != "/var/run/darkplum/provider-keys" {
+		t.Errorf("ProviderKeysDir = %q, want the default", cfg.ProviderKeysDir)
+	}
+}
+
+func TestLoad_ProviderKeysDirOverride(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("PROVIDER_KEYS_DIR", "/tmp/custom-provider-keys")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.ProviderKeysDir != "/tmp/custom-provider-keys" {
+		t.Errorf("ProviderKeysDir = %q", cfg.ProviderKeysDir)
+	}
+}
+
+func TestLoad_AnthropicDefaultMaxTokensDefault(t *testing.T) {
+	baseEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.AnthropicDefaultMaxTokens != 8192 {
+		t.Errorf("AnthropicDefaultMaxTokens = %d, want default 8192", cfg.AnthropicDefaultMaxTokens)
+	}
+}
+
+func TestLoad_AnthropicDefaultMaxTokensRejectsNonPositive(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("ANTHROPIC_DEFAULT_MAX_TOKENS", "0")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected an error for ANTHROPIC_DEFAULT_MAX_TOKENS=0")
+	}
+	t.Setenv("ANTHROPIC_DEFAULT_MAX_TOKENS", "not-a-number")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected an error for a non-integer ANTHROPIC_DEFAULT_MAX_TOKENS")
+	}
+}
+
+// TestLoad_AnthropicModelFilterAcceptsInvalidGlobWithoutFailing is the
+// regression guard for the failure-isolation ruling: a typo'd vendor filter
+// must never be able to block the whole gateway from starting, unlike
+// BEDROCK_MODEL_FILTER (parsed via the validating parseGlobList, which
+// fails Load outright on a bad pattern). Validity of each Anthropic pattern
+// is instead checked per-tick by routing.ApplyGlobFilter, which fails
+// closed (non-fatally) for that one vendor only.
+func TestLoad_AnthropicModelFilterAcceptsInvalidGlobWithoutFailing(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("ANTHROPIC_MODEL_FILTER", "[invalid-glob")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("an invalid ANTHROPIC_MODEL_FILTER glob must not fail Load, got: %v", err)
+	}
+	if len(cfg.AnthropicModelFilter) != 1 || cfg.AnthropicModelFilter[0] != "[invalid-glob" {
+		t.Errorf("expected the raw (unvalidated) pattern to be carried through, got %v", cfg.AnthropicModelFilter)
+	}
+}
+
+func TestLoad_AnthropicModelFilterParsesCommaList(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("ANTHROPIC_MODEL_FILTER", "claude-haiku-*, claude-opus-* ,,claude-sonnet-*")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []string{"claude-haiku-*", "claude-opus-*", "claude-sonnet-*"}
+	if len(cfg.AnthropicModelFilter) != len(want) {
+		t.Fatalf("AnthropicModelFilter = %v, want %v", cfg.AnthropicModelFilter, want)
+	}
+	for i, p := range want {
+		if cfg.AnthropicModelFilter[i] != p {
+			t.Errorf("AnthropicModelFilter[%d] = %q, want %q", i, cfg.AnthropicModelFilter[i], p)
+		}
+	}
+}
+
+func TestLoad_AnthropicModelFilterEmptyIsNil(t *testing.T) {
+	baseEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.AnthropicModelFilter != nil {
+		t.Errorf("expected a nil filter by default, got %v", cfg.AnthropicModelFilter)
+	}
+}
+
+func TestLoad_AnthropicModelFilterSetAtParsesRFC3339(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("ANTHROPIC_MODEL_FILTER_SET_AT", "2026-01-15T12:00:00Z")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want, _ := time.Parse(time.RFC3339, "2026-01-15T12:00:00Z")
+	if !cfg.AnthropicModelFilterSetAt.Equal(want) {
+		t.Errorf("AnthropicModelFilterSetAt = %v, want %v", cfg.AnthropicModelFilterSetAt, want)
+	}
+}
+
+func TestLoad_AnthropicModelFilterSetAtUnsetIsZeroTime(t *testing.T) {
+	baseEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.AnthropicModelFilterSetAt.IsZero() {
+		t.Errorf("expected the zero time when unset, got %v", cfg.AnthropicModelFilterSetAt)
+	}
+}
+
+// TestLoad_AnthropicModelFilterSetAtUnparseableDoesNotFailLoad mirrors
+// TestLoad_AnthropicModelFilterAcceptsInvalidGlobWithoutFailing: a malformed
+// SET_AT must never be able to block the gateway from starting — it simply
+// loses every last-writer-wins comparison against a DB row (the zero time).
+func TestLoad_AnthropicModelFilterSetAtUnparseableDoesNotFailLoad(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("ANTHROPIC_MODEL_FILTER_SET_AT", "not-a-timestamp")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("an unparseable ANTHROPIC_MODEL_FILTER_SET_AT must not fail Load, got: %v", err)
+	}
+	if !cfg.AnthropicModelFilterSetAt.IsZero() {
+		t.Errorf("expected the zero time for an unparseable value, got %v", cfg.AnthropicModelFilterSetAt)
+	}
+}
+
+func TestLoad_OpenAIModelFilterSetAtParsesRFC3339(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("OPENAI_MODEL_FILTER_SET_AT", "2026-02-01T09:30:00Z")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want, _ := time.Parse(time.RFC3339, "2026-02-01T09:30:00Z")
+	if !cfg.OpenAIModelFilterSetAt.Equal(want) {
+		t.Errorf("OpenAIModelFilterSetAt = %v, want %v", cfg.OpenAIModelFilterSetAt, want)
+	}
+}
+
+func TestLoad_OpenAIModelFilterSetAtUnsetIsZeroTime(t *testing.T) {
+	baseEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !cfg.OpenAIModelFilterSetAt.IsZero() {
+		t.Errorf("expected the zero time when unset, got %v", cfg.OpenAIModelFilterSetAt)
+	}
+}
+
+func TestLoad_AnthropicBaseURLRejectsHTTPOutsideDevMode(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:9999")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected an error for a non-https ANTHROPIC_BASE_URL outside DEV_MODE")
+	}
+}
+
+func TestLoad_AnthropicBaseURLAllowsHTTPInDevMode(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("DEV_MODE", "true")
+	t.Setenv("ANTHROPIC_BASE_URL", "http://127.0.0.1:9999")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.AnthropicBaseURL != "http://127.0.0.1:9999" {
+		t.Errorf("AnthropicBaseURL = %q", cfg.AnthropicBaseURL)
+	}
+}
+
+func TestLoad_AnthropicBaseURLEmptyByDefault(t *testing.T) {
+	baseEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.AnthropicBaseURL != "" {
+		t.Errorf("AnthropicBaseURL = %q, want empty by default", cfg.AnthropicBaseURL)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// OpenAI knobs — same semantics as the Anthropic ones above, minus a default
+// max tokens knob (OpenAI's max_completion_tokens is simply omitted when the
+// caller doesn't set one; see internal/provider/openai).
+// ---------------------------------------------------------------------------
+
+func TestLoad_OpenAIModelFilterAcceptsInvalidGlobWithoutFailing(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("OPENAI_MODEL_FILTER", "[invalid-glob")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("an invalid OPENAI_MODEL_FILTER glob must not fail Load, got: %v", err)
+	}
+	if len(cfg.OpenAIModelFilter) != 1 || cfg.OpenAIModelFilter[0] != "[invalid-glob" {
+		t.Errorf("expected the raw (unvalidated) pattern to be carried through, got %v", cfg.OpenAIModelFilter)
+	}
+}
+
+func TestLoad_OpenAIModelFilterParsesCommaList(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("OPENAI_MODEL_FILTER", "gpt-4o*, gpt-5* ,,o3*")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	want := []string{"gpt-4o*", "gpt-5*", "o3*"}
+	if len(cfg.OpenAIModelFilter) != len(want) {
+		t.Fatalf("OpenAIModelFilter = %v, want %v", cfg.OpenAIModelFilter, want)
+	}
+	for i, p := range want {
+		if cfg.OpenAIModelFilter[i] != p {
+			t.Errorf("OpenAIModelFilter[%d] = %q, want %q", i, cfg.OpenAIModelFilter[i], p)
+		}
+	}
+}
+
+func TestLoad_OpenAIModelFilterEmptyIsNil(t *testing.T) {
+	baseEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.OpenAIModelFilter != nil {
+		t.Errorf("expected a nil filter by default, got %v", cfg.OpenAIModelFilter)
+	}
+}
+
+func TestLoad_OpenAIBaseURLRejectsHTTPOutsideDevMode(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("OPENAI_BASE_URL", "http://127.0.0.1:9998")
+	if _, err := Load(); err == nil {
+		t.Fatal("expected an error for a non-https OPENAI_BASE_URL outside DEV_MODE")
+	}
+}
+
+func TestLoad_OpenAIBaseURLAllowsHTTPInDevMode(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("DEV_MODE", "true")
+	t.Setenv("OPENAI_BASE_URL", "http://127.0.0.1:9998")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.OpenAIBaseURL != "http://127.0.0.1:9998" {
+		t.Errorf("OpenAIBaseURL = %q", cfg.OpenAIBaseURL)
+	}
+}
+
+func TestLoad_OpenAIBaseURLEmptyByDefault(t *testing.T) {
+	baseEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.OpenAIBaseURL != "" {
+		t.Errorf("OpenAIBaseURL = %q, want empty by default", cfg.OpenAIBaseURL)
 	}
 }

@@ -17,6 +17,9 @@ spec:
         app.kubernetes.io/name: darkplum-web
         app.kubernetes.io/part-of: darkplum
     spec:
+      # Static files behind nginx: it never talks to the Kubernetes API, so it
+      # gets no ServiceAccount token.
+      automountServiceAccountToken: false
       containers:
         - name: web
           image: darkplum-web:latest

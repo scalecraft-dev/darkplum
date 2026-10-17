@@ -50,6 +50,26 @@ const (
 	// the admin-visible activity log. No other conversation endpoint writes
 	// an activity event.
 	ConversationDeleted EventType = "conversation.deleted"
+
+	// ProviderKeyInstalled and ProviderKeyRotated are recorded on a
+	// successful PUT /api/v1/providers/:vendor/key, distinguished by whether
+	// the gateway reported the vendor as already `configured` before this
+	// write (rotated) or not (installed) -- see providers.go's PutKey.
+	// Detail carries {vendor, key_last4, model_filter_before,
+	// model_filter_after}: key_last4 is computed from the SUBMITTED body
+	// (never read back from storage, which never holds it anyway -- the key
+	// itself is never stored in Postgres, only in the cluster Secret).
+	ProviderKeyInstalled EventType = "provider.key_installed"
+	ProviderKeyRotated   EventType = "provider.key_rotated"
+	// ProviderKeyRemoved is recorded on a successful DELETE
+	// /api/v1/providers/:vendor/key. Detail carries {vendor,
+	// model_filter_before, model_filter_after} -- no key_last4 (there is no
+	// submitted key on a removal).
+	ProviderKeyRemoved EventType = "provider.key_removed"
+	// ProviderFilterChanged is recorded on a successful PUT
+	// /api/v1/providers/:vendor/filter. Detail carries {vendor,
+	// model_filter_before, model_filter_after} -- no key_last4.
+	ProviderFilterChanged EventType = "provider.filter_changed"
 )
 
 // Event is the input to Recorder.Record.

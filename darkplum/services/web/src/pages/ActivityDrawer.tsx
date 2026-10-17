@@ -14,9 +14,16 @@ import { getUsageStats, listActivity, listUsage } from '../lib/api'
 import { useTheme } from '../context/ThemeContext'
 import type { InferenceEvent, KeyUsageSummary, TimeRange, UsageBucket, UserUsageSummary } from '../types'
 import { eventLabel, eventVariant, formatEventDetail, inferenceEventLabel, type EventVariant } from '../lib/activityEvents'
-import { denialLabel, routerReasonText } from '../lib/modelRouting'
+import {
+  denialLabel,
+  displayClassOf,
+  isEgress,
+  ranOnSuffix,
+  routerReasonText,
+  vendorLabel,
+} from '../lib/modelRouting'
 import { useToast } from '../components/Toast'
-import { Avatar, Badge, Skeleton } from '../components/ui'
+import { Avatar, Badge, EgressGlyph, Skeleton } from '../components/ui'
 import styles from './ActivityDrawer.module.css'
 
 const CHART_COLORS = {
@@ -81,11 +88,17 @@ function inferenceToRow(e: InferenceEvent): {
   label: string
   variant: EventVariant
   detail: string
+  egress: string | null
 } {
   const { label, variant } = inferenceEventLabel(e)
+  const cls = e.backend_class ?? null
+  const display = cls ? displayClassOf({ backend_class: cls }) : null
   const detail = [
     e.denial_code ? `${denialLabel(e.denial_code)} (${e.denial_code})` : '',
-    `model: ${e.model}`,
+    // Named as a place and a company. A drawer opened on one person is where
+    // someone asks "what did they send, and where did it go?", so the answer
+    // rides on every row rather than only on the ones that left.
+    `model: ${e.model}${ranOnSuffix(cls, e.provider)}`,
     e.route_name ? `route: ${e.route_name}` : '',
     e.router_reason ? routerReasonText(e.router_reason).toLowerCase() : '',
     `${e.latency_ms}ms`,
@@ -99,6 +112,7 @@ function inferenceToRow(e: InferenceEvent): {
     label,
     variant,
     detail,
+    egress: display !== null && isEgress(display) ? vendorLabel(e.provider) : null,
   }
 }
 
@@ -140,7 +154,18 @@ export function ActivityDrawer({ open, onClose, user, apiKey, timeRange }: Drawe
   const chartColors = CHART_COLORS[theme]
 
   const [buckets, setBuckets] = useState<UsageBucket[]>([])
-  const [recentEvents, setRecentEvents] = useState<Array<{ id: string; created_at: string; label: string; variant: 'neutral' | 'info' | 'warning' | 'danger' | 'success'; detail: string }>>([])
+  const [recentEvents, setRecentEvents] = useState<
+    Array<{
+      id: string
+      created_at: string
+      label: string
+      variant: 'neutral' | 'info' | 'warning' | 'danger' | 'success'
+      detail: string
+      /** The vendor a request went out to, or null. Admin events never leave
+       *  the account, so theirs is always null. */
+      egress: string | null
+    }>
+  >([])
   const [loadingChart, setLoadingChart] = useState(false)
   const [loadingEvents, setLoadingEvents] = useState(false)
 
@@ -183,6 +208,7 @@ export function ActivityDrawer({ open, onClose, user, apiKey, timeRange }: Drawe
           label: eventLabel(e.event_type),
           variant: eventVariant(e.event_type),
           detail: e.detail ? formatEventDetail(e.detail) : '',
+          egress: null,
         }))
 
         const inferenceMapped = usageRes.events.map(inferenceToRow)
@@ -365,6 +391,16 @@ export function ActivityDrawer({ open, onClose, user, apiKey, timeRange }: Drawe
                   <div key={e.id} className={styles.eventItem}>
                     <span className={styles.eventTime}>{formatRelativeTime(e.created_at)}</span>
                     <Badge variant={e.variant}>{e.label}</Badge>
+                    {e.egress && (
+                      <Badge
+                        variant="warning"
+                        bordered
+                        title={`This request ran at ${e.egress}'s own API, using your organisation's key. It left your cloud account.`}
+                      >
+                        <EgressGlyph />
+                        Left cloud account · {e.egress}
+                      </Badge>
+                    )}
                     {e.detail && (
                       <span className={styles.eventDetail} title={e.detail}>{e.detail}</span>
                     )}

@@ -27,6 +27,7 @@ func TestModelAllowed(t *testing.T) {
 
 func TestValidPrincipalResidency(t *testing.T) {
 	self := residencySelfHostedOnly
+	cloudOnly := residencyCloudAccountOnly
 	any := residencyAny
 	cases := []struct {
 		name string
@@ -34,6 +35,7 @@ func TestValidPrincipalResidency(t *testing.T) {
 		want bool
 	}{
 		{"nil (inherit) is valid", nil, true},
+		{"cloud_account_only is valid", &cloudOnly, true},
 		{"self_hosted_only is valid", &self, true},
 		{"any is rejected (nothing to override with)", &any, false},
 		{"garbage is rejected", strPtrLocal("bogus"), false},
@@ -58,6 +60,23 @@ func TestOrgPolicyTightened_Residency(t *testing.T) {
 	}
 	if orgPolicyTightened(residencyAny, residencyAny, nil, nil) {
 		t.Fatal("no residency change must not be a tighten")
+	}
+	// Three-rung ladder (migration 016): any < cloud_account_only <
+	// self_hosted_only, each step up is a tighten, each step down is not.
+	if !orgPolicyTightened(residencyAny, residencyCloudAccountOnly, nil, nil) {
+		t.Fatal("any -> cloud_account_only must be a tighten")
+	}
+	if !orgPolicyTightened(residencyCloudAccountOnly, residencySelfHostedOnly, nil, nil) {
+		t.Fatal("cloud_account_only -> self_hosted_only must be a tighten")
+	}
+	if orgPolicyTightened(residencyCloudAccountOnly, residencyAny, nil, nil) {
+		t.Fatal("cloud_account_only -> any must not be a tighten")
+	}
+	if orgPolicyTightened(residencySelfHostedOnly, residencyCloudAccountOnly, nil, nil) {
+		t.Fatal("self_hosted_only -> cloud_account_only must not be a tighten (it's a loosening)")
+	}
+	if orgPolicyTightened(residencyCloudAccountOnly, residencyCloudAccountOnly, nil, nil) {
+		t.Fatal("no residency change (cloud_account_only) must not be a tighten")
 	}
 }
 

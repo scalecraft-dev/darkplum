@@ -1,7 +1,8 @@
 // Per-principal routing policy: org -> user -> api_key (migration
-// 015_principal_policies.sql). Same JSON shape at every level:
+// 015_principal_policies.sql, widened to a third residency rung by migration
+// 016_external_api_residency.sql). Same JSON shape at every level:
 //
-//	{"residency": null|"self_hosted_only", "allowed_models": null|[...], "default_model": null|string}
+//	{"residency": null|"cloud_account_only"|"self_hosted_only", "allowed_models": null|[...], "default_model": null|string}
 //
 // null always means "inherit the level above"; org's null residency means
 // "any" (there is nothing above org). allowed_models is a tri-state via
@@ -88,12 +89,12 @@ type principalPolicyResponse struct {
 }
 
 // validPrincipalResidency mirrors principal_routing_policies.residency's
-// CHECK constraint: nil (inherit) or exactly "self_hosted_only". Unlike the
-// org level, a principal can never explicitly set "any" -- there is nothing
-// to override "any" with, since inheriting IS "any" in the absence of a
-// stricter ancestor.
+// CHECK constraint (migration 016): nil (inherit), "cloud_account_only", or
+// "self_hosted_only". Unlike the org level, a principal can never explicitly
+// set "any" -- there is nothing to override "any" with, since inheriting IS
+// "any" in the absence of a stricter ancestor.
 func validPrincipalResidency(r *string) bool {
-	return r == nil || *r == residencySelfHostedOnly
+	return r == nil || *r == residencyCloudAccountOnly || *r == residencySelfHostedOnly
 }
 
 // modelAllowed reports whether id is permitted by an (already-merged)
@@ -549,7 +550,7 @@ func keyNamesByID(ctx context.Context, db *pgxpool.Pool, ids []string) (map[stri
 // (only the key itself is affected) -- exactly DESIGN4's "keys" contract.
 func (h *PolicyHandler) validateAndPreviewWrite(ctx context.Context, principalType, targetID, ownerUserID string, req policyObject) (*gatewayEffectivePolicy, error) {
 	if !validPrincipalResidency(req.Residency) {
-		return nil, errors.New("residency must be null or 'self_hosted_only'")
+		return nil, errors.New("residency must be null, 'cloud_account_only', or 'self_hosted_only'")
 	}
 	if req.AllowedModels != nil {
 		if err := validateAllowedModelIDs(ctx, h.db, *req.AllowedModels); err != nil {
@@ -1062,7 +1063,7 @@ func (h *PolicyHandler) PreviewUserPolicy(c *gin.Context) {
 		}
 	}
 	if !validPrincipalResidency(req.Residency) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "residency must be null or 'self_hosted_only'"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "residency must be null, 'cloud_account_only', or 'self_hosted_only'"})
 		return
 	}
 
@@ -1148,7 +1149,7 @@ func (h *PolicyHandler) PreviewAPIKeyPolicy(c *gin.Context) {
 		}
 	}
 	if !validPrincipalResidency(req.Residency) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "residency must be null or 'self_hosted_only'"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "residency must be null, 'cloud_account_only', or 'self_hosted_only'"})
 		return
 	}
 

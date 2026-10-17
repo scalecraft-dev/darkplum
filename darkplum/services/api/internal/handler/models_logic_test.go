@@ -1,8 +1,56 @@
 package handler
 
 import (
+	"encoding/json"
+	"os"
 	"testing"
 	"time"
+)
+
+// residencyTruthTablePath is the SAME cross-service golden the gateway
+// generates from policy.ResidencyPermits (see
+// gateway/internal/policy/residency_truth_table_test.go) and
+// services/web/scripts/check-policy.mts reads — guilfoyle's M3 review
+// finding: one truth table, not three hand-typed copies that can drift out
+// of sync with each other. Path is relative to this package
+// (services/api/internal/handler).
+const residencyTruthTablePath = "../../../gateway/internal/policy/testdata/residency_truth_table.json"
+
+// residencyTruthTableCell/residencyTruthTable mirror the gateway's JSON
+// shape exactly (see that package's doc comment on the field names being
+// part of the cross-service contract).
+type residencyTruthTableCell struct {
+	Residency string `json:"residency"`
+	Class     string `json:"class"`
+	Permitted bool   `json:"permitted"`
+}
+
+type residencyTruthTable struct {
+	ResidencyRank []string                  `json:"residency_rank"`
+	KnownClasses  []string                  `json:"known_classes"`
+	UnknownToken  string                    `json:"unknown_token"`
+	Cells         []residencyTruthTableCell `json:"cells"`
+}
+
+func loadResidencyTruthTable(t *testing.T) residencyTruthTable {
+	t.Helper()
+	data, err := os.ReadFile(residencyTruthTablePath)
+	if err != nil {
+		t.Fatalf("read %s: %v", residencyTruthTablePath, err)
+	}
+	var table residencyTruthTable
+	if err := json.Unmarshal(data, &table); err != nil {
+		t.Fatalf("decode %s: %v", residencyTruthTablePath, err)
+	}
+	return table
+}
+
+// exampleUnknownResidency/exampleUnknownClass exercise a golden cell whose
+// residency/class is table.UnknownToken — see the gateway's identical
+// constants for why any other unrecognised string classifies the same way.
+const (
+	exampleUnknownResidency = "not-a-real-residency"
+	exampleUnknownClass     = "some_future_class"
 )
 
 func TestModelIsAvailable(t *testing.T) {
@@ -33,14 +81,106 @@ func TestNormalizeBackendClass(t *testing.T) {
 	cases := map[string]string{
 		"self_hosted":   backendClassSelfHosted,
 		"cloud_managed": backendClassCloudManaged,
-		"":              backendClassSelfHosted,
-		"bogus":         backendClassSelfHosted,
-		"Cloud_Managed": backendClassSelfHosted, // case-sensitive; not the exact literal
+		"external_api":  backendClassExternalAPI,
+		// Unrecognized/absent defaults to the STRICTEST known class
+		// (external_api), not self_hosted -- see normalizeBackendClass's doc
+		// comment for why that flipped once a third class existed.
+		"":              backendClassExternalAPI,
+		"bogus":         backendClassExternalAPI,
+		"Cloud_Managed": backendClassExternalAPI, // case-sensitive; not the exact literal
 	}
 	for input, want := range cases {
 		if got := normalizeBackendClass(input); got != want {
 			t.Errorf("normalizeBackendClass(%q) = %q, want %q", input, got, want)
 		}
+	}
+}
+
+// TestResidencyRank asserts this package's residencyRank ladder against the
+// SAME cross-service residency_rank order the gateway generates from its own
+// residencyByRank (see residencyTruthTablePath) -- not a hand-typed
+// duplicate, so a ladder change in one implementation without the other
+// fails here.
+func TestResidencyRank(t *testing.T) {
+	table := loadResidencyTruthTable(t)
+	for i, residency := range table.ResidencyRank {
+		if got := residencyRank(residency); got != i {
+			t.Errorf("residencyRank(%q) = %d, want %d (per %s's residency_rank order)", residency, got, i, residencyTruthTablePath)
+		}
+		for j := i + 1; j < len(table.ResidencyRank); j++ {
+			if residencyRank(residency) >= residencyRank(table.ResidencyRank[j]) {
+				t.Errorf("%q must rank below %q", residency, table.ResidencyRank[j])
+			}
+		}
+	}
+	if residencyRank(exampleUnknownResidency) != residencyRank(table.ResidencyRank[len(table.ResidencyRank)-1]) {
+		t.Errorf("unknown residency must rank as strict as %q", table.ResidencyRank[len(table.ResidencyRank)-1])
+	}
+}
+
+// TestResidencyPermitsClass asserts residencyPermitsClass against EVERY cell
+// of the shared cross-service truth table (residencyTruthTablePath) -- the
+// SAME artifact the gateway's policy.ResidencyPermits and
+// services/web/scripts/check-policy.mts are asserted against -- rather than
+// a hand-typed table that could silently drift from either. See
+// guilfoyle's M3 review finding.
+func TestResidencyPermitsClass(t *testing.T) {
+	table := loadResidencyTruthTable(t)
+	if len(table.Cells) == 0 {
+		t.Fatalf("%s has no cells -- did the gateway generator run?", residencyTruthTablePath)
+	}
+	for _, cell := range table.Cells {
+		residency := cell.Residency
+		if residency == table.UnknownToken {
+			residency = exampleUnknownResidency
+		}
+		class := cell.Class
+		if class == table.UnknownToken {
+			class = exampleUnknownClass
+		}
+		if got := residencyPermitsClass(residency, class); got != cell.Permitted {
+			t.Errorf("residencyPermitsClass(%q, %q) = %v, want %v (per %s)", residency, class, got, cell.Permitted, residencyTruthTablePath)
+		}
+	}
+}
+
+func TestRequestPermitsExternalAPI(t *testing.T) {
+	cases := map[string]bool{
+		"":                          false,
+		"external_api":              true,
+		" external_api ":            true,
+		"external_api,other":        true,
+		"other,external_api":        true,
+		"External_API":              false, // case-sensitive; not the exact token
+		"externalapi":               false,
+		"self_hosted,cloud_managed": false,
+	}
+	for input, want := range cases {
+		if got := requestPermitsExternalAPI(input); got != want {
+			t.Errorf("requestPermitsExternalAPI(%q) = %v, want %v", input, got, want)
+		}
+	}
+}
+
+func TestModelVisibleInList(t *testing.T) {
+	// The capability header hides external_api regardless of how permissive
+	// residency is.
+	if modelVisibleInList(residencyAny, false, backendClassExternalAPI) {
+		t.Error("external_api must be hidden when the caller didn't send the classes header, even under residency=any")
+	}
+	if !modelVisibleInList(residencyAny, true, backendClassExternalAPI) {
+		t.Error("external_api must be visible under residency=any when the caller sent the classes header")
+	}
+	// Residency still applies once the header is present.
+	if modelVisibleInList(residencyCloudAccountOnly, true, backendClassExternalAPI) {
+		t.Error("cloud_account_only must still refuse external_api even with the header present")
+	}
+	// The header has no bearing on non-external_api classes.
+	if !modelVisibleInList(residencyAny, false, backendClassSelfHosted) {
+		t.Error("self_hosted must remain visible regardless of the classes header")
+	}
+	if !modelVisibleInList(residencyAny, false, backendClassCloudManaged) {
+		t.Error("cloud_managed must remain visible regardless of the classes header")
 	}
 }
 
@@ -55,7 +195,7 @@ func TestBuildModelsList_NoPolicyIncludesEverything(t *testing.T) {
 		{Alias: "smart", TargetModelID: "claude-3-sonnet", OwnedBy: "bedrock", BackendClass: backendClassCloudManaged, TargetDiscoveredAt: now},
 	}
 
-	got := buildModelsList(models, aliases, nil, residencyAny, now, modelAvailabilityWindow, nil)
+	got := buildModelsList(models, aliases, nil, residencyAny, true, now, modelAvailabilityWindow, nil)
 	if len(got) != 4 {
 		t.Fatalf("len(got) = %d, want 4: %+v", len(got), got)
 	}
@@ -91,7 +231,7 @@ func TestBuildModelsList_SelfHostedOnlyOmitsCloudManaged(t *testing.T) {
 		{Alias: "smart", TargetModelID: "claude-3-sonnet", OwnedBy: "bedrock", BackendClass: backendClassCloudManaged, TargetDiscoveredAt: now},
 	}
 
-	got := buildModelsList(models, aliases, nil, residencySelfHostedOnly, now, modelAvailabilityWindow, nil)
+	got := buildModelsList(models, aliases, nil, residencySelfHostedOnly, true, now, modelAvailabilityWindow, nil)
 
 	for _, e := range got {
 		if e.BackendClass == backendClassCloudManaged {
@@ -106,8 +246,55 @@ func TestBuildModelsList_SelfHostedOnlyOmitsCloudManaged(t *testing.T) {
 	}
 }
 
+// TestBuildModelsList_CloudAccountOnlyPermitsCloudManagedRefusesExternalAPI
+// covers the third residency rung specifically: cloud_account_only must
+// still show a cloud_managed model (it never left the cloud account) but
+// must refuse an external_api one (it does).
+func TestBuildModelsList_CloudAccountOnlyPermitsCloudManagedRefusesExternalAPI(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	models := []modelDBRow{
+		{ModelID: "llama3", Provider: "vllm", BackendClass: backendClassSelfHosted, DiscoveredAt: now},
+		{ModelID: "claude-3-sonnet", Provider: "bedrock", BackendClass: backendClassCloudManaged, DiscoveredAt: now},
+		{ModelID: "claude-3-opus", Provider: "anthropic", BackendClass: backendClassExternalAPI, DiscoveredAt: now},
+	}
+
+	got := buildModelsList(models, nil, nil, residencyCloudAccountOnly, true, now, modelAvailabilityWindow, nil)
+
+	ids := map[string]bool{}
+	for _, e := range got {
+		ids[e.ID] = true
+	}
+	if !ids["llama3"] || !ids["claude-3-sonnet"] {
+		t.Fatalf("expected self_hosted and cloud_managed present under cloud_account_only, got %v", ids)
+	}
+	if ids["claude-3-opus"] {
+		t.Fatalf("expected external_api omitted under cloud_account_only, got %v", ids)
+	}
+}
+
+// TestBuildModelsList_ExternalAPIHiddenWithoutCapabilityHeader covers the
+// rollout-safety gate independently of residency: even under the loosest
+// residency (any), an external_api model must not appear unless
+// permitExternalAPI is true.
+func TestBuildModelsList_ExternalAPIHiddenWithoutCapabilityHeader(t *testing.T) {
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	models := []modelDBRow{
+		{ModelID: "claude-3-opus", Provider: "anthropic", BackendClass: backendClassExternalAPI, DiscoveredAt: now},
+	}
+
+	got := buildModelsList(models, nil, nil, residencyAny, false, now, modelAvailabilityWindow, nil)
+	if len(got) != 0 {
+		t.Fatalf("expected external_api hidden without the capability header, got %+v", got)
+	}
+
+	got = buildModelsList(models, nil, nil, residencyAny, true, now, modelAvailabilityWindow, nil)
+	if len(got) != 1 {
+		t.Fatalf("expected external_api present with the capability header under residency=any, got %+v", got)
+	}
+}
+
 func TestBuildModelsList_EmptyInputsProduceEmptySlice(t *testing.T) {
-	got := buildModelsList(nil, nil, nil, residencyAny, time.Now(), modelAvailabilityWindow, nil)
+	got := buildModelsList(nil, nil, nil, residencyAny, true, time.Now(), modelAvailabilityWindow, nil)
 	if got == nil {
 		t.Fatal("buildModelsList returned nil, want a non-nil empty slice so JSON encodes []")
 	}
@@ -135,7 +322,7 @@ func TestBuildModelsList_UnavailableModelAndAliasOmitted(t *testing.T) {
 		{Alias: "cold", TargetModelID: "stale", OwnedBy: "vllm", BackendClass: backendClassSelfHosted, TargetDiscoveredAt: stale},
 	}
 
-	got := buildModelsList(models, aliases, nil, residencyAny, now, modelAvailabilityWindow, nil)
+	got := buildModelsList(models, aliases, nil, residencyAny, true, now, modelAvailabilityWindow, nil)
 
 	ids := map[string]bool{}
 	for _, e := range got {
@@ -161,7 +348,7 @@ func TestNormalizeGatewayModels(t *testing.T) {
 	entries := []openAIModelEntry{
 		{ID: "", OwnedBy: "vllm"}, // empty id must be dropped
 		{ID: "llama3", OwnedBy: "vllm", BackendClass: backendClassSelfHosted},
-		{ID: "no-owner"}, // OwnedBy defaults to "vllm", BackendClass defaults to self_hosted
+		{ID: "no-owner"}, // OwnedBy defaults to "vllm", BackendClass defaults to external_api (strictest)
 		{ID: "llama3", OwnedBy: "bedrock", BackendClass: backendClassCloudManaged}, // duplicate id, last one wins
 	}
 
@@ -190,8 +377,8 @@ func TestNormalizeGatewayModels(t *testing.T) {
 	if noOwner.Provider != "vllm" {
 		t.Errorf("no-owner Provider = %q, want vllm default", noOwner.Provider)
 	}
-	if noOwner.BackendClass != backendClassSelfHosted {
-		t.Errorf("no-owner BackendClass = %q, want self_hosted default", noOwner.BackendClass)
+	if noOwner.BackendClass != backendClassExternalAPI {
+		t.Errorf("no-owner BackendClass = %q, want external_api default (strictest known class)", noOwner.BackendClass)
 	}
 }
 
@@ -212,7 +399,7 @@ func TestBuildModelsList_RoutedAlias_ViableEntryShape(t *testing.T) {
 		},
 	}
 
-	got := buildModelsList(nil, nil, routed, residencyAny, now, modelAvailabilityWindow, nil)
+	got := buildModelsList(nil, nil, routed, residencyAny, true, now, modelAvailabilityWindow, nil)
 	if len(got) != 1 {
 		t.Fatalf("len(got) = %d, want 1: %+v", len(got), got)
 	}
@@ -266,7 +453,7 @@ func TestBuildModelsList_RoutedAlias_OmittedWhenNoViableRoute(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := buildModelsList(nil, nil, tc.routed, residencyAny, now, modelAvailabilityWindow, nil)
+			got := buildModelsList(nil, nil, tc.routed, residencyAny, true, now, modelAvailabilityWindow, nil)
 			if len(got) != 0 {
 				t.Fatalf("expected the routed alias to be omitted, got %+v", got)
 			}
@@ -291,7 +478,7 @@ func TestBuildModelsList_RoutedAlias_ResidencyPartialViability(t *testing.T) {
 		},
 	}
 
-	got := buildModelsList(nil, nil, routed, residencySelfHostedOnly, now, modelAvailabilityWindow, nil)
+	got := buildModelsList(nil, nil, routed, residencySelfHostedOnly, true, now, modelAvailabilityWindow, nil)
 	if len(got) != 1 {
 		t.Fatalf("expected the alias to survive on its self_hosted route, got %+v", got)
 	}
@@ -307,7 +494,7 @@ func TestBuildModelsList_RoutedAlias_ResidencyPartialViability(t *testing.T) {
 
 	// Now BOTH routes are cloud_managed: nothing is viable, alias omitted.
 	routed[0].Routes[0].TargetBackendClass = backendClassCloudManaged
-	got = buildModelsList(nil, nil, routed, residencySelfHostedOnly, now, modelAvailabilityWindow, nil)
+	got = buildModelsList(nil, nil, routed, residencySelfHostedOnly, true, now, modelAvailabilityWindow, nil)
 	if len(got) != 0 {
 		t.Fatalf("expected the alias to be omitted when no route is residency-permitted, got %+v", got)
 	}
@@ -320,7 +507,7 @@ func TestBuildModelsList_StaticAliasGetsAliasKind(t *testing.T) {
 	models := []modelDBRow{{ModelID: "llama3", Provider: "vllm", BackendClass: backendClassSelfHosted, DiscoveredAt: now}}
 	aliases := []aliasDBRow{{Alias: "default", TargetModelID: "llama3", OwnedBy: "vllm", BackendClass: backendClassSelfHosted, TargetDiscoveredAt: now}}
 
-	got := buildModelsList(models, aliases, nil, residencyAny, now, modelAvailabilityWindow, nil)
+	got := buildModelsList(models, aliases, nil, residencyAny, true, now, modelAvailabilityWindow, nil)
 	for _, e := range got {
 		if e.ID == "default" && e.AliasKind != aliasKindStatic {
 			t.Errorf("static alias entry AliasKind = %q, want %q", e.AliasKind, aliasKindStatic)

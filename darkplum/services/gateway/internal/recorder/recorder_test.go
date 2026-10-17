@@ -110,10 +110,11 @@ func denialEvent(requestID string) InferenceEvent {
 }
 
 // A gateway that starts before the api has migrated must not lose audit
-// events: it steps down through schemas (routing -> requested_model ->
-// legacy), writes each event exactly once, and picks newer schemas back up
-// without a restart once their columns exist — one schema level at a time,
-// matching how migrations 010/011 and 013 land independently.
+// events: it steps down through schemas (backend_class -> routing ->
+// requested_model -> legacy), writes each event exactly once, and picks
+// newer schemas back up without a restart once their columns exist — one
+// schema level at a time, matching how migrations 010/011, 013, and 016 land
+// independently.
 func TestWriteBatch_FallsBackThenRecoversAcrossSchemaLevels(t *testing.T) {
 	pool := setupRecorderDB(t)
 	ctx := context.Background()
@@ -128,8 +129,8 @@ func TestWriteBatch_FallsBackThenRecoversAcrossSchemaLevels(t *testing.T) {
 	if n != 1 {
 		t.Fatalf("event must be written exactly once via the legacy insert, got %d rows", n)
 	}
-	if r.schemaLevel != 2 {
-		t.Fatalf("expected the recorder to settle on the legacy schema (level 2), got %d", r.schemaLevel)
+	if r.schemaLevel != 3 {
+		t.Fatalf("expected the recorder to settle on the legacy schema (level 3), got %d", r.schemaLevel)
 	}
 	if !r.nextSchemaProbe.After(time.Now()) {
 		t.Fatal("recorder should schedule a future re-probe of newer schemas")
@@ -151,9 +152,10 @@ func TestWriteBatch_FallsBackThenRecoversAcrossSchemaLevels(t *testing.T) {
 		t.Fatalf("expected legacy insert before the probe is due, got requested=%v denial=%v", requested, denial)
 	}
 
-	// Probe due: the recorder walks forward from the newest schema (routing,
-	// still missing its columns) and correctly settles on requested_model
-	// (level 1) rather than jumping straight back to legacy.
+	// Probe due: the recorder walks forward from the newest schema
+	// (backend_class/routing, still missing their columns) and correctly
+	// settles on requested_model (level 2) rather than jumping straight back
+	// to legacy.
 	r.nextSchemaProbe = time.Now().Add(-time.Second)
 	r.writeBatch([]InferenceEvent{denialEvent("after-011")})
 
@@ -169,12 +171,13 @@ func TestWriteBatch_FallsBackThenRecoversAcrossSchemaLevels(t *testing.T) {
 		denial == nil || *denial != "model_not_enabled" || status != 403 {
 		t.Fatalf("audit row wrong: model=%q requested=%v denial=%v status=%d", model, requested, denial, status)
 	}
-	if r.schemaLevel != 1 {
-		t.Fatalf("expected the recorder to settle on the requested_model schema (level 1), got %d", r.schemaLevel)
+	if r.schemaLevel != 2 {
+		t.Fatalf("expected the recorder to settle on the requested_model schema (level 2), got %d", r.schemaLevel)
 	}
 
-	// Migration 013 lands. The next re-probe recovers all the way to the
-	// newest (routing) schema.
+	// Migration 013 lands, but not yet 016 (backend_class). The next
+	// re-probe recovers to "routing" (level 1), not all the way to the
+	// newest.
 	if _, err := pool.Exec(ctx, `
 		ALTER TABLE inference_events
 			ADD COLUMN purpose TEXT NOT NULL DEFAULT 'inference',
@@ -204,8 +207,31 @@ func TestWriteBatch_FallsBackThenRecoversAcrossSchemaLevels(t *testing.T) {
 		routerReason == nil || *routerReason != "rules:default" || routerLatency == nil || *routerLatency != 42 {
 		t.Fatalf("got purpose=%q route_name=%v router_reason=%v router_latency_ms=%v", purpose, routeName, routerReason, routerLatency)
 	}
+	if r.schemaLevel != 1 {
+		t.Fatalf("expected the recorder to settle on the routing schema (level 1) with backend_class still missing, got %d", r.schemaLevel)
+	}
+
+	// Migration 016 lands (backend_class). The next re-probe recovers all
+	// the way to the newest schema.
+	if _, err := pool.Exec(ctx, `ALTER TABLE inference_events ADD COLUMN backend_class TEXT`); err != nil {
+		t.Fatalf("alter: %v", err)
+	}
+	r.nextSchemaProbe = time.Now().Add(-time.Second)
+
+	r.writeBatch([]InferenceEvent{{
+		RequestID: "after-016", Model: "us.anthropic.claude-3-5-sonnet", StatusCode: 200, LatencyMS: 5,
+		BackendClass: "cloud_managed",
+	}})
+
+	var backendClass *string
+	if err := pool.QueryRow(ctx, `SELECT backend_class FROM inference_events WHERE request_id = 'after-016'`).Scan(&backendClass); err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	if backendClass == nil || *backendClass != "cloud_managed" {
+		t.Fatalf("backend_class = %v, want cloud_managed", backendClass)
+	}
 	if r.schemaLevel != 0 {
-		t.Fatalf("expected the recorder to recover to the routing schema (level 0), got %d", r.schemaLevel)
+		t.Fatalf("expected the recorder to recover to the backend_class schema (level 0), got %d", r.schemaLevel)
 	}
 }
 
@@ -243,6 +269,59 @@ func mustAddRoutingColumns(t *testing.T, pool *pgxpool.Pool) {
 			ADD COLUMN router_reason TEXT,
 			ADD COLUMN router_latency_ms INT`); err != nil {
 		t.Fatalf("alter: %v", err)
+	}
+}
+
+// mustAddBackendClassColumn brings a table already at the migration 013
+// shape (via mustAddRoutingColumns) up to migration 016's backend_class.
+func mustAddBackendClassColumn(t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(), `ALTER TABLE inference_events ADD COLUMN backend_class TEXT`); err != nil {
+		t.Fatalf("alter: %v", err)
+	}
+}
+
+// TestWriteBatch_BackendClassStoredForDenialAndDispatch asserts backend_class
+// round-trips for both a denied row (model_residency_violation, reached
+// after route.Class was known — see handler.HandleChatCompletions) and a
+// dispatched row, and is NULL when unset (a denial reached before route
+// resolution, e.g. model_not_found, has no class to carry).
+func TestWriteBatch_BackendClassStoredForDenialAndDispatch(t *testing.T) {
+	pool := setupRecorderDB(t)
+	ctx := context.Background()
+	mustAddRoutingColumns(t, pool)
+	mustAddBackendClassColumn(t, pool)
+	r := &Recorder{pool: pool}
+
+	r.writeBatch([]InferenceEvent{
+		{RequestID: "denied-with-class", Model: "us.anthropic.claude-3-5-sonnet", StatusCode: 403, LatencyMS: 2, DenialCode: "model_residency_violation", BackendClass: "cloud_managed"},
+		{RequestID: "denied-no-route", Model: "does-not-exist", StatusCode: 404, LatencyMS: 1, DenialCode: "model_not_found"},
+		{RequestID: "dispatched", Model: "llama-3-8b", StatusCode: 200, LatencyMS: 5, BackendClass: "self_hosted"},
+	})
+
+	got := map[string]*string{}
+	rows, err := pool.Query(ctx, `SELECT request_id, backend_class FROM inference_events WHERE request_id IN ('denied-with-class','denied-no-route','dispatched')`)
+	if err != nil {
+		t.Fatalf("query: %v", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id string
+		var bc *string
+		if err := rows.Scan(&id, &bc); err != nil {
+			t.Fatalf("scan: %v", err)
+		}
+		got[id] = bc
+	}
+
+	if got["denied-with-class"] == nil || *got["denied-with-class"] != "cloud_managed" {
+		t.Errorf("denied-with-class backend_class = %v, want cloud_managed", got["denied-with-class"])
+	}
+	if got["denied-no-route"] != nil {
+		t.Errorf("denied-no-route backend_class = %v, want NULL", got["denied-no-route"])
+	}
+	if got["dispatched"] == nil || *got["dispatched"] != "self_hosted" {
+		t.Errorf("dispatched backend_class = %v, want self_hosted", got["dispatched"])
 	}
 }
 

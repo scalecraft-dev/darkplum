@@ -103,6 +103,16 @@ type Manager struct {
 	// tick is skipped rather than piling up concurrent discovery storms.
 	refreshing atomic.Bool
 
+	// refreshingSources guards RefreshSource against overlapping calls for
+	// the SAME source name — name -> *atomic.Bool, lazily created. This is
+	// deliberately its OWN guard, never refreshing above: refreshing is one
+	// flag shared by every source's whole-table Refresh tick, and reusing it
+	// here would mean a POST /v1/providers/anthropic/refresh hint in flight
+	// could cause a concurrent .../openai/refresh hint (or the periodic
+	// Refresh tick itself) to be skipped even though neither touches the
+	// same vendor's Source.
+	refreshingSources sync.Map
+
 	mu          sync.Mutex
 	lastGood    map[string][]string  // source name -> last successful id list
 	lastSuccess map[string]time.Time // source name -> time of last successful discovery
@@ -227,6 +237,71 @@ func (m *Manager) Refresh(ctx context.Context) {
 	m.table.Store(NewTable(routes))
 }
 
+// RefreshSource runs Discover for exactly ONE named source and re-resolves
+// the route table, without touching any other source's last-good state —
+// the on-demand counterpart of Refresh, used by
+// internal/handler.ProvidersHandler's post-install/rotate refresh hint (POST
+// /v1/providers/:vendor/refresh) to pick up a freshly installed vendor key
+// faster than the next periodic Refresh tick.
+//
+// Guarded by its OWN per-source in-flight flag (refreshingSources), NOT
+// m.refreshing: a concurrent call for a DIFFERENT source name — including
+// another vendor's hint, or the periodic Refresh tick itself — is never
+// skipped because of this call; only a second overlapping call for the SAME
+// name is. name's Discover call runs outside m.mu, exactly like Refresh's
+// own per-source discovery; only the state update and route-table re-resolve
+// below take the lock. Unknown source names are logged and otherwise
+// ignored.
+func (m *Manager) RefreshSource(ctx context.Context, name string) {
+	flagVal, _ := m.refreshingSources.LoadOrStore(name, new(atomic.Bool))
+	flag := flagVal.(*atomic.Bool)
+	if !flag.CompareAndSwap(false, true) {
+		log.Printf("routing: on-demand refresh of %s already in progress, skipping this call", name)
+		return
+	}
+	defer flag.Store(false)
+
+	src, ok := m.sourceNamed(name)
+	if !ok {
+		log.Printf("routing: RefreshSource: unknown source %q", name)
+		return
+	}
+
+	srcCtx, cancel := context.WithTimeout(ctx, m.sourceTimeout)
+	ids, err := src.Discover(srcCtx)
+	cancel()
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	now := m.clock()
+	if err != nil {
+		m.lastErr[name] = err
+		log.Printf("routing: %s: on-demand refresh failed, keeping last-good (%d models): %v",
+			name, len(m.lastGood[name]), err)
+	} else {
+		m.lastErr[name] = nil
+		m.lastGood[name] = ids
+		m.lastSuccess[name] = now
+	}
+
+	m.updateExpiryLocked(now)
+	routes, winners := m.resolveLocked()
+	m.logRouteChangesLocked(routes, winners)
+	m.prevWinner = winners
+	m.table.Store(NewTable(routes))
+}
+
+// sourceNamed returns the registered Source with the given name, if any.
+func (m *Manager) sourceNamed(name string) (Source, bool) {
+	for _, s := range m.sources {
+		if s.Name == name {
+			return s, true
+		}
+	}
+	return Source{}, false
+}
+
 // discoverAllConcurrently runs Discover on every source in its own goroutine,
 // each bounded by a context derived from ctx with sourceTimeout, and returns
 // results indexed by registration order (m.sources[i] <-> results[i]).
@@ -277,10 +352,11 @@ func (m *Manager) updateExpiryLocked(now time.Time) {
 }
 
 // resolveLocked rebuilds the route table from the current last-good lists,
-// applying the collision rule: self_hosted beats cloud_managed; among
-// self-hosted sources, earlier registration order (index into m.sources)
-// wins. Sources currently past lastGoodTTL (m.expired) contribute nothing. It
-// also logs a WARNING naming every source involved whenever the winner for a
+// applying the collision rule: the lowest-ranked class wins (self_hosted
+// beats cloud_managed beats external_api — see classRank); among sources of
+// the SAME rank, earlier registration order (index into m.sources) wins.
+// Sources currently past lastGoodTTL (m.expired) contribute nothing. It also
+// logs a WARNING naming every source involved whenever the winner for a
 // contested model id changes from the previous refresh. Must be called with
 // m.mu held.
 func (m *Manager) resolveLocked() (map[string]Route, map[string]string) {
@@ -301,11 +377,17 @@ func (m *Manager) resolveLocked() (map[string]Route, map[string]string) {
 	winners := make(map[string]string, len(claimants))
 
 	for id, idxs := range claimants {
+		// idxs is already in registration order (built by iterating
+		// m.sources ascending above), so scanning left-to-right and only
+		// replacing the winner on a STRICTLY better (lower) rank means a tie
+		// keeps whichever candidate was registered first — "registration
+		// order only within a rank".
 		winner := idxs[0]
-		for _, idx := range idxs {
-			if m.sources[idx].Class == ClassSelfHosted {
+		bestRank := rankOfClass(m.sources[winner].Class)
+		for _, idx := range idxs[1:] {
+			if r := rankOfClass(m.sources[idx].Class); r < bestRank {
 				winner = idx
-				break
+				bestRank = r
 			}
 		}
 

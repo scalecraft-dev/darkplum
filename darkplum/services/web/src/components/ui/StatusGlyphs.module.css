@@ -1,0 +1,11 @@
+/* A glyph always precedes the words it marks, inside a badge or in running
+   text, and carries its own trailing space. One step of the spacing scale —
+   4px, what the Models page's private copies used, so nothing shifted when
+   they were folded into this. Anywhere the glyph sits in a flex row, cancel
+   the row's gap against THIS value rather than zeroing the margin: a glyph
+   pushed up against the first letter reads as part of the word. */
+.glyph {
+  flex-shrink: 0;
+  margin-right: var(--space-1);
+  vertical-align: -1px;
+}

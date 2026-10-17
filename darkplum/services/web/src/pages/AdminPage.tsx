@@ -109,7 +109,7 @@ export function AdminPage() {
     void loadPrincipals()
     // The catalogue only matters once the drawer opens, and a failure there is
     // reported inside the drawer.
-    listAdminModels().then(setModels).catch(() => setModels([]))
+    listAdminModels().then((r) => setModels(r.models)).catch(() => setModels([]))
     listModelAliases().then(setAliases).catch(() => setAliases([]))
   }, [loadUsers, loadKeys, loadPrincipals])
 

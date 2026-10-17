@@ -50,7 +50,8 @@ const defaultMaxTokens = 4096
 //     fail validation.
 //   - MaxTokens of 0 defaults to defaultMaxTokens (Converse's per-model
 //     default is not always what we want as a floor).
-//   - Temperature is forwarded only when non-nil.
+//   - Temperature and TopP are forwarded only when non-nil; Stop is forwarded
+//     only when non-empty.
 func translateRequest(req provider.ChatRequest) (system []types.SystemContentBlock, messages []types.Message, inferenceConfig *types.InferenceConfiguration, err error) {
 	var systemText strings.Builder
 	type turn struct {
@@ -127,6 +128,13 @@ func translateRequest(req provider.ChatRequest) (system []types.SystemContentBlo
 	if req.Temperature != nil {
 		temp := float32(*req.Temperature)
 		inferenceConfig.Temperature = &temp
+	}
+	if req.TopP != nil {
+		topP := float32(*req.TopP)
+		inferenceConfig.TopP = &topP
+	}
+	if len(req.Stop) > 0 {
+		inferenceConfig.StopSequences = req.Stop
 	}
 
 	return system, messages, inferenceConfig, nil

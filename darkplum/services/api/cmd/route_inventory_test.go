@@ -37,6 +37,7 @@ import (
 	"github.com/scalecraft/darkplum/api/internal/auth"
 	"github.com/scalecraft/darkplum/api/internal/db"
 	"github.com/scalecraft/darkplum/api/internal/handler"
+	"github.com/scalecraft/darkplum/api/internal/kube"
 )
 
 // routeInventoryEntry mirrors one element of docs/api-routes.json.
@@ -174,11 +175,12 @@ func TestRouteInventoryMatchesGolden(t *testing.T) {
 	policy := handler.NewPolicyHandler(pool, activityRecorder, "http://unused.invalid", "unused")
 	modelHandler := handler.NewModelHandler("http://unused.invalid", "unused", pool)
 	conversations := handler.NewConversationHandler(pool, activityRecorder)
+	providers := handler.NewProvidersHandler(pool, activityRecorder, "http://unused.invalid", "unused", kube.NewWriter(), modelHandler, true)
 
 	baseDeps := routerDeps{
 		pool: pool, authCfg: authCfg, sessionMW: sessionMW, localProvider: localProvider,
 		users: users, keys: keys, chat: chat, activityH: activityH, routing: routing,
-		policy: policy, modelHandler: modelHandler, conversations: conversations,
+		policy: policy, modelHandler: modelHandler, conversations: conversations, providers: providers,
 	}
 
 	// Branch 1: local auth only (oidcProvider nil) — the default install.

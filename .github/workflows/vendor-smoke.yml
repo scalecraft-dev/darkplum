@@ -1,0 +1,49 @@
+name: Vendor smoke
+
+# Calls the real Anthropic and OpenAI APIs through the gateway's provider
+# packages: model discovery, one non-streaming completion and one streaming
+# completion per vendor, asserting token usage is reported on both paths.
+#
+# Manual only. It spends real money (a few hundred tokens on each vendor's
+# cheapest model) and needs repository secrets, so it never runs on push or on a
+# pull request — a fork must not be able to reach the keys. Run it before a
+# release that touches services/gateway/internal/provider/{anthropic,openai}.
+on:
+  workflow_dispatch:
+    inputs:
+      anthropic_model:
+        description: Anthropic model id to call
+        default: claude-haiku-4-5
+      openai_model:
+        description: OpenAI model id to call
+        default: gpt-5-mini
+
+permissions:
+  contents: read
+
+jobs:
+  vendor-smoke:
+    name: Real vendor round trip
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: darkplum/services/gateway
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: darkplum/services/gateway/go.mod
+          cache-dependency-path: darkplum/services/gateway/go.sum
+      # The vendorsmoke build tag keeps these tests out of every ordinary
+      # `go test ./...`; each test also skips when its key is absent, so a
+      # repository with only one vendor's secret still gets a useful run.
+      - name: anthropic
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          VENDOR_SMOKE_ANTHROPIC_MODEL: ${{ inputs.anthropic_model }}
+        run: go test -tags vendorsmoke -count=1 -run VendorSmoke -v ./internal/provider/anthropic/
+      - name: openai
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          VENDOR_SMOKE_OPENAI_MODEL: ${{ inputs.openai_model }}
+        run: go test -tags vendorsmoke -count=1 -run VendorSmoke -v ./internal/provider/openai/

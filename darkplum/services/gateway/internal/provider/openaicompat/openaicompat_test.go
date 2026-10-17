@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -242,6 +243,63 @@ func TestComplete_HappyPath(t *testing.T) {
 	// Authorization must be stripped before reaching the upstream.
 	if capturedAuthHeader != "" {
 		t.Errorf("Authorization header leaked to upstream: %q", capturedAuthHeader)
+	}
+}
+
+// TestComplete_TopPAndStopForwarded asserts top_p and stop are round-tripped
+// onto the upstream request body when the caller set them, and omitted
+// entirely when not set — request-shape honesty applies both ways.
+func TestComplete_TopPAndStopForwarded(t *testing.T) {
+	var captured map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &captured); err != nil {
+			t.Fatalf("decode upstream request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(buildMockCompletion("id-1", "model", "ok", 1, 1))
+	}))
+	defer srv.Close()
+
+	p := newTestProvider(t, srv.URL)
+	topP := 0.9
+	req := testRequest()
+	req.TopP = &topP
+	req.Stop = []string{"STOP"}
+
+	if _, err := p.Complete(context.Background(), req); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if got, ok := captured["top_p"].(float64); !ok || got != 0.9 {
+		t.Errorf("top_p = %v, want 0.9", captured["top_p"])
+	}
+	stopVal, ok := captured["stop"].([]any)
+	if !ok || len(stopVal) != 1 || stopVal[0] != "STOP" {
+		t.Errorf("stop = %v, want [STOP]", captured["stop"])
+	}
+}
+
+func TestComplete_TopPAndStopOmittedWhenUnset(t *testing.T) {
+	var captured map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if err := json.Unmarshal(body, &captured); err != nil {
+			t.Fatalf("decode upstream request body: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write(buildMockCompletion("id-1", "model", "ok", 1, 1))
+	}))
+	defer srv.Close()
+
+	p := newTestProvider(t, srv.URL)
+	if _, err := p.Complete(context.Background(), testRequest()); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if _, ok := captured["top_p"]; ok {
+		t.Errorf("expected no top_p field when unset, got %v", captured["top_p"])
+	}
+	if _, ok := captured["stop"]; ok {
+		t.Errorf("expected no stop field when unset, got %v", captured["stop"])
 	}
 }
 
@@ -533,6 +591,75 @@ func TestStream_Non200(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "500") {
 		t.Errorf("error should mention status code 500, got: %v", err)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Stream() — idle-read watchdog (real transport, not a fake io.Reader)
+// ---------------------------------------------------------------------------
+
+// TestStream_IdleTimeoutAbortsBlockedRead is the regression test for the
+// review finding that the idle watchdog never actually aborted a blocked
+// read: Stream built the upstream *http.Request with the caller's ctx
+// instead of idleCtx, so cancelling idleCtx (via IdleTimeoutReader's
+// cancelCause) did nothing to the in-flight request — net/http only aborts a
+// request by cancelling the exact context.Context it was built with. This
+// server sends headers plus one SSE chunk, then blocks forever (until the
+// test ends) without closing the connection, simulating a wedged upstream
+// (e.g. an OOM-killed model process that leaves the TCP connection open).
+// With a shortened StreamIdleTimeout, Stream must return an idle-timeout
+// error promptly, AND the server handler's own request context must
+// actually be cancelled (proving the request — not just IdleTimeoutReader's
+// local bookkeeping — was aborted).
+func TestStream_IdleTimeoutAbortsBlockedRead(t *testing.T) {
+	block := make(chan struct{})
+	serverCtxDone := make(chan struct{})
+	t.Cleanup(func() { close(block) })
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "data: "+`{"id":"chatcmpl_hang","object":"chat.completion.chunk","model":"llama-3-8b","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}`+"\n\n")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		// Block until either the test cleans up (fallback, so the handler
+		// goroutine doesn't leak past the test) or the client's request
+		// context is cancelled — which is the actual assertion: it proves
+		// Stream's idle watchdog aborted the REQUEST, not just its own local
+		// read loop.
+		select {
+		case <-block:
+		case <-r.Context().Done():
+			close(serverCtxDone)
+		}
+	}))
+	defer srv.Close()
+
+	p := newTestProvider(t, srv.URL)
+	p.StreamIdleTimeout = 100 * time.Millisecond
+	req := testRequest()
+	req.Stream = true
+
+	start := time.Now()
+	_, err := p.Stream(context.Background(), req, &bytes.Buffer{})
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatal("expected an idle-timeout error")
+	}
+	if !strings.Contains(err.Error(), "idle timeout") {
+		t.Errorf("expected an idle-timeout error, got: %v", err)
+	}
+	if elapsed > 5*time.Second {
+		t.Errorf("idle timeout took too long to fire: %s", elapsed)
+	}
+
+	select {
+	case <-serverCtxDone:
+		// Good: the server observed the request context being cancelled.
+	case <-time.After(5 * time.Second):
+		t.Fatal("server handler's request context was never cancelled — the idle watchdog aborted only the local read loop, not the actual upstream request")
 	}
 }
 

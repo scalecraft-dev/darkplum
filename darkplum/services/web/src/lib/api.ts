@@ -1,5 +1,22 @@
-import type { User, ApiKey, ChatMessage, ActivityEvent, AliasRouteTest, InferenceEvent, InferencePurpose, UsageBucket, UsageSummary, UserUsageSummary, KeyUsageSummary, Model, AdminModel, ModelAlias, ModelAliasInput, Residency, RoutingPolicy, PrincipalPolicy, EffectivePolicy, PolicyPreview, PolicyPrincipalsPage, ConversationSummary, ConversationFull, ConversationMessage, ConversationMessageInput } from '../types'
+import type { User, ApiKey, ChatMessage, ActivityEvent, AliasRouteTest, BackendClass, InferenceEvent, InferencePurpose, UsageBucket, UsageSummary, UserUsageSummary, KeyUsageSummary, Model, AdminModel, AdminModelsResult, ModelAlias, ModelAliasInput, ProviderStatus, Residency, RoutingPolicy, PrincipalPolicy, EffectivePolicy, PolicyPreview, PolicyPrincipalsPage, ConversationSummary, ConversationFull, ConversationMessage, ConversationMessageInput, VendorName } from '../types'
+import { parseRetryAfter } from './modelRouting'
 import { ROUTES, buildPath, type QueryValue, type Route } from './routes'
+
+/**
+ * What this bundle can make sense of, declared on every request.
+ *
+ * Deploy order is not enforceable here — one repo, one `make deploy` — so the
+ * server has to be able to tell an old bundle from a new one rather than assume
+ * they moved together. Without this header the api leaves external_api models
+ * out of every list it answers, which is what makes a stale cached bundle safe:
+ * it never sees a vendor model, so it can never label one "Runs in your
+ * infrastructure".
+ *
+ * It is a capability declaration and nothing more. It is not sent on
+ * /v1/chat/completions, and it never affects what the gateway will permit —
+ * enforcement is the routing policy's job, on every request, header or not.
+ */
+const CLASSES_HEADER = { 'X-Darkplum-Classes': 'external_api' } as const
 
 /**
  * An error carrying the HTTP status so callers can branch on 400 / 404 / 409
@@ -11,18 +28,45 @@ export class ApiError extends Error {
    *  than a sentence — a 409 from a routing-policy save lists `locked_out`
    *  principals — and the page showing the refusal wants that, not a toast. */
   readonly details?: unknown
+  /** Seconds to wait, from a 429's Retry-After. Undefined on every other
+   *  status: no other refusal has an interval to offer, and inventing one on
+   *  a button would be worse than leaving it enabled. */
+  readonly retryAfterSeconds?: number
 
-  constructor(message: string, status: number, details?: unknown) {
+  constructor(message: string, status: number, details?: unknown, retryAfterSeconds?: number) {
     super(message)
     this.name = 'ApiError'
     this.status = status
     this.details = details
+    this.retryAfterSeconds = retryAfterSeconds
   }
 
   /** `locked_out` from a routing-policy 409, or [] when this isn't one. */
   lockedOut(): string[] {
     const d = this.details as { locked_out?: unknown } | undefined
     return Array.isArray(d?.locked_out) ? d.locked_out.filter((x): x is string => typeof x === 'string') : []
+  }
+
+  /**
+   * The closed-vocabulary code from `{"error":{"code":…}}`, or ''.
+   *
+   * Branch on this, never on the message. The message is prose the server may
+   * reword; the code is the contract. It is also the only part of an error
+   * body this client reads beside the message — nothing echoed back from a
+   * request body is ever shown, so a key cannot reach the screen through an
+   * error.
+   */
+  code(): string {
+    const d = this.details as { error?: { code?: unknown } } | undefined
+    const code = d?.error?.code
+    return typeof code === 'string' ? code : ''
+  }
+
+  /** The model ids a `models_enabled` 409 names, or []. */
+  enabledModels(): string[] {
+    const d = this.details as { error?: { models?: unknown } } | undefined
+    const models = d?.error?.models
+    return Array.isArray(models) ? models.filter((x): x is string => typeof x === 'string') : []
   }
 }
 
@@ -61,7 +105,12 @@ function extractErrorMessage(raw: string): string | undefined {
 async function fetchJSON<T>(path: string, options?: RequestInit): Promise<T> {
   const fetchOptions = options ?? {}
   const res = await fetch(path, {
-    headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest', ...fetchOptions.headers },
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Requested-With': 'XMLHttpRequest',
+      ...CLASSES_HEADER,
+      ...fetchOptions.headers,
+    },
     credentials: 'same-origin',
     ...fetchOptions,
   })
@@ -78,6 +127,10 @@ async function fetchJSON<T>(path: string, options?: RequestInit): Promise<T> {
       extractErrorMessage(body) || fallback || res.statusText || `HTTP ${res.status}`,
       res.status,
       parseJSONBody(body),
+      // Read on the one status that carries it. The vendor's own interval
+      // reaches us through the gateway and the api unmodified; a 429 with no
+      // header still gets a wait, decided here rather than invented per screen.
+      res.status === 429 ? parseRetryAfter(res.headers.get('Retry-After')) : undefined,
     )
   }
   if (res.status === 204) return undefined as T
@@ -123,7 +176,7 @@ async function requestBlob(
 ): Promise<{ blob: Blob; filename: string }> {
   const res = await fetch(pathOf(route, opts.params, opts.query), {
     method: route.method,
-    headers: { 'X-Requested-With': 'XMLHttpRequest' },
+    headers: { 'X-Requested-With': 'XMLHttpRequest', ...CLASSES_HEADER },
     credentials: 'same-origin',
   })
   if (res.status === 401) {
@@ -225,6 +278,10 @@ export type UsageFilters = {
   purpose?: InferencePurpose | 'all'
   /** The gateway's error code on a refused request, e.g. model_not_allowed. */
   denial_code?: string
+  /** Where the request ran, as a comma-separated list of
+   *  self_hosted | cloud_managed | external_api | unrecorded. Omitted means
+   *  every row, recorded or not. */
+  backend_class?: string
   since?: string
   until?: string
   limit?: number
@@ -284,8 +341,108 @@ export function listModels(): Promise<{
 
 // Admin Models
 
-export function listAdminModels(): Promise<AdminModel[]> {
-  return request<AdminModel[]>(ROUTES.listAdminModels)
+/** Every vendor the UI always shows a row for, so a state is never absent
+ *  merely because the gateway has not mentioned it. */
+const VENDOR_NAMES = ['anthropic', 'openai'] as const
+
+/** The vendor status block, read defensively: it comes from the gateway's last
+ *  sync through the api, and a field the api could not fill must not throw away
+ *  the catalogue it arrived with. An entry that is not an object is dropped;
+ *  a vendor that is missing is added as not_configured, which is what "the
+ *  gateway has never mentioned it" means. */
+function normaliseProviders(raw: unknown): ProviderStatus[] {
+  const byName = new Map<string, ProviderStatus>()
+  if (Array.isArray(raw)) {
+    for (const entry of raw) {
+      if (typeof entry !== 'object' || entry === null) continue
+      const p = entry as Partial<ProviderStatus>
+      if (p.name !== 'anthropic' && p.name !== 'openai') continue
+      byName.set(p.name, {
+        name: p.name,
+        configured: p.configured === true,
+        state: typeof p.state === 'string' ? (p.state as ProviderStatus['state']) : 'not_configured',
+        model_count: typeof p.model_count === 'number' ? p.model_count : 0,
+        last_sync_at: typeof p.last_sync_at === 'string' ? p.last_sync_at : null,
+        // A source this bundle does not know reads as 'none'. The card says
+        // different things about a filter set from the command line and one
+        // set here; guessing which would put the wrong instruction on screen.
+        filter_source:
+          p.filter_source === 'db' || p.filter_source === 'env' ? p.filter_source : 'none',
+        filter: stringList(p.filter),
+        installing_until: typeof p.installing_until === 'string' ? p.installing_until : null,
+        // Absent on an api that predates the removal stamp, which is the same
+        // answer as "nothing is being removed" — never inferred from anything
+        // else, because inferring it would hide a card's actions.
+        removing_until: typeof p.removing_until === 'string' ? p.removing_until : null,
+      })
+    }
+  }
+  return VENDOR_NAMES.map(
+    (name) =>
+      byName.get(name) ?? {
+        name,
+        configured: false,
+        state: 'not_configured' as const,
+        model_count: 0,
+        last_sync_at: null,
+        filter_source: 'none' as const,
+        filter: [],
+        installing_until: null,
+        removing_until: null,
+      },
+  )
+}
+
+/** A list of ids from a response, with anything that is not a string dropped.
+ *  These lists are rendered as a checklist and then written back as a filter,
+ *  so one bad entry must not become a pattern nobody chose. */
+function stringList(raw: unknown): string[] {
+  return Array.isArray(raw) ? raw.filter((x): x is string => typeof x === 'string') : []
+}
+
+/**
+ * The admin catalogue.
+ *
+ * Two shapes, and which one arrives is decided by the classes header this
+ * client always sends:
+ *   with it     {"data": [...rows], "providers": [...]}
+ *   without it  [...rows]            (an older api, or a bundle that predates
+ *                                     the header — not this one)
+ *
+ * We always send the header, so `data` is the shape we expect. The bare array
+ * is still read rather than treated as a failure: a cached bundle talking to
+ * an older api should show a catalogue without vendors, not an error page.
+ * There is no third key guessed at — `data` is the contract.
+ */
+export async function listAdminModels(): Promise<AdminModelsResult> {
+  const body = await request<
+    | AdminModel[]
+    | {
+        data?: AdminModel[]
+        providers?: unknown
+        provider_features?: unknown
+        key_install_transport_ok?: unknown
+      }
+  >(ROUTES.listAdminModels)
+  if (Array.isArray(body)) {
+    return {
+      models: body,
+      providers: normaliseProviders(undefined),
+      providerFeatures: [],
+      keyInstallTransportOk: null,
+    }
+  }
+  return {
+    models: body?.data ?? [],
+    providers: normaliseProviders(body?.providers),
+    // Absent on an older gateway or api, which is the same answer as "cannot
+    // install a key from here" — and read as such, never assumed.
+    providerFeatures: stringList(body?.provider_features),
+    // Null, not false: an api that predates the field has not refused
+    // anything, and the browser's own isSecureContext answers instead.
+    keyInstallTransportOk:
+      typeof body?.key_install_transport_ok === 'boolean' ? body.key_install_transport_ok : null,
+  }
 }
 
 export function toggleModel(id: string, enabled: boolean): Promise<AdminModel> {
@@ -299,6 +456,97 @@ export function setModelDisplayName(id: string, displayName: string | null): Pro
     params: { id },
     body: { display_name: displayName },
   })
+}
+
+// Vendor provider keys (admin)
+//
+// The key is an argument to two of these and is held nowhere else: it goes
+// into the JSON body of one request and the local goes out of scope when the
+// promise settles. request() below sends it once — there is no retry in this
+// client, so a key is never re-sent to a server that has already refused it —
+// and nothing here logs a request body. On failure the caller sees the
+// server's own `error.message` and `error.code`; no part of the request is
+// echoed into an error, a toast or the URL.
+
+/** What a vendor's API answers to, and which of those this filter would offer.
+ *  `admitted` is `reachable` minus the non-chat models the gateway never
+ *  catalogues, narrowed by the filter when one was sent. */
+export interface VendorVerification {
+  reachable: string[]
+  admitted: string[]
+}
+
+/**
+ * Checks a key against the vendor, through the gateway — the egress path the
+ * key will really use, so a proxy or firewall that would break it in
+ * production breaks it here instead of after it is stored.
+ *
+ * With no key, the installed one is used: that is how Change models lists what
+ * is on offer without asking for the key again. Nothing is stored either way.
+ */
+export function verifyVendorKey(
+  vendor: VendorName,
+  body: { key?: string; model_filter?: string[] } = {},
+): Promise<VendorVerification> {
+  return request<VendorVerification>(ROUTES.verifyProviderKey, { params: { vendor }, body })
+}
+
+/** The result of a successful install: what is now on offer, when the gateway
+ *  should have it, and anything that did not go to plan without the install
+ *  having failed (the ConfigMap mirror, the gateway refresh). */
+export interface VendorKeyInstalled {
+  admitted: string[]
+  /** RFC3339. The card counts towards this rather than towards a local timer,
+   *  so the progress survives a reload. */
+  installing_until: string
+  warnings?: string[]
+}
+
+/** Stores the key and the model filter together. Verified at the vendor before
+ *  anything is written, so a mistyped key cannot replace a working one. */
+export function installVendorKey(
+  vendor: VendorName,
+  body: { key: string; model_filter: string[] },
+): Promise<VendorKeyInstalled> {
+  return request<VendorKeyInstalled>(ROUTES.putProviderKey, { params: { vendor }, body })
+}
+
+/** Changes which of the vendor's models are catalogued, using the key already
+ *  installed. The key is not involved and is not asked for. */
+export function setVendorFilter(
+  vendor: VendorName,
+  modelFilter: string[],
+): Promise<{ admitted: string[] }> {
+  return request<{ admitted: string[] }>(ROUTES.putProviderFilter, {
+    params: { vendor },
+    body: { model_filter: modelFilter },
+  })
+}
+
+/**
+ * Removes the key. The vendor's name is typed by the administrator and sent as
+ * `confirm`, so the api refuses a removal that some other page could have
+ * triggered. `disable_models` answers the 409 this returns while any of the
+ * vendor's models are still enabled — the models are turned off in the same
+ * transaction rather than left pointing at a key that has gone.
+ *
+ * The model filter is kept: reinstalling a key should not also mean choosing
+ * the models again.
+ *
+ * `warnings` is what happened around the removal without it having failed —
+ * models left enabled, a mirror that could not be rewritten. The card shows
+ * them verbatim while the removal is reaching the gateway; a 204 with no body
+ * is the ordinary case and yields none.
+ */
+export async function removeVendorKey(
+  vendor: VendorName,
+  opts: { disableModels?: boolean } = {},
+): Promise<{ warnings: string[] }> {
+  const body = await request<{ warnings?: unknown } | undefined>(ROUTES.deleteProviderKey, {
+    params: { vendor },
+    body: { confirm: vendor, ...(opts.disableModels ? { disable_models: true } : {}) },
+  })
+  return { warnings: stringList(body?.warnings) }
 }
 
 // Model aliases (admin)
@@ -464,20 +712,40 @@ export function exportConversation(id: string): Promise<{ blob: Blob; filename: 
 /**
  * A chat failure carrying the gateway's OpenAI-style error code, so the
  * conversation UI can explain routing refusals (model_not_found,
- * model_not_enabled, model_residency_violation, policy_unavailable) instead of
- * showing a generic failure.
+ * model_not_enabled, model_residency_violation, policy_unavailable) and vendor
+ * failures (provider_rate_limited, provider_auth_failed, upstream_error,
+ * upstream_timeout, unsupported_parameter) instead of showing a generic
+ * failure.
  */
 export class ChatError extends Error {
   readonly code?: string
   readonly type?: string
   readonly status?: number
+  /** The request field a 400 unsupported_parameter names, from the error
+   *  body's `param`. */
+  readonly param?: string
+  /** Seconds to wait, parsed from a 429's Retry-After. Undefined unless this
+   *  is a rate limit: no other refusal has an interval to offer, and a number
+   *  on one would be invented. */
+  readonly retryAfterSeconds?: number
 
-  constructor(message: string, opts: { code?: string; type?: string; status?: number } = {}) {
+  constructor(
+    message: string,
+    opts: {
+      code?: string
+      type?: string
+      status?: number
+      param?: string
+      retryAfterSeconds?: number
+    } = {},
+  ) {
     super(message)
     this.name = 'ChatError'
     this.code = opts.code
     this.type = opts.type
     this.status = opts.status
+    this.param = opts.param
+    this.retryAfterSeconds = opts.retryAfterSeconds
   }
 }
 
@@ -493,6 +761,19 @@ export interface ChatResponseMeta {
   route: string | null
   /** X-Darkplum-Router-Reason — closed vocabulary, see routerReasonText(). */
   routerReason: string | null
+  /** X-Darkplum-Backend-Class — where the reply actually ran. The gateway is
+   *  the only thing that knows: a routed alias resolves after the request has
+   *  left, so nothing on this side can work it out from the model picked. */
+  backendClass: BackendClass | null
+  /** X-Darkplum-Provider — the provider kind that served it, which is the
+   *  vendor's name on an external route. */
+  provider: string | null
+}
+
+/** Only the three wire values are accepted off a header. Anything else is null
+ *  — 'no class reported' — rather than a class the UI would then label. */
+function readBackendClass(raw: string | null): BackendClass | null {
+  return raw === 'self_hosted' || raw === 'cloud_managed' || raw === 'external_api' ? raw : null
 }
 
 export async function streamChat(
@@ -508,7 +789,14 @@ export async function streamChat(
   try {
     res = await fetch(pathOf(ROUTES.chatCompletions), {
       method: ROUTES.chatCompletions.method,
-      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'XMLHttpRequest' },
+      // Sent here too so the header goes out on every request from one place,
+      // but it is inert on this route: what may answer is decided by the
+      // routing policy, and no header a caller sends can widen it.
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+        ...CLASSES_HEADER,
+      },
       credentials: 'same-origin',
       body: JSON.stringify({ model, messages, stream: true }),
       signal,
@@ -529,6 +817,8 @@ export async function streamChat(
     model: res.headers.get('X-Darkplum-Model'),
     route: res.headers.get('X-Darkplum-Route'),
     routerReason: res.headers.get('X-Darkplum-Router-Reason'),
+    backendClass: readBackendClass(res.headers.get('X-Darkplum-Backend-Class')),
+    provider: res.headers.get('X-Darkplum-Provider'),
   })
 
   if (!res.ok) {
@@ -543,16 +833,18 @@ export async function streamChat(
     let message: string | undefined
     let code: string | undefined
     let type: string | undefined
+    let param: string | undefined
     const trimmed = raw.trim()
     if (trimmed.startsWith('{')) {
       try {
         const body = JSON.parse(trimmed) as {
-          error?: { message?: string; code?: string; type?: string } | string
+          error?: { message?: string; code?: string; type?: string; param?: string } | string
         }
         if (body.error && typeof body.error === 'object') {
           message = body.error.message
           code = body.error.code
           type = body.error.type
+          param = typeof body.error.param === 'string' ? body.error.param : undefined
         } else if (typeof body.error === 'string' && body.error) {
           message = body.error
         }
@@ -565,6 +857,12 @@ export async function streamChat(
         code,
         type,
         status: res.status,
+        param,
+        // Read only on the one status that can carry it. The vendor's own
+        // interval reaches us through the gateway and the api unmodified; a
+        // 429 that arrives without one still gets a wait, decided by the UI.
+        retryAfterSeconds:
+          res.status === 429 ? parseRetryAfter(res.headers.get('Retry-After')) : undefined,
       }),
     )
     return
@@ -599,10 +897,19 @@ export async function streamChat(
         try {
           const parsed = JSON.parse(data) as {
             choices?: Array<{ delta: { content?: string } }>
-            error?: { message: string; code?: string; type?: string }
+            error?: { message: string; code?: string; type?: string; param?: string }
           }
           if (parsed.error) {
-            onError(new ChatError(parsed.error.message, { code: parsed.error.code, type: parsed.error.type }))
+            // No status and no Retry-After here: the response committed as a
+            // 200 before this frame, so a mid-stream rate limit carries no
+            // interval and the UI falls back to its own short wait.
+            onError(
+              new ChatError(parsed.error.message, {
+                code: parsed.error.code,
+                type: parsed.error.type,
+                param: typeof parsed.error.param === 'string' ? parsed.error.param : undefined,
+              }),
+            )
             return
           }
           const token = parsed.choices?.[0]?.delta?.content

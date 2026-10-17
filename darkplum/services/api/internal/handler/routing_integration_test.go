@@ -387,8 +387,10 @@ func TestRoutingPolicy_GetPutAndInvalidValue(t *testing.T) {
 	if err := json.Unmarshal(resp.Body.Bytes(), &policy); err != nil {
 		t.Fatalf("decode policy: %v", err)
 	}
-	if policy.Residency != residencyAny {
-		t.Fatalf("expected default residency %q, got %q", residencyAny, policy.Residency)
+	// Migration 016 seeds a fresh install's org residency to
+	// cloud_account_only, not "any" -- see that migration's comment.
+	if policy.Residency != residencyCloudAccountOnly {
+		t.Fatalf("expected default residency %q, got %q", residencyCloudAccountOnly, policy.Residency)
 	}
 
 	resp = doJSON(t, r, http.MethodPut, "/api/v1/routing-policy", map[string]string{"residency": "bogus"})
@@ -841,11 +843,18 @@ func TestPutAlias_Routed_ResidencyConflict409(t *testing.T) {
 	userID := newTestUser(t, ctx, pool)
 	insertModel(t, ctx, pool, "llama3", backendClassSelfHosted, true)
 	insertModel(t, ctx, pool, "claude-3-sonnet", backendClassCloudManaged, true)
-	if _, err := pool.Exec(ctx, `UPDATE routing_policy SET residency = 'self_hosted_only' WHERE id = true`); err != nil {
-		t.Fatalf("set residency: %v", err)
-	}
 	h := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
 	r := newRoutingTestRouter(h, userID)
+
+	// Set residency through the real endpoint (rather than writing the
+	// legacy routing_policy mirror directly): putRoutedAlias's conflict
+	// check reads the org's real residency from principal_routing_policies
+	// since migration 016 -- writing only the legacy mirror would no longer
+	// affect it.
+	setResp := doJSON(t, r, http.MethodPut, "/api/v1/routing-policy", map[string]string{"residency": residencySelfHostedOnly})
+	if setResp.Code != http.StatusOK {
+		t.Fatalf("set residency: status = %d, body = %s", setResp.Code, setResp.Body.String())
+	}
 
 	body := routedBody("general", [2]string{"general", "llama3"}, [2]string{"cloud", "claude-3-sonnet"})
 	resp := doJSON(t, r, http.MethodPut, "/api/v1/model-aliases/smart", body)
@@ -907,8 +916,10 @@ func TestPutRoutingPolicy_WarningsListCloudManagedRoutes(t *testing.T) {
 	h := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
 	r := newRoutingTestRouter(h, userID)
 
-	// Create the routed alias while residency is still "any", so the PUT
-	// itself doesn't 409 -- the warning fires later, on the residency flip.
+	// Create the routed alias while residency is still cloud_account_only
+	// (migration 016's fresh-install default, which still permits
+	// cloud_managed), so the PUT itself doesn't 409 -- the warning fires
+	// later, on the residency flip to self_hosted_only.
 	resp := doJSON(t, r, http.MethodPut, "/api/v1/model-aliases/smart",
 		routedBody("general", [2]string{"general", "llama3"}, [2]string{"cloud", "claude-3-sonnet"}))
 	if resp.Code != http.StatusOK {
@@ -923,7 +934,7 @@ func TestPutRoutingPolicy_WarningsListCloudManagedRoutes(t *testing.T) {
 	if err := json.Unmarshal(resp.Body.Bytes(), &policy); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	want := "alias smart: route 'cloud' → claude-3-sonnet will be refused"
+	want := "alias smart: route 'cloud' → claude-3-sonnet (cloud_managed) will be refused"
 	found := false
 	for _, w := range policy.Warnings {
 		if w == want {

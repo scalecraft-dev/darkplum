@@ -37,6 +37,13 @@ type ChatRequest struct {
 	Stream      bool
 	MaxTokens   int
 	Temperature *float64
+	// TopP is forwarded to every provider when the caller set it (nil
+	// otherwise). Unlike Temperature, no provider today needs to retry
+	// without it — this is a plain passthrough field.
+	TopP *float64
+	// Stop is forwarded to every provider when the caller set it. Empty
+	// (nil/zero-length) means the caller did not set `stop`.
+	Stop []string
 }
 
 // Message is a single turn in a conversation. Content can be a plain string
@@ -249,3 +256,46 @@ func BuildFinalChunkSSE(id, model, finishReason string, stats *StreamStats) ([]b
 
 // StreamDoneSSE is the SSE stream terminator. Write this after the final chunk.
 const StreamDoneSSE = "data: [DONE]\n\n"
+
+// ---------------------------------------------------------------------------
+// Cross-provider error/metadata contracts
+// ---------------------------------------------------------------------------
+
+// Regional is implemented by a provider whose backend is bound to a single
+// cloud region (Bedrock today; a future GCP Vertex provider would too).
+// internal/handler's Recording integration reads Region() to populate
+// inference_events.region without a second per-request lookup or a
+// provider-package-specific type assertion.
+type Regional interface {
+	Region() string
+}
+
+// APIError is implemented by a provider's own error type when it wants to
+// report a structured status/body/retry-after rather than have the gateway
+// treat it as an opaque upstream failure. bedrock.BedrockAPIError implements
+// this (see its HTTPStatus/ResponseBody/RetryAfterSeconds methods, added
+// alongside its existing StatusCode/Body/Cause fields, which callers that
+// already type-assert *bedrock.BedrockAPIError directly keep working
+// unchanged); future vendor providers (anthropic, openai) will too, mapping
+// their own HTTP statuses into the wire contract's closed set (429 with
+// Retry-After, 502 provider_auth_failed, 502 upstream_error, 504
+// upstream_timeout).
+//
+// handler.handleProviderError and handler.writeStreamError use this
+// interface — never err.Error() — to decide what a caller sees, so an
+// upstream's raw error text (which can carry internal hostnames, vendor
+// request ids, or account detail) never reaches the client on any path,
+// including the SSE partial-stream error path, which historically echoed it.
+type APIError interface {
+	error
+	// HTTPStatus is the status code to write to the client.
+	HTTPStatus() int
+	// ResponseBody is the fully-formed OpenAI-compatible JSON error body to
+	// write verbatim (or to embed in an SSE "data:" frame for a mid-stream
+	// failure).
+	ResponseBody() []byte
+	// RetryAfterSeconds is the value to echo on a 429 response's Retry-After
+	// header, or 0 if the provider did not report one / the error is not a
+	// rate limit.
+	RetryAfterSeconds() int
+}

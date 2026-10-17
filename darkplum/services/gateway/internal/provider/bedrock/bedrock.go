@@ -268,5 +268,23 @@ func (e *BedrockAPIError) Error() string {
 
 func (e *BedrockAPIError) Unwrap() error { return e.Cause }
 
-// compile-time interface check.
+// HTTPStatus implements provider.APIError. Named distinctly from the
+// StatusCode field (Go does not allow a method and a field to share a name
+// on the same type) so existing callers that read e.StatusCode directly are
+// unaffected by this addition.
+func (e *BedrockAPIError) HTTPStatus() int { return e.StatusCode }
+
+// ResponseBody implements provider.APIError, returning the same
+// already-OpenAI-shaped bytes as the Body field (see the naming note on
+// HTTPStatus above).
+func (e *BedrockAPIError) ResponseBody() []byte { return e.Body }
+
+// RetryAfterSeconds implements provider.APIError. Always 0: Bedrock's
+// ThrottlingException does not carry a caller-usable retry-after value, so
+// there is nothing to pass through on a 429.
+func (e *BedrockAPIError) RetryAfterSeconds() int { return 0 }
+
+// compile-time interface checks.
 var _ provider.Provider = (*BedrockProvider)(nil)
+var _ provider.APIError = (*BedrockAPIError)(nil)
+var _ provider.Regional = (*BedrockProvider)(nil)

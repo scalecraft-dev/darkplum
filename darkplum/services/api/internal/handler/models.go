@@ -37,14 +37,48 @@ type ModelHandler struct {
 	// the gateway's effective policy — see that method's doc comment.
 	effCacheMu sync.Mutex
 	effCache   map[string]effectiveCacheEntry
+
+	// providersMu guards providers, providerFeatures, and anyInstalling --
+	// everything cached from the gateway's last successful GET /v1/models
+	// (service-key + capability-header call only -- see SyncModels), for
+	// ListAdminModels/ProvidersHandler to pass through or gate on. providers
+	// is left at its zero value (nil slice, marshals as []) until the first
+	// successful sync -- "empty array if the gateway never reported one",
+	// per the wire contract -- and left UNCHANGED by a failed sync (network
+	// error, non-200, decode failure), so a transient gateway blip doesn't
+	// flash the admin Providers panel to empty.
+	providersMu      sync.Mutex
+	providers        []gatewayProviderStatus
+	providerFeatures []string
+	// anyInstalling caches whether vendor_provider_settings has any row with
+	// installing_until OR removing_until in the future, refreshed at the end
+	// of every SyncModels run -- cmd/main.go's sync loop polls this (via
+	// AnyInstalling) to decide whether to tick every 5s (PLAN-UI v2.1)
+	// instead of MODEL_SYNC_INTERVAL_SECONDS, without adding a second query
+	// to the hot ticker path.
+	anyInstalling bool
+
+	// secureCookies mirrors auth.Config.SecureCookie (SECURE_COOKIES) --
+	// ListAdminModels uses it, together with the inbound request's Host, to
+	// compute key_install_transport_ok the same way providers.go's
+	// keyInstallTransportOK does, so the UI can show the "needs HTTPS"
+	// reason before an admin ever pastes a key rather than only after PUT
+	// key refuses it.
+	secureCookies bool
+	// kick backs Kick/KickCh -- see Kick's doc comment.
+	kick chan struct{}
 }
 
 // effectiveCacheEntry is one session user's cached effective policy, used
 // only to filter the chat-facing /v1/models list (never for enforcement).
+// residency is the caller's OWN effective residency (org->user merge,
+// tighten-only), NOT the org's alone -- see getSessionEffective and
+// ListModels' use of it in place of getResidency for a session caller.
 type effectiveCacheEntry struct {
 	expiresAt     time.Time
 	allowedModels *[]string
 	defaultModel  *string
+	residency     string
 }
 
 // NewModelHandler constructs a ModelHandler. gatewayURL and serviceKey are used
@@ -62,7 +96,34 @@ func NewModelHandler(gatewayURL, serviceKey string, pool *pgxpool.Pool) *ModelHa
 		gateway:            newGatewayEffectiveClient(gatewayURL, serviceKey),
 		availabilityWindow: modelAvailabilityWindow,
 		effCache:           make(map[string]effectiveCacheEntry),
+		kick:               make(chan struct{}, 1),
 	}
+}
+
+// Kick wakes cmd/main.go's sync loop (see KickCh) for an immediate,
+// out-of-band SyncModels run, instead of waiting for the loop's next
+// natural tick -- providers.go's PutKey/PutFilter/DeleteKey call this right
+// after a successful write, alongside their own existing immediate (async,
+// bounded) SyncModels call, so the loop notices AnyInstalling() went true
+// and drops to its fast tick cadence within about a second of the write,
+// rather than up to a full modelSyncInterval (default 60s) later.
+//
+// Non-blocking: kick is buffered to depth 1, and a Kick that arrives while
+// the channel already holds an unread signal (the loop hasn't gotten around
+// to draining it yet) is simply dropped -- one pending wake-up is exactly as
+// good as two, since the loop always runs a fresh SyncModels when it
+// drains it, and a caller must never block on this.
+func (h *ModelHandler) Kick() {
+	select {
+	case h.kick <- struct{}{}:
+	default:
+	}
+}
+
+// KickCh returns the channel cmd/main.go's sync loop selects on to receive
+// Kick() wake-ups. See Kick's doc comment.
+func (h *ModelHandler) KickCh() <-chan struct{} {
+	return h.kick
 }
 
 // SetAvailabilityWindow overrides the default modelAvailabilityWindow used by
@@ -71,6 +132,14 @@ func NewModelHandler(gatewayURL, serviceKey string, pool *pgxpool.Pool) *ModelHa
 // MODEL_AVAILABILITY_WINDOW_SECONDS value after construction.
 func (h *ModelHandler) SetAvailabilityWindow(w time.Duration) {
 	h.availabilityWindow = w
+}
+
+// SetSecureCookies records whether the api is configured for HTTPS
+// (SECURE_COOKIES=true), for ListAdminModels' key_install_transport_ok
+// computation. Exported so cmd/main.go can apply authCfg.SecureCookie after
+// construction, matching SetAvailabilityWindow's pattern.
+func (h *ModelHandler) SetSecureCookies(v bool) {
+	h.secureCookies = v
 }
 
 // modelRow is the full DB representation returned by admin endpoints.
@@ -132,26 +201,28 @@ type openAIModelsResponse struct {
 	PolicyFiltered bool `json:"policy_filtered"`
 }
 
-// getSessionEffective returns the session user's effective allowed_models
-// and default_model for filtering the chat-facing /v1/models list, backed by
-// a cache of modelsEffectiveCacheTTL (5s) per user so a busy chat UI
-// re-fetching the model list doesn't hammer the gateway on every keystroke/
-// tab focus. A cache miss/expiry calls the gateway's
-// GET /v1/policy/effective; any failure (timeout, non-200, gateway down) is
-// returned to the caller, which must fall back to the unfiltered list rather
+// getSessionEffective returns the session user's effective allowed_models,
+// default_model, AND residency (the org->user merge, tighten-only -- NOT
+// just the org's own residency; see gatewayEffectivePolicy.Residency) for
+// filtering the chat-facing /v1/models list, backed by a cache of
+// modelsEffectiveCacheTTL (5s) per user so a busy chat UI re-fetching the
+// model list doesn't hammer the gateway on every keystroke/tab focus. A
+// cache miss/expiry calls the gateway's GET /v1/policy/effective; any
+// failure (timeout, non-200, gateway down) is returned to the caller, which
+// must fall back to the org-level residency and unfiltered allowlist rather
 // than fail the request — see ListModels. This is a UX filter only, never
 // the enforcement point.
-func (h *ModelHandler) getSessionEffective(ctx context.Context, userID string) (*[]string, *string, error) {
+func (h *ModelHandler) getSessionEffective(ctx context.Context, userID string) (*[]string, *string, string, error) {
 	h.effCacheMu.Lock()
 	if e, ok := h.effCache[userID]; ok && time.Now().Before(e.expiresAt) {
 		h.effCacheMu.Unlock()
-		return e.allowedModels, e.defaultModel, nil
+		return e.allowedModels, e.defaultModel, e.residency, nil
 	}
 	h.effCacheMu.Unlock()
 
 	eff, err := h.gateway.effective(ctx, userID, nil)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, "", err
 	}
 
 	h.effCacheMu.Lock()
@@ -159,10 +230,11 @@ func (h *ModelHandler) getSessionEffective(ctx context.Context, userID string) (
 		expiresAt:     time.Now().Add(modelsEffectiveCacheTTL),
 		allowedModels: eff.AllowedModels,
 		defaultModel:  eff.DefaultModel,
+		residency:     eff.Residency,
 	}
 	h.effCacheMu.Unlock()
 
-	return eff.AllowedModels, eff.DefaultModel, nil
+	return eff.AllowedModels, eff.DefaultModel, eff.Residency, nil
 }
 
 // orgDefaultModel reads the org policy row's default_model, used as the
@@ -176,10 +248,27 @@ func (h *ModelHandler) orgDefaultModel(ctx context.Context) (*string, error) {
 }
 
 // ListModels handles GET /v1/models — chat-facing, returns enabled models plus
-// aliases whose target is enabled, in OpenAI-compatible format. Under the
-// self_hosted_only residency policy, cloud_managed models (and aliases
-// pointing at them) are omitted entirely — this is a UX convenience for the
-// picker, not the enforcement point (that's the gateway; see policy.Snapshot).
+// aliases whose target is enabled, in OpenAI-compatible format. Entries of a
+// class residencyPermitsClass refuses (e.g. cloud_managed under
+// self_hosted_only, external_api under anything but "any") are omitted
+// entirely — this is a UX convenience for the picker, not the enforcement
+// point (that's the gateway; see policy.Snapshot). An external_api entry is
+// additionally omitted whenever the INBOUND request didn't send
+// darkplumClassesHeader, regardless of residency — see
+// requestPermitsExternalAPI and buildModelsList's permitExternalAPI param.
+//
+// The residency used is the CALLER's own effective residency (org->user
+// merge, tighten-only), not just the org's: getResidency's org-level value
+// is only the starting point/fallback (used when there is no session
+// identity, or the session's effective policy can't be fetched — see below);
+// a session user whose own row narrows residency below the org's (e.g. the
+// org is "any" but this user is self_hosted_only) must not be offered a
+// model their own policy will refuse. A Bearer/API-key caller doesn't need
+// this override: bearerModels' underlying gateway GET /v1/models call
+// already residency-filters that key's Data list itself (see the gateway's
+// HandleListModels), so the allowedModels intersection below already
+// reflects the caller's true residency regardless of which residency value
+// this function uses for the class-level pre-filter.
 //
 // The list is filtered to the caller's effective allowed_models, and
 // default_model is the caller's effective default, for BOTH kinds of caller:
@@ -195,8 +284,10 @@ func (h *ModelHandler) orgDefaultModel(ctx context.Context) (*string, error) {
 // same answer -- an SDK caller that lists models and then gets 403 on one
 // of them reads as a broken product. Routed/static alias entries whose every
 // target is disallowed are omitted. If the policy lookup fails the list
-// degrades to residency-only filtering with policy_filtered=false (see
-// openAIModelsResponse); enforcement stays with the gateway either way.
+// degrades to org-level-residency-only filtering with policy_filtered=false
+// (see openAIModelsResponse) — the SAME fallback already used for the
+// allowlist (unrestricted rather than inventing a new failure mode);
+// enforcement stays with the gateway either way.
 func (h *ModelHandler) ListModels(c *gin.Context) {
 	ctx := c.Request.Context()
 
@@ -206,18 +297,28 @@ func (h *ModelHandler) ListModels(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "list models failed"})
 		return
 	}
+	permitExternalAPI := requestPermitsExternalAPI(c.GetHeader(darkplumClassesHeader))
 
 	var allowedModels *[]string
 	var defaultModel *string
 	policyFiltered := false
 	if userID := c.GetString("user_id"); userID != "" {
-		am, dm, effErr := h.getSessionEffective(ctx, userID)
+		am, dm, effResidency, effErr := h.getSessionEffective(ctx, userID)
 		if effErr != nil {
 			slog.WarnContext(ctx, "list models: gateway effective policy unavailable, falling back to unfiltered list", "user_id", userID, "err", effErr)
 		} else {
 			allowedModels = am
 			defaultModel = dm
 			policyFiltered = true
+			// Override the org-level residency read above with the caller's
+			// OWN effective residency (org->user merge) — see ListModels' doc
+			// comment. effResidency is always non-empty on a successful fetch
+			// (the gateway's EffectivePolicy.Residency is never the zero
+			// value), but the org fallback is kept defensively rather than
+			// ever showing an empty residency to buildModelsList.
+			if effResidency != "" {
+				residency = effResidency
+			}
 		}
 	} else if bearer := c.GetHeader("Authorization"); strings.HasPrefix(bearer, "Bearer ") {
 		// Only a Bearer credential is forwarded (apiOrSession already gates
@@ -357,7 +458,7 @@ func (h *ModelHandler) ListModels(c *gin.Context) {
 		return
 	}
 
-	data := buildModelsList(models, aliases, routedAliases, residency, time.Now(), h.availabilityWindow, allowedModels)
+	data := buildModelsList(models, aliases, routedAliases, residency, permitExternalAPI, time.Now(), h.availabilityWindow, allowedModels)
 	c.JSON(http.StatusOK, openAIModelsResponse{Object: "list", Data: data, DefaultModel: defaultModel, PolicyFiltered: policyFiltered})
 }
 
@@ -377,6 +478,16 @@ func (h *ModelHandler) bearerModels(ctx context.Context, authorization string) (
 		return nil, nil, err
 	}
 	req.Header.Set("Authorization", authorization)
+	// See SyncModels' identical header: this api always understands
+	// external_api, so it always asks the gateway for the caller's full
+	// effective list including any vendor models the caller's OWN policy
+	// permits (an API-key caller whose policy allows a vendor model must see
+	// it in GET /v1/models exactly as a session caller would -- the
+	// models.go:194 invariant). Whether THIS api hands a vendor model back
+	// to whoever called ITS /v1/models is a separate, later check
+	// (permitExternalAPI in ListModels), based on what THAT caller's own
+	// request carried.
+	req.Header.Set(darkplumClassesHeader, backendClassExternalAPI)
 	resp, err := h.client.Do(req)
 	if err != nil {
 		return nil, nil, err
@@ -401,16 +512,141 @@ func (h *ModelHandler) bearerModels(ctx context.Context, authorization string) (
 	return ids, body.DefaultModel, nil
 }
 
-// getResidency reads the routing_policy singleton's current residency value.
+// getResidency reads the org's current residency value from
+// principal_routing_policies, the authoritative table since migration 015 --
+// NOT the legacy routing_policy mirror, which migration 016's trigger
+// deliberately DOWNGRADES cloud_account_only to 'any' for the benefit of an
+// old gateway that has no concept of the third rung (see that migration's
+// comment). This api is never that old gateway: reading the mirror here
+// would silently under-restrict a cloud_account_only org's own chat-facing
+// model list back down to 'any'.
 func (h *ModelHandler) getResidency(ctx context.Context) (string, error) {
-	var residency string
-	err := h.pool.QueryRow(ctx, `SELECT residency FROM routing_policy WHERE id = true`).Scan(&residency)
-	return residency, err
+	var dbResidency *string
+	err := h.pool.QueryRow(ctx, `SELECT residency FROM principal_routing_policies WHERE principal_type = 'org'`).Scan(&dbResidency)
+	if err != nil {
+		return "", err
+	}
+	return orgResidencyString(dbResidency), nil
+}
+
+// adminModelsResponse is GET /api/v1/models' (admin) WRAPPED response shape,
+// sent only when the request carries darkplumClassesHeader (see
+// requestPermitsExternalAPI and ListAdminModels) -- the new web bundle
+// always sends it. Without the header, the endpoint keeps returning the bare
+// JSON array it always has (see ListAdminModels): changing an established
+// response from an array to an object is a breaking shape change for any
+// existing consumer, so the wrapper is additive and opt-in via the same
+// capability handshake gating external_api visibility itself, rather than
+// unconditional. Data omits external_api rows in BOTH shapes when the
+// header is absent (the bare-array default can never carry a class its
+// caller never asked for); Providers is passed through from the gateway's
+// last successful sync regardless of the header once the wrapper is in use.
+type adminModelsResponse struct {
+	Data      []modelRow              `json:"data"`
+	Providers []gatewayProviderStatus `json:"providers"`
+	// ProviderFeatures is passed through from the gateway's last successful
+	// sync (PLAN-UI): today's only defined token is "ui_key_install",
+	// meaning the gateway serves POST /v1/providers/:vendor/{verify,refresh}
+	// -- ProvidersHandler refuses install/filter/delete with 409
+	// gateway_too_old when it's absent. Marshals as [] before the first
+	// successful sync, matching Providers' own zero-value contract.
+	ProviderFeatures []string `json:"provider_features"`
+	// KeyInstallTransportOK reports whether THIS request could safely carry a
+	// vendor key to PUT .../key or POST .../verify -- computed by the same
+	// rule providers.go's keyInstallTransportOK enforces (HTTPS, via
+	// secureCookies, OR a loopback Host), so the UI can show the "needs
+	// HTTPS" reason up front instead of only after a paste is refused.
+	KeyInstallTransportOK bool `json:"key_install_transport_ok"`
+}
+
+// AnyInstalling reports whether the last SyncModels run saw any vendor with
+// a live installing_until -- see the providersMu/anyInstalling field doc
+// comment. Exported so cmd/main.go's sync loop can decide its tick interval
+// without importing internal/db itself.
+func (h *ModelHandler) AnyInstalling() bool {
+	h.providersMu.Lock()
+	defer h.providersMu.Unlock()
+	return h.anyInstalling
+}
+
+// cachedProviders returns the gateway's last-synced per-vendor status block
+// and top-level provider_features, both copied so the caller can't mutate
+// the handler's cache. Shared by ListAdminModels and ProvidersHandler (same
+// package) so there is exactly one place that reads providersMu's guarded
+// fields for this purpose.
+func (h *ModelHandler) cachedProviders() ([]gatewayProviderStatus, []string) {
+	h.providersMu.Lock()
+	defer h.providersMu.Unlock()
+	providers := append([]gatewayProviderStatus{}, h.providers...)
+	features := append([]string{}, h.providerFeatures...)
+	return providers, features
+}
+
+// providerFeature is a provider_features token. Only one is defined today.
+const providerFeatureUIKeyInstall = "ui_key_install"
+
+// hasProviderFeature reports whether features names feature.
+func hasProviderFeature(features []string, feature string) bool {
+	for _, f := range features {
+		if f == feature {
+			return true
+		}
+	}
+	return false
+}
+
+// vendorHintWindows reads every vendor_provider_settings row's
+// installing_until and removing_until, normalizing a NULL or already-past
+// value to nil in each map -- "null when absent or past", per PLAN-UI's GET
+// /api/v1/models contract -- so ListAdminModels never has to repeat that
+// normalization at the call site. installing_until and removing_until are
+// mutually exclusive in practice (PutKey clears the latter, DeleteKey clears
+// the former), but this reads and normalizes both independently regardless.
+func vendorHintWindows(ctx context.Context, pool *pgxpool.Pool) (installing, removing map[string]*time.Time, err error) {
+	rows, err := pool.Query(ctx, `SELECT vendor, installing_until, removing_until FROM vendor_provider_settings`)
+	if err != nil {
+		return nil, nil, fmt.Errorf("query vendor_provider_settings: %w", err)
+	}
+	defer rows.Close()
+
+	installing = make(map[string]*time.Time, 2)
+	removing = make(map[string]*time.Time, 2)
+	now := time.Now()
+	for rows.Next() {
+		var vendor string
+		var installUntil, removeUntil *time.Time
+		if err := rows.Scan(&vendor, &installUntil, &removeUntil); err != nil {
+			return nil, nil, fmt.Errorf("scan vendor_provider_settings row: %w", err)
+		}
+		if installUntil != nil && installUntil.After(now) {
+			installing[vendor] = installUntil
+		} else {
+			installing[vendor] = nil
+		}
+		if removeUntil != nil && removeUntil.After(now) {
+			removing[vendor] = removeUntil
+		} else {
+			removing[vendor] = nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("vendor_provider_settings rows: %w", err)
+	}
+	return installing, removing, nil
 }
 
 // ListAdminModels handles GET /api/v1/models — admin view, returns all models
 // with full metadata including the enabled flag.
+//
+// Response shape is capability-gated by darkplumClassesHeader, same as the
+// chat-facing /v1/models and the gateway's own /v1/models: without the
+// header, a bare JSON array (today's shape, external_api rows omitted --
+// this is the ONLY case a pre-vendor-providers admin bundle ever sees, so it
+// keeps working unchanged). With the header, adminModelsResponse
+// ({"data":[...],"providers":[...]}), external_api rows included.
 func (h *ModelHandler) ListAdminModels(c *gin.Context) {
+	permitExternalAPI := requestPermitsExternalAPI(c.GetHeader(darkplumClassesHeader))
+
 	rows, err := h.pool.Query(c.Request.Context(), `
 		SELECT id, model_id, provider, display_name, enabled, backend_class, discovered_at, updated_at
 		FROM models
@@ -432,6 +668,9 @@ func (h *ModelHandler) ListAdminModels(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "scan models failed"})
 			return
 		}
+		if m.BackendClass == backendClassExternalAPI && !permitExternalAPI {
+			continue
+		}
 		m.Available = modelIsAvailableWithin(m.DiscoveredAt, now, h.availabilityWindow)
 		models = append(models, m)
 	}
@@ -441,7 +680,38 @@ func (h *ModelHandler) ListAdminModels(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, models)
+	if !permitExternalAPI {
+		c.JSON(http.StatusOK, models)
+		return
+	}
+
+	providers, features := h.cachedProviders()
+
+	// installing_until and removing_until live only in the api's own
+	// vendor_provider_settings (the gateway has no concept of either window)
+	// -- merge them into each cached provider entry by vendor name. A lookup
+	// failure degrades to leaving both unset rather than failing the whole
+	// request: these are progress-bar hints, not enforcement, and the rest
+	// of the response is still valid without them.
+	installing, removing, err := vendorHintWindows(c.Request.Context(), h.pool)
+	if err != nil {
+		slog.WarnContext(c.Request.Context(), "list admin models: read hint windows failed", "err", err)
+	}
+	for i := range providers {
+		if until, ok := installing[providers[i].Name]; ok {
+			providers[i].InstallingUntil = until
+		}
+		if until, ok := removing[providers[i].Name]; ok {
+			providers[i].RemovingUntil = until
+		}
+	}
+
+	c.JSON(http.StatusOK, adminModelsResponse{
+		Data:                  models,
+		Providers:             providers,
+		ProviderFeatures:      features,
+		KeyInstallTransportOK: keyInstallTransportOK(h.secureCookies, c.Request.Host),
+	})
 }
 
 // toggleModelRequest is the request body for PATCH /api/v1/models/:id.
@@ -552,10 +822,51 @@ func (h *ModelHandler) ToggleModel(c *gin.Context) {
 	c.JSON(http.StatusOK, m)
 }
 
+// gatewayProviderStatus is one entry of the gateway's GET /v1/models optional
+// top-level "providers" array (service-key callers that sent
+// darkplumClassesHeader only -- see the wire contract): always both vendors,
+// configured or not. SyncModels captures the array verbatim; ListAdminModels
+// passes it straight through, unfiltered by the capability header check that
+// gates the models list itself, since it describes gateway-side plumbing an
+// admin needs to see to diagnose a vendor provider regardless of whether
+// their own browser bundle understands external_api models yet.
+// FilterSource, Filter, and EnvFilterSetAt (PLAN-UI) are the gateway's own
+// per-vendor last-writer-wins view: FilterSource is "db"|"env"|"none",
+// Filter is the effective filter currently in force, and EnvFilterSetAt is
+// the ConfigMap SET_AT the gateway last saw for that vendor -- the api's
+// ProvidersHandler reads EnvFilterSetAt (never displays it) to compute a
+// skew-proof filter_set_at on every UI write (see providers.go's
+// nextFilterSetAt). InstallingUntil is NEVER set by the gateway (it has no
+// concept of an install window) -- it is populated by ListAdminModels from
+// vendor_provider_settings after every sync-triggered or on-demand read of
+// this struct, so it round-trips through SyncModels' decode untouched (the
+// gateway's JSON never contains this key). RemovingUntil is the same story
+// for DELETE .../key's removal hint window (review addition to migration
+// 017): also NEVER set by the gateway, populated by ListAdminModels from
+// vendor_provider_settings, and deliberately NOT omitempty -- the review
+// spec calls for an explicit `"removing_until": null` rather than an
+// absent key when there's no removal in progress, unlike InstallingUntil's
+// existing omitempty behavior (left as-is; changing an already-shipped
+// field's shape is out of scope here).
+type gatewayProviderStatus struct {
+	Name            string     `json:"name"`
+	Configured      bool       `json:"configured"`
+	State           string     `json:"state"`
+	ModelCount      int        `json:"model_count"`
+	LastSyncAt      *time.Time `json:"last_sync_at"`
+	FilterSource    string     `json:"filter_source,omitempty"`
+	Filter          []string   `json:"filter,omitempty"`
+	EnvFilterSetAt  *time.Time `json:"env_filter_set_at,omitempty"`
+	InstallingUntil *time.Time `json:"installing_until,omitempty"`
+	RemovingUntil   *time.Time `json:"removing_until"`
+}
+
 // gatewayModelsResponse is the shape we expect from GET {gatewayURL}/v1/models.
 type gatewayModelsResponse struct {
-	Object string             `json:"object"`
-	Data   []openAIModelEntry `json:"data"`
+	Object           string                  `json:"object"`
+	Data             []openAIModelEntry      `json:"data"`
+	Providers        []gatewayProviderStatus `json:"providers,omitempty"`
+	ProviderFeatures []string                `json:"provider_features,omitempty"`
 }
 
 // modelPurgeAfter documents the purge cutoff used in the DELETE below (kept
@@ -587,6 +898,15 @@ func (h *ModelHandler) SyncModels(ctx context.Context) {
 		return
 	}
 	req.Header.Set("Authorization", "Bearer "+h.serviceKey)
+	// Order-independence by capability handshake (PLAN v3.1): the gateway
+	// only includes external_api models and the providers status block in
+	// its response to a caller that names the class it understands. This
+	// api always understands it (that's what this migration/release ships),
+	// so it always sends it here regardless of what the INBOUND request to
+	// the api's own /v1/models carried -- that separate check
+	// (requestPermitsExternalAPI) gates what this api hands back to ITS
+	// callers, not what it asks the gateway for.
+	req.Header.Set(darkplumClassesHeader, backendClassExternalAPI)
 
 	resp, err := h.client.Do(req)
 	if err != nil {
@@ -604,6 +924,36 @@ func (h *ModelHandler) SyncModels(ctx context.Context) {
 	if err := json.NewDecoder(resp.Body).Decode(&gwResp); err != nil {
 		slog.ErrorContext(ctx, "sync models: decode gateway response failed", "err", err)
 		return
+	}
+
+	// Cache the providers block for ListAdminModels regardless of whether any
+	// models were discovered this tick -- a successful sync with an empty
+	// providers array (old gateway, pre-CU3) must still overwrite a stale
+	// cached value from a hypothetical earlier newer-gateway response, since
+	// "passed through from the last sync" means the LAST sync, not the last
+	// non-empty one.
+	h.providersMu.Lock()
+	h.providers = gwResp.Providers
+	h.providerFeatures = gwResp.ProviderFeatures
+	h.providersMu.Unlock()
+
+	// Refresh the "is any vendor mid-install-or-removal" cache cmd/main.go's
+	// sync loop polls to decide its tick interval (PLAN-UI v2.1, extended by
+	// review to also cover removing_until: DELETE's own "Removing" progress
+	// hint deserves the same fast tick installing_until already gets) -- a
+	// plain read, done once per sync rather than once per tick, and tolerant
+	// of a query failure (leaves the previous cached value in place rather
+	// than spuriously falling back to the slow interval on a transient DB
+	// blip).
+	var anyInstalling bool
+	if err := h.pool.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM vendor_provider_settings WHERE installing_until > now() OR removing_until > now())`,
+	).Scan(&anyInstalling); err != nil {
+		slog.WarnContext(ctx, "sync models: check installing vendors failed", "err", err)
+	} else {
+		h.providersMu.Lock()
+		h.anyInstalling = anyInstalling
+		h.providersMu.Unlock()
 	}
 
 	// The upsert runs in a transaction serialised against PutAlias (routing.go)

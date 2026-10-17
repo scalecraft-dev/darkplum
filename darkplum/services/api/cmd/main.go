@@ -25,6 +25,7 @@ import (
 	"github.com/scalecraft/darkplum/api/internal/auth"
 	"github.com/scalecraft/darkplum/api/internal/db"
 	"github.com/scalecraft/darkplum/api/internal/handler"
+	"github.com/scalecraft/darkplum/api/internal/kube"
 )
 
 func main() {
@@ -168,6 +169,7 @@ func run() error {
 	modelSyncInterval := modelSyncIntervalFromEnv()
 	modelHandler := handler.NewModelHandler(gatewayURL, serviceKey, pool)
 	modelHandler.SetAvailabilityWindow(modelAvailabilityWindowFromEnv())
+	modelHandler.SetSecureCookies(authCfg.SecureCookie)
 	go func() {
 		delay := 2 * time.Second
 		for i := 0; i < 20; i++ {
@@ -189,16 +191,7 @@ func run() error {
 			}
 		}
 
-		ticker := time.NewTicker(modelSyncInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				modelHandler.SyncModels(ctx)
-			}
-		}
+		runModelSyncTicker(ctx, modelHandler, modelSyncInterval)
 	}()
 
 	// Local password auth is always available. OIDC is additive when configured.
@@ -237,6 +230,7 @@ func run() error {
 	routing.SetAvailabilityWindow(modelAvailabilityWindowFromEnv())
 	policy := handler.NewPolicyHandler(pool, activityRecorder, gatewayURL, serviceKey)
 	conversations := handler.NewConversationHandler(pool, activityRecorder)
+	providers := handler.NewProvidersHandler(pool, activityRecorder, gatewayURL, serviceKey, kube.NewWriter(), modelHandler, authCfg.SecureCookie)
 
 	r := buildRouter(routerDeps{
 		pool:          pool,
@@ -252,6 +246,7 @@ func run() error {
 		policy:        policy,
 		modelHandler:  modelHandler,
 		conversations: conversations,
+		providers:     providers,
 	})
 
 	srv := &http.Server{
@@ -306,6 +301,7 @@ type routerDeps struct {
 	policy        *handler.PolicyHandler
 	modelHandler  *handler.ModelHandler
 	conversations *handler.ConversationHandler
+	providers     *handler.ProvidersHandler
 }
 
 // buildRouter registers every route the api serves. See routerDeps' doc
@@ -317,6 +313,13 @@ func buildRouter(d routerDeps) *gin.Engine {
 	r.Use(requestID())
 	r.Use(requestLogger())
 	r.Use(corsMiddleware())
+	// Registered before csrfProtection (and before session auth): a Bearer
+	// credential on a vendor-key route must be refused outright, not merely
+	// left to fall through to session auth, because Bearer requests skip
+	// csrfProtection's X-Requested-With check below (see that function) --
+	// letting a Bearer-carrying request reach these routes at all would
+	// reopen the CSRF hole PLAN-UI's security ruling closed.
+	r.Use(rejectBearerOnProviderRoutes())
 	r.Use(csrfProtection())
 
 	r.GET("/health", func(c *gin.Context) { c.Status(http.StatusOK) })
@@ -422,6 +425,33 @@ func buildRouter(d routerDeps) *gin.Engine {
 			adminOnly.GET("/usage/summary", d.activityH.UsageSummary)
 			adminOnly.GET("/usage/user-summary", d.activityH.UserSummary)
 			adminOnly.GET("/usage/key-summary", d.activityH.KeySummary)
+
+			// Vendor key install/rotate/remove (PLAN-UI). Rate-limited on
+			// every route that calls out to the vendor through the gateway's
+			// verify (verify itself, install/rotate, and change-models,
+			// which all invoke the same gateway verify path): 5/min per
+			// acting admin, PLUS a process-wide cap of 20/hr (see
+			// providerProcessRL below), so a mistyped key or filter retried
+			// in a loop can't hammer the vendor's own rate limits. DELETE
+			// never calls the vendor (it only removes the Secret key) and is
+			// typed-confirmation-gated instead.
+			providerActorRL := auth.KeyedRateLimit(5.0/60.0, 5, func(c *gin.Context) string { return c.GetString("user_id") })
+			// providerProcessRL is keyed by the constant "org" -- despite the
+			// name, this is NOT an org-scoped limit (there is no org_id
+			// anywhere in this request path to key on): it is one shared
+			// bucket for the entire api PROCESS, deliberately, and only
+			// behaves like a whole-deployment limit because this handler
+			// assumes replicas: 1 (see k8s/base/api/deployment.yaml). Running
+			// more than one api replica would give each pod its own
+			// independent 20/hr bucket -- i.e. an effective org-wide limit of
+			// 20*N/hr -- since auth.KeyedRateLimit's state is in-process, not
+			// shared (e.g. via Postgres or Redis). Revisit this the day the
+			// api deployment ever scales beyond one replica.
+			providerProcessRL := auth.KeyedRateLimit(20.0/3600.0, 20, func(c *gin.Context) string { return "org" })
+			adminOnly.POST("/providers/:vendor/verify", providerActorRL, providerProcessRL, d.providers.PostVerify)
+			adminOnly.PUT("/providers/:vendor/key", providerActorRL, providerProcessRL, d.providers.PutKey)
+			adminOnly.PUT("/providers/:vendor/filter", providerActorRL, providerProcessRL, d.providers.PutFilter)
+			adminOnly.DELETE("/providers/:vendor/key", d.providers.DeleteKey)
 		}
 	}
 
@@ -466,10 +496,64 @@ const modelSyncMinInterval = 10 * time.Second
 // gateway itself already knows.
 const modelSyncDefaultInterval = 60 * time.Second
 
+// providerInstallSyncInterval is the sync loop's tick interval while any
+// vendor has a live installing_until (PLAN-UI v2.1) -- fast enough that the
+// admin's "Installing" progress card and admitted-models list reflect the
+// gateway's post-install state within a few ticks, not a full
+// MODEL_SYNC_INTERVAL_SECONDS cycle.
+const providerInstallSyncInterval = 5 * time.Second
+
 // modelSyncIntervalFromEnv reads MODEL_SYNC_INTERVAL_SECONDS from the
 // environment and applies parseModelSyncInterval.
 func modelSyncIntervalFromEnv() time.Duration {
 	return parseModelSyncInterval(os.Getenv("MODEL_SYNC_INTERVAL_SECONDS"))
+}
+
+// runModelSyncTicker runs the periodic model sync loop: SyncModels on every
+// tick of syncInterval, dropping to providerInstallSyncInterval while
+// modelHandler.AnyInstalling() is true (PLAN-UI v2.1) and reverting once it
+// isn't -- plus an immediate, out-of-band SyncModels whenever
+// modelHandler.Kick() fires (see ModelHandler.KickCh's doc comment).
+//
+// The Kick case exists because otherwise the loop only notices
+// AnyInstalling() went true on its own next natural tick: with the default
+// 60s syncInterval, a vendor key install right after a tick fired could sit
+// up to ~60s before the loop ever ran a sync to pick up installing_until and
+// switch to the fast cadence, even though providers.go's own
+// syncModelsBounded already ran ONE immediate sync for that specific
+// request. Kick closes that gap for every subsequent tick, not just the
+// first one.
+//
+// Blocks until ctx is done, then returns -- pulled out of run() as its own
+// function so it's callable directly from a test with a short-lived ctx and
+// a fake gateway, without booting the whole server.
+func runModelSyncTicker(ctx context.Context, modelHandler *handler.ModelHandler, syncInterval time.Duration) {
+	ticker := time.NewTicker(syncInterval)
+	defer ticker.Stop()
+	currentInterval := syncInterval
+
+	sync := func() {
+		modelHandler.SyncModels(ctx)
+		want := syncInterval
+		if modelHandler.AnyInstalling() {
+			want = providerInstallSyncInterval
+		}
+		if want != currentInterval {
+			ticker.Reset(want)
+			currentInterval = want
+		}
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sync()
+		case <-modelHandler.KickCh():
+			sync()
+		}
+	}
 }
 
 // parseModelSyncInterval defaults to modelSyncDefaultInterval and enforces
@@ -591,6 +675,38 @@ func corsMiddleware() gin.HandlerFunc {
 		MaxAge:           12 * time.Hour,
 	}
 	return cors.New(cfg)
+}
+
+// providerRoutesPrefix is every route ProvidersHandler serves.
+const providerRoutesPrefix = "/api/v1/providers/"
+
+// rejectBearerOnProviderRoutes refuses any request under
+// providerRoutesPrefix that carries an Authorization: Bearer header with
+// 403, before session auth, CSRF, or anything else in the chain runs (see
+// buildRouter's registration order). These routes install a key into the
+// cluster Secret and must only ever be reachable by an interactive admin
+// session with CSRF protection intact -- a Bearer credential exists
+// specifically so an SDK/script can skip that protection on the
+// OpenAI-compatible surface (apiOrSession, csrfProtection), which must never
+// extend to this one.
+func rejectBearerOnProviderRoutes() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		if strings.HasPrefix(c.Request.URL.Path, providerRoutesPrefix) &&
+			strings.HasPrefix(c.GetHeader("Authorization"), "Bearer ") {
+			// Structured {code,message} like every other error these routes
+			// return (internal/handler/providers.go's apiErrorBody) -- the
+			// web engineer's UI reads error.message verbatim regardless of
+			// which layer produced the refusal.
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+				"error": gin.H{
+					"code":    "bearer_not_allowed",
+					"message": "vendor key routes do not accept API-key or bearer credentials; sign in as an admin",
+				},
+			})
+			return
+		}
+		c.Next()
+	}
 }
 
 func csrfProtection() gin.HandlerFunc {

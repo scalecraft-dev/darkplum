@@ -17,6 +17,9 @@ spec:
         app.kubernetes.io/name: darkplum-api
         app.kubernetes.io/part-of: darkplum
     spec:
+      # Own ServiceAccount: its single permission is patch on the two vendor-key
+      # objects (provider-rbac.yaml).
+      serviceAccountName: darkplum-api
       containers:
         - name: api
           image: darkplum-api:latest

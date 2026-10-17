@@ -280,6 +280,21 @@ func (s *PgStore) loadFromDB(ctx context.Context) (Snapshot, error) {
 		return Snapshot{}, fmt.Errorf("policy: query api_keys: %w", err)
 	}
 
+	// vendor_provider_settings (migration 017) may not exist yet on a
+	// customer database mid-rollout, exactly like principal_routing_policies
+	// before migration 015 landed — see loadVendorFilters. Missing table =>
+	// empty map, never a load failure: a vendor filter is a "nice to have"
+	// UI feature, not core routing-enforcement state, and its absence must
+	// never fail the whole policy snapshot closed.
+	vendorFilters, err := s.loadVendorFilters(ctx)
+	if err != nil {
+		if !isUndefinedTableError(err) {
+			return Snapshot{}, fmt.Errorf("policy: query vendor_provider_settings: %w", err)
+		}
+		log.Printf("policy: WARNING vendor_provider_settings does not exist yet (migration 017 not applied) — vendor model filters fall back to the <VENDOR>_MODEL_FILTER env pair for this snapshot")
+		vendorFilters = nil
+	}
+
 	return Snapshot{
 		Enabled:         enabled,
 		Aliases:         buildAliases(aliasRows, routeRows),
@@ -293,7 +308,35 @@ func (s *PgStore) loadFromDB(ctx context.Context) (Snapshot, error) {
 		KeyRows:         built.KeyRows,
 		KeyOwner:        keyOwner,
 		UserKeys:        userKeys,
+		VendorFilters:   vendorFilters,
 	}, nil
+}
+
+// loadVendorFilters queries every row of vendor_provider_settings (migration
+// 017, owned by the api) into a vendor -> VendorFilterRow map. Returns the
+// raw error (including an undefined-table 42P01) for loadFromDB to classify
+// — this function performs I/O only, mirroring loadPrincipalPolicyRows.
+func (s *PgStore) loadVendorFilters(ctx context.Context) (map[string]VendorFilterRow, error) {
+	rows, err := s.pool.Query(ctx, `SELECT vendor, model_filter, filter_set_at FROM vendor_provider_settings`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	out := make(map[string]VendorFilterRow)
+	for rows.Next() {
+		var vendor string
+		var filter []string
+		var setAt time.Time
+		if err := rows.Scan(&vendor, &filter, &setAt); err != nil {
+			return nil, fmt.Errorf("scan vendor_provider_settings row: %w", err)
+		}
+		out[vendor] = VendorFilterRow{Filter: filter, SetAt: setAt}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read vendor_provider_settings rows: %w", err)
+	}
+	return out, nil
 }
 
 // loadAPIKeyOwners queries every non-revoked api_keys row for its owning
@@ -418,6 +461,14 @@ func nullableSlicePtr(s []string) *[]string {
 // because the table doesn't exist yet) and the — should be unreachable given
 // prp_org_singleton plus migration 015's seed INSERT, but not trusted to hold
 // forever — case where the table exists yet somehow has no org row.
+// buildPrincipalPolicies tolerates a DB that has not yet run migration 016:
+// routing_policy.residency's pre-016 CHECK only ever contains 'any' or
+// 'self_hosted_only', both handled identically whether 016 has landed or
+// not, and neither loadFromDB nor buildPrincipalPolicies validates the
+// column's value against a hardcoded vocabulary — an unrecognised string
+// (from a partially-applied 016, or a value this gateway build predates) is
+// normalised by residencyRankOf/Effective to the strictest known value
+// rather than rejected.
 // principalPolicies is buildPrincipalPolicies' return value: the precomputed
 // EffectivePolicy per level (used by Snapshot.EffectiveFor at request time)
 // alongside the raw, unmerged PolicyRow per level (used by
@@ -447,7 +498,21 @@ func buildPrincipalPolicies(rows []rawPrincipalPolicyRow, orgResidencyFallback s
 	}
 	keyRows := make(map[string]keyRowWithOwner)
 
+	// sawUnknownResidency tracks whether any residency value encountered
+	// while building this snapshot (the routing_policy fallback, or any
+	// principal row) fell outside {any, cloud_account_only,
+	// self_hosted_only}. Effective/residencyRankOf already normalise an
+	// unknown value to the strictest known one on every read, so enforcement
+	// is correct regardless; this is purely so an operator sees ONE WARNING
+	// per snapshot load naming the situation, mirroring buildAliases'
+	// sawLegacyModelClassifierKind pattern, rather than either silence or a
+	// line per row/request.
+	sawUnknownResidency := !isKnownResidency(orgResidencyFallback)
+
 	for _, r := range rows {
+		if r.Residency != nil && !isKnownResidency(*r.Residency) {
+			sawUnknownResidency = true
+		}
 		switch r.PrincipalType {
 		case PrincipalTypeOrg:
 			orgRow = PolicyRow{Level: PrincipalTypeOrg, Residency: r.Residency, AllowedModels: r.AllowedModels, DefaultModel: r.DefaultModel}
@@ -479,9 +544,20 @@ func buildPrincipalPolicies(rows []rawPrincipalPolicyRow, orgResidencyFallback s
 		}
 	}
 
-	if !foundOrgRow && orgResidencyFallback == ResidencySelfHostedOnly {
-		v := ResidencySelfHostedOnly
+	// The routing_policy fallback applies whenever no explicit org row was
+	// found AND the fallback itself represents some restriction (anything
+	// other than "any") — generalised from the old binary check
+	// (`== ResidencySelfHostedOnly`) so a cloud_account_only fallback (or any
+	// future value; residencyRankOf treats an unrecognised one as strictest)
+	// carries over identically instead of being silently dropped to "any".
+	if !foundOrgRow && orgResidencyFallback != ResidencyAny {
+		v := orgResidencyFallback
 		orgRow.Residency = &v
+	}
+
+	if sawUnknownResidency {
+		log.Printf("policy: WARNING one or more residency values were not one of %q, %q, %q — treating as %q for this snapshot",
+			ResidencyAny, ResidencyCloudAccountOnly, ResidencySelfHostedOnly, ResidencySelfHostedOnly)
 	}
 
 	orgEff := Effective([]PolicyRow{orgRow})

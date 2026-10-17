@@ -131,10 +131,13 @@ var _ policy.Store = (*fakePolicyStore)(nil)
 // The two classifiers are a real RulesClassifier for both: none of these
 // tests exercise a routed alias, so the classifier is never invoked, but a
 // real (rather than nil) Classifier keeps NewChatHandler's contract (both
-// always non-nil) honest even for tests that don't care.
+// always non-nil) honest even for tests that don't care. providerStatus is a
+// real registry seeded exactly like cmd/main.go, so tests exercising the
+// providers array (GET /v1/models) see production-shaped defaults without
+// each constructing their own.
 func newTestHandler(providers fakeProviders, routes map[string]routing.Route, snap policy.Snapshot, loaded bool) *ChatHandler {
 	rules := router.NewRulesClassifier()
-	return NewChatHandler(providers, staticRoutes{table: routing.NewTable(routes)}, &fakePolicyStore{snap: snap, loaded: loaded}, rules, rules)
+	return NewChatHandler(providers, staticRoutes{table: routing.NewTable(routes)}, &fakePolicyStore{snap: snap, loaded: loaded}, rules, rules, provider.NewStatusRegistry("anthropic", "openai"))
 }
 
 // fakeClassifier is a router.Classifier test double whose Decision/error is
@@ -170,7 +173,7 @@ var _ router.Classifier = (*fakeClassifier)(nil)
 // fake wired to both slots keeps these tests independent of that dispatch
 // detail unless a test overrides it directly).
 func newRoutedTestHandler(providers fakeProviders, routes map[string]routing.Route, snap policy.Snapshot, classifier router.Classifier) *ChatHandler {
-	return NewChatHandler(providers, staticRoutes{table: routing.NewTable(routes)}, &fakePolicyStore{snap: snap, loaded: true}, classifier, classifier)
+	return NewChatHandler(providers, staticRoutes{table: routing.NewTable(routes)}, &fakePolicyStore{snap: snap, loaded: true}, classifier, classifier, provider.NewStatusRegistry("anthropic", "openai"))
 }
 
 // ---------------------------------------------------------------------------

@@ -38,7 +38,7 @@ export DOCKER_CLI_HINTS = false
 export DOCKER_CLI_HOOKS = 0
 
 .PHONY: help check-prereqs _require-outputs _deploy-vllm deploy deploy-infra deploy-k8s deploy-platform build-images push-images configure-sso test status destroy \
-       deploy-model remove-model list-models verify-bedrock-iam expose-web unexpose-web set-hf-token deploy-semantic-router remove-semantic-router \
+       deploy-model remove-model list-models verify-bedrock-iam expose-web unexpose-web set-hf-token set-anthropic-key set-openai-key remove-anthropic-key remove-openai-key deploy-semantic-router remove-semantic-router \
        dev-up dev-down dev-build-gateway dev-build-api dev-build-web dev-status dev-logs dev-test
 
 help: ## Show this help
@@ -186,6 +186,14 @@ deploy-platform: build-images push-images ## Build, push, and deploy gateway + w
 	@kubectl apply -f $(K8S_DIR)/base/namespaces/darkplum-system.yaml
 	@echo "Deploying gateway service account..."
 	@kubectl apply -f $(K8S_DIR)/base/gateway/service-account.yaml
+	@# Vendor keys: the (empty) Secret and ConfigMap, and the api's patch-only Role on
+	@# them, must exist before the api rolls — Admin > Models installs a key with a
+	@# PATCH, and a PATCH never creates. provider-objects.yaml has no `data` stanza,
+	@# so re-applying it here on every deploy never touches an installed key.
+	@echo "Applying vendor-key objects and the api's role on them..."
+	@kubectl apply -f $(K8S_DIR)/base/gateway/provider-objects.yaml
+	@kubectl apply -f $(K8S_DIR)/base/api/service-account.yaml
+	@kubectl apply -f $(K8S_DIR)/base/api/provider-rbac.yaml
 	@echo "Creating database credentials secret from Terraform output..."
 	@DATABASE_URL=$$(cd $(TF_DIR) && terraform output -raw database_url) && \
 		kubectl create secret generic postgres-credentials \
@@ -247,6 +255,7 @@ deploy-platform: build-images push-images ## Build, push, and deploy gateway + w
 	@echo "Applying network policies..."
 	@kubectl apply -f $(K8S_DIR)/base/network-policies/vllm-ingress.yaml
 	@kubectl apply -f $(K8S_DIR)/base/network-policies/gateway-egress.yaml
+	@kubectl apply -f $(K8S_DIR)/base/network-policies/gateway-ingress.yaml
 	@echo ""
 	@echo "Platform components deployed to darkplum-system."
 	@echo "Check status: kubectl get pods -n darkplum-system"
@@ -377,10 +386,14 @@ destroy: ## Tear down all resources
 	@kubectl delete -f $(K8S_DIR)/base/gateway/deployment.yaml --ignore-not-found 2>/dev/null || true
 	@kubectl delete -f $(K8S_DIR)/base/gateway/service-account.yaml --ignore-not-found 2>/dev/null || true
 	@kubectl delete -f $(K8S_DIR)/base/api/deployment.yaml --ignore-not-found 2>/dev/null || true
+	@kubectl delete -f $(K8S_DIR)/base/api/provider-rbac.yaml --ignore-not-found 2>/dev/null || true
+	@kubectl delete -f $(K8S_DIR)/base/api/service-account.yaml --ignore-not-found 2>/dev/null || true
+	@kubectl delete -f $(K8S_DIR)/base/gateway/provider-objects.yaml --ignore-not-found 2>/dev/null || true
 	@kubectl delete -f $(K8S_DIR)/base/web/service.yaml --ignore-not-found 2>/dev/null || true
 	@kubectl delete -f $(K8S_DIR)/base/web/deployment.yaml --ignore-not-found 2>/dev/null || true
 	@kubectl delete -f $(K8S_DIR)/base/network-policies/vllm-ingress.yaml --ignore-not-found 2>/dev/null || true
 	@kubectl delete -f $(K8S_DIR)/base/network-policies/gateway-egress.yaml --ignore-not-found 2>/dev/null || true
+	@kubectl delete -f $(K8S_DIR)/base/network-policies/gateway-ingress.yaml --ignore-not-found 2>/dev/null || true
 	@kubectl delete -f $(K8S_DIR)/base/network-policies/inference-egress.yaml --ignore-not-found 2>/dev/null || true
 	@helm uninstall semantic-router -n darkplum-system >/dev/null 2>&1 || true
 	@kubectl delete -f $(K8S_DIR)/semantic-router/network-policies.yaml --ignore-not-found 2>/dev/null || true
@@ -560,6 +573,120 @@ set-hf-token: ## Store a Hugging Face token for gated models (reads HF_TOKEN fro
 		--from-literal=token="$$HF_TOKEN" --dry-run=client -o yaml | kubectl apply -f - >/dev/null
 	@echo "Hugging Face token stored in $(NAMESPACE)/huggingface-token. New model downloads use it; restart an existing"
 	@echo "deployment to pick it up: kubectl rollout restart -n $(NAMESPACE) deploy/<vllm-deployment>"
+
+# -----------------------------------------------------------------------------
+# Vendor API keys (class external_api: Anthropic / OpenAI called directly)
+#
+# The key lives in one place: the darkplum-provider-keys Secret in
+# darkplum-system, file-mounted into the gateway only. It is never written to the
+# database, never reaches the api, and is read here from the environment — never
+# from argv, and never passed to a child process on its command line (printf is
+# a shell builtin; curl and kubectl receive it on stdin).
+#
+# The catalog filter set here lives in the darkplum-provider-config ConfigMap, not
+# in the Deployment's literal env, so re-running deploy-platform cannot reset it.
+# The same filter can be chosen in Admin > Models, where it lives in the database
+# and is mirrored into this ConfigMap; each write carries a _SET_AT stamp and the
+# gateway uses whichever was written last, so MODELS= given here takes effect even
+# after a filter was chosen in the UI (the UI then offers to adopt it). There is
+# no IAM allowlist below the gateway for a vendor key: the filter IS the catalog
+# bound, and an empty filter means no vendor models.
+#
+# DEV=1 targets the local kind cluster instead of the current kubectl context.
+# -----------------------------------------------------------------------------
+_PK_KUBECTL = $(if $(DEV),$(KUBECTL_DEV),kubectl)
+
+set-anthropic-key remove-anthropic-key: PK_VENDOR := Anthropic
+set-anthropic-key remove-anthropic-key: PK_ENV := ANTHROPIC_API_KEY
+set-anthropic-key remove-anthropic-key: PK_FILE := anthropic-api-key
+set-anthropic-key remove-anthropic-key: PK_FILTER := ANTHROPIC_MODEL_FILTER
+set-anthropic-key: PK_AUTH := x-api-key: 
+set-anthropic-key: PK_EXTRA := header = "anthropic-version: 2023-06-01"
+set-anthropic-key: PK_URL := https://api.anthropic.com/v1/models?limit=1000
+set-anthropic-key: PK_EXAMPLE := claude-*
+set-anthropic-key: PK_CONSOLE := a workspace-scoped key with a workspace spend limit (console.anthropic.com > Workspaces)
+
+set-openai-key remove-openai-key: PK_VENDOR := OpenAI
+set-openai-key remove-openai-key: PK_ENV := OPENAI_API_KEY
+set-openai-key remove-openai-key: PK_FILE := openai-api-key
+set-openai-key remove-openai-key: PK_FILTER := OPENAI_MODEL_FILTER
+set-openai-key: PK_AUTH := Authorization: Bearer 
+set-openai-key: PK_EXTRA :=
+set-openai-key: PK_URL := https://api.openai.com/v1/models
+set-openai-key: PK_EXAMPLE := gpt-*
+set-openai-key: PK_CONSOLE := a project-scoped key with a model allowlist and a project budget (platform.openai.com > Projects)
+
+set-anthropic-key: ## Install or rotate the org's Anthropic API key: read -s ANTHROPIC_API_KEY && export ANTHROPIC_API_KEY && make set-anthropic-key MODELS='claude-*' [DEV=1] [ALLOW_ALL=1]
+set-openai-key: ## Install or rotate the org's OpenAI API key: read -s OPENAI_API_KEY && export OPENAI_API_KEY && make set-openai-key MODELS='gpt-*' [DEV=1] [ALLOW_ALL=1]
+set-anthropic-key set-openai-key:
+	@KEY="$${$(PK_ENV)}"; \
+	[ -n "$$KEY" ] || { echo "ERROR: set $(PK_ENV) in the environment first, e.g.  read -s $(PK_ENV) && export $(PK_ENV)"; exit 1; }; \
+	[[ "$$KEY" =~ ^[A-Za-z0-9_-]+$$ ]] || { echo "ERROR: $(PK_ENV) contains characters no $(PK_VENDOR) key has. Nothing was changed."; exit 1; }; \
+	K="$(_PK_KUBECTL)"; NS=darkplum-system; \
+	OLD_FILTER=$$($$K get configmap darkplum-provider-config -n $$NS -o jsonpath='{.data.$(PK_FILTER)}' 2>/dev/null); \
+	FILTER="$(MODELS)"; FILTER="$${FILTER// /}"; [ -n "$$FILTER" ] || FILTER="$$OLD_FILTER"; \
+	[ -n "$$FILTER" ] || { echo "ERROR: MODELS is required the first time, e.g.  make $@ MODELS='$(PK_EXAMPLE)'"; \
+		echo "       It is the catalog filter: only $(PK_VENDOR) models matching these globs can ever be enabled."; exit 1; }; \
+	IFS=',' read -ra PATS <<< "$$FILTER"; \
+	for PAT in "$${PATS[@]}"; do \
+		if [[ -z "$${PAT//[*?]/}" && -z "$(ALLOW_ALL)" ]]; then \
+			echo "ERROR: MODELS='$$PAT' admits every model this key can reach, including ones $(PK_VENDOR) has not released yet."; \
+			echo "       Nothing below the gateway bounds a vendor key, so name a family, e.g. MODELS='$(PK_EXAMPLE)'."; \
+			echo "       (ALLOW_ALL=1 overrides. Nothing was changed.)"; exit 1; \
+		fi; \
+	done; \
+	if [ -z "$(SKIP_VERIFY)" ]; then \
+		echo "Checking the key against $(PK_VENDOR)..."; \
+		RESP=$$(printf 'header = "$(PK_AUTH)%s"\n$(PK_EXTRA)\n' "$$KEY" | curl -sS --max-time 30 -K - -w '\n%{http_code}' '$(PK_URL)') || { echo "ERROR: could not reach $(PK_VENDOR). Nothing was changed. (SKIP_VERIFY=1 skips this check.)"; exit 1; }; \
+		CODE=$$(echo "$$RESP" | tail -1); \
+		[ "$$CODE" = "200" ] || { echo "ERROR: $(PK_VENDOR) rejected this key (HTTP $$CODE). Nothing was changed."; exit 1; }; \
+		IDS=$$(echo "$$RESP" | sed '$$d' | jq -r '.data[].id'); \
+		TOTAL=$$(echo "$$IDS" | grep -c . || true); MATCHED=""; \
+		for ID in $$IDS; do for PAT in "$${PATS[@]}"; do PAT="$${PAT// /}"; \
+			if [[ -n "$$PAT" && "$$ID" == $$PAT ]]; then MATCHED="$$MATCHED $$ID"; break; fi; done; done; \
+		N=$$(echo $$MATCHED | wc -w | tr -d ' '); \
+		echo "  This key can reach $$TOTAL $(PK_VENDOR) models. The filter '$$FILTER' admits $$N of them:"; \
+		for ID in $$MATCHED; do echo "    $$ID"; done; \
+		echo "  A glob also admits matching models $(PK_VENDOR) releases later; they arrive disabled, like any new model."; \
+		echo "  The gateway drops ids that are plainly not chat models (embeddings, audio, image, moderation) after this filter."; \
+		[ "$$N" -gt 0 ] || { echo "ERROR: the filter matches nothing this key can reach. Nothing was changed."; exit 1; }; \
+	fi; \
+	HAD_KEY=$$($$K get secret darkplum-provider-keys -n $$NS -o jsonpath='{.data.$(PK_FILE)}' 2>/dev/null); \
+	$$K get secret darkplum-provider-keys -n $$NS >/dev/null 2>&1 || $$K create secret generic darkplum-provider-keys -n $$NS >/dev/null; \
+	printf '{"data":{"$(PK_FILE)":"%s"}}' "$$(printf '%s' "$$KEY" | base64 | tr -d '\n')" | \
+		$$K patch secret darkplum-provider-keys -n $$NS --type merge --patch-file /dev/stdin >/dev/null; \
+	$$K get configmap darkplum-provider-config -n $$NS >/dev/null 2>&1 || $$K create configmap darkplum-provider-config -n $$NS >/dev/null; \
+	if [ "$$FILTER" != "$$OLD_FILTER" ]; then \
+		OLD_STAMP=$$($$K get configmap darkplum-provider-config -n $$NS -o jsonpath='{.data.$(PK_FILTER)_SET_AT}' 2>/dev/null); \
+		STAMP=$$(jq -rn --arg old "$$OLD_STAMP" '[now, (($$old | try fromdateiso8601 catch 0) + 1)] | max | floor | todateiso8601'); \
+		$$K patch configmap darkplum-provider-config -n $$NS --type merge -p "$$(jq -n --arg k '$(PK_FILTER)' --arg v "$$FILTER" --arg t "$$STAMP" '{data:{($$k):$$v, ($$k+"_SET_AT"):$$t}}')" >/dev/null; \
+	fi; \
+	if [ -z "$$HAD_KEY" ] || [ "$$FILTER" != "$$OLD_FILTER" ]; then \
+		echo "Restarting the gateway to load the $(PK_VENDOR) filter..."; \
+		$$K rollout restart deploy/darkplum-gateway -n $$NS >/dev/null; \
+		$$K rollout status deploy/darkplum-gateway -n $$NS --timeout=180s; \
+	else \
+		echo "Key rotated in place. The gateway picks it up within about 90 seconds; no restart, no dropped requests."; \
+	fi; \
+	echo ""; \
+	echo "$(PK_VENDOR) key stored in $$NS/darkplum-provider-keys. It is org-wide: darkplum cannot see or verify what it is"; \
+	echo "scoped to, and has no spend cap of its own. Use $(PK_CONSOLE)."; \
+	echo ""; \
+	echo "Nothing can answer yet. New models start disabled, and the organisation's routing policy keeps prompts"; \
+	echo "inside your cloud account until an administrator allows otherwise:"; \
+	echo "  Open Admin > Models$(if $(DEV), at http://localhost:$(DEV_PORT)/admin/models,) and choose \"Review and enable\"."
+
+remove-anthropic-key: ## Remove the org's Anthropic key and catalog filter (its models stop answering) [DEV=1]
+remove-openai-key: ## Remove the org's OpenAI key and catalog filter (its models stop answering) [DEV=1]
+remove-anthropic-key remove-openai-key:
+	@K="$(_PK_KUBECTL)"; NS=darkplum-system; \
+	$$K patch secret darkplum-provider-keys -n $$NS --type json -p '[{"op":"remove","path":"/data/$(PK_FILE)"}]' >/dev/null 2>&1 || true; \
+	$$K patch configmap darkplum-provider-config -n $$NS --type json -p '[{"op":"remove","path":"/data/$(PK_FILTER)"}]' >/dev/null 2>&1 || true; \
+	$$K patch configmap darkplum-provider-config -n $$NS --type json -p '[{"op":"remove","path":"/data/$(PK_FILTER)_SET_AT"}]' >/dev/null 2>&1 || true; \
+	$$K rollout restart deploy/darkplum-gateway -n $$NS >/dev/null; \
+	$$K rollout status deploy/darkplum-gateway -n $$NS --timeout=180s; \
+	echo "$(PK_VENDOR) key and filter removed. Its models keep their settings, show as unreachable, and refuse requests."; \
+	echo "Revoke the key at $(PK_VENDOR) as well — removing it here does not invalidate it."
 
 remove-model: ## Remove a self-hosted model added with deploy-model: make remove-model NAME=qwen
 	@[[ "$(NAME)" =~ ^[a-z0-9][a-z0-9-]{0,30}$$ ]] || { echo "ERROR: NAME is required."; exit 1; }

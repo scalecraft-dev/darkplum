@@ -31,6 +31,16 @@
   color: var(--fg-subtle);
 }
 
+/* A disabled input looked exactly like an editable one, which on a form with
+   a settled step — the key field once the key has been checked — reads as a
+   field that has stopped responding. Same opacity as a disabled button, so
+   "not now" looks the same on both. */
+.input:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+  background: var(--bg-surface-raised);
+}
+
 .error {
   border-color: var(--danger-fg);
 }

@@ -8,14 +8,44 @@ package routing
 import "sort"
 
 // Backend classes. These mirror models.backend_class in the control-plane
-// schema (migration 010) and drive the residency enforcement check in the
-// chat handler: self_hosted beats cloud_managed on id collision, and
-// self_hosted_only residency policy blocks any route whose Class is
-// ClassCloudManaged.
+// schema (migrations 010 and, for ClassExternalAPI, 016) and drive both the
+// collision precedence in manager.go's resolveLocked and the residency
+// enforcement check in policy.ResidencyPermits: self_hosted beats
+// cloud_managed beats external_api on id collision, and a residency policy
+// tighter than "any" blocks routes in rank order (self_hosted_only permits
+// only self_hosted; cloud_account_only additionally permits cloud_managed;
+// external_api requires "any").
 const (
 	ClassSelfHosted   = "self_hosted"
 	ClassCloudManaged = "cloud_managed"
+	// ClassExternalAPI is a direct vendor API backend (Anthropic, OpenAI) —
+	// the model runs entirely outside the customer's cloud account. See
+	// policy.ResidencyPermits.
+	ClassExternalAPI = "external_api"
 )
+
+// classRank orders backend classes for the collision-precedence rule in
+// manager.go's resolveLocked: when more than one source claims the same
+// model id, the lowest-ranked (most "ours") class wins — self_hosted (0)
+// beats cloud_managed (1) beats external_api (2). Registration order (the
+// order sources were passed to NewManager) breaks ties within the same rank;
+// see resolveLocked's doc comment.
+var classRank = map[string]int{
+	ClassSelfHosted:   0,
+	ClassCloudManaged: 1,
+	ClassExternalAPI:  2,
+}
+
+// rankOfClass returns class's collision rank, or a rank worse than any known
+// class if class is unrecognised. Defensive only: every Source registers
+// with one of the ClassX constants above, so this fallback should never be
+// exercised in practice.
+func rankOfClass(class string) int {
+	if r, ok := classRank[class]; ok {
+		return r
+	}
+	return len(classRank)
+}
 
 // Route describes how a single resolved model id is served.
 type Route struct {

@@ -1,0 +1,52 @@
+# Installing a vendor key from Admin > Models: the api writes the key into the
+# darkplum-provider-keys Secret and mirrors the catalog filter into the
+# darkplum-provider-config ConfigMap.
+#
+# `patch` only, on those two named objects (resourceNames): the api cannot touch
+# any other Secret, and cannot list, watch, create or delete. No `create` is why
+# both objects are pre-created (gateway/provider-objects.yaml) — a PATCH never
+# creates.
+#
+# What this does NOT give: the api cannot be stopped from reading the key back. A
+# Kubernetes PATCH response is the whole object, so a no-op patch returns the
+# Secret's data; withholding `get` is tidiness, not a boundary. The api discards
+# that response and never returns a key, but a compromised api holds this verb.
+# The honest delta of an api compromise is therefore: the vendor keys, in addition
+# to what it already yields (every conversation, and the ability to act as any
+# user).
+# The gateway holds no Kubernetes permission at all; it reads the key from its
+# file mount.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: darkplum-api-provider-keys
+  namespace: darkplum-system
+  labels:
+    app.kubernetes.io/name: darkplum-api
+    app.kubernetes.io/part-of: darkplum
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    resourceNames: ["darkplum-provider-keys"]
+    verbs: ["patch"]
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    resourceNames: ["darkplum-provider-config"]
+    verbs: ["patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: darkplum-api-provider-keys
+  namespace: darkplum-system
+  labels:
+    app.kubernetes.io/name: darkplum-api
+    app.kubernetes.io/part-of: darkplum
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: darkplum-api-provider-keys
+subjects:
+  - kind: ServiceAccount
+    name: darkplum-api
+    namespace: darkplum-system

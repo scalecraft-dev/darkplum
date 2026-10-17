@@ -52,3 +52,10 @@
 .bordered.neutral {
   border: 1px solid var(--border-default);
 }
+
+/* Provisional state: nothing has reported this yet. The dash is the signal,
+   so it survives greyscale and colour-blind viewing the way the glyph beside
+   it does — the variant colour is never carrying the meaning alone. */
+.dashed {
+  border-style: dashed;
+}
