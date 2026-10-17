@@ -167,9 +167,9 @@ func (h *BillingHandler) PutKey(c *gin.Context) {
 		kubeErrorJSON(c, err)
 		return
 	}
-	h.svc.MarkInstalled(vendor)
+	h.svc.Install(vendor, key)
 	last4 := billing.Last4(key)
-	if err := h.svc.Store.SetStatus(ctx, vendor, true, billing.StatePulling, nil, &last4, false); err != nil {
+	if err := h.svc.Store.SetInstalled(ctx, vendor, last4); err != nil {
 		slog.ErrorContext(ctx, "billing key: status write failed", "vendor", vendor)
 	}
 
@@ -182,7 +182,7 @@ func (h *BillingHandler) PutKey(c *gin.Context) {
 	evt.Detail = map[string]any{"vendor": vendor, "key_last4": last4}
 	h.activity.Record(ctx, evt)
 
-	go h.svc.PullVendor(context.Background(), vendor, key)
+	go h.svc.PullVendor(context.Background(), vendor, billing.TriggerInstall)
 
 	c.JSON(http.StatusOK, gin.H{"state": "installed"})
 }
@@ -209,8 +209,8 @@ func (h *BillingHandler) DeleteKey(c *gin.Context) {
 		kubeErrorJSON(c, err)
 		return
 	}
-	h.svc.MarkRemoved(vendor)
-	if err := h.svc.Store.SetStatus(ctx, vendor, false, billing.StateNotConfigure, nil, nil, false); err != nil {
+	h.svc.Remove(vendor)
+	if err := h.svc.Store.SetRemoved(ctx, vendor); err != nil {
 		slog.ErrorContext(ctx, "billing key: status write failed", "vendor", vendor)
 	}
 	evt := activity.FromContext(c, activity.ProviderBillingKeyRemoved)

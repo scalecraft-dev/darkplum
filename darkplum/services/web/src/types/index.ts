@@ -176,6 +176,7 @@ export type BillingState =
   | 'wrong_key_type'
   | 'unreachable'
   | 'pulling'
+  | 'pending_mount'
 
 export interface ProviderBilling {
   configured: boolean

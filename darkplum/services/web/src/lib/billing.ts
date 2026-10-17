@@ -95,6 +95,13 @@ export function billingStateCopy(vendor: ReconciliationVendor, state: BillingSta
             ? 'This is a project key. The reports need an organisation admin key created under Organization settings > Admin keys.'
             : 'This is an inference key. The reports need an Admin API key created under Settings > Admin keys.',
       }
+    case 'pending_mount':
+      return {
+        label: 'Key stored, mounting',
+        variant: 'warning',
+        detail:
+          'The billing key is stored and the cluster has not mounted it yet — usually under two minutes. The next pull will use it.',
+      }
     case 'unreachable':
       return {
         label: 'Not reachable',

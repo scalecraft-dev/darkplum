@@ -1556,6 +1556,8 @@ if (!WEB_PORT_FORWARD_COMMAND.startsWith('kubectl port-forward -n darkplum-syste
     'This is an inference key. The reports need an Admin API key created under Settings > Admin keys.',
   )
   check('wrong_key_type is danger', billingStateCopy('anthropic', 'wrong_key_type').variant, 'danger')
+  check('pending_mount is a warning, not a danger', billingStateCopy('anthropic', 'pending_mount').variant, 'warning')
+  check('pending_mount says the key is stored', billingStateCopy('anthropic', 'pending_mount').detail.includes('stored'), true)
   check('openai wrong_key_type names a project key', billingStateCopy('openai', 'wrong_key_type').detail.startsWith('This is a project key.'), true)
   check('ok badge', billingStateCopy('openai', 'ok').label, 'Reconciling')
   check('not_configured is dashed neutral', billingStateCopy('anthropic', 'not_configured').dashed, true)

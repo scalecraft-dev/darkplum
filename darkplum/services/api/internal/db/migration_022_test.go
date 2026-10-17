@@ -54,3 +54,24 @@ func TestMigration022_VendorBilling(t *testing.T) {
 		t.Fatalf("re-apply duplicated status rows: %d", n)
 	}
 }
+
+func TestMigration023_PendingMount(t *testing.T) {
+	pool := setupSchemaUpTo(t, "022_vendor_billing_reconciliation.sql")
+	ctx := context.Background()
+	if err := RunMigrations(ctx, pool); err != nil {
+		t.Fatalf("RunMigrations: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE vendor_billing_status SET state='pending_mount' WHERE vendor='openai'`); err != nil {
+		t.Fatalf("pending_mount must be accepted: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE vendor_billing_status SET state='bogus' WHERE vendor='openai'`); err == nil {
+		t.Fatal("state CHECK must still reject")
+	}
+	data, err := migrationsFS.ReadFile("migrations/023_vendor_billing_pending_mount.sql")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, string(data)); err != nil {
+		t.Fatalf("re-apply 023: %v", err)
+	}
+}

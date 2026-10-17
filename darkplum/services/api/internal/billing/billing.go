@@ -37,6 +37,9 @@ const (
 	StateNotConfigure = "not_configured"
 	StateOK           = "ok"
 	StatePulling      = "pulling"
+	// StatePendingMount: key stored (configured=true) but the cluster has not
+	// mounted the Secret file into this pod yet; retried on the next poll.
+	StatePendingMount = "pending_mount"
 	KindStoreFailed   = "store_failed" // last_error_kind only
 )
 
