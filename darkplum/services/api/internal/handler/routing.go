@@ -54,10 +54,12 @@ func validAliasFormat(alias string) bool {
 	return aliasRe.MatchString(alias)
 }
 
-// validResidency is a pure predicate mirroring routing_policy.residency's
-// CHECK constraint.
+// validResidency is a pure predicate mirroring the org row's residency
+// domain (principal_routing_policies.residency, migration 016's widened
+// CHECK): the full three-rung ladder, since the org level is the one place
+// "any" is an explicit, settable value rather than "inherit".
 func validResidency(v string) bool {
-	return v == residencyAny || v == residencySelfHostedOnly
+	return v == residencyAny || v == residencyCloudAccountOnly || v == residencySelfHostedOnly
 }
 
 // validRouteName is a pure predicate mirroring model_alias_routes.route_name's
@@ -707,28 +709,35 @@ func (h *RoutingHandler) putRoutedAlias(c *gin.Context, tx pgx.Tx, alias string,
 		}
 	}
 
-	// 409: residency is currently self_hosted_only and one or more routes
-	// target a cloud_managed model. The per-request check in the gateway
-	// still enforces later flips (an admin flipping residency back to 'any'
-	// doesn't need to touch this alias again).
-	var residency string
-	if err := tx.QueryRow(ctx, `SELECT residency FROM routing_policy WHERE id = true`).Scan(&residency); err != nil {
+	// 409: one or more routes target a model of a class the CURRENT org
+	// residency refuses. The per-request check in the gateway still enforces
+	// later flips (an admin loosening residency back doesn't need to touch
+	// this alias again).
+	//
+	// Reads principal_routing_policies directly, NOT the legacy routing_policy
+	// mirror: since migration 016, that mirror DOWNGRADES cloud_account_only
+	// to 'any' for an old gateway's benefit (see that migration's comment),
+	// so reading it here would silently let a cloud_account_only org create a
+	// routed alias with an external_api route it will never actually be able
+	// to reach.
+	var dbResidency *string
+	if err := tx.QueryRow(ctx, `SELECT residency FROM principal_routing_policies WHERE principal_type = 'org'`).Scan(&dbResidency); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "check routing policy failed"})
 		return
 	}
-	if residency == residencySelfHostedOnly {
-		var conflicts []string
-		for _, rt := range routes {
-			if targetsByID[rt.TargetModelID].backendClass == backendClassCloudManaged {
-				conflicts = append(conflicts, fmt.Sprintf("route %q targets cloud-managed model %q", rt.RouteName, rt.TargetModelID))
-			}
+	residency := orgResidencyString(dbResidency)
+	var conflicts []string
+	for _, rt := range routes {
+		class := targetsByID[rt.TargetModelID].backendClass
+		if !residencyPermitsClass(residency, class) {
+			conflicts = append(conflicts, fmt.Sprintf("route %q targets a %s model %q", rt.RouteName, class, rt.TargetModelID))
 		}
-		if len(conflicts) > 0 {
-			c.JSON(http.StatusConflict, gin.H{
-				"error": "residency policy is self_hosted_only; " + strings.Join(conflicts, "; "),
-			})
-			return
-		}
+	}
+	if len(conflicts) > 0 {
+		c.JSON(http.StatusConflict, gin.H{
+			"error": fmt.Sprintf("residency policy is %s; %s", residency, strings.Join(conflicts, "; ")),
+		})
+		return
 	}
 
 	var createdAt, updatedAt time.Time
@@ -922,10 +931,11 @@ func (h *RoutingHandler) TestAlias(c *gin.Context) {
 // Residency stays a plain (non-nullable) string here, unlike the
 // user/api_key shape, since "any" IS a value an admin can explicitly choose
 // at the org level (there's nothing above org to inherit from). Warnings is
-// populated only by PutRoutingPolicy, and only when the new residency is
-// 'self_hosted_only' and at least one routed alias has a route targeting a
-// cloud_managed model — that route will be refused per-request from now on,
-// even though the PUT itself still succeeds with 200. AffectedPrincipals and
+// populated only by PutRoutingPolicy, and only when the new residency is not
+// 'any' and at least one routed alias has a route targeting a model of a
+// class that residency refuses (residencyRouteWarnings) — that route will be
+// refused per-request from now on, even though the PUT itself still succeeds
+// with 200. AffectedPrincipals and
 // OrgNarrowed are set only when the PUT tightens the org policy (see
 // orgPolicyTightened) and the gateway could evaluate it: AffectedPrincipals
 // is the number of users and keys WITH A POLICY OF THEIR OWN whose reachable
@@ -980,13 +990,14 @@ type putRoutingPolicyRequest struct {
 }
 
 // orgPolicyTightened reports whether newReq narrows what oldResidency/oldAM
-// already permitted -- residency going from any to self_hosted_only, or
-// allowed_models going from unrestricted to restricted, or losing at least
-// one previously-allowed model id. Used to decide whether PutRoutingPolicy
-// asks the gateway for impact at all (a loosening or no-op change can't
-// shrink anyone's effective set, so it isn't worth a call).
+// already permitted -- residency moving UP the any/cloud_account_only/
+// self_hosted_only ladder (see residencyRank), or allowed_models going from
+// unrestricted to restricted, or losing at least one previously-allowed
+// model id. Used to decide whether PutRoutingPolicy asks the gateway for
+// impact at all (a loosening or no-op change can't shrink anyone's effective
+// set, so it isn't worth a call).
 func orgPolicyTightened(oldResidency, newResidency string, oldAM, newAM *[]string) bool {
-	if oldResidency != residencySelfHostedOnly && newResidency == residencySelfHostedOnly {
+	if residencyRank(newResidency) > residencyRank(oldResidency) {
 		return true
 	}
 	return allowlistNarrowed(oldAM, newAM)
@@ -1077,7 +1088,7 @@ func (h *RoutingHandler) PutRoutingPolicy(c *gin.Context) {
 		return
 	}
 	if !validResidency(req.Residency) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "residency must be 'any' or 'self_hosted_only'"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "residency must be 'any', 'cloud_account_only', or 'self_hosted_only'"})
 		return
 	}
 
@@ -1106,8 +1117,11 @@ func (h *RoutingHandler) PutRoutingPolicy(c *gin.Context) {
 	}
 	oldResidency := orgResidencyString(oldDBResidency)
 
+	// dbResidency mirrors orgResidencyString's inverse: NULL stores "any" (the
+	// org level's "nothing above to inherit from" base case); any other
+	// ladder value is stored literally.
 	var dbResidency *string
-	if req.Residency == residencySelfHostedOnly {
+	if req.Residency != residencyAny {
 		dbResidency = &req.Residency
 	}
 
@@ -1185,8 +1199,8 @@ func (h *RoutingHandler) PutRoutingPolicy(c *gin.Context) {
 	}
 	resp.Residency = orgResidencyString(newDBResidency)
 
-	if resp.Residency == residencySelfHostedOnly {
-		warnings, err := h.cloudManagedRouteWarnings(ctx)
+	if resp.Residency != residencyAny {
+		warnings, err := h.residencyRouteWarnings(ctx, resp.Residency)
 		if err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "check routed alias residency conflicts failed"})
 			return
@@ -1217,34 +1231,40 @@ func (h *RoutingHandler) PutRoutingPolicy(c *gin.Context) {
 	c.JSON(http.StatusOK, resp)
 }
 
-// cloudManagedRouteWarnings lists, in "alias X: route 'y' → <model> will be
-// refused" form, every routed alias route that targets a cloud_managed
-// model — used by PutRoutingPolicy when residency flips to
-// 'self_hosted_only' so the admin sees, at flip time, exactly which
-// already-configured routes are about to start being refused per request.
-func (h *RoutingHandler) cloudManagedRouteWarnings(ctx context.Context) ([]string, error) {
+// residencyRouteWarnings lists, in "alias X: route 'y' → <model> (<class>)
+// will be refused" form, every routed alias route whose target's
+// backend_class the given residency refuses (residencyPermitsClass) — used
+// by PutRoutingPolicy whenever the new org residency is anything but "any",
+// so the admin sees, at write time, exactly which already-configured routes
+// are about to start being refused per request. Generalized from the
+// two-class, self_hosted_only-only version of this check: under
+// cloud_account_only this reports external_api routes; under
+// self_hosted_only it reports both cloud_managed and external_api routes.
+func (h *RoutingHandler) residencyRouteWarnings(ctx context.Context, residency string) ([]string, error) {
 	rows, err := h.db.Query(ctx, `
-		SELECT r.alias, r.route_name, r.target_model_id
+		SELECT r.alias, r.route_name, r.target_model_id, m.backend_class
 		FROM model_alias_routes r
 		JOIN models m ON m.model_id = r.target_model_id
-		WHERE m.backend_class = 'cloud_managed'
 		ORDER BY r.alias, r.position
 	`)
 	if err != nil {
-		return nil, fmt.Errorf("query cloud-managed routes: %w", err)
+		return nil, fmt.Errorf("query routes: %w", err)
 	}
 	defer rows.Close()
 
 	var warnings []string
 	for rows.Next() {
-		var aliasName, routeName, targetModelID string
-		if err := rows.Scan(&aliasName, &routeName, &targetModelID); err != nil {
-			return nil, fmt.Errorf("scan cloud-managed route: %w", err)
+		var aliasName, routeName, targetModelID, backendClass string
+		if err := rows.Scan(&aliasName, &routeName, &targetModelID, &backendClass); err != nil {
+			return nil, fmt.Errorf("scan route: %w", err)
 		}
-		warnings = append(warnings, fmt.Sprintf("alias %s: route '%s' → %s will be refused", aliasName, routeName, targetModelID))
+		if residencyPermitsClass(residency, backendClass) {
+			continue
+		}
+		warnings = append(warnings, fmt.Sprintf("alias %s: route '%s' → %s (%s) will be refused", aliasName, routeName, targetModelID, backendClass))
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("cloud-managed routes rows: %w", err)
+		return nil, fmt.Errorf("routes rows: %w", err)
 	}
 	return warnings, nil
 }

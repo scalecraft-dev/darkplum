@@ -264,6 +264,34 @@
   },
   {
     "service": "api",
+    "method": "POST",
+    "path": "/api/v1/providers/:vendor/verify",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "PUT",
+    "path": "/api/v1/providers/:vendor/key",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "PUT",
+    "path": "/api/v1/providers/:vendor/filter",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "DELETE",
+    "path": "/api/v1/providers/:vendor/key",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
     "method": "GET",
     "path": "/api/v1/model-aliases",
     "auth": "admin",
@@ -436,5 +464,21 @@
     "auth": "service",
     "surface": "machine",
     "reason": "Org-wide lock-out check consulted by the api's PUT /api/v1/routing-policy before it writes: re-merges every principal with an explicit policy row under the proposed org policy in one call, so the org PUT refuses (409) a lock-out exactly like the user/key PUTs do, with the one gateway merge implementation"
+  },
+  {
+    "service": "gateway",
+    "method": "POST",
+    "path": "/v1/providers/:vendor/verify",
+    "auth": "service",
+    "surface": "machine",
+    "reason": "Called only by the api, with the service key, to verify and activate a vendor key an administrator installs from Admin > Models"
+  },
+  {
+    "service": "gateway",
+    "method": "POST",
+    "path": "/v1/providers/:vendor/refresh",
+    "auth": "service",
+    "surface": "machine",
+    "reason": "Called only by the api, with the service key, to verify and activate a vendor key an administrator installs from Admin > Models"
   }
 ]

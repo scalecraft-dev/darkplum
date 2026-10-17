@@ -33,6 +33,13 @@ export interface ChatMessage {
   /** Routed aliases: the gateway's own word for why that route was picked, in
    *  the closed vocabulary (rules:… / fallback:… / model:…). Display only. */
   routerReason?: string | null
+  /** Where this reply actually ran, from the gateway's response header. Known
+   *  for the turn that just arrived; history stores the model only, so it is
+   *  absent after a reload. Display only. */
+  backendClass?: BackendClass | null
+  /** The vendor that served it, from the gateway's response header — the
+   *  provider kind (anthropic, openai, bedrock, vllm…). Display only. */
+  provider?: string | null
   /** The model this conversation was pinned to had gone, so the alias chose
    *  again for this turn. Display only. */
   rerouted?: boolean
@@ -78,25 +85,106 @@ export interface ConversationMessageInput {
   request_id?: string
 }
 
-/** Where a model actually runs. Mirrors models.backend_class in the API. */
-export type BackendClass = 'self_hosted' | 'cloud_managed'
+/**
+ * Where a model actually runs. Mirrors models.backend_class in the API, and is
+ * exactly the closed wire vocabulary — nothing else may be sent or stored.
+ *
+ *   self_hosted   in your own cluster (vLLM, LM Studio)
+ *   cloud_managed your cloud account (AWS Bedrock)
+ *   external_api  the vendor's own API, called with your organisation's key
+ */
+export type BackendClass = 'self_hosted' | 'cloud_managed' | 'external_api'
+
+/**
+ * What the UI is willing to say about where a model runs. 'unknown' is a
+ * display state only — a value no backend has reported, or one this bundle
+ * does not recognise because the server is newer than it is. It is never sent
+ * anywhere, and it is refused under every residency, so an unrecognised class
+ * can never be mistaken for a safe one.
+ */
+export type DisplayClass = BackendClass | 'unknown'
+
+/** A vendor Darkplum can hold an organisation-wide API key for. */
+export type VendorName = 'anthropic' | 'openai'
+
+/**
+ * What the gateway last managed to do with one vendor's key, in the closed
+ * vocabulary the wire contract defines. A vendor that is not working never
+ * stops the gateway; it is reported here and in /health instead.
+ */
+export type ProviderState =
+  | 'not_configured'
+  | 'ok'
+  | 'filter_missing'
+  | 'filter_matched_nothing'
+  | 'auth_failed'
+  | 'unreachable'
+
+/**
+ * Where the model filter in force for a vendor was written.
+ *
+ *   db    the UI, or anything else that wrote through the api
+ *   env   the command line (`make set-*-key MODELS=…`), mirrored into the
+ *         gateway's environment
+ *   none  no filter, which for a vendor means no models are offered
+ *
+ * Last writer wins in both directions, so this is a fact about the most recent
+ * write and not a permanent mode. A value this bundle does not recognise reads
+ * as 'none': claiming a filter came from somewhere is worse than saying the
+ * filter's origin is unknown.
+ */
+export type FilterSource = 'db' | 'env' | 'none'
+
+/** One vendor's status, as the admin models response passes it through from
+ *  the gateway's last sync. Both vendors are always listed. */
+export interface ProviderStatus {
+  name: VendorName
+  configured: boolean
+  state: ProviderState
+  model_count: number
+  last_sync_at: string | null
+  /** Absent on an older api — read as 'none'. */
+  filter_source: FilterSource
+  /** The patterns in force, as the source above wrote them. Empty when there
+   *  is no filter. Shown, never guessed at: a family glob written from the
+   *  command line is the operator's own words and is repeated verbatim. */
+  filter: string[]
+  /** RFC3339, set by an install or a filter change: until this moment the
+   *  gateway may still be answering with the previous key or filter, so the
+   *  card shows the change landing rather than the stale state underneath it.
+   *  Null when nothing is in flight. */
+  installing_until: string | null
+  /** RFC3339, set when the key is deleted and cleared when one is installed.
+   *  Until this moment the gateway may still be answering with the key that
+   *  has just been removed, so the vendor reports itself configured and `ok`
+   *  while nothing of the sort is true any more — the card reads this first.
+   *  Null when no removal is in flight, and on an api that predates it. */
+  removing_until: string | null
+}
 
 /** A route the administrator wrote, as the chat-facing model list exposes it:
  *  the name and what it is for. Targets are never named to end users. */
 export interface ModelRouteSummary {
   route_name: string
   description: string
-  /** Optional: the API is only required to send names and descriptions. When it
-   *  does send a class, the picker can say that routes run in different places. */
-  target_backend_class?: BackendClass
+  /** Where this route's target runs, as the chat-facing GET /v1/models sends it
+   *  (api routeSummary.backend_class). Not `target_backend_class` — that name
+   *  belongs to the admin alias endpoints (ModelAliasRoute). A route without a
+   *  class is treated as unknown, never as self-hosted. */
+  backend_class?: BackendClass
 }
 
 export interface Model {
   id: string
   object: string
   created: number
+  /** The provider kind that serves it: vllm | lmstudio | bedrock | anthropic |
+   *  openai | mock. On an external_api model this is the vendor, and it is what
+   *  the picker names when it says where a prompt goes. */
   owned_by: string
-  /** Absent on older gateways/APIs — treat a missing value as 'self_hosted'. */
+  /** Absent on an older gateway/API, and on anything no backend has reported.
+   *  Read it through displayClassOf() — a missing or unrecognised value is
+   *  'unknown', never a class that happens to sound safe. */
   backend_class?: BackendClass
   /** Present only on alias entries: the model id this alias resolves to. For a
    *  routed alias this is the default route's target. */
@@ -110,16 +198,45 @@ export interface Model {
 export interface AdminModel {
   id: string
   model_id: string
+  /** vllm | lmstudio | bedrock | anthropic | openai | mock. */
   provider: string
   display_name: string | null
   enabled: boolean
   discovered_at: string
   updated_at: string
-  /** Absent on older APIs — treat a missing value as 'self_hosted'. */
+  /** Absent on an older API — read it through displayClassOf(), which calls an
+   *  absent or unrecognised value 'unknown' rather than guessing. */
   backend_class?: BackendClass
   /** False when the gateway has not seen this model for 3+ minutes. The row
    *  stays configured either way. Absent on older APIs — treat as reachable. */
   available?: boolean
+}
+
+/**
+ * The admin catalogue, as the models endpoint answers it. The response used to
+ * be a bare array and still is on an older API; a newer one wraps it so it can
+ * carry the vendor status block alongside. Both shapes are read — see
+ * listAdminModels() — and this is the normalised result.
+ */
+export interface AdminModelsResult {
+  models: AdminModel[]
+  /** Empty when the gateway never reported one (older gateway, or a sync that
+   *  has not happened yet). Never partially trusted: an empty array means "not
+   *  reported", which the Models tab says in those words. */
+  providers: ProviderStatus[]
+  /** What the gateway behind this api can do, passed through from its own
+   *  providers block. Absent on an older gateway, which is exactly the case
+   *  the Model vendors card has to recognise: without "ui_key_install" the
+   *  install routes answer 409, so the card offers the command line instead of
+   *  a form that would fail on submit. */
+  providerFeatures: string[]
+  /** Whether the api would accept a key over the transport this page is served
+   *  on. False means it answers 403 `insecure_transport` to an install or a
+   *  verify carrying a key, so the card shows the command line rather than a
+   *  form. Null on an api that predates the field — read it through
+   *  canInstallKeyOverTransport(), which falls back to the browser's own
+   *  isSecureContext rather than assuming either answer. */
+  keyInstallTransportOk: boolean | null
 }
 
 /** 'static' points at one model. 'routed' holds the routes an administrator
@@ -206,8 +323,22 @@ export interface AliasRouteTest {
   would_be_refused: { code: string; message: string } | null
 }
 
-/** Routing policy residency. 'self_hosted_only' refuses cloud-managed models. */
-export type Residency = 'any' | 'self_hosted_only'
+/**
+ * Routing policy residency — a ladder, loosest first. Each rung refuses
+ * everything the rung below it refuses, and more:
+ *
+ *   any                every known class
+ *   cloud_account_only self-hosted and cloud-managed; refuses external_api
+ *   self_hosted_only   self-hosted only
+ *
+ * A value this bundle does not recognise is read as the strictest rung, so a
+ * newer server can never widen an older UI's idea of what is permitted.
+ */
+export type Residency = 'any' | 'cloud_account_only' | 'self_hosted_only'
+
+/** The rungs a user or key may set on itself. A principal only ever narrows,
+ *  so the loosest rung is not one of them; null inherits. */
+export type PrincipalResidency = 'cloud_account_only' | 'self_hosted_only'
 
 export interface RoutingPolicy {
   residency: Residency
@@ -231,8 +362,8 @@ export interface RoutingPolicy {
    *  fewer models too. `affected_principals` never counts these people. */
   org_narrowed?: boolean
   /** Enabled, allowed models no backend has reported yet when the new
-   *  residency is self-hosted only: their class is unknown, so the API neither
-   *  counts them as lost nor as kept. Present only when non-empty. */
+   *  residency narrows: their class is unknown, so the API neither counts them
+   *  as lost nor as kept. Present only when non-empty. */
   unresolved_models?: string[]
 }
 
@@ -249,8 +380,8 @@ export type PrincipalType = 'org' | 'user' | 'api_key'
 
 /** One principal's own row, exactly as stored. null everywhere = inherits all. */
 export interface PrincipalPolicy {
-  /** null inherits. The only value that can be set is the tighter one. */
-  residency: 'self_hosted_only' | null
+  /** null inherits. Only a rung tighter than what is inherited can be set. */
+  residency: PrincipalResidency | null
   /** null inherits. Concrete model ids only — never aliases. */
   allowed_models: string[] | null
   /** null inherits. May be an alias. */
@@ -363,6 +494,18 @@ export interface InferenceEvent {
   user_name: string | null
   user_email: string | null
   model: string
+  /**
+   * Where the request actually ran, as the gateway recorded it. null has two
+   * causes and the UI must not imply only one of them: the request was refused
+   * before a route resolved (so there was no class to record), or the row
+   * predates the column. The usage filter calls both 'unrecorded'.
+   */
+  backend_class?: BackendClass | null
+  /** Which provider served it: vllm | lmstudio | bedrock | anthropic | openai
+   *  | mock. Never null from a current api; absent on an older one. On an
+   *  external_api row this is the vendor, and it is the only thing that turns
+   *  "left your account" into "left your account, to Anthropic". */
+  provider?: string | null
   /** Absent on older APIs — treat a missing value as 'inference'. */
   purpose?: InferencePurpose
   /** Routed aliases: the route that answered and why, as recorded. */

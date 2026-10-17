@@ -44,10 +44,14 @@ INSERT INTO principal_routing_policies (principal_type, residency, updated_at, u
 
 -- Rollout safety: keep routing_policy.residency mirrored from the org row
 -- until every gateway replica has rolled onto reading
--- principal_routing_policies directly (migration 016, later, drops
--- routing_policy once that's safe). Without this, a gateway pod still on the
--- old snapshot loader would silently stop seeing residency changes made
--- through the new org policy endpoint during a rolling deploy.
+-- principal_routing_policies directly (dropping routing_policy is the
+-- eventual cleanup once that's safe -- migration 016 does NOT do this; it
+-- widens the residency ladder to a third value and teaches this trigger to
+-- downgrade that value rather than mirror it verbatim, since an old gateway
+-- has no concept of it -- see that migration's comment). Without this
+-- mirror, a gateway pod still on the old snapshot loader would silently stop
+-- seeing residency changes made through the new org policy endpoint during a
+-- rolling deploy.
 CREATE OR REPLACE FUNCTION prp_mirror_org_residency() RETURNS trigger AS $$
 BEGIN
   IF NEW.principal_type = 'org' THEN

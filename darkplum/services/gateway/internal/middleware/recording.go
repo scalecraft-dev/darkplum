@@ -147,6 +147,12 @@ func Recording(rec *recorder.Recorder) gin.HandlerFunc {
 			}
 		}
 
+		// backend_class is set on the context the moment route.Class is known
+		// (handler.HandleChatCompletions), so a DENIED row (model_not_enabled,
+		// model_residency_violation, model_not_allowed) carries it too, not
+		// only a dispatched request — see recorder.InferenceEvent.BackendClass.
+		backendClass := c.GetString("backend_class")
+
 		main := recorder.InferenceEvent{
 			RequestID:        requestID,
 			APIKeyID:         keyID,
@@ -165,6 +171,7 @@ func Recording(rec *recorder.Recorder) gin.HandlerFunc {
 			RouteName:        routeName,
 			RouterReason:     routerReason,
 			RouterLatencyMS:  routerLatencyMS,
+			BackendClass:     backendClass,
 		}
 
 		// A routed alias's classifier decision never produces a second audit

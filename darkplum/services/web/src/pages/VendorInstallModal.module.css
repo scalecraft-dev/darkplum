@@ -1,0 +1,311 @@
+/* --- Install a vendor key ---
+   Deliberately the same vocabulary as VendorEnableModal: the two are read one
+   after the other — install the key, then review and enable — and a change of
+   rhythm between them would read as a change of subject. Same body gap, same
+   picker frame, same boundary stripe, same footer. */
+
+.body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin-top: var(--space-4);
+}
+
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.text {
+  font-size: var(--fs-sm);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-muted);
+}
+
+/* Quieter than .text: this is why a control behaves as it does, read after
+   someone has decided to use it. */
+.hint {
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-subtle);
+}
+
+/* --- the key field --- */
+
+/* The only thing ever said about the key: a length and four characters.
+   Monospace, because both facts are counted rather than read. */
+.shape {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--fg-muted);
+  font-variant-numeric: tabular-nums;
+  margin-top: calc(-1 * var(--space-2));
+}
+
+/* --- what will be stored --- */
+
+.picker {
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  padding: var(--space-3);
+  min-width: 0;
+}
+
+.legend {
+  padding: 0 var(--space-1);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--fg-subtle);
+  font-variant-numeric: tabular-nums;
+}
+
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  max-height: 18rem;
+  overflow-y: auto;
+}
+
+.group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+/* A family heading and its all/none control. The control is only rendered for
+   a family with more than one member — on a family of one it would be a second
+   way to press the checkbox beside it. */
+.groupHead {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: 0 var(--space-2);
+}
+
+.groupName {
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--fg-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.groupToggle {
+  font-size: var(--fs-xs);
+  color: var(--fg-muted);
+  border-radius: var(--radius-sm);
+  padding: 0 var(--space-1);
+  cursor: pointer;
+}
+
+.groupToggle:hover:not(:disabled) {
+  color: var(--fg-default);
+  background: var(--bg-surface-hover);
+}
+
+.groupToggle:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.groupToggle:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 1px;
+}
+
+.items {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.item {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.item:hover {
+  background: var(--bg-surface-hover);
+}
+
+.item:focus-within {
+  outline: 2px solid var(--border-focus);
+  outline-offset: -2px;
+}
+
+.checkbox {
+  width: 14px;
+  height: 14px;
+  margin: 2px 0 0;
+  accent-color: var(--brand-default);
+  flex-shrink: 0;
+}
+
+.itemText {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.itemName {
+  font-size: var(--fs-sm);
+  color: var(--fg-default);
+}
+
+.itemId {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+  word-break: break-all;
+}
+
+/* The patterns the ticks turn into. Shown because a filter nobody can read is
+   a filter nobody can check — and because "claude-sonnet*" is the difference
+   between two models and every sonnet released from now on. */
+.stored {
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-muted);
+}
+
+.storedValue {
+  font-family: var(--font-mono);
+  color: var(--fg-default);
+  /* Breaks between patterns, and only inside one when a single pattern is
+     wider than the line. break-all split "claude-haiku-4-5-20251001" across
+     two lines with a comma's worth of room to spare, which made a list of
+     four patterns look like a list of six. */
+  overflow-wrap: break-word;
+}
+
+/* --- the spend boundary --- */
+
+.boundary {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  background: var(--warning-bg);
+  border-left: 2px solid var(--warning-fg);
+  border-radius: var(--radius-sm);
+}
+
+.boundaryText {
+  font-size: var(--fs-sm);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-default);
+}
+
+.boundaryChange {
+  font-size: var(--fs-sm);
+  line-height: var(--lh-relaxed);
+  font-weight: var(--fw-medium);
+  color: var(--fg-default);
+}
+
+/* --- things that went wrong, and things that are simply a different path --- */
+
+.error {
+  font-size: var(--fs-sm);
+  line-height: var(--lh-relaxed);
+  color: var(--danger-fg);
+}
+
+.failure {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-3);
+  background: var(--danger-bg);
+  border-left: 2px solid var(--danger-fg);
+  border-radius: var(--radius-sm);
+}
+
+.failureTitle {
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  color: var(--fg-default);
+}
+
+/* An older gateway is not a failure — it is the other way of doing this. Info,
+   not amber, and it carries the command rather than an apology. */
+.notice {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3);
+  background: var(--info-bg);
+  border-left: 2px solid var(--info-fg);
+  border-radius: var(--radius-sm);
+}
+
+.noticeText {
+  font-size: var(--fs-sm);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-default);
+}
+
+/* Escape with a key in the field. Asked in place rather than as a second
+   dialog: a modal on top of a modal is two focus traps and one decision. */
+.discard {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  background: var(--bg-surface-raised);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+}
+
+.discardText {
+  font-size: var(--fs-sm);
+  color: var(--fg-default);
+}
+
+.discardActions {
+  display: flex;
+  gap: var(--space-2);
+}
+
+/* --- results --- */
+
+.resultTitle {
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  color: var(--fg-default);
+  margin-top: var(--space-2);
+}
+
+.idList {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: var(--space-1) 0 0;
+  padding-left: var(--space-4);
+}
+
+.footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}

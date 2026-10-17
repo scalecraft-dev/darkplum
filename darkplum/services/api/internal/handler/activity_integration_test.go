@@ -41,6 +41,158 @@ func insertInferenceEventWithPurpose(t *testing.T, ctx context.Context, pool *pg
 	}
 }
 
+// insertInferenceEventWithBackendClass inserts an inference_events row with
+// an explicit (possibly nil) backend_class, for exercising the
+// ?backend_class= filter and CSV column added by migration
+// 016_external_api_residency.sql.
+func insertInferenceEventWithBackendClass(t *testing.T, ctx context.Context, pool *pgxpool.Pool, requestID, userID, model string, backendClass *string) {
+	t.Helper()
+	_, err := pool.Exec(ctx, `
+		INSERT INTO inference_events (request_id, user_id, model, status_code, latency_ms, backend_class)
+		VALUES ($1, $2, $3, 200, 10, $4)
+	`, requestID, userID, model, backendClass)
+	if err != nil {
+		t.Fatalf("insert inference_events row (backend_class=%v): %v", backendClass, err)
+	}
+}
+
+// TestListUsage_BackendClassFilter covers the ?backend_class= comma-list
+// filter, including the "unrecorded" sentinel for a NULL column (a request
+// refused before any route resolved a class).
+func TestListUsage_BackendClassFilter(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	userID := newTestUser(t, ctx, pool)
+
+	selfHosted := backendClassSelfHosted
+	externalAPI := backendClassExternalAPI
+	insertInferenceEventWithBackendClass(t, ctx, pool, "req-self", userID, "llama3", &selfHosted)
+	insertInferenceEventWithBackendClass(t, ctx, pool, "req-vendor", userID, "claude-3-opus", &externalAPI)
+	insertInferenceEventWithBackendClass(t, ctx, pool, "req-unrecorded", userID, "llama3", nil)
+
+	h := NewActivityHandler(pool)
+	r := newActivityTestRouter(h)
+
+	cases := []struct {
+		query    string
+		wantReqs []string
+	}{
+		{"backend_class=self_hosted", []string{"req-self"}},
+		{"backend_class=external_api", []string{"req-vendor"}},
+		{"backend_class=unrecorded", []string{"req-unrecorded"}},
+		{"backend_class=self_hosted,unrecorded", []string{"req-self", "req-unrecorded"}},
+		{"", []string{"req-self", "req-vendor", "req-unrecorded"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.query, func(t *testing.T) {
+			target := "/api/v1/usage"
+			if tc.query != "" {
+				target += "?" + tc.query
+			}
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, target, nil))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+			}
+			var resp usageListResponse
+			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			got := map[string]bool{}
+			for _, e := range resp.Events {
+				got[e.RequestID] = true
+			}
+			if len(got) != len(tc.wantReqs) {
+				t.Fatalf("events = %+v, want request ids %v", resp.Events, tc.wantReqs)
+			}
+			for _, want := range tc.wantReqs {
+				if !got[want] {
+					t.Errorf("expected request_id %q in results, got %v", want, got)
+				}
+			}
+		})
+	}
+
+	// Invalid token: 400.
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/usage?backend_class=bogus", nil))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("backend_class=bogus: status = %d, want 400", rec.Code)
+	}
+}
+
+// TestListUsage_BackendClassJSONField covers the plain (unfiltered) list
+// response carrying backend_class per event, null when unrecorded.
+func TestListUsage_BackendClassJSONField(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	userID := newTestUser(t, ctx, pool)
+	externalAPI := backendClassExternalAPI
+	insertInferenceEventWithBackendClass(t, ctx, pool, "req-vendor", userID, "claude-3-opus", &externalAPI)
+	insertInferenceEventWithBackendClass(t, ctx, pool, "req-unrecorded", userID, "llama3", nil)
+
+	h := NewActivityHandler(pool)
+	r := newActivityTestRouter(h)
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/usage", nil))
+	var resp usageListResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	byReq := map[string]inferenceEvent{}
+	for _, e := range resp.Events {
+		byReq[e.RequestID] = e
+	}
+	if byReq["req-vendor"].BackendClass == nil || *byReq["req-vendor"].BackendClass != backendClassExternalAPI {
+		t.Fatalf("req-vendor backend_class = %v, want external_api", byReq["req-vendor"].BackendClass)
+	}
+	if byReq["req-unrecorded"].BackendClass != nil {
+		t.Fatalf("req-unrecorded backend_class = %v, want null (unrecorded)", byReq["req-unrecorded"].BackendClass)
+	}
+}
+
+// TestExportUsage_BackendClassFilterAndColumn covers the export gaining the
+// backend_class CSV column and honouring the same ?backend_class= filter as
+// ListUsage.
+func TestExportUsage_BackendClassFilterAndColumn(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	userID := newTestUser(t, ctx, pool)
+	externalAPI := backendClassExternalAPI
+	insertInferenceEventWithBackendClass(t, ctx, pool, "req-vendor", userID, "claude-3-opus", &externalAPI)
+	insertInferenceEventWithBackendClass(t, ctx, pool, "req-unrecorded", userID, "llama3", nil)
+
+	h := NewActivityHandler(pool)
+	r := newActivityTestRouter(h)
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/usage/export?backend_class=external_api", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	rows, err := csv.NewReader(strings.NewReader(rec.Body.String())).ReadAll()
+	if err != nil {
+		t.Fatalf("parse csv: %v", err)
+	}
+	if len(rows) != 2 { // header + req-vendor only
+		t.Fatalf("rows = %v, want header + 1 external_api row", rows)
+	}
+	header := rows[0]
+	colIdx := -1
+	for i, col := range header {
+		if col == "backend_class" {
+			colIdx = i
+		}
+	}
+	if colIdx == -1 {
+		t.Fatalf("csv header %v missing backend_class column", header)
+	}
+	if rows[1][colIdx] != backendClassExternalAPI {
+		t.Fatalf("backend_class column = %q, want external_api", rows[1][colIdx])
+	}
+}
+
 // TestListUsage_DefaultsToInferenceAndFiltersByPurpose covers the ?purpose=
 // contract: a missing purpose defaults to "inference" (excluding
 // routing/routing_dryrun rows); an explicit value filters to exactly that

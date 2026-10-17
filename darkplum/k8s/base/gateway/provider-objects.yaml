@@ -1,0 +1,27 @@
+# Where vendor API keys and their catalog filters live. Both objects are created
+# EMPTY here and filled later — by Admin > Models (through the api's patch-only
+# Role) or by `make set-anthropic-key` / `make set-openai-key`.
+#
+# There is deliberately NO `data` stanza, and there must never be one: `kubectl
+# apply` only ever prunes fields it applied itself, so a manifest that never
+# mentions `data` can be re-applied on every deploy without touching an installed
+# key. Adding `data:` here — even empty — is how a redeploy would start wiping
+# customers' vendor keys.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: darkplum-provider-keys
+  namespace: darkplum-system
+  labels:
+    app.kubernetes.io/name: darkplum-gateway
+    app.kubernetes.io/part-of: darkplum
+type: Opaque
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: darkplum-provider-config
+  namespace: darkplum-system
+  labels:
+    app.kubernetes.io/name: darkplum-gateway
+    app.kubernetes.io/part-of: darkplum

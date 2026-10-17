@@ -1,0 +1,33 @@
+# Who may connect to the gateway.
+#
+# Only the api. Everything that reaches the gateway goes through it: webchat and
+# API-key traffic are proxied by the api, and so are the service-key calls that
+# verify a vendor key an administrator installs from Admin > Models — a request
+# that carries that key in its body. Before this policy any pod in the cluster
+# could open a connection to :8080; the service key was the only thing between it
+# and those routes.
+#
+# Kubelet health probes and `kubectl port-forward` are not subject to pod
+# NetworkPolicy (node-local traffic), so /health probes, `make test` and
+# `make status` keep working.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-ingress
+  namespace: darkplum-system
+  labels:
+    app.kubernetes.io/part-of: darkplum
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: darkplum-gateway
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: darkplum-api
+      ports:
+        - protocol: TCP
+          port: 8080

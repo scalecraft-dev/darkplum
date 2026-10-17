@@ -1,0 +1,261 @@
+/* --- Model vendors ---
+   Sits above the catalogue, because whether a vendor is reachable at all
+   decides whether its half of the catalogue means anything. One card holding
+   two rows, not two cards: these are two instances of one question, and two
+   cards would read as two unrelated features. */
+
+.section {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  padding: var(--space-5);
+  margin-bottom: var(--space-5);
+}
+
+.head {
+  margin-bottom: var(--space-4);
+}
+
+.title {
+  font-size: var(--fs-md);
+  font-weight: var(--fw-semibold);
+  color: var(--fg-default);
+  letter-spacing: -0.01em;
+}
+
+.subtitle {
+  margin-top: 2px;
+  font-size: var(--fs-sm);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-muted);
+  max-width: 76ch;
+}
+
+.rows {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.row {
+  padding: var(--space-3) var(--space-4);
+  background: var(--bg-base);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+}
+
+.rowHead {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.vendor {
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+  color: var(--fg-default);
+}
+
+/* Pushed to the end of the head row: a timestamp is the least urgent thing
+   here, and it should never sit between the vendor and its state. */
+.sync {
+  margin-left: auto;
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+  white-space: nowrap;
+}
+
+/* What is true. Body colour — the badge above already carries the severity,
+   and a whole sentence in a semantic colour is the first thing to fail
+   contrast on a hovered surface. */
+.detail {
+  margin-top: var(--space-2);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-default);
+  max-width: 76ch;
+}
+
+/* What to do about it. Quieter than the fact it follows, because someone
+   scanning for "is this working?" should reach the answer before the
+   instructions. */
+.next {
+  margin-top: var(--space-1);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-muted);
+  max-width: 76ch;
+}
+
+/* Wide enough for the longest command on this card — the port-forward, at 65
+   characters — so neither block is handed to the reader pre-scrolled. Still
+   narrower than the prose above it (76ch), which keeps the code reading as an
+   inset rather than as the body of the card. */
+.command {
+  margin-top: var(--space-3);
+  max-width: 68ch;
+}
+
+/* The api's own warnings from a removal, verbatim. Same size as .next — they
+   are read after the sentence above them, not instead of it — and marked with
+   the warning rule so they are not mistaken for a description of the wait. */
+.warnings {
+  margin-top: var(--space-2);
+  padding-left: var(--space-3);
+  border-left: 2px solid var(--warning-border);
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-muted);
+  max-width: 76ch;
+}
+
+/* What this card is not about, said once under the subtitle. Subtle, one line:
+   it answers a question somebody has while scanning, and it must not look like
+   a warning about anything. */
+.scope {
+  margin-top: var(--space-2);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-subtle);
+  max-width: 76ch;
+}
+
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* --- the wait ---
+   Determinate, because there is a real deadline to count towards
+   (installing_until, from the api) and an indeterminate spinner on a
+   two-minute wait reads as a page that has hung. The width is set from the
+   server's timestamp, so a reload picks the bar up where it was. */
+
+.progress {
+  margin-top: var(--space-2);
+  height: 4px;
+  width: 100%;
+  max-width: 44ch;
+  background: var(--bg-surface-raised);
+  border-radius: var(--radius-full);
+  overflow: hidden;
+}
+
+.progressFill {
+  height: 100%;
+  background: var(--brand-default);
+  border-radius: var(--radius-full);
+  transition: width var(--transition-normal) linear;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .progressFill {
+    transition: none;
+  }
+}
+
+/* --- what is on offer --- */
+
+.filter {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.filterLabel {
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--fg-subtle);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.filterValue {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--fg-default);
+  /* At the separators. See VendorInstallModal.module.css .storedValue. */
+  overflow-wrap: break-word;
+}
+
+/* The command line wrote this one. Informational, not a warning: both writers
+   are legitimate and the last one wins. */
+.adopt {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+  padding: var(--space-3);
+  background: var(--info-bg);
+  border-left: 2px solid var(--info-fg);
+  border-radius: var(--radius-sm);
+}
+
+.adoptText {
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-default);
+  max-width: 76ch;
+}
+
+.error {
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--danger-fg);
+}
+
+/* --- actions ---
+   One row, wrapping. Ordered by how often they are wanted and how much they
+   cost: the way forward first, the destructive one last and ghost. */
+
+.actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+}
+
+/* Not the danger variant: a bordered red button sitting permanently on a
+   healthy card reads as an alarm. It states its own consequence on press —
+   the modal asks for the vendor's name typed out — and looks like what it is
+   until then. */
+.remove {
+  margin-left: auto;
+  color: var(--fg-subtle);
+}
+
+.remove:hover:not(:disabled) {
+  color: var(--danger-fg);
+}
+
+@media (max-width: 767px) {
+  .section {
+    padding: var(--space-4);
+  }
+
+  .sync {
+    margin-left: 0;
+    flex-basis: 100%;
+  }
+
+  /* The actions wrap on a narrow viewport, and a button pushed to the right
+     of a wrapped row lands on a line of its own for no reason. */
+  .remove {
+    margin-left: 0;
+  }
+}

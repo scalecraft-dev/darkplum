@@ -11,9 +11,12 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"regexp"
 	"sort"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -21,7 +24,6 @@ import (
 	"github.com/scalecraft/darkplum/gateway/internal/middleware"
 	"github.com/scalecraft/darkplum/gateway/internal/policy"
 	"github.com/scalecraft/darkplum/gateway/internal/provider"
-	"github.com/scalecraft/darkplum/gateway/internal/provider/bedrock"
 	"github.com/scalecraft/darkplum/gateway/internal/router"
 	"github.com/scalecraft/darkplum/gateway/internal/routing"
 )
@@ -36,19 +38,131 @@ type openAIErrorBody struct {
 	Message string `json:"message"`
 	Type    string `json:"type"`
 	Code    string `json:"code,omitempty"`
+	// Param names the request field a 400 unsupported_parameter response
+	// refers to (e.g. "tools", "tool_choice", "response_format") — see
+	// unsupportedRequestParam. Empty/omitted for every other error code.
+	Param string `json:"param,omitempty"`
+}
+
+// stopField accepts the OpenAI `stop` request field in either shape the API
+// allows: a single string, or an array of strings. Normalises to []string so
+// provider.ChatRequest.Stop always has one representation regardless of
+// which shape the caller sent — the same dual-shape tolerance
+// provider.Message.UnmarshalJSON already applies to `content`.
+type stopField []string
+
+func (s *stopField) UnmarshalJSON(data []byte) error {
+	var single string
+	if err := json.Unmarshal(data, &single); err == nil {
+		if single != "" {
+			*s = stopField{single}
+		}
+		return nil
+	}
+	var multi []string
+	if err := json.Unmarshal(data, &multi); err != nil {
+		return err
+	}
+	*s = stopField(multi)
+	return nil
+}
+
+// responseFormatField is the subset of the OpenAI `response_format` object
+// the gateway inspects: only Type matters, to detect the structured-output
+// shape ("json_schema") request-shape honesty refuses on every route (see
+// unsupportedRequestParam). "json_object" (plain JSON mode, no schema) is
+// left alone — a backend that ignores it silently degrades to prose, which
+// is the same pre-existing behaviour every other inert field gets.
+type responseFormatField struct {
+	Type string `json:"type"`
 }
 
 // chatCompletionRequest is the subset of the OpenAI chat/completions request
-// body that the gateway needs to inspect for routing and recording. Fields we
-// do not need to inspect (top_p, n, stop, etc.) are round-tripped transparently
-// by the provider implementations.
+// body that the gateway needs to inspect for routing, recording, and
+// request-shape honesty. Inert fields (user, n, seed, logit_bias, metadata,
+// ...) are deliberately not modelled here — Go's json package silently
+// ignores fields with no matching struct tag, which is exactly the
+// "round-tripped transparently" behaviour those fields should get, except
+// that today's providers rebuild the outbound request from ChatRequest and
+// so never actually forward them; see unsupportedRequestParam for the
+// fields that must NOT be silently dropped this way.
 type chatCompletionRequest struct {
 	Model       string             `json:"model"`
 	Messages    []provider.Message `json:"messages"`
 	Stream      bool               `json:"stream"`
 	MaxTokens   int                `json:"max_tokens,omitempty"`
 	Temperature *float64           `json:"temperature,omitempty"`
+	TopP        *float64           `json:"top_p,omitempty"`
+	Stop        stopField          `json:"stop,omitempty"`
+
+	// The fields below are inspected ONLY to produce an honest 400
+	// unsupported_parameter (see unsupportedRequestParam) — never forwarded
+	// to any provider.
+	Tools          []json.RawMessage    `json:"tools,omitempty"`
+	ToolChoice     json.RawMessage      `json:"tool_choice,omitempty"`
+	Functions      []json.RawMessage    `json:"functions,omitempty"`
+	FunctionCall   json.RawMessage      `json:"function_call,omitempty"`
+	ResponseFormat *responseFormatField `json:"response_format,omitempty"`
 }
+
+// unsupportedRequestParam inspects req for fields the gateway does not
+// implement on ANY backend today (tool calling, structured JSON output, and
+// multi-part image/audio content) and returns the OpenAI-style parameter
+// name to report in a 400 unsupported_parameter response, or "" if none of
+// them are present. This runs before route resolution, for EVERY request,
+// regardless of which class the resolved model belongs to — a caller must
+// get an honest, immediate 400 rather than have the parameter silently
+// dropped no matter which backend it lands on.
+//
+// tools/functions are refused only when non-empty; tool_choice/function_call
+// are refused only when set to something other than "none" — an SDK that
+// always includes an empty/off default must not be penalised for it. Inert
+// fields (user, n, seed, logit_bias, metadata, top_p, stop, ...) are
+// deliberately not inspected here.
+func unsupportedRequestParam(req chatCompletionRequest) string {
+	if len(req.Tools) > 0 {
+		return "tools"
+	}
+	if isSetAndNotNone(req.ToolChoice) {
+		return "tool_choice"
+	}
+	if len(req.Functions) > 0 {
+		return "functions"
+	}
+	if isSetAndNotNone(req.FunctionCall) {
+		return "function_call"
+	}
+	if req.ResponseFormat != nil && req.ResponseFormat.Type == "json_schema" {
+		return "response_format"
+	}
+	for _, m := range req.Messages {
+		if m.HasNonTextContent {
+			return "messages[].content"
+		}
+	}
+	return ""
+}
+
+// isSetAndNotNone reports whether raw is present and is neither JSON null
+// nor the string "none" — the two ways a client signals "tool use is off"
+// that must not trigger a 400.
+func isSetAndNotNone(raw json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	trimmed := strings.TrimSpace(string(raw))
+	return trimmed != "null" && trimmed != `"none"`
+}
+
+// providerFeatureUIKeyInstall is the one entry GET /v1/models' top-level
+// provider_features array carries today: this gateway build implements
+// POST /v1/providers/:vendor/verify and POST /v1/providers/:vendor/refresh
+// (see ProvidersHandler), so the api's admin "install a vendor key from the
+// UI" flow is safe to offer. The api's PUT/DELETE .../providers/:vendor/*
+// routes refuse 409 gateway_too_old when a cached providers block lacks this
+// feature, so a rolling deploy never lets an admin install a key against a
+// gateway pod that predates the feature.
+const providerFeatureUIKeyInstall = "ui_key_install"
 
 // noModelRecorded is written to the "resolved_model" context key (and used as
 // the requested_model value in the structured denial log) for the two 400
@@ -71,6 +185,17 @@ type routeSnapshotter interface {
 	Snapshot() *routing.Table
 }
 
+// providerStatusSource supplies the current vendor provider status block for
+// GET /v1/models' `providers` array (service-key + X-Darkplum-Classes:
+// external_api callers only — see HandleListModels). Satisfied by
+// *provider.StatusRegistry; defined as an interface so tests can substitute
+// a fake without constructing a real registry. May be nil (a build with no
+// registry wired in reports no providers array at all, exactly like an
+// empty one).
+type providerStatusSource interface {
+	Snapshot() []provider.ProviderStatus
+}
+
 // ChatHandler is the model-routing enforcement point for
 // POST /v1/chat/completions, GET /v1/models, POST /v1/routing/dryrun, and
 // GET /v1/policy/effective.
@@ -80,20 +205,28 @@ type routeSnapshotter interface {
 //     try the caller's effective default_model first (see the
 //     default-model-resolution block below) — otherwise, and if that lookup
 //     found nothing, model is required (400)
-//  2. policy snapshot must be loaded, else fail closed (503 policy_unavailable)
-//  3. alias resolve (admin intent wins over a same-named discovered model; no
+//  2. request-shape honesty (400 unsupported_parameter) — tools, tool_choice,
+//     functions, function_call, response_format of type json_schema, and any
+//     non-text content block are refused before route resolution, on EVERY
+//     route, since no backend implements any of them today (see
+//     unsupportedRequestParam)
+//  3. policy snapshot must be loaded, else fail closed (503 policy_unavailable)
+//  4. alias resolve (admin intent wins over a same-named discovered model; no
 //     chains). A routed alias additionally classifies the request here (step
-//     3a below) to pick which of its routes' targets to resolve to; a static
+//     4a below) to pick which of its routes' targets to resolve to; a static
 //     alias resolves straight to its target exactly as before.
-//  4. route lookup on the resolved id (404 model_not_found — no default fall-through, ever)
-//  5. enabled check (403 model_not_enabled)
-//  6. residency check (403 model_residency_violation) — against the
-//     PRINCIPAL'S effective (strictest) residency, not just the org's
-//  7. model_not_allowed check (403) — the resolved id must be in the
+//  5. route lookup on the resolved id (404 model_not_found — no default fall-through, ever)
+//  6. enabled check (403 model_not_enabled)
+//  7. residency check (403 model_residency_violation) — against the
+//     PRINCIPAL'S effective (strictest) residency, not just the org's, using
+//     policy.ResidencyPermits(eff.Residency, route.Class) so the ladder
+//     (any/cloud_account_only/self_hosted_only) and every backend class
+//     (self_hosted/cloud_managed/external_api) are enforced in one place
+//  8. model_not_allowed check (403) — the resolved id must be in the
 //     principal's effective allowlist
-//  8. dispatch
+//  9. dispatch
 //
-// Steps 4-7 run unchanged regardless of how the target was resolved: a route
+// Steps 5-8 run unchanged regardless of how the target was resolved: a route
 // a routed alias's classifier picked goes through exactly the same
 // enforcement as a plain model id or a static alias's target. A forbidden
 // pick is refused (see respondModelNotFound/respondModelNotEnabled/
@@ -109,16 +242,22 @@ type ChatHandler struct {
 	// classifierFor). Both are always non-nil.
 	rulesClassifier    router.Classifier
 	semanticClassifier router.Classifier
+
+	// providerStatus supplies GET /v1/models' `providers` array. May be nil.
+	providerStatus providerStatusSource
 }
 
-// NewChatHandler constructs a ChatHandler.
-func NewChatHandler(providers providerLookup, routes routeSnapshotter, pol policy.Store, rulesClassifier, semanticClassifier router.Classifier) *ChatHandler {
+// NewChatHandler constructs a ChatHandler. providerStatus may be nil (no
+// providers array is ever included in that case) — cmd/main.go always passes
+// a real *provider.StatusRegistry seeded with every known vendor name.
+func NewChatHandler(providers providerLookup, routes routeSnapshotter, pol policy.Store, rulesClassifier, semanticClassifier router.Classifier, providerStatus providerStatusSource) *ChatHandler {
 	return &ChatHandler{
 		providers:          providers,
 		routes:             routes,
 		policy:             pol,
 		rulesClassifier:    rulesClassifier,
 		semanticClassifier: semanticClassifier,
+		providerStatus:     providerStatus,
 	}
 }
 
@@ -245,6 +384,26 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 		return
 	}
 
+	// Request-shape honesty: tools/tool_choice/functions/function_call/
+	// response_format(json_schema)/non-text content blocks are refused
+	// before route resolution, on EVERY route — not just external_api —
+	// because no backend today actually implements any of them; forwarding
+	// req.Model or dispatching first would mean the caller only sometimes
+	// gets told, depending on what the request happened to resolve to.
+	if param := unsupportedRequestParam(req); param != "" {
+		c.Set("denial_code", "unsupported_parameter")
+		logDenial(c, "unsupported_parameter", req.Model, "", "")
+		c.JSON(http.StatusBadRequest, openAIError{
+			Error: openAIErrorBody{
+				Message: fmt.Sprintf("parameter %q is not supported by this gateway on any backend", param),
+				Type:    "invalid_request_error",
+				Code:    "unsupported_parameter",
+				Param:   param,
+			},
+		})
+		return
+	}
+
 	snap, loaded := h.policy.Current()
 	if !loaded {
 		c.Set("denial_code", "policy_unavailable")
@@ -345,6 +504,16 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 		return
 	}
 
+	// backend_class is written to the context (so a DENIED row still carries
+	// it — see middleware.Recording) and to a response header the moment
+	// route.Class is known, mirroring X-Darkplum-Model's placement: every
+	// check from here on can refuse the request, and every one of those
+	// refusals still names the class and the provider kind that was about to
+	// be used.
+	c.Set("backend_class", route.Class)
+	c.Header("X-Darkplum-Backend-Class", route.Class)
+	c.Header("X-Darkplum-Provider", route.Kind)
+
 	if !snap.Enabled[resolvedModel] {
 		c.Set("denial_code", "model_not_enabled")
 		logDenial(c, "model_not_enabled", req.Model, resolvedModel, route.Class)
@@ -362,10 +531,10 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 	// itself allows cloud-managed models.
 	eff := snap.EffectiveFor(attributedUserID(c), c.GetString(middleware.ContextKeyID), c.GetString(middleware.ContextKeyType))
 
-	if eff.Residency == policy.ResidencySelfHostedOnly && route.Class == routing.ClassCloudManaged {
+	if !policy.ResidencyPermits(eff.Residency, route.Class) {
 		c.Set("denial_code", "model_residency_violation")
 		logDenial(c, "model_residency_violation", req.Model, resolvedModel, route.Class)
-		respondResidencyViolation(c, resolvedModel, routeCtx)
+		respondResidencyViolation(c, resolvedModel, eff.Residency, route.Class, routeCtx)
 		return
 	}
 
@@ -406,9 +575,14 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 		c.Set("provider_name", prov.Name())
 	}
 
+	// provider.Regional (implemented by BedrockProvider, and by any future
+	// region-bound vendor provider) replaces a direct *bedrock.BedrockProvider
+	// type assertion — this package no longer imports internal/provider/bedrock
+	// at all, so adding another regional backend never requires touching the
+	// handler.
 	providerRegion := ""
-	if bp, ok := prov.(*bedrock.BedrockProvider); ok {
-		providerRegion = bp.Region()
+	if rp, ok := prov.(provider.Regional); ok {
+		providerRegion = rp.Region()
 	}
 	c.Set("provider_region", providerRegion)
 
@@ -418,6 +592,8 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 		Stream:      req.Stream,
 		MaxTokens:   req.MaxTokens,
 		Temperature: req.Temperature,
+		TopP:        req.TopP,
+		Stop:        []string(req.Stop),
 	}
 
 	if req.Stream {
@@ -503,20 +679,42 @@ func (h *ChatHandler) handleComplete(c *gin.Context, prov provider.Provider, cha
 	c.Data(http.StatusOK, "application/json", body)
 }
 
+// classesHeaderAllowsExternalAPI reports whether the request's
+// X-Darkplum-Classes header (comma-separated; only the "external_api" token
+// is defined today) names external_api. Gates external_api models out of
+// GET /v1/models for EVERY caller — service or user key alike — when absent,
+// not merely those a user key's own policy would already exclude: this is
+// the order-independence capability handshake (see the wire contract in
+// DARKPLUM_IMPLEMENTATION.md), which exists so an old, not-yet-upgraded api
+// (whose SyncModels never sends the header) can never even catalogue a
+// vendor model, regardless of what any principal's allowlist says.
+func classesHeaderAllowsExternalAPI(c *gin.Context) bool {
+	for _, tok := range strings.Split(c.GetHeader("X-Darkplum-Classes"), ",") {
+		if strings.TrimSpace(tok) == routing.ClassExternalAPI {
+			return true
+		}
+	}
+	return false
+}
+
 // HandleListModels returns every model currently in the route table,
 // regardless of enabled status — the api's SyncModels needs the full
 // discovered set, not just what's currently enabled. Each entry reports
-// owned_by (the backend kind) and backend_class (self_hosted/cloud_managed)
-// straight from the route, so this handler never needs a provider lookup.
+// owned_by (the backend kind) and backend_class (self_hosted/cloud_managed/
+// external_api) straight from the route, so this handler never needs a
+// provider lookup.
 //
 // Filtering by effective routing policy applies ONLY to a user API key
 // (ContextKeyType == middleware.KeyTypeUser): the caller's own allowlist
 // hides models it could never successfully call anyway. A SERVICE key's
-// response is always the full, unfiltered list — the api's SyncModels is the
-// one caller of this endpoint using a service key, and it needs the
-// complete discovered set (including models no principal is currently
-// allowed to use) to keep its own models table in sync; filtering that away
-// would silently stop syncing models the moment an admin tightened policy.
+// response is otherwise the full list — the api's SyncModels is the one
+// caller of this endpoint using a service key, and it needs the complete
+// discovered set (including models no principal is currently allowed to
+// use) to keep its own models table in sync; filtering that away would
+// silently stop syncing models the moment an admin tightened policy.
+// external_api models are the one exception even for a service key: they are
+// omitted unless the caller sent X-Darkplum-Classes: external_api (see
+// classesHeaderAllowsExternalAPI) regardless of key type or policy.
 func (h *ChatHandler) HandleListModels(c *gin.Context) {
 	type modelEntry struct {
 		ID           string `json:"id"`
@@ -529,16 +727,32 @@ func (h *ChatHandler) HandleListModels(c *gin.Context) {
 	// that names no model will run on) — set only for a user key, where the
 	// list is also filtered; nil for the service key's unfiltered view. The
 	// api relays it to Bearer callers of its own /v1/models so the two lists
-	// agree on both membership and default.
+	// agree on both membership and default. Providers is populated only for
+	// a SERVICE key that sent the classes header — see the wire contract's
+	// `providers` array; omitted entirely (not even `[]`) for every other
+	// caller, so a user-key/old-api response shape is unchanged.
 	type modelsResponse struct {
-		Object       string       `json:"object"`
-		Data         []modelEntry `json:"data"`
-		DefaultModel *string      `json:"default_model,omitempty"`
+		Object       string                    `json:"object"`
+		Data         []modelEntry              `json:"data"`
+		DefaultModel *string                   `json:"default_model,omitempty"`
+		Providers    []provider.ProviderStatus `json:"providers,omitempty"`
+		// ProviderFeatures names the vendor-key-management capabilities THIS
+		// gateway build supports, alongside Providers — the api's PUT
+		// .../providers/:vendor/key|filter and DELETE .../key refuse (409
+		// gateway_too_old) when a cached providers block lacks
+		// "ui_key_install", so an old gateway (whose Providers is nil because
+		// it predates this field, or whose cached block was never refreshed)
+		// never has a vendor key installed against it and then silently
+		// ignored. Populated under the exact same condition as Providers
+		// (service key + X-Darkplum-Classes: external_api) — never included
+		// for a user key or an old api that never sends the header.
+		ProviderFeatures []string `json:"provider_features,omitempty"`
 	}
 
 	now := time.Now().Unix()
 	table := h.routes.Snapshot()
 	ids := table.IDs() // already sorted
+	allowExternalAPI := classesHeaderAllowsExternalAPI(c)
 
 	var eff policy.EffectivePolicy
 	filterByPolicy := false
@@ -560,7 +774,13 @@ func (h *ChatHandler) HandleListModels(c *gin.Context) {
 			// Defensive: IDs() is always derived from the same table snapshot.
 			continue
 		}
-		if filterByPolicy && !eff.Allows(id) {
+		if route.Class == routing.ClassExternalAPI && !allowExternalAPI {
+			continue
+		}
+		// A user key's list is what that key can actually call: the same
+		// allowlist AND residency checks HandleChatCompletions applies, so an
+		// SDK that lists models never offers one it would then be refused on.
+		if filterByPolicy && (!eff.Allows(id) || !policy.ResidencyPermits(eff.Residency, route.Class)) {
 			continue
 		}
 		models = append(models, modelEntry{
@@ -575,6 +795,10 @@ func (h *ChatHandler) HandleListModels(c *gin.Context) {
 	resp := modelsResponse{Object: "list", Data: models}
 	if filterByPolicy {
 		resp.DefaultModel = eff.DefaultModel
+	}
+	if allowExternalAPI && c.GetString(middleware.ContextKeyType) == middleware.KeyTypeService && h.providerStatus != nil {
+		resp.Providers = h.providerStatus.Snapshot()
+		resp.ProviderFeatures = []string{providerFeatureUIKeyInstall}
 	}
 	c.JSON(http.StatusOK, resp)
 }
@@ -704,6 +928,24 @@ type effectivePolicyRowIn struct {
 	DefaultModel  *string   `json:"default_model"`
 }
 
+// invalidOverrideResidencyMessage is the 400 body for an
+// override.policy.residency value validOverrideResidency rejects.
+var invalidOverrideResidencyMessage = fmt.Sprintf(
+	`override.policy.residency must be null, %q, or %q`,
+	policy.ResidencyCloudAccountOnly, policy.ResidencySelfHostedOnly,
+)
+
+// validOverrideResidency reports whether v is an acceptable
+// override.policy.residency value for POST /v1/policy/effective and POST
+// /v1/policy/impact: nil (inherit) or one of the two values a level may
+// explicitly tighten to. There is no explicit "any" at this level — every
+// PolicyRow's own "any" is expressed by leaving Residency nil, exactly like
+// every other level (see policy.PolicyRow's doc comment); an org-level
+// override wanting "any" uses policy:null (inherit/remove the row) instead.
+func validOverrideResidency(v *string) bool {
+	return v == nil || *v == policy.ResidencyCloudAccountOnly || *v == policy.ResidencySelfHostedOnly
+}
+
 // HandleEffectivePolicyOverride handles POST /v1/policy/effective, the
 // preview counterpart of GET /v1/policy/effective: it builds the same
 // principal chain (Snapshot.ChainFor) and runs the SAME Effective() merge as
@@ -794,10 +1036,10 @@ func (h *ChatHandler) HandleEffectivePolicyOverride(c *gin.Context) {
 
 		var row *policy.PolicyRow
 		if req.Override.Policy != nil {
-			if req.Override.Policy.Residency != nil && *req.Override.Policy.Residency != policy.ResidencySelfHostedOnly {
+			if !validOverrideResidency(req.Override.Policy.Residency) {
 				c.JSON(http.StatusBadRequest, openAIError{
 					Error: openAIErrorBody{
-						Message: `override.policy.residency must be null or "self_hosted_only"`,
+						Message: invalidOverrideResidencyMessage,
 						Type:    "invalid_request_error",
 						Code:    "invalid_request",
 					},
@@ -951,10 +1193,10 @@ func (h *ChatHandler) HandleEffectivePolicyImpact(c *gin.Context) {
 	}
 	var row *policy.PolicyRow
 	if req.Override.Policy != nil {
-		if req.Override.Policy.Residency != nil && *req.Override.Policy.Residency != policy.ResidencySelfHostedOnly {
+		if !validOverrideResidency(req.Override.Policy.Residency) {
 			c.JSON(http.StatusBadRequest, openAIError{
 				Error: openAIErrorBody{
-					Message: `override.policy.residency must be null or "self_hosted_only"`,
+					Message: invalidOverrideResidencyMessage,
 					Type:    "invalid_request_error",
 					Code:    "invalid_request",
 				},
@@ -1051,17 +1293,41 @@ func policyImpact(snap policy.Snapshot, table *routing.Table, override *policy.P
 	return resp
 }
 
+// ---------------------------------------------------------------------------
+// Classes-header note for policy preview/impact endpoints
+//
+// GET/POST /v1/policy/effective, POST /v1/policy/impact, and POST
+// /v1/routing/dryrun deliberately do NOT check classesHeaderAllowsExternalAPI
+// the way HandleListModels/GET /v1/models does: every model in the route
+// table, external_api included, is always considered when computing the
+// allowed/reachable/unresolved sets and dry-run refusals below, regardless of
+// X-Darkplum-Classes.
+//
+// These four endpoints are service-key-only (enforced at the top of each
+// handler) and exist purely for the api to preview or dry-run a policy
+// change — an admin evaluating "what would this change do" needs the TRUE
+// answer, not one artificially narrowed by a header whose entire purpose is
+// keeping a caller that doesn't understand a class from ever seeing it in a
+// catalogue response. Gating these on the header would make an org's
+// residency/impact preview silently wrong the moment a vendor model exists
+// but the caller happened not to set it — a correctness bug hiding behind a
+// capability handshake that was never meant to apply to a preview surface.
+// (The new api, the only caller of these four endpoints, is classes-aware by
+// construction — it is the same binary whose SyncModels sends the header to
+// GET /v1/models — so this is not a real-world gap, only a documented
+// decision about what these endpoints are for.)
+// ---------------------------------------------------------------------------
+
 // allowedModels is the policy-side counterpart of reachableModels: the
 // enabled models eff permits under its residency, WITHOUT the routability
 // test. Impact counts are about what an admin's policy change takes away,
-// and must not move because a backend happens to be down at save time.
-// Under self_hosted_only a model the route table has never seen has no
-// known class and is EXCLUDED (the same deny-when-uncertain rule enforcement
-// applies). policyImpact does not let that exclusion count as a loss,
-// though: such models are reported as UnresolvedModels and taken out of the
-// before/after comparison, so the counts state only what is certain and
-// the caveat is said separately. Under residency any, class is irrelevant
-// and the model is kept.
+// and must not move because a backend happens to be down at save time. A
+// model the route table has never seen has no known class and is EXCLUDED
+// under every residency, including "any" (see policy.ResidencyPermits'
+// deny-unknown-class rule) — policyImpact does not let that exclusion count
+// as a loss, though: such models are reported as UnresolvedModels and taken
+// out of the before/after comparison, so the counts state only what is
+// certain and the caveat is said separately.
 func allowedModels(eff policy.EffectivePolicy, snap policy.Snapshot, table *routing.Table) []string {
 	ids := make([]string, 0, len(snap.Enabled))
 	for id, enabled := range snap.Enabled {
@@ -1075,11 +1341,15 @@ func allowedModels(eff policy.EffectivePolicy, snap policy.Snapshot, table *rout
 		if !eff.Allows(id) {
 			continue
 		}
-		if eff.Residency == policy.ResidencySelfHostedOnly {
-			route, ok := table.Lookup(id)
-			if !ok || route.Class == routing.ClassCloudManaged {
-				continue
-			}
+		route, ok := table.Lookup(id)
+		if !ok {
+			// No route table entry -> unknown class -> refused under every
+			// residency; see unresolvedModels, which reports this case
+			// separately rather than silently counting it as a loss.
+			continue
+		}
+		if !policy.ResidencyPermits(eff.Residency, route.Class) {
+			continue
 		}
 		out = append(out, id)
 	}
@@ -1087,12 +1357,12 @@ func allowedModels(eff policy.EffectivePolicy, snap policy.Snapshot, table *rout
 }
 
 // unresolvedModels lists the enabled models eff allows whose class the route
-// table does not know, when eff's residency is self_hosted_only (the only
-// time class decides anything). See policyImpactResponse.UnresolvedModels.
+// table does not know at all. This applies under EVERY residency, including
+// "any" — deny-when-uncertain is not limited to self_hosted_only (see
+// policy.ResidencyPermits) — so a model with no route table entry is always
+// unresolved, never silently treated as reachable just because the current
+// policy happens to be permissive. See policyImpactResponse.UnresolvedModels.
 func unresolvedModels(eff policy.EffectivePolicy, snap policy.Snapshot, table *routing.Table) []string {
-	if eff.Residency != policy.ResidencySelfHostedOnly {
-		return []string{}
-	}
 	out := []string{}
 	for id, enabled := range snap.Enabled {
 		if !enabled || !eff.Allows(id) {
@@ -1162,7 +1432,7 @@ func previewEffective(snap policy.Snapshot, table *routing.Table, userID, keyID 
 // routable AND enabled AND residency-ok — the "right now" view GET
 // /v1/policy/effective reports separately from the raw allowed_models
 // allowlist (which may name models that don't exist yet, aren't enabled, or
-// are cloud_managed under a self_hosted_only residency).
+// are excluded by the current residency policy — see policy.ResidencyPermits).
 func reachableModels(eff policy.EffectivePolicy, snap policy.Snapshot, table *routing.Table) []string {
 	ids := table.IDs() // already sorted
 	reachable := make([]string, 0, len(ids))
@@ -1177,7 +1447,7 @@ func reachableModels(eff policy.EffectivePolicy, snap policy.Snapshot, table *ro
 		if !ok {
 			continue
 		}
-		if eff.Residency == policy.ResidencySelfHostedOnly && route.Class == routing.ClassCloudManaged {
+		if !policy.ResidencyPermits(eff.Residency, route.Class) {
 			continue
 		}
 		reachable = append(reachable, id)
@@ -1290,10 +1560,10 @@ func (h *ChatHandler) HandleRoutingDryrun(c *gin.Context) {
 			Code:    "model_not_enabled",
 			Message: fmt.Sprintf("model %q is not enabled on this gateway", target),
 		}
-	} else if snap.Residency == policy.ResidencySelfHostedOnly && rt.Class == routing.ClassCloudManaged {
+	} else if !policy.ResidencyPermits(snap.Residency, rt.Class) {
 		resp.WouldBeRefused = &routingDryrunRefusal{
 			Code:    "model_residency_violation",
-			Message: fmt.Sprintf("model %q is cloud-managed, which the current residency policy (self-hosted only) does not permit", target),
+			Message: residencyViolationMessage(target, rt.Class, snap.Residency),
 		}
 	}
 
@@ -1341,13 +1611,62 @@ func respondModelNotEnabled(c *gin.Context, model string, rc *routeContext) {
 	})
 }
 
-// respondResidencyViolation writes the 403 for a cloud_managed route refused
-// by a self_hosted_only residency policy. See respondModelNotFound for rc.
-// Uses the SAME message text as respondModelNotEnabled for a routed pick —
-// "not enabled/allowed by residency" covers both refusal reasons in one
-// phrasing, exactly as specified for the routed-alias forbidden-pick error.
-func respondResidencyViolation(c *gin.Context, model string, rc *routeContext) {
-	msg := fmt.Sprintf("model %q is cloud-managed, which the current residency policy (self-hosted only) does not permit", model)
+// residencyClassLabel renders a backend class for denial text in the form an
+// admin reading an error/audit line would recognise, rather than the raw
+// wire value.
+func residencyClassLabel(class string) string {
+	switch class {
+	case routing.ClassSelfHosted:
+		return "self-hosted"
+	case routing.ClassCloudManaged:
+		return "cloud-managed"
+	case routing.ClassExternalAPI:
+		return "an external API"
+	default:
+		return "of an unrecognised class"
+	}
+}
+
+// residencyLabel renders a residency policy value for denial text.
+func residencyLabel(residency string) string {
+	switch residency {
+	case policy.ResidencyAny:
+		return "any"
+	case policy.ResidencyCloudAccountOnly:
+		return "cloud account only"
+	case policy.ResidencySelfHostedOnly:
+		return "self-hosted only"
+	default:
+		return "self-hosted only" // unrecognised value, same fallback residencyRankOf uses
+	}
+}
+
+// residencyViolationMessage names the ACTUAL class of model and the ACTUAL
+// residency policy that refused it, rather than a fixed "cloud-managed... self-
+// hosted only" string — the wire contract requires the denial text to be
+// accurate for external_api and cloud_account_only, not just the original
+// cloud_managed/self_hosted_only pair. It also names plainly that the
+// gateway does not substitute another route across the account boundary,
+// per the v3.1 ruling that a vendor-provider refusal must say so.
+func residencyViolationMessage(model, class, residency string) string {
+	msg := fmt.Sprintf("model %q is %s, which the current residency policy (%s) does not permit",
+		model, residencyClassLabel(class), residencyLabel(residency))
+	if class == routing.ClassExternalAPI {
+		msg += "; darkplum does not substitute another model across the account boundary"
+	}
+	return msg
+}
+
+// respondResidencyViolation writes the 403 for a route refused by the
+// calling principal's residency policy. See respondModelNotFound for rc.
+// residency/class are the ACTUAL values involved (eff.Residency and
+// route.Class), so the message always names what actually happened rather
+// than a hardcoded cloud_managed/self_hosted_only pair. Uses the SAME
+// message text as respondModelNotEnabled for a routed pick — "not
+// enabled/allowed by residency" covers both refusal reasons in one phrasing,
+// exactly as specified for the routed-alias forbidden-pick error.
+func respondResidencyViolation(c *gin.Context, model, residency, class string, rc *routeContext) {
+	msg := residencyViolationMessage(model, class, residency)
 	if rc != nil {
 		msg = fmt.Sprintf("route %q of alias %q selects model %q, which is not enabled/allowed by residency", rc.Route, rc.Alias, model)
 	}
@@ -1403,7 +1722,8 @@ func respondRequestCanceled(c *gin.Context) {
 // (model=<alias> with requested_model NULL would otherwise be the only trace
 // of an alias-routed 404/403). code is one of model_not_found,
 // model_not_enabled, model_residency_violation, model_not_allowed,
-// policy_unavailable, invalid_request, request_canceled. requestedModel is always the raw value
+// policy_unavailable, invalid_request, unsupported_parameter,
+// request_canceled. requestedModel is always the raw value
 // the caller sent in the request body (regardless of whether it was an
 // alias), except for invalid_request where no reliable value exists —
 // noModelRecorded ("(none)") is passed instead so the log and the audit
@@ -1434,21 +1754,60 @@ func respondPolicyUnavailable(c *gin.Context) {
 	})
 }
 
-// handleProviderError maps provider errors to HTTP responses. BedrockAPIError
-// carries a pre-translated status code and body; all other errors become 502.
+// genericUpstreamError classifies a plain (non-provider.APIError) error into
+// one of the wire contract's two catch-all codes: upstream_timeout (504) for
+// anything that looks like a network-level timeout, upstream_error (502)
+// otherwise. context.DeadlineExceeded satisfies net.Error (Timeout() ==
+// true), so it is covered here without a separate check — see
+// internal/routing's classifyError, which applies the same rule. This is the
+// only classification a caller error not implementing provider.APIError can
+// get: unlike a structured APIError, there is no reliable way to tell a rate
+// limit or an auth failure from a plain wrapped error without parsing
+// upstream-specific text, which would defeat the entire point of never
+// echoing that text to the client.
+func genericUpstreamError(err error) (status int, code string) {
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return http.StatusGatewayTimeout, "upstream_timeout"
+	}
+	return http.StatusBadGateway, "upstream_error"
+}
+
+// genericUpstreamMessage returns a fixed, scrubbed message for a generic
+// upstream failure — never the upstream's own error text, which can carry
+// internal hostnames or vendor request/account detail.
+func genericUpstreamMessage(code string) string {
+	if code == "upstream_timeout" {
+		return "the upstream model backend timed out"
+	}
+	return "the upstream model backend returned an error"
+}
+
+// handleProviderError maps a provider error to an HTTP response. A
+// provider.APIError (BedrockAPIError today; any future vendor provider's own
+// error type) carries a pre-translated status, body, and retry-after value —
+// written through verbatim, with Retry-After passed on for a 429. Every
+// other error is classified generically (see genericUpstreamError) and
+// answered with a scrubbed, closed-vocabulary message: err.Error() is NEVER
+// echoed to the client on this path, since an upstream failure (e.g. an
+// openaicompat dial error, which embeds the upstream URL) can carry internal
+// detail that must not leave the gateway.
 func handleProviderError(c *gin.Context, err error) {
-	var bedrockErr *bedrock.BedrockAPIError
-	if errors.As(err, &bedrockErr) {
-		// BedrockAPIError.Body is already an OpenAI-compatible JSON error body,
-		// produced by bedrock.TranslateBedrockError. Write status + body directly.
-		c.Data(bedrockErr.StatusCode, "application/json", bedrockErr.Body)
+	var apiErr provider.APIError
+	if errors.As(err, &apiErr) {
+		if ra := apiErr.RetryAfterSeconds(); ra > 0 {
+			c.Header("Retry-After", strconv.Itoa(ra))
+		}
+		c.Data(apiErr.HTTPStatus(), "application/json", apiErr.ResponseBody())
 		return
 	}
 
-	c.JSON(http.StatusBadGateway, openAIError{
+	status, code := genericUpstreamError(err)
+	c.JSON(status, openAIError{
 		Error: openAIErrorBody{
-			Message: fmt.Sprintf("upstream provider error: %s", err.Error()),
+			Message: genericUpstreamMessage(code),
 			Type:    "upstream_error",
+			Code:    code,
 		},
 	})
 }
@@ -1456,9 +1815,27 @@ func handleProviderError(c *gin.Context, err error) {
 // writeStreamError attempts to write an SSE error event to w. This is
 // best-effort: if headers have already been sent and partial SSE written, we
 // cannot guarantee the client will parse this correctly, but some clients do
-// handle "event: error" frames.
+// handle "event: error" frames. Like handleProviderError, this never echoes
+// err.Error() — a provider.APIError's already-scrubbed ResponseBody is
+// embedded directly in the SSE frame; any other error gets the same generic,
+// closed-vocabulary message handleProviderError's JSON path would have used.
+// There is no way to relay Retry-After on a committed SSE stream, so a
+// mid-stream 429 carries no header equivalent here.
 func writeStreamError(w io.Writer, err error) error {
-	msg := fmt.Sprintf("data: {\"error\":{\"message\":%q,\"type\":\"upstream_error\"}}\n\n", err.Error())
-	_, writeErr := io.WriteString(w, msg)
+	var apiErr provider.APIError
+	var payload []byte
+	if errors.As(err, &apiErr) {
+		payload = apiErr.ResponseBody()
+	} else {
+		_, code := genericUpstreamError(err)
+		payload, _ = json.Marshal(openAIError{
+			Error: openAIErrorBody{
+				Message: genericUpstreamMessage(code),
+				Type:    "upstream_error",
+				Code:    code,
+			},
+		})
+	}
+	_, writeErr := fmt.Fprintf(w, "data: %s\n\n", payload)
 	return writeErr
 }

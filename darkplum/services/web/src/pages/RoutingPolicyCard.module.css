@@ -34,11 +34,60 @@
   color: var(--fg-muted);
 }
 
+.headMeta {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--space-1);
+  flex-shrink: 0;
+}
+
+/* The rung in force, read at a glance. Neutral by default: the ordinary state
+   is not news. Only the rung that sends prompts out of the account is
+   coloured, and it carries the same arrow used everywhere else for egress. */
+.currentRung {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px var(--space-2);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--fg-muted);
+  background: var(--bg-surface-raised);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-full);
+  text-align: right;
+}
+
+.currentRungEgress {
+  color: var(--warning-fg);
+  background: var(--warning-bg);
+  border-color: var(--warning-border);
+}
+
 .updated {
   flex-shrink: 0;
   font-size: var(--fs-xs);
   color: var(--fg-subtle);
   white-space: nowrap;
+}
+
+/* A fact about the catalogue rather than about the choice above it: same
+   place as .effect, none of its weight. */
+.effectQuiet {
+  margin-top: var(--space-2);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-subtle);
+  max-width: 76ch;
+}
+
+/* The class of a model in the list of what a tightening refuses. It sits after
+   the id, because the id is what identifies it and the class is why it is on
+   the list. */
+.confirmClass {
+  margin-left: var(--space-2);
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
 }
 
 .options {

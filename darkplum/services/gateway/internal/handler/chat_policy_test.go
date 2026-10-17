@@ -721,6 +721,39 @@ func TestHandleEffectivePolicyOverride_400BadResidency(t *testing.T) {
 	}
 }
 
+// TestHandleEffectivePolicyOverride_400RejectsExplicitAny asserts "any" is
+// still rejected as an override.policy.residency value at every level — the
+// new vocabulary widens acceptance to cloud_account_only, it does not also
+// legalise an explicit "any" (org's "any" is expressed by policy:null).
+func TestHandleEffectivePolicyOverride_400RejectsExplicitAny(t *testing.T) {
+	h := newTestHandler(fakeProviders{}, baseOverrideRoutes(), baseOverrideSnapshot(), true)
+
+	body := fmt.Sprintf(`{"user_id":%q,"override":{"level":"org","policy":{"residency":"any"}}}`, previewUserID)
+	w, c := newEffectivePolicyOverrideRequest(t, middleware.KeyTypeService, body)
+	h.HandleEffectivePolicyOverride(c)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf(`expected 400 for an explicit "any" override value, got %d; body=%s`, w.Code, w.Body.String())
+	}
+}
+
+// TestHandleEffectivePolicyOverride_AcceptsCloudAccountOnly guards the new
+// residency vocabulary: cloud_account_only, previously rejected alongside
+// every value but self_hosted_only, must now be an accepted override.
+func TestHandleEffectivePolicyOverride_AcceptsCloudAccountOnly(t *testing.T) {
+	h := newTestHandler(fakeProviders{}, baseOverrideRoutes(), baseOverrideSnapshot(), true)
+
+	body := fmt.Sprintf(`{"user_id":%q,"override":{"level":"org","policy":{"residency":"cloud_account_only"}}}`, previewUserID)
+	w, c := newEffectivePolicyOverrideRequest(t, middleware.KeyTypeService, body)
+	h.HandleEffectivePolicyOverride(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for a cloud_account_only override, got %d; body=%s", w.Code, w.Body.String())
+	}
+	got := decodeOverridePreview(t, w.Body.Bytes())
+	if got.Residency != policy.ResidencyCloudAccountOnly {
+		t.Errorf("residency = %q, want %q", got.Residency, policy.ResidencyCloudAccountOnly)
+	}
+}
+
 func TestHandleEffectivePolicyOverride_PolicyUnavailable503(t *testing.T) {
 	h := newTestHandler(fakeProviders{}, baseOverrideRoutes(), policy.Snapshot{}, false)
 
@@ -1015,6 +1048,25 @@ func TestHandleEffectivePolicyImpact_400NonOrgLevel(t *testing.T) {
 	}
 }
 
+// TestHandleEffectivePolicyImpact_AcceptsCloudAccountOnlyRejectsAny mirrors
+// the override-endpoint residency vocabulary tests above, for the org-only
+// impact endpoint.
+func TestHandleEffectivePolicyImpact_AcceptsCloudAccountOnlyRejectsAny(t *testing.T) {
+	h := newTestHandler(fakeProviders{}, baseOverrideRoutes(), impactSnapshot(), true)
+
+	w, c := newPolicyImpactRequest(t, middleware.KeyTypeService, `{"override":{"level":"org","policy":{"residency":"cloud_account_only"}}}`)
+	h.HandleEffectivePolicyImpact(c)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 for a cloud_account_only override, got %d; body=%s", w.Code, w.Body.String())
+	}
+
+	w, c = newPolicyImpactRequest(t, middleware.KeyTypeService, `{"override":{"level":"org","policy":{"residency":"any"}}}`)
+	h.HandleEffectivePolicyImpact(c)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf(`expected 400 for an explicit "any" override value, got %d; body=%s`, w.Code, w.Body.String())
+	}
+}
+
 func TestHandleEffectivePolicyImpact_503WhenPolicyNotLoaded(t *testing.T) {
 	h := newTestHandler(fakeProviders{}, baseOverrideRoutes(), impactSnapshot(), false)
 	w, c := newPolicyImpactRequest(t, middleware.KeyTypeService, `{"override":{"level":"org","policy":{"allowed_models":["m1"]}}}`)
@@ -1197,11 +1249,15 @@ func TestHandleEffectivePolicyImpact_UnknownClassIsReportedNotCounted(t *testing
 	if got.OrgNarrowed || len(got.Narrowed) != 0 {
 		t.Errorf("an unknown-class model must not be stated as lost: org_narrowed=%v narrowed=%+v", got.OrgNarrowed, got.Narrowed)
 	}
-	// Under residency any nothing is unresolved, even with m4 present.
+	// Deny-when-uncertain now applies under EVERY residency, including "any"
+	// (the [RULING] deny-unknown-class-under-ALL-residencies rule) — m4 is
+	// still unresolved here even though this override doesn't touch
+	// residency at all, because an id with no route table entry has no known
+	// class regardless of what residency policy is in force.
 	w, c = newPolicyImpactRequest(t, middleware.KeyTypeService, `{"override":{"level":"org","policy":{"allowed_models":["m1","m2","m3","m4"]}}}`)
 	h.HandleEffectivePolicyImpact(c)
 	got = decodePolicyImpact(t, w.Body.Bytes())
-	if len(got.UnresolvedModels) != 0 {
-		t.Errorf("unresolved_models must be empty under residency any, got %v", got.UnresolvedModels)
+	if len(got.UnresolvedModels) != 1 || got.UnresolvedModels[0] != "m4" {
+		t.Errorf("unresolved_models = %v, want [m4] even under residency any", got.UnresolvedModels)
 	}
 }

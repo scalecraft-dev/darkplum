@@ -12,10 +12,19 @@
 // already approved.
 package policy
 
-// Residency values for routing_policy.residency.
+import "time"
+
+// Residency values. Org-level rows (routing_policy.residency, and the org
+// row of principal_routing_policies once migration 016 lands) may carry any
+// of the three; principal (user/api_key) rows only ever carry
+// ResidencyCloudAccountOnly or ResidencySelfHostedOnly explicitly — there is
+// no explicit "any" at that level, only the absence of a row (nil), which
+// inherits. See ResidencyPermits and Effective for the ladder these values
+// form.
 const (
-	ResidencyAny            = "any"
-	ResidencySelfHostedOnly = "self_hosted_only"
+	ResidencyAny              = "any"
+	ResidencyCloudAccountOnly = "cloud_account_only"
+	ResidencySelfHostedOnly   = "self_hosted_only"
 )
 
 // Alias kinds for model_aliases.kind (migration 013).
@@ -97,11 +106,11 @@ type Snapshot struct {
 	// re-resolved through Aliases again (model_aliases guarantees a target is
 	// never itself an alias).
 	Aliases map[string]AliasDef
-	// Residency is ResidencyAny or ResidencySelfHostedOnly. This is the
-	// org-level value only (routing_policy.residency, or the org row of
-	// principal_routing_policies once migration 015 lands) — per-principal
-	// enforcement must use EffectiveFor's strictest value instead, not this
-	// field directly.
+	// Residency is one of the Residency* constants. This is the org-level
+	// value only (routing_policy.residency, or the org row of
+	// principal_routing_policies once migration 015/016 lands) —
+	// per-principal enforcement must use EffectiveFor's strictest value
+	// instead, not this field directly.
 	Residency string
 
 	// OrgPolicy is the org level's own precomputed EffectivePolicy (chain of
@@ -152,6 +161,26 @@ type Snapshot struct {
 	// the inverse of KeyOwner precomputed once per snapshot load rather than
 	// scanned from KeyOwner per request.
 	UserKeys map[string][]string
+
+	// VendorFilters maps vendor name ("anthropic", "openai") -> its
+	// DB-stored model filter row (migration 017's vendor_provider_settings,
+	// written by the api's PUT .../providers/:vendor/key|filter). A vendor
+	// with no row (never installed via the UI, or the table doesn't exist
+	// yet on a customer database that hasn't run migration 017) simply has
+	// no entry — routing.vendorFilterFunc then falls back to the
+	// <VENDOR>_MODEL_FILTER env pair, exactly like today. See
+	// PgStore.loadVendorFilters.
+	VendorFilters map[string]VendorFilterRow
+}
+
+// VendorFilterRow is one vendor's row of vendor_provider_settings, as read
+// by PgStore.loadVendorFilters: the model_filter glob patterns an admin
+// installed from Admin > Models, and the timestamp they were set at — the
+// "db" side of routing.resolveVendorFilter's last-writer-wins comparison
+// against the <VENDOR>_MODEL_FILTER_SET_AT env value.
+type VendorFilterRow struct {
+	Filter []string
+	SetAt  time.Time
 }
 
 // ChainFor returns the raw, unmerged policy chain for a principal in the

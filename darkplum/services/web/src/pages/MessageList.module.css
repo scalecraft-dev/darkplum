@@ -250,6 +250,24 @@
   color: var(--fg-muted);
 }
 
+/* This message left the organisation's cloud account. Filled rather than
+   outlined, unlike the re-routed mark beside it: one is a curiosity about
+   routing, the other is where the person's words went, and only one of those
+   is worth a second glance from someone who has just pasted something in.
+   It still sits inside the footnote line — a banner over every vendor reply
+   would train people to stop reading it by the third message. */
+.provenanceEgress {
+  display: inline-flex;
+  align-items: center;
+  margin-left: var(--space-2);
+  padding: 0 var(--space-1);
+  color: var(--warning-fg);
+  background: var(--warning-bg);
+  border: 1px solid var(--warning-border);
+  border-radius: var(--radius-sm);
+  white-space: nowrap;
+}
+
 /* The alias had to choose again mid-conversation. Rare, and worth a mark of
    its own rather than a colour change on the line. */
 .provenanceNote {
@@ -382,10 +400,23 @@
   transition: background var(--transition-fast), border-color var(--transition-fast);
 }
 
-.failureBtn:hover,
+.failureBtn:hover:not([aria-disabled='true']),
 .failureLink:hover {
   background: var(--bg-surface-hover);
   border-color: var(--fg-subtle);
+}
+
+/* Held shut while a rate limit runs down: still readable, still focusable
+   (see the aria-disabled note in MessageList), plainly not pressable. */
+.failureBtn[aria-disabled='true'] {
+  color: var(--fg-subtle);
+  cursor: not-allowed;
+}
+
+/* Tabular figures so a ticking second never shifts the button's width. */
+.failureCountdown {
+  font-variant-numeric: tabular-nums;
+  white-space: pre;
 }
 
 .failureModel {

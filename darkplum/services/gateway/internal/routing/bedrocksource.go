@@ -104,5 +104,5 @@ func (s *bedrockSourceState) discover(ctx context.Context) ([]string, error) {
 		ids = append(ids, id)
 	}
 
-	return ApplyGlobFilter(ids, s.filters)
+	return ApplyGlobFilter(ids, s.filters, "BEDROCK_MODEL_FILTER")
 }

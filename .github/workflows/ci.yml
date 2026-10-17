@@ -43,6 +43,11 @@ jobs:
           if [ -n "$unformatted" ]; then echo "gofmt needed:"; echo "$unformatted"; exit 1; fi
       - run: go build ./...
       - run: go vet ./...
+      # The vendorsmoke-tagged tests call the real Anthropic and OpenAI APIs and
+      # only ever run from the manual Vendor smoke workflow. Compile-check them
+      # here (no keys, no network) so they cannot rot unnoticed between runs.
+      - if: matrix.service == 'gateway'
+        run: go vet -tags vendorsmoke ./...
       # The api and gateway integration tests (migrations, model sync, aliases,
       # service key, audit recorder) run against the Postgres service container;
       # without TEST_DATABASE_URL they would skip silently.
@@ -74,6 +79,7 @@ jobs:
       # no fetch() lives outside the API client. The Go services run the same
       # golden against their live route tables.
       - run: pnpm run check:parity
+      - run: pnpm run check:policy
 
   terraform:
     name: Terraform

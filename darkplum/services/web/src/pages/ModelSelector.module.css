@@ -91,6 +91,39 @@
   background: var(--danger-fg);
 }
 
+/* The prompt will leave the organisation's cloud account. Amber, like every
+   other egress marker — and the only dot with a ring, because this is the one
+   state the person typing needs to notice without being told to look. It does
+   not pulse: this is a standing fact about the model they chose, not something
+   in progress. */
+.dotEgress {
+  background: var(--warning-fg);
+  box-shadow: 0 0 0 2px var(--warning-bg);
+}
+
+/* Nobody has reported where this runs. Hollow rather than filled: a state we
+   do not have, not a state we have and dislike. */
+.dotUnknown {
+  background: transparent;
+  border: 1px solid var(--fg-subtle);
+}
+
+/* The egress line as a whole is the one place the header raises its voice. The
+   glyph beside the dot says it a second way, for anyone the colour is lost on. */
+.statusEgress {
+  color: var(--warning-fg);
+}
+
+.statusGlyph {
+  flex-shrink: 0;
+  /* This line's flex gap would sit on top of the glyph's own trailing space,
+     so the gap is cancelled and the shared 4px is what remains — the same
+     distance the glyph keeps from its words in a badge, under a reply and in
+     the usage log. Cancelling both is what left "⌲Sent to Anthropic" with the
+     arrow touching the S. */
+  margin-right: calc(var(--space-1) - var(--space-2));
+}
+
 /* Secondary line for a static alias — supplementary, so it is the first
    thing dropped when the header runs out of room. */
 .aliasTarget {

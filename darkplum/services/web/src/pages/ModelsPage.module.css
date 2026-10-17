@@ -36,6 +36,17 @@
   outline-offset: 2px;
 }
 
+/* One fact about every model in the catalogue, not about any one provider, so
+   it reads as a standing note above the list rather than as a warning on a
+   card. Same measure as .policyNote above it. */
+.catalogueNote {
+  margin-bottom: var(--space-4);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-normal);
+  color: var(--fg-muted);
+  max-width: 68ch;
+}
+
 /* --- Search + filter toolbar --- */
 
 .toolbar {
@@ -224,6 +235,58 @@
   /* No extra padding — table fills edge-to-edge */
 }
 
+/* --- First run on a vendor card ---
+   The one loud thing on this page, and only while it is true: a vendor whose
+   key works and whose models are all still off. It sits inside the card it is
+   about rather than at the top of the page, because the decision it offers is
+   about these models and no others. */
+
+.firstRun {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+  padding: var(--space-3) var(--space-5);
+  background: var(--warning-bg);
+  border-bottom: 1px solid var(--warning-border);
+}
+
+.firstRunText {
+  min-width: 0;
+}
+
+.firstRunTitle {
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  color: var(--fg-default);
+}
+
+.firstRunBody {
+  margin-top: 2px;
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-muted);
+  max-width: 72ch;
+}
+
+/* A standing limit on a vendor card, once the first-run banner has gone. Same
+   place, a fraction of the weight: it is worth knowing, not worth stopping
+   for. No gap — the glyph carries its own 4px, as everywhere else. */
+.providerNote {
+  display: flex;
+  align-items: flex-start;
+  padding: var(--space-2) var(--space-5);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-subtle);
+  background: var(--bg-base);
+  border-bottom: 1px solid var(--border-default);
+}
+
+.providerNote svg {
+  margin-top: 2px;
+}
+
 .providerBodyCollapsed {
   display: none;
 }
@@ -288,10 +351,6 @@
   flex-wrap: wrap;
   align-items: center;
   gap: var(--space-1);
-}
-
-.badgeIcon {
-  margin-right: 4px;
 }
 
 .statusHint {
@@ -421,8 +480,17 @@
     padding: var(--space-3) var(--space-4);
   }
 
-  .vendorHeading {
+  .vendorHeading,
+  .providerNote {
     padding: var(--space-2) var(--space-4);
+  }
+
+  /* The banner's button drops under its text rather than squeezing it: the
+     sentence explaining what the button does is the part that must survive. */
+  .firstRun {
+    flex-direction: column;
+    align-items: stretch;
+    padding: var(--space-3) var(--space-4);
   }
 }
 

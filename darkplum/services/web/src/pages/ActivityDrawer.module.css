@@ -172,8 +172,12 @@
   flex-direction: column;
 }
 
+/* Wraps rather than squeezing: a request that left the account now carries a
+   second badge, and on a narrow drawer the detail text should give way to it
+   instead of pushing it out of the row. */
 .eventItem {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: var(--space-3);
   padding: var(--space-2) 0;

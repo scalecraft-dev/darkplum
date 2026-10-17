@@ -6,6 +6,7 @@ import type {
   AliasKind,
   AliasRouteTest,
   AliasTargetHealth,
+  DisplayClass,
   ModelAlias,
   ModelAliasInput,
   ModelAliasRoute,
@@ -15,22 +16,32 @@ import { ApiError, testModelAlias } from '../lib/api'
 import {
   ALIAS_HINT,
   BUILTIN_KEYWORDS,
+  INERT_BUILTINS,
   MAX_KEYWORDS_PER_ROUTE,
   MAX_KEYWORD_LENGTH,
   MAX_ROUTE_DESCRIPTION,
   ROUTE_NAME_HINT,
   STICKINESS_HINT,
+  UNKNOWN_CLASS_HINT,
   UNREACHABLE_HINT,
   aliasKindOf,
-  backendClassOf,
+  backendClassLabel,
+  backendClassTooltip,
+  backendClassVariant,
+  displayClassOf,
+  isEgress,
   isReachable,
   isRoutedAlias,
+  multimodalRouteNote,
   routerReasonText,
+  targetClassOf,
   validateAlias,
   validateRouteName,
+  vendorLabel,
 } from '../lib/modelRouting'
+import { residencyLabel, residencyPermits } from '../lib/policy'
 import { useToast } from '../components/Toast'
-import { Badge, Button, Input, Modal, Table, TableEmpty } from '../components/ui'
+import { Badge, Button, ClassGlyph, Input, Modal, Table, TableEmpty } from '../components/ui'
 import { CopyButton } from '../components/ui/CopyButton'
 import { Skeleton } from '../components/ui/Skeleton'
 import styles from './AliasesSection.module.css'
@@ -48,25 +59,48 @@ interface Props {
   onDelete: (alias: string) => Promise<void>
 }
 
-type HealthKind = 'ok' | 'missing' | 'disabled' | 'blocked' | 'unreachable'
+/** 'partial' belongs to a routed alias only: some of its routes answer and
+ *  some are refused, which is neither of the other two things. */
+type HealthKind = 'ok' | 'partial' | 'unknown' | 'missing' | 'disabled' | 'blocked' | 'unreachable'
 
-/** Most permanent problem first: a missing target outranks a disabled one,
- *  a policy refusal outranks a backend that is merely away for a few minutes. */
+/**
+ * Most permanent problem first: a missing target outranks a disabled one, and
+ * a refusal outranks a backend that is merely away for a few minutes.
+ *
+ * A target whose class nobody has reported is 'unknown', not 'ok'. The gateway
+ * refuses an unknown class under every residency, so calling this route active
+ * would be a promise the next request breaks — and the fix ("wait for a backend
+ * to report it") is different from every other state here.
+ */
 function healthOf(t: AliasTargetHealth, residency: Residency): HealthKind {
   if (!t.target_exists) return 'missing'
   if (!t.target_enabled) return 'disabled'
-  if (residency === 'self_hosted_only' && t.target_backend_class === 'cloud_managed') {
-    return 'blocked'
-  }
+  const cls = targetClassOf(t)
+  if (cls === 'unknown') return 'unknown'
+  if (!residencyPermits(residency, cls)) return 'blocked'
   if (t.target_available === false) return 'unreachable'
   return 'ok'
 }
 
-const HEALTH_COPY: Record<HealthKind, { label: string; variant: 'success' | 'warning' | 'danger'; hint: string }> = {
+const HEALTH_COPY: Record<
+  HealthKind,
+  { label: string; variant: 'success' | 'warning' | 'danger'; dashed?: boolean; hint: string }
+> = {
   ok: {
     label: 'Active',
     variant: 'success',
     hint: '',
+  },
+  partial: {
+    label: 'Some routes refused',
+    variant: 'warning',
+    hint: 'Messages that take a working route are answered as normal. The routes listed below are refused, with the route named — nothing is sent to another model instead.',
+  },
+  unknown: {
+    label: 'Target not reported',
+    variant: 'warning',
+    dashed: true,
+    hint: UNKNOWN_CLASS_HINT,
   },
   missing: {
     label: 'Target missing',
@@ -81,7 +115,7 @@ const HEALTH_COPY: Record<HealthKind, { label: string; variant: 'success' | 'war
   blocked: {
     label: 'Blocked by policy',
     variant: 'warning',
-    hint: 'The routing policy allows self-hosted models only, and this target is cloud-managed.',
+    hint: '',
   },
   unreachable: {
     label: 'Target unreachable',
@@ -90,31 +124,104 @@ const HEALTH_COPY: Record<HealthKind, { label: string; variant: 'success' | 'war
   },
 }
 
+/**
+ * The blocked hint names the rung and the class, because "blocked by policy"
+ * with three rungs and three classes leaves an administrator guessing which of
+ * nine combinations they are looking at.
+ */
+function blockedHint(cls: DisplayClass, residency: Residency): string {
+  return `The routing policy is set to "${residencyLabel(residency)}", and this target is ${backendClassLabel(cls).toLowerCase()}. Change the policy, or point this at a model the policy permits.`
+}
+
+/**
+ * Which classes an alias can reach, in ladder order, each once.
+ *
+ * This is the whole point of the feature on one line: an alias may hold a
+ * self-hosted route and a vendor route side by side, and the person who picks
+ * it in chat never chooses between them. An administrator looking down this
+ * column needs to see that an alias straddles the account boundary without
+ * opening it, so the classes ride in the cell rather than inside the editor.
+ */
+const CLASS_ORDER: DisplayClass[] = ['self_hosted', 'cloud_managed', 'external_api', 'unknown']
+
+/** One chip per class the alias can reach, with the vendors named on the
+ *  external one — "External API" alone does not tell an administrator whose
+ *  terms of service their users' messages are about to fall under. */
+function aliasClassChips(
+  a: ModelAlias,
+  models: AdminModel[],
+): { cls: DisplayClass; label: string }[] {
+  const ids = isRoutedAlias(a)
+    ? (a.routes ?? []).map((r) => r.target_model_id)
+    : a.target_model_id
+      ? [a.target_model_id]
+      : []
+  const byClass = new Map<DisplayClass, Set<string>>()
+  for (const id of ids) {
+    const model = models.find((m) => m.model_id === id)
+    if (!model) continue
+    const cls = displayClassOf(model)
+    if (!byClass.has(cls)) byClass.set(cls, new Set())
+    if (isEgress(cls)) byClass.get(cls)!.add(vendorLabel(model.provider))
+  }
+  return CLASS_ORDER.filter((c) => byClass.has(c)).map((cls) => {
+    const vendors = [...(byClass.get(cls) ?? [])].sort()
+    return {
+      cls,
+      label: vendors.length > 0 ? vendors.join(' + ') : backendClassLabel(cls),
+    }
+  })
+}
+
+/**
+ * The sentence under the status badge. Everything except 'blocked' has one
+ * fixed answer; 'blocked' has to name the rung and the class, so it is built
+ * from whichever target is actually being refused rather than described in
+ * general terms.
+ */
+function statusHint(a: ModelAlias, health: HealthKind, residency: Residency): string {
+  if (health !== 'blocked') return HEALTH_COPY[health].hint
+  const targets: AliasTargetHealth[] = isRoutedAlias(a) ? a.routes ?? [] : [a]
+  const offending = targets.find((t) => healthOf(t, residency) === 'blocked')
+  return blockedHint(offending ? targetClassOf(offending) : 'unknown', residency)
+}
+
 /** Short words for one route's problem, next to the route it belongs to. */
-const ROUTE_HEALTH_LABEL: Record<Exclude<HealthKind, 'ok'>, string> = {
+const ROUTE_HEALTH_LABEL: Record<Exclude<HealthKind, 'ok' | 'partial'>, string> = {
   missing: 'target missing',
   disabled: 'target disabled',
   blocked: 'blocked by policy',
   unreachable: 'target unreachable',
+  unknown: 'target has not reported where it runs',
 }
 
 const HEALTH_RANK: Record<HealthKind, number> = {
   ok: 0,
-  unreachable: 1,
-  blocked: 2,
-  disabled: 3,
-  missing: 4,
+  partial: 1,
+  unreachable: 2,
+  unknown: 3,
+  blocked: 4,
+  disabled: 5,
+  missing: 6,
 }
 
-/** The state of the whole alias is the state of its worst route: one broken
- *  route is a refusal for every message that classifies into it. */
+/**
+ * The state of a routed alias.
+ *
+ * Not simply "its worst route": an alias with four working routes and one
+ * blocked one is not broken, and calling it "blocked by policy" sends an
+ * administrator looking for an outage that is not there. When some routes
+ * answer and some do not, that mixture is its own state; only when nothing can
+ * answer does the worst route speak for the whole alias.
+ */
 function aliasHealth(a: ModelAlias, residency: Residency): HealthKind {
   if (!isRoutedAlias(a)) return healthOf(a, residency)
   const routes = a.routes ?? []
   if (routes.length === 0) return 'missing'
-  return routes
-    .map((r) => healthOf(r, residency))
-    .reduce((worst, next) => (HEALTH_RANK[next] > HEALTH_RANK[worst] ? next : worst), 'ok')
+  const healths = routes.map((r) => healthOf(r, residency))
+  if (healths.every((h) => h === 'ok')) return 'ok'
+  if (healths.some((h) => h === 'ok')) return 'partial'
+  return healths.reduce((worst, next) => (HEALTH_RANK[next] > HEALTH_RANK[worst] ? next : worst), 'ok')
 }
 
 /** 'model' is a removed kind that only a pre-migration server still sends. It
@@ -188,9 +295,17 @@ function targetOptionLabel(m: AdminModel): string {
 function ModelOptions({ models }: { models: AdminModel[] }) {
   const grouped = useMemo(() => {
     const sorted = [...models].sort((a, b) => a.model_id.localeCompare(b.model_id))
+    const external = sorted.filter((m) => displayClassOf(m) === 'external_api')
     return {
-      selfHosted: sorted.filter((m) => backendClassOf(m) === 'self_hosted'),
-      cloud: sorted.filter((m) => backendClassOf(m) === 'cloud_managed'),
+      selfHosted: sorted.filter((m) => displayClassOf(m) === 'self_hosted'),
+      cloud: sorted.filter((m) => displayClassOf(m) === 'cloud_managed'),
+      /** One group per vendor: an administrator choosing a route target is
+       *  choosing which company receives those messages, and the group heading
+       *  is the only place in a native select that can say so. */
+      externalByVendor: [...new Set(external.map((m) => m.provider))]
+        .sort()
+        .map((v) => ({ vendor: v, models: external.filter((m) => m.provider === v) })),
+      unknown: sorted.filter((m) => displayClassOf(m) === 'unknown'),
     }
   }, [models])
 
@@ -210,11 +325,27 @@ function ModelOptions({ models }: { models: AdminModel[] }) {
           ))}
         </optgroup>
       )}
+      {grouped.externalByVendor.map(({ vendor, models: vendorModels }) => (
+        <optgroup key={vendor} label={`External API — ${vendorLabel(vendor)}`}>
+          {vendorModels.map((m) => (
+            <option key={m.id} value={m.model_id}>{targetOptionLabel(m)}</option>
+          ))}
+        </optgroup>
+      ))}
+      {grouped.unknown.length > 0 && (
+        <optgroup label="Not reported by any backend yet">
+          {grouped.unknown.map((m) => (
+            <option key={m.id} value={m.model_id}>{targetOptionLabel(m)}</option>
+          ))}
+        </optgroup>
+      )}
     </>
   )
 }
 
-/** What is wrong with this target as things stand, in one sentence, or null. */
+/** What is wrong with this target as things stand, in one sentence, or null.
+ *  The residency sentence names the rung in force and the class that conflicts
+ *  with it, so the fix is legible without opening the other tab. */
 function targetWarning(
   models: AdminModel[],
   targetModelId: string,
@@ -224,11 +355,21 @@ function targetWarning(
   const model = models.find((m) => m.model_id === targetModelId)
   if (!model) return 'No model has this ID. Requests that take this route are refused.'
   if (!model.enabled) return 'This model is turned off, so this route is refused until you enable it.'
-  if (residency === 'self_hosted_only' && backendClassOf(model) === 'cloud_managed') {
-    return 'The routing policy allows self-hosted models only, so this route is refused until the policy changes.'
-  }
+  const cls = displayClassOf(model)
+  if (cls === 'unknown') return UNKNOWN_CLASS_HINT
+  if (!residencyPermits(residency, cls)) return blockedHint(cls, residency)
   if (!isReachable(model)) return UNREACHABLE_HINT
   return null
+}
+
+/** A route that binds the multimodal signal, flagged wherever it points. The
+ *  target's class used to decide this — the advice was to send those messages
+ *  to a self-hosted model instead — and there is no such target any more: the
+ *  gateway refuses a non-text content block before a route is resolved, on
+ *  every backend. The rule is left where it is stored and named as inert. */
+function multimodalWarning(routeName: string, keywords: string[]): string | null {
+  if (!keywords.includes('builtin:multimodal')) return null
+  return multimodalRouteNote(routeName || 'This route')
 }
 
 // ---------------------------------------------------------------------------
@@ -286,22 +427,30 @@ function KeywordEditor({ routeName, keywords, onChange }: KeywordsProps) {
 
       {keywords.length > 0 && (
         <ul className={styles.chipList}>
-          {keywords.map((k) => (
-            <li key={k} className={styles.chip}>
-              <code className={styles.chipText}>{k}</code>
-              <button
-                type="button"
-                className={styles.chipRemove}
-                onClick={() => remove(k)}
-                aria-label={`Remove keyword ${k} from ${label}`}
-              >
-                <svg width="10" height="10" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
-                  <line x1="3" y1="3" x2="11" y2="11" />
-                  <line x1="11" y1="3" x2="3" y2="11" />
-                </svg>
-              </button>
-            </li>
-          ))}
+          {keywords.map((k) => {
+            // A signal nothing can match any more. It stays on the route and
+            // stays removable — it is the administrator's to delete, not ours
+            // — but it is not shown as a live rule. The sentence naming it is
+            // above the editor, so this carries no second copy of it.
+            const inert = INERT_BUILTINS.has(k)
+            return (
+              <li key={k} className={`${styles.chip} ${inert ? styles.chipInert : ''}`}>
+                <code className={styles.chipText}>{k}</code>
+                {inert && <span className={styles.chipInertFlag}>never matches today</span>}
+                <button
+                  type="button"
+                  className={styles.chipRemove}
+                  onClick={() => remove(k)}
+                  aria-label={`Remove keyword ${k} from ${label}`}
+                >
+                  <svg width="10" height="10" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+                    <line x1="3" y1="3" x2="11" y2="11" />
+                    <line x1="11" y1="3" x2="3" y2="11" />
+                  </svg>
+                </button>
+              </li>
+            )
+          })}
         </ul>
       )}
 
@@ -342,15 +491,24 @@ function KeywordEditor({ routeName, keywords, onChange }: KeywordsProps) {
           <ul className={styles.builtinList}>
             {unusedBuiltins.map((b) => (
               <li key={b.token} className={styles.builtinItem}>
+                {/* An inert signal is shown, not hidden: an administrator
+                    looking for the image rule should find out here that it
+                    cannot fire, rather than add it from memory and wait for a
+                    match that never comes. Disabled, so the accessible name is
+                    the token and the reason beside it is read with it. */}
                 <button
                   type="button"
-                  className={styles.builtinBtn}
+                  className={`${styles.builtinBtn} ${b.inert ? styles.builtinBtnInert : ''}`}
                   onClick={() => add(b.token)}
-                  aria-label={`Add ${b.token} to ${label}`}
+                  disabled={Boolean(b.inert)}
+                  aria-label={b.inert ? undefined : `Add ${b.token} to ${label}`}
                 >
                   {b.token}
                 </button>
-                <span className={styles.builtinText}>{b.explanation}</span>
+                <span className={styles.builtinText}>
+                  {b.explanation}
+                  {b.inert && <span className={styles.builtinInert}> {b.inert}</span>}
+                </span>
               </li>
             ))}
           </ul>
@@ -411,6 +569,7 @@ function RouteRow({
   const fieldId = useId()
   const label = route.route_name || `route ${index + 1}`
   const warning = targetWarning(models, route.target_model_id, residency)
+  const multimodal = multimodalWarning(route.route_name, route.keywords)
 
   return (
     <li className={styles.route}>
@@ -499,6 +658,14 @@ function RouteRow({
       </div>
 
       {warning && <p className={styles.formWarning}>{warning}</p>}
+      {/* Shown whichever classifier is in use: the semantic router keeps the
+          keywords on the route, so a rule that can never fire is still a rule
+          somebody will read as live when keyword matching comes back. */}
+      {multimodal && (
+        <p className={styles.formWarning} role="alert">
+          {multimodal}
+        </p>
+      )}
 
       {keywordsUsed ? (
         <KeywordEditor
@@ -688,14 +855,26 @@ function AliasEditor({ editing, models, residency, existing, onClose, onSave }: 
       await onSave(alias.trim(), body)
       onClose()
     } catch (err) {
-      // The API's own words, against the field they belong to where that is
-      // knowable. A routed body can fail for a reason no single field owns.
+      // The API's own words, against the field they belong to — but only where
+      // the STATUS says which field that is. This used to sniff the message for
+      // the word "alias" to place a 400, which quietly stopped working the
+      // moment the server started saying "residency policy is …; route "x"
+      // targets a … model" — a sentence with no "alias" in it, and nothing to
+      // do with the alias field. Error prose is not an API; a UI that branches
+      // on it breaks whenever someone improves the wording.
+      //
+      // 409 no longer means one thing either: it was "that alias name exists",
+      // and it is now also "a route on this alias targets a class the residency
+      // policy refuses". Those belong on two different fields and only the
+      // prose tells them apart, so neither gets a field — the name collision is
+      // already caught locally in validate() before the request is sent, which
+      // is where that precise error actually comes from.
+      //
+      // 404 on a static alias is the one status that still names its own field:
+      // the target model id does not exist.
       const status = err instanceof ApiError ? err.status : 0
       const message = (err as Error).message
-      if (status === 409 && kind === 'static') setAliasError(message)
-      else if (status === 404 && kind === 'static') setTargetError(message)
-      else if (status === 400 && kind === 'static' && /alias/i.test(message)) setAliasError(message)
-      else if (kind === 'static') setTargetError(message)
+      if (status === 404 && kind === 'static') setTargetError(message)
       else setFormError(message)
     } finally {
       setSaving(false)
@@ -1161,6 +1340,7 @@ export function AliasesSection({
                   const routed = isRoutedAlias(a)
                   const health = aliasHealth(a, residency)
                   const copy = HEALTH_COPY[health]
+                  const classChips = aliasClassChips(a, models)
                   const routes = a.routes ?? []
                   const flaggedRoutes = routes
                     .map((r) => ({ route: r, health: healthOf(r, residency) }))
@@ -1195,7 +1375,7 @@ export function AliasesSection({
                                     <code className={styles.targetId}>{route.route_name}</code>
                                     {' → '}
                                     <code className={styles.targetId}>{route.target_model_id}</code>
-                                    {` — ${ROUTE_HEALTH_LABEL[routeHealth as Exclude<HealthKind, 'ok'>]}`}
+                                    {` — ${ROUTE_HEALTH_LABEL[routeHealth as Exclude<HealthKind, 'ok' | 'partial'>]}`}
                                   </li>
                                 ))}
                               </ul>
@@ -1207,12 +1387,37 @@ export function AliasesSection({
                             {a.target_model_id && <CopyButton value={a.target_model_id} label="Copy" />}
                           </div>
                         )}
+                        {/* Where the things it reaches actually run. On a
+                            routed alias this is often more than one place, and
+                            that is exactly the fact worth surfacing. */}
+                        {classChips.length > 0 && (
+                          <div className={styles.classChips}>
+                            {classChips.map(({ cls, label }) => (
+                              <Badge
+                                key={cls}
+                                variant={backendClassVariant(cls)}
+                                bordered
+                                dashed={cls === 'unknown'}
+                                title={backendClassTooltip(cls)}
+                              >
+                                <ClassGlyph cls={cls} />
+                                {label}
+                              </Badge>
+                            ))}
+                          </div>
+                        )}
                       </td>
                       <td>
-                        <Badge variant={copy.variant} bordered={health !== 'ok'}>
+                        <Badge
+                          variant={copy.variant}
+                          bordered={health !== 'ok'}
+                          dashed={copy.dashed}
+                        >
                           {copy.label}
                         </Badge>
-                        {copy.hint && <p className={styles.statusHint}>{copy.hint}</p>}
+                        {statusHint(a, health, residency) && (
+                          <p className={styles.statusHint}>{statusHint(a, health, residency)}</p>
+                        )}
                         {warnings.length > 0 && (
                           <ul className={styles.rowWarnings}>
                             {warnings.map((w) => (

@@ -44,9 +44,17 @@ import {
   type EventVariant,
   inferenceEventLabel,
 } from '../lib/activityEvents'
-import { DENIAL_CODES, denialLabel, routerReasonText } from '../lib/modelRouting'
+import {
+  DENIAL_CODES,
+  denialLabel,
+  displayClassOf,
+  isEgress,
+  ranOnSuffix,
+  routerReasonText,
+  vendorLabel,
+} from '../lib/modelRouting'
 import { useToast } from '../components/Toast'
-import { Badge, Button, Skeleton, Table, TableEmpty } from '../components/ui'
+import { Badge, Button, EgressGlyph, Skeleton, Table, TableEmpty } from '../components/ui'
 import { ActivityDrawer } from './ActivityDrawer'
 import styles from './ActivityTab.module.css'
 
@@ -88,6 +96,26 @@ const PURPOSES: { label: string; value: PurposeFilter }[] = [
   { label: 'All',         value: 'all'            },
 ]
 
+/**
+ * Where a recorded request ran. The API takes a comma-separated list, so the
+ * values here are lists — "anywhere outside your cloud account" is one option
+ * today and stays one option if a third vendor class is ever added.
+ *
+ * 'unrecorded' is offered rather than hidden, and it is two different things:
+ * a request refused before a route resolved — there was no class yet — and a
+ * row written before the column existed. Naming only the second would let an
+ * administrator dismiss the option as old data and miss every early refusal
+ * in it. A filter that quietly dropped them would be worse still: an audit log
+ * that lies by omission about how many requests there were.
+ */
+const BACKEND_CLASS_FILTERS: { label: string; value: string }[] = [
+  { label: 'Your infrastructure',                        value: 'self_hosted'  },
+  { label: 'Your cloud account',                         value: 'cloud_managed' },
+  { label: 'Outside your cloud account',                 value: 'external_api' },
+  { label: 'Inside your cloud account',                  value: 'self_hosted,cloud_managed' },
+  { label: 'Not recorded — refused early, or pre-upgrade', value: 'unrecorded' },
+]
+
 // Hex values directly since CSS vars are unreliable in SVG attributes.
 // Defined per-theme because the dark grid color (#1A1E2A) is invisible on
 // light mode bone backgrounds.
@@ -123,6 +151,9 @@ interface UnifiedEvent {
   /** Routed aliases only: the route that answered and the recorded reason. */
   route: string | null
   reason: string | null
+  /** Requests only, and only when the class was recorded: this one left the
+   *  organisation's cloud account, to the vendor named here. */
+  egress: string | null
 }
 
 // ---------------------------------------------------------------------------
@@ -196,6 +227,7 @@ function adminEventToUnified(e: ActivityEvent): UnifiedEvent {
     ip_address:     e.ip_address,
     route:          null,
     reason:         null,
+    egress:         null,
   }
 }
 
@@ -223,7 +255,12 @@ function inferenceEventToUnified(e: InferenceEvent): UnifiedEvent {
   // shown whenever it differs. (A body with no model at all records neither.)
   const asked =
     e.requested_model && e.requested_model !== e.model ? `, asked for: ${e.requested_model}` : ''
-  const base = `model: ${e.model}${asked}, latency: ${e.latency_ms}ms, status: ${e.status_code}`
+  // Where it ran, when the row records it, said as a place and a company
+  // rather than as an enum: a log is read by people answering questions about
+  // their data, and "external_api" is not the word any of those questions get
+  // asked in.
+  const cls = e.backend_class ?? null
+  const base = `model: ${e.model}${ranOnSuffix(cls, e.provider)}${asked}, latency: ${e.latency_ms}ms, status: ${e.status_code}`
   // The refusal reason, said first — it's what an admin reading a failed row
   // wants to know before the plumbing details.
   const detail_text =
@@ -242,6 +279,10 @@ function inferenceEventToUnified(e: InferenceEvent): UnifiedEvent {
     ip_address:     e.ip_address,
     route:          e.route_name ?? null,
     reason:         e.router_reason ?? null,
+    egress:
+      cls !== null && isEgress(displayClassOf({ backend_class: cls }))
+        ? vendorLabel(e.provider)
+        : null,
   }
 }
 
@@ -303,6 +344,9 @@ export function ActivityTab() {
   /** The gateway's error code on a refused request. Meaningless on admin
    *  events, which are never refusals in this sense. */
   const [denialCode, setDenialCode] = useState('')
+  /** Where the request ran, as a comma-separated class list. Empty is every
+   *  row, recorded or not. */
+  const [backendClass, setBackendClass] = useState('')
 
   // Filter menus. Read once; a failure costs a menu, not the page.
   const [allUsers, setAllUsers]   = useState<User[]>([])
@@ -335,7 +379,7 @@ export function ActivityTab() {
   useEffect(() => {
     listUsers().then(setAllUsers).catch(() => setAllUsers([]))
     listApiKeys().then(setAllKeys).catch(() => setAllKeys([]))
-    listAdminModels().then(setAllModels).catch(() => setAllModels([]))
+    listAdminModels().then((r) => setAllModels(r.models)).catch(() => setAllModels([]))
   }, [])
 
   /** Exactly what the visible log is filtered by. The export sends the same
@@ -351,13 +395,22 @@ export function ActivityTab() {
       api_key_id: apiKeyId || undefined,
       model: modelId || undefined,
       denial_code: denialCode || undefined,
+      // Goes through the same object the table is built from, so the CSV a
+      // compliance reviewer downloads to answer "what left our account?"
+      // cannot contain rows the screen did not show them.
+      backend_class: backendClass || undefined,
       purpose,
     }),
-    [personId, apiKeyId, modelId, denialCode, purpose],
+    [personId, apiKeyId, modelId, denialCode, backendClass, purpose],
   )
 
   const filtersActive =
-    eventType !== '' || personId !== '' || apiKeyId !== '' || modelId !== '' || denialCode !== ''
+    eventType !== '' ||
+    personId !== '' ||
+    apiKeyId !== '' ||
+    modelId !== '' ||
+    denialCode !== '' ||
+    backendClass !== ''
 
   // ---------------------------------------------------------------------------
   // Data fetching
@@ -466,7 +519,18 @@ export function ActivityTab() {
   // page 4 of the old filter is not page 4 of the new one.
   useEffect(() => {
     setPage(0)
-  }, [timeRange, logView, purpose, pageSize, eventType, personId, apiKeyId, modelId, denialCode])
+  }, [
+    timeRange,
+    logView,
+    purpose,
+    pageSize,
+    eventType,
+    personId,
+    apiKeyId,
+    modelId,
+    denialCode,
+    backendClass,
+  ])
 
   useEffect(() => {
     void fetchSummaryAndChart()
@@ -804,6 +868,24 @@ export function ActivityTab() {
           </label>
         )}
 
+        {/* Only requests have a place they ran; an admin event happens in the
+            api and nowhere else. */}
+        {logView !== 'admin' && (
+          <label className={styles.filter}>
+            <span className={styles.filterLabel}>Where it ran</span>
+            <select
+              className={styles.filterSelect}
+              value={backendClass}
+              onChange={(e) => setBackendClass(e.target.value)}
+            >
+              <option value="">Anywhere</option>
+              {BACKEND_CLASS_FILTERS.map((c) => (
+                <option key={c.value} value={c.value}>{c.label}</option>
+              ))}
+            </select>
+          </label>
+        )}
+
         {logView !== 'admin' && (
           <label className={styles.filter}>
             <span className={styles.filterLabel}>Denial reason</span>
@@ -838,7 +920,14 @@ export function ActivityTab() {
           <button
             type="button"
             className={styles.clearFilters}
-            onClick={() => { setEventType(''); setPersonId(''); setApiKeyId(''); setModelId(''); setDenialCode('') }}
+            onClick={() => {
+              setEventType('')
+              setPersonId('')
+              setApiKeyId('')
+              setModelId('')
+              setDenialCode('')
+              setBackendClass('')
+            }}
           >
             Clear filters
           </button>
@@ -904,7 +993,24 @@ export function ActivityTab() {
                       )}
                     </td>
                     <td>
-                      <Badge variant={e.action_variant}>{e.action_label}</Badge>
+                      <div className={styles.actionCell}>
+                        <Badge variant={e.action_variant}>{e.action_label}</Badge>
+                        {/* Beside the outcome, not buried in the detail
+                            string: scanning this column for what left the
+                            account is the reason this log gets opened. The
+                            vendor is on the badge, because "it left" and "who
+                            has it" are one question, never two. */}
+                        {e.egress && (
+                          <Badge
+                            variant="warning"
+                            bordered
+                            title={`This request ran at ${e.egress}'s own API, using your organisation's key. It left your cloud account.`}
+                          >
+                            <EgressGlyph />
+                            Left cloud account · {e.egress}
+                          </Badge>
+                        )}
+                      </div>
                     </td>
                     <td>
                       <span className={styles.detailText} title={e.detail_text}>

@@ -308,6 +308,67 @@ func TestTranslateRequest_TemperatureNonNilForwarded(t *testing.T) {
 	}
 }
 
+func TestTranslateRequest_TopPNilOmitted(t *testing.T) {
+	req := provider.ChatRequest{
+		TopP:     nil,
+		Messages: []provider.Message{{Role: "user", Content: "hi"}},
+	}
+
+	_, _, cfg, err := translateRequest(req)
+	if err != nil {
+		t.Fatalf("translateRequest returned error: %v", err)
+	}
+	if cfg.TopP != nil {
+		t.Errorf("expected nil top_p, got %v", *cfg.TopP)
+	}
+}
+
+func TestTranslateRequest_TopPNonNilForwarded(t *testing.T) {
+	topP := 0.9
+	req := provider.ChatRequest{
+		TopP:     &topP,
+		Messages: []provider.Message{{Role: "user", Content: "hi"}},
+	}
+
+	_, _, cfg, err := translateRequest(req)
+	if err != nil {
+		t.Fatalf("translateRequest returned error: %v", err)
+	}
+	if cfg.TopP == nil || *cfg.TopP != 0.9 {
+		t.Errorf("expected top_p=0.9, got %v", cfg.TopP)
+	}
+}
+
+func TestTranslateRequest_StopEmptyOmitted(t *testing.T) {
+	req := provider.ChatRequest{
+		Stop:     nil,
+		Messages: []provider.Message{{Role: "user", Content: "hi"}},
+	}
+
+	_, _, cfg, err := translateRequest(req)
+	if err != nil {
+		t.Fatalf("translateRequest returned error: %v", err)
+	}
+	if cfg.StopSequences != nil {
+		t.Errorf("expected nil stop sequences, got %v", cfg.StopSequences)
+	}
+}
+
+func TestTranslateRequest_StopNonEmptyForwarded(t *testing.T) {
+	req := provider.ChatRequest{
+		Stop:     []string{"STOP", "END"},
+		Messages: []provider.Message{{Role: "user", Content: "hi"}},
+	}
+
+	_, _, cfg, err := translateRequest(req)
+	if err != nil {
+		t.Fatalf("translateRequest returned error: %v", err)
+	}
+	if len(cfg.StopSequences) != 2 || cfg.StopSequences[0] != "STOP" || cfg.StopSequences[1] != "END" {
+		t.Errorf("expected stop sequences [STOP END], got %v", cfg.StopSequences)
+	}
+}
+
 // ---------------------------------------------------------------------------
 // translateResponse tests
 // ---------------------------------------------------------------------------

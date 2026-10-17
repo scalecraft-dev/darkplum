@@ -155,6 +155,9 @@ See `terraform/aws/variables.tf` for the full list.
 | `make list-models` | List self-hosted model deployments and gateway upstreams |
 | `make verify-bedrock-iam` | Prove the gateway's IAM role allows only the configured Bedrock models |
 | `make set-hf-token` | Store a Hugging Face token for gated models (from `$HF_TOKEN`) |
+| `make set-anthropic-key MODELS='claude-*'` | Install or rotate the organisation's Anthropic API key (from `$ANTHROPIC_API_KEY`) and set its catalog filter |
+| `make set-openai-key MODELS='gpt-*'` | Same for OpenAI (from `$OPENAI_API_KEY`) |
+| `make remove-anthropic-key` / `make remove-openai-key` | Remove a vendor key and its filter; its models stop answering |
 | `make deploy-semantic-router` | Install the open-source intent classifier for routed aliases |
 | `pnpm run check:parity` (in `services/web`) | Verify every API route has a UI and vice versa against `docs/api-routes.json` |
 | `make remove-semantic-router` | Remove it (routed aliases fall back to their default route) |
@@ -191,7 +194,11 @@ on an AWS Network Load Balancer:
 
 - `make expose-web` — internal NLB, plain HTTP. Reachable from inside the VPC /
   your VPN only. Session cookies lose the Secure flag; use this to evaluate, not
-  to run.
+  to run. A vendor key cannot be installed from Admin > Models over plain HTTP;
+  until there is a certificate, reach the UI through a port-forward instead
+  (`kubectl port-forward -n darkplum-system svc/darkplum-web 8081:80`, then
+  `http://localhost:8081` — the tunnel to the cluster is TLS), or use
+  `make set-anthropic-key`.
 - `make expose-web CERT_ARN=arn:aws:acm:...` — HTTPS terminated at the NLB with
   your ACM certificate. Add `SCHEME=internet-facing` to publish publicly. Point a
   DNS CNAME at the printed hostname; the certificate must match that name.
@@ -237,14 +244,22 @@ Every model sits behind one OpenAI-compatible endpoint. The gateway resolves eac
 request to a backend and refuses anything it cannot place — an unknown, disabled
 or policy-blocked model gets an error, never a silent redirect.
 
-**Two kinds of backend**
+**Three kinds of backend**, in order of how far a prompt travels:
 
 - **Self-hosted** — open-source models served by vLLM on your own GPU nodes.
   Prompts and completions never leave the cluster.
 - **Cloud-managed** — Bedrock models (Claude, plus open-weight Llama and Mistral)
-  called under your own AWS account through the gateway's IAM role.
+  called under your own AWS account through the gateway's IAM role. Prompts leave
+  the cluster and stay inside your cloud account.
+- **External API** — Anthropic and OpenAI models called directly at the vendor's
+  own API with your organisation's key. Prompts leave your cluster **and** your
+  cloud account, under your contract with that vendor. Off until you install a
+  key, and refused by the default routing policy until an administrator allows
+  it (see *Anthropic and OpenAI* below).
 
-If the same model ID is served by both, the self-hosted backend always wins.
+If the same model ID is served by more than one, the backend that keeps the
+prompt closest wins: self-hosted over cloud-managed over external API. A request
+never silently travels further than it has to.
 
 **Changing the default self-hosted model.** Any vLLM-supported, ungated Hugging
 Face model that fits in 24GB VRAM (A10G) works. Set in `terraform/aws/terraform.tfvars`:
@@ -290,6 +305,119 @@ underlying models in that geography's regions only — no all-region wildcard an
 `global.` profiles. `make verify-bedrock-iam` simulates the deployed role and fails
 if anything outside the allowlist would be permitted.
 
+**Anthropic and OpenAI (your own vendor keys).** Install a key from the product
+or from a terminal; both end up in the same place and either can be used at any
+time.
+
+*In the product:* **Admin > Models > Model vendors > Install key.** Paste the key,
+choose **Check key** — Darkplum asks the vendor, through the gateway, which
+models the key can reach and lists them — tick the models to offer, and choose
+**Install key**. The card shows *Installing* until your cluster has picked the
+key up (usually about two minutes; you can leave the page), then offers **Review
+and enable**. *Replace key*, *Change models* and *Remove key* are on the same
+card. Nothing is restarted. Installing from the product needs Darkplum to be
+served over HTTPS, or reached on `localhost` — see below; without either, the card
+shows the terminal path instead.
+
+*From a terminal:* the key is read from the environment, never passed on the
+command line, and checked against the vendor before anything is changed:
+
+```bash
+read -s ANTHROPIC_API_KEY && export ANTHROPIC_API_KEY
+make set-anthropic-key MODELS='claude-*'          # MODELS = catalog filter (globs)
+
+read -s OPENAI_API_KEY && export OPENAI_API_KEY
+make set-openai-key MODELS='gpt-*'
+```
+
+The list you tick in the product and `MODELS` on the command line are the same
+setting — the catalog filter. Whichever was set last is the one in force; after a
+command-line change the card says so and offers to adopt it. `MODELS` is required
+the first time. There is no IAM allowlist beneath the
+gateway for a vendor key, so this filter *is* the catalog bound: only matching
+models can ever be listed, enabled or allowlisted, and an empty filter means no
+vendor models at all. Name a family: a bare `*` is refused (`ALLOW_ALL=1`
+overrides), because a glob also admits models the vendor releases later — they
+arrive disabled, like any new model. After the filter, the gateway also drops
+ids that are plainly not chat models (embeddings, audio, image, moderation);
+that is catalog hygiene, not a bound. The target prints how many models the key can reach and
+which of them the filter admits.
+
+Then choose **Review and enable** on the vendor's card.
+Two things stand between an installed key and an answer, deliberately: the
+organisation's residency must be loosened to *Any model, including outside your
+account* (a confirmed, audited change — every install, new or existing, sits at
+*Your cloud account only*), and each model must be enabled. The same dialog does
+both. After that a vendor model is an ordinary model: pick it in chat, put it in
+an allowlist, make it a user's default, or make it one route of a routed alias
+next to a self-hosted route — one endpoint, one policy, and the caller never
+chooses the backend. Per-user and per-key residency can still hold individual
+people and keys to your cloud account or to self-hosted only.
+
+The key lives in one place — the `darkplum-provider-keys` Secret in
+`darkplum-system`, file-mounted into the gateway only. It is never written to the
+database and never returned by any endpoint. Installing it from Admin > Models
+sends it from your browser through the web tier and the api, in memory, on its way
+into that Secret — so that path must be HTTPS: the api refuses a key over plain
+HTTP (local `localhost` development excepted), and inside the cluster the hops
+between web, api and gateway are plain HTTP, as they are for everything else
+Darkplum carries. The make target avoids all of that: the key goes from your
+terminal to the Kubernetes API over TLS and nowhere else. The api's only
+Kubernetes permission is `patch` on that one Secret and on the filter's
+ConfigMap — it cannot reach any other Secret — but be clear about what that does
+not mean: a Kubernetes `patch` returns the object, so a compromised api could
+read the vendor keys, on top of what compromising it already yields. The install form is why the web app now ships a strict
+Content-Security-Policy: a script injected into the admin UI could already act as
+the signed-in admin, and a pasted key would add disclosure to that. *Replace key*,
+or the same make target, rotates it: the gateway re-reads the mounted file, so rotation is not a rollout
+(allow about two minutes for the kubelet to refresh the mount). Behind an egress
+proxy, set `HTTPS_PROXY` on the gateway; vendor calls honour it. A missing or
+rejected key, an empty filter or a vendor outage disables that vendor only —
+self-hosted and Bedrock models keep answering — and **Admin > Models** shows
+which of those it is under *Model vendors*.
+
+Rotation, diagnosing a vendor that is not answering (`/health` on the gateway
+carries each vendor's state), turning a vendor off, and the one ordering rule
+that matters — drain the vendor catalog **before** rolling the api back past this
+release — are in [`docs/RUNBOOK-vendor-apis.md`](docs/RUNBOOK-vendor-apis.md).
+
+Limits to know, because this backend is different in kind from the other two:
+
+- **There is no cloud IAM boundary beneath the gateway.** For Bedrock, the
+  gateway's role refuses models outside the allowlist even if the gateway is
+  wrong. For a vendor key the only control below the gateway is the scope *you*
+  set on the key at the vendor — an Anthropic workspace key with a spend limit,
+  an OpenAI project key with a model allowlist and a budget. Darkplum cannot see
+  or verify that scope. Set it.
+- **The key is organisation-wide.** Every permitted user and API key spends
+  against the same vendor key; there is no per-principal vendor credential.
+  Anyone who can read Secrets in `darkplum-system` can read it — which is whoever
+  administers the cluster. Any Darkplum administrator can replace or remove it
+  from Admin > Models; each install, replacement, removal and model-list change is
+  in Admin > Activity with who did it and the last four characters of the key
+  they submitted.
+- **No spend cap in the product.** Usage is recorded per request (tokens,
+  provider and backend class, filterable and exportable in Admin > Activity as
+  "Outside your cloud account"), but nothing stops a request for cost. The first
+  hard stop is the limit you set at the vendor.
+- **No failover across backends, by design.** If a vendor is down or
+  rate-limiting, that request fails with the vendor's status (`429` with
+  `Retry-After` is passed through); it is not retried on a local model, and a
+  local outage is never retried on a vendor. Sending a prompt somewhere else
+  because a GPU node was unhealthy would be a data-egress decision taken when
+  nobody is watching.
+- **Bring-your-own key per request is declined by design.** Callers present
+  Darkplum API keys only; a caller-supplied vendor key would let the caller,
+  not the policy, decide where a prompt goes.
+- **Text only.** `tools`, `tool_choice`, `functions`, `response_format:
+  json_schema` and image content are refused with `400 unsupported_parameter`
+  naming the field, on every backend — previously they were silently dropped.
+  `top_p` and `stop` are forwarded.
+
+What is *not* configurable from the product: deploying self-hosted models
+(`make deploy-model`) and the Bedrock model patterns (Terraform) are still set at
+deploy time.
+
 **Who may use which models** — policy per organisation, per user and per API
 key (Admin > Models for the organisation; Admin > Users & Keys, "Routing
 policy" on each row). Each level carries the same three settings:
@@ -298,7 +426,8 @@ policy" on each row). Each level carries the same three settings:
   allows). Lists hold concrete models; an "add every target of alias …" helper
   expands an alias when you click it, so adding a route later never widens
   anyone's access.
-- *Residency* — inherit, or tighten to self-hosted only. It can never loosen.
+- *Residency* — inherit, or tighten to *your cloud account only* or *self-hosted
+  only*. Below the organisation it can never loosen.
 - *Default model* — preselected in the chat picker; used by an API key whose
   request names no model.
 
@@ -330,9 +459,13 @@ reserves room for them.
 
 **Routing policy and aliases** (Admin > Models):
 
-- *Residency* — `any`, or `self-hosted only`, which refuses every request that
-  would go to a cloud-managed model. Set for the organisation here; tightened
-  per user or per key from Users & Keys.
+- *Residency* — a three-step ladder. *Any model, including outside your account*
+  permits all three kinds of backend; *Your cloud account only* (the default)
+  refuses external-API models; *Self-hosted only* refuses cloud-managed and
+  external-API models alike. A model whose backend class the gateway does not
+  recognise is refused at every step. Set for the organisation here — loosening
+  it asks for confirmation and is recorded in the audit log — and tightened per
+  user or per key from Users & Keys.
 - *Aliases* — stable names such as `default-chat` that point at a model, so
   swapping models is an admin change rather than a code change. The usage log
   records both the alias requested and the model that served it.

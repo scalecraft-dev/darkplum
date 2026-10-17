@@ -1,22 +1,115 @@
 package handler
 
-import "time"
+import (
+	"strings"
+	"time"
+)
 
 // Backend class and residency values. These mirror the CHECK constraints in
-// migrations/010_model_routing.sql (models.backend_class, routing_policy.residency)
-// and are shared between models.go and routing.go.
+// migrations/010_model_routing.sql and migrations/016_external_api_residency.sql
+// (models.backend_class, routing_policy.residency, principal_routing_policies.
+// residency) and are shared between models.go, routing.go and policy.go.
 const (
 	backendClassSelfHosted   = "self_hosted"
 	backendClassCloudManaged = "cloud_managed"
+	backendClassExternalAPI  = "external_api"
 
-	residencyAny            = "any"
-	residencySelfHostedOnly = "self_hosted_only"
+	residencyAny              = "any"
+	residencyCloudAccountOnly = "cloud_account_only"
+	residencySelfHostedOnly   = "self_hosted_only"
+
+	// darkplumClassesHeader is the capability handshake header (PLAN v3.1's
+	// "Wire contract"): a comma-separated list of backend_class tokens the
+	// CALLER understands and wants included in a model list. Only
+	// backendClassExternalAPI is a defined token today. It is honoured by the
+	// api's own model-list endpoints (session GET /v1/models, the bearer
+	// path, and the admin models list) exactly the way the gateway honours it
+	// on its own GET /v1/models: a caller that never sends it (an old cached
+	// web bundle, an SDK that predates vendor providers) never learns a
+	// vendor model exists, so it can never mislabel one "runs in your
+	// infrastructure" or route a stale picker at it. It NEVER affects
+	// enforcement on /v1/chat/completions -- see models.go:194's invariant.
+	darkplumClassesHeader = "X-Darkplum-Classes"
 
 	// aliasKindStatic and aliasKindRouted mirror model_aliases.kind's CHECK
 	// constraint (migration 013_routed_aliases.sql).
 	aliasKindStatic = "static"
 	aliasKindRouted = "routed"
 )
+
+// residencyRank places a residency value on the tighten-only ladder defined
+// by PLAN v3.1's wire contract: any(0) < cloud_account_only(1) <
+// self_hosted_only(2). An unrecognized value is treated as the strictest
+// rung (self_hosted_only) per that contract's "unknown residency -> treat as
+// self_hosted_only" rule -- a residency column read back from the database
+// should never actually hold anything else (it's CHECK-constrained), but a
+// caller-supplied hypothetical (POST .../preview, POST /v1/policy/impact)
+// must not silently under-restrict just because it's an unfamiliar string.
+func residencyRank(v string) int {
+	switch v {
+	case residencyAny:
+		return 0
+	case residencyCloudAccountOnly:
+		return 1
+	case residencySelfHostedOnly:
+		return 2
+	default:
+		return 2
+	}
+}
+
+// residencyPermitsClass is the api's mirror of the gateway's
+// ResidencyPermits(residency, class) predicate (PLAN v3.1's wire contract):
+// any permits every KNOWN class; cloud_account_only permits self_hosted and
+// cloud_managed (refuses external_api); self_hosted_only permits only
+// self_hosted. An unrecognized class is refused under every residency,
+// including "any" -- this is the one asymmetry with residencyRank's
+// "unknown -> strictest" rule, because guilfoyle's ruling in PLAN v3 is
+// stricter still for classes: an unrecognized class is denied outright, not
+// merely gated behind the loosest residency.
+//
+// This is a UX-filtering predicate only (which entries buildModelsList
+// includes), never the enforcement point -- see buildModelsList's own doc
+// comment.
+func residencyPermitsClass(residency, class string) bool {
+	switch class {
+	case backendClassSelfHosted:
+		return true
+	case backendClassCloudManaged:
+		return residencyRank(residency) <= residencyRank(residencyCloudAccountOnly)
+	case backendClassExternalAPI:
+		return residencyRank(residency) <= residencyRank(residencyAny)
+	default:
+		return false
+	}
+}
+
+// requestPermitsExternalAPI parses an inbound X-Darkplum-Classes header value
+// (comma-separated; only "external_api" is defined) and reports whether it
+// names backendClassExternalAPI. Pure so the parsing (whitespace, empty
+// entries, absent header) is unit-testable without a database or gin
+// context; models.go's callers pass c.GetHeader(darkplumClassesHeader).
+func requestPermitsExternalAPI(headerValue string) bool {
+	for _, tok := range strings.Split(headerValue, ",") {
+		if strings.TrimSpace(tok) == backendClassExternalAPI {
+			return true
+		}
+	}
+	return false
+}
+
+// modelVisibleInList combines the two independent gates on whether a model
+// of the given backend_class belongs in a chat-facing or admin model list:
+// residency (an admin policy choice, in force for every caller regardless of
+// what their client understands) and the capability header (a rollout-safety
+// gate that hides a class the CALLER never asked for, independent of
+// policy -- see darkplumClassesHeader's doc comment). Both must pass.
+func modelVisibleInList(residency string, permitExternalAPI bool, class string) bool {
+	if class == backendClassExternalAPI && !permitExternalAPI {
+		return false
+	}
+	return residencyPermitsClass(residency, class)
+}
 
 // modelAvailabilityWindow is the default value for how recently a model must
 // have been (re-)discovered to be considered available, used whenever a
@@ -62,17 +155,31 @@ func modelIsAvailableWithin(discoveredAt, now time.Time, window time.Duration) b
 const modelRoutingAdvisoryLockKey int64 = 0x64706d6c // "dpml", arbitrary
 
 // normalizeBackendClass maps a gateway-reported backend_class value onto one
-// of the two values the models.backend_class CHECK constraint accepts,
-// defaulting to self_hosted when the field is absent or holds anything the
-// gateway doesn't currently emit. This matches the contract: an unrecognized
-// class must not be treated as cloud_managed (that would be a "unexpected new
-// value gets extra restrictions" surprise) — the gateway is the sole
-// enforcement point and is expected to report a real value once it knows one.
+// of the three values the models.backend_class CHECK constraint accepts,
+// defaulting to the STRICTEST known class -- external_api -- when the field
+// is absent or holds anything the gateway doesn't currently emit.
+//
+// This is the opposite default from before external_api existed, and
+// deliberately so: with only two classes, defaulting unknown to self_hosted
+// was a reasonable "don't surprise the admin with extra restrictions" choice
+// (the gateway was the sole enforcement point either way, and this endpoint
+// is a UX filter -- see buildModelsList's doc comment). With three classes,
+// that reasoning is backwards: defaulting an unrecognized value to
+// self_hosted would let a model of some future, not-yet-taught class
+// masquerade as fully in-cluster -- staying visible under self_hosted_only,
+// and (once the web surfaces backend_class as a trust signal) potentially
+// labelled "runs in your infrastructure" when it might be calling out to a
+// vendor. Defaulting to external_api instead keeps an unrecognized class out
+// of every residency-restricted view (residencyPermitsClass refuses it under
+// cloud_account_only and self_hosted_only) until this function is taught the
+// new value -- fail closed, not fail permissive.
 func normalizeBackendClass(s string) string {
-	if s == backendClassCloudManaged {
-		return backendClassCloudManaged
+	switch s {
+	case backendClassSelfHosted, backendClassCloudManaged, backendClassExternalAPI:
+		return s
+	default:
+		return backendClassExternalAPI
 	}
-	return backendClassSelfHosted
 }
 
 // modelDBRow is the subset of the models table needed to build the chat-facing
@@ -143,7 +250,12 @@ type routedAliasDBRow struct {
 // picker's list agrees with what the gateway would actually accept. Applied
 // against the model/alias TARGET id, never the alias name itself, matching
 // the contract that allowlists are concrete model ids only.
-func buildModelsList(models []modelDBRow, aliases []aliasDBRow, routedAliases []routedAliasDBRow, residency string, now time.Time, availabilityWindow time.Duration, allowed *[]string) []openAIModelEntry {
+//
+// permitExternalAPI is the caller's own X-Darkplum-Classes capability (see
+// darkplumClassesHeader): false hides every external_api entry regardless of
+// residency, so a caller that has never heard of vendor models can't be
+// shown one.
+func buildModelsList(models []modelDBRow, aliases []aliasDBRow, routedAliases []routedAliasDBRow, residency string, permitExternalAPI bool, now time.Time, availabilityWindow time.Duration, allowed *[]string) []openAIModelEntry {
 	var allowedSet map[string]bool
 	if allowed != nil {
 		allowedSet = make(map[string]bool, len(*allowed))
@@ -156,7 +268,7 @@ func buildModelsList(models []modelDBRow, aliases []aliasDBRow, routedAliases []
 	entries := make([]openAIModelEntry, 0, len(models)+len(aliases)+len(routedAliases))
 
 	for _, m := range models {
-		if residency == residencySelfHostedOnly && m.BackendClass == backendClassCloudManaged {
+		if !modelVisibleInList(residency, permitExternalAPI, m.BackendClass) {
 			continue
 		}
 		if allowedSet != nil && !allowedSet[m.ModelID] {
@@ -175,7 +287,7 @@ func buildModelsList(models []modelDBRow, aliases []aliasDBRow, routedAliases []
 	}
 
 	for _, a := range aliases {
-		if residency == residencySelfHostedOnly && a.BackendClass == backendClassCloudManaged {
+		if !modelVisibleInList(residency, permitExternalAPI, a.BackendClass) {
 			continue
 		}
 		if allowedSet != nil && !allowedSet[a.TargetModelID] {
@@ -210,7 +322,7 @@ func buildModelsList(models []modelDBRow, aliases []aliasDBRow, routedAliases []
 			if !rt.TargetExists || !rt.TargetEnabled {
 				continue
 			}
-			if residency == residencySelfHostedOnly && rt.TargetBackendClass == backendClassCloudManaged {
+			if !modelVisibleInList(residency, permitExternalAPI, rt.TargetBackendClass) {
 				continue
 			}
 			if allowedSet != nil && !allowedSet[rt.TargetModelID] {
@@ -254,8 +366,9 @@ type normalizedModel struct {
 }
 
 // normalizeGatewayModels applies field defaulting (empty owned_by -> "vllm",
-// unrecognized/absent backend_class -> self_hosted) and de-duplicates by
-// model id, keeping the last occurrence. It is pure so the defaulting and
+// unrecognized/absent backend_class -> external_api, the strictest known
+// class -- see normalizeBackendClass) and de-duplicates by model id, keeping
+// the last occurrence. It is pure so the defaulting and
 // de-dup behaviour is unit-testable without a database or an HTTP stub.
 //
 // The gateway should never report the same model id twice in one response,

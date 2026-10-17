@@ -5,10 +5,13 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/scalecraft/darkplum/gateway/internal/routing"
 )
 
 func strP(s string) *string { return &s }
 func selfHostedP() *string  { v := ResidencySelfHostedOnly; return &v }
+func cloudAcctP() *string   { v := ResidencyCloudAccountOnly; return &v }
 
 // modelsP builds a *[]string test input. Deliberately make()+copy, not
 // append([]string(nil), ids...): with zero ids that append form returns nil,
@@ -148,6 +151,112 @@ func TestEffective_ResidencyMostSpecificLevelIsSourceWhenMultipleSet(t *testing.
 	}
 	if eff.Sources.Residency != PrincipalTypeAPIKey {
 		t.Errorf("Sources.Residency = %q, want %q (most specific)", eff.Sources.Residency, PrincipalTypeAPIKey)
+	}
+}
+
+// TestEffective_ResidencyCloudAccountOnlyIsMiddleRank asserts the new
+// three-value ladder: a stricter self_hosted_only at a less specific level
+// still wins over a looser cloud_account_only at a more specific level, and
+// the reverse (cloud_account_only tightening an "any" org) also holds.
+func TestEffective_ResidencyCloudAccountOnlyIsMiddleRank(t *testing.T) {
+	eff := Effective([]PolicyRow{
+		{Level: PrincipalTypeOrg},
+		{Level: PrincipalTypeUser, Residency: cloudAcctP()},
+	})
+	if eff.Residency != ResidencyCloudAccountOnly {
+		t.Errorf("Residency = %q, want %q", eff.Residency, ResidencyCloudAccountOnly)
+	}
+	if eff.Sources.Residency != PrincipalTypeUser {
+		t.Errorf("Sources.Residency = %q, want %q", eff.Sources.Residency, PrincipalTypeUser)
+	}
+}
+
+// TestEffective_ResidencySelfHostedOnlyBeatsCloudAccountOnlyRegardlessOfLevel
+// asserts strictest-wins holds across all three values, not just the old
+// binary any/self_hosted_only case: a more specific level's LOOSER explicit
+// value must never override a less specific level's stricter one.
+func TestEffective_ResidencySelfHostedOnlyBeatsCloudAccountOnlyRegardlessOfLevel(t *testing.T) {
+	eff := Effective([]PolicyRow{
+		{Level: PrincipalTypeOrg, Residency: selfHostedP()},
+		{Level: PrincipalTypeUser, Residency: cloudAcctP()},
+	})
+	if eff.Residency != ResidencySelfHostedOnly {
+		t.Errorf("Residency = %q, want %q (org's stricter value must not be loosened by the user row)", eff.Residency, ResidencySelfHostedOnly)
+	}
+	if eff.Sources.Residency != PrincipalTypeOrg {
+		t.Errorf("Sources.Residency = %q, want %q (the level that actually set the winning, stricter value)", eff.Sources.Residency, PrincipalTypeOrg)
+	}
+}
+
+// TestEffective_UnknownResidencyValueTreatedAsStrictest guards the wire
+// contract's "unknown residency value -> strictest" rule for a row loaded
+// from a database this gateway build doesn't fully recognise (e.g. a future
+// residency value added after this binary shipped).
+func TestEffective_UnknownResidencyValueTreatedAsStrictest(t *testing.T) {
+	weird := "some-future-value"
+	eff := Effective([]PolicyRow{
+		{Level: PrincipalTypeOrg, Residency: &weird},
+	})
+	if eff.Residency != ResidencySelfHostedOnly {
+		t.Errorf("Residency = %q, want %q (unknown value normalised to strictest)", eff.Residency, ResidencySelfHostedOnly)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ResidencyPermits
+// ---------------------------------------------------------------------------
+
+func TestResidencyPermits_AnyPermitsEveryKnownClass(t *testing.T) {
+	for _, class := range []string{routing.ClassSelfHosted, routing.ClassCloudManaged, routing.ClassExternalAPI} {
+		if !ResidencyPermits(ResidencyAny, class) {
+			t.Errorf("ResidencyPermits(any, %q) = false, want true", class)
+		}
+	}
+}
+
+func TestResidencyPermits_CloudAccountOnlyExcludesExternalAPI(t *testing.T) {
+	cases := map[string]bool{
+		routing.ClassSelfHosted:   true,
+		routing.ClassCloudManaged: true,
+		routing.ClassExternalAPI:  false,
+	}
+	for class, want := range cases {
+		if got := ResidencyPermits(ResidencyCloudAccountOnly, class); got != want {
+			t.Errorf("ResidencyPermits(cloud_account_only, %q) = %v, want %v", class, got, want)
+		}
+	}
+}
+
+func TestResidencyPermits_SelfHostedOnlyPermitsOnlySelfHosted(t *testing.T) {
+	cases := map[string]bool{
+		routing.ClassSelfHosted:   true,
+		routing.ClassCloudManaged: false,
+		routing.ClassExternalAPI:  false,
+	}
+	for class, want := range cases {
+		if got := ResidencyPermits(ResidencySelfHostedOnly, class); got != want {
+			t.Errorf("ResidencyPermits(self_hosted_only, %q) = %v, want %v", class, got, want)
+		}
+	}
+}
+
+// TestResidencyPermits_UnknownClassAlwaysDenied is the [RULING] guard: an
+// unrecognised class must be refused under EVERY residency, including "any" —
+// not merely under the tighter ones.
+func TestResidencyPermits_UnknownClassAlwaysDenied(t *testing.T) {
+	for _, residency := range []string{ResidencyAny, ResidencyCloudAccountOnly, ResidencySelfHostedOnly} {
+		if ResidencyPermits(residency, "some_future_class") {
+			t.Errorf("ResidencyPermits(%q, unknown class) = true, want false", residency)
+		}
+	}
+}
+
+func TestResidencyPermits_UnknownResidencyTreatedAsStrictest(t *testing.T) {
+	if ResidencyPermits("not-a-real-residency", routing.ClassCloudManaged) {
+		t.Error("expected an unknown residency value to deny cloud_managed, same as self_hosted_only")
+	}
+	if !ResidencyPermits("not-a-real-residency", routing.ClassSelfHosted) {
+		t.Error("expected an unknown residency value to still permit self_hosted (permitted under every residency)")
 	}
 }
 

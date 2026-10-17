@@ -1,10 +1,25 @@
 import { useEffect, useMemo, useState } from 'react'
-import type { AdminModel, ModelAlias, Residency, RoutingPolicy } from '../types'
-import { backendClassOf } from '../lib/modelRouting'
-import { POLICY_RULE, POLICY_TIMING, aliasTargetIds, modelLabel, orgPolicyRestricted } from '../lib/policy'
-import { Button, Modal } from '../components/ui'
+import type { AdminModel, DisplayClass, ModelAlias, Residency, RoutingPolicy } from '../types'
+import {
+  backendClassLabel,
+  displayClassOf,
+  vendorLabel,
+} from '../lib/modelRouting'
+import {
+  POLICY_RULE,
+  POLICY_TIMING,
+  RESIDENCY_LADDER,
+  aliasTargetIds,
+  modelLabel,
+  orgPolicyRestricted,
+  residencyLabel,
+  residencyPermits,
+  residencyRank,
+} from '../lib/policy'
+import { Button, EgressGlyph, Modal } from '../components/ui'
 import { Skeleton } from '../components/ui/Skeleton'
 import { ModelAllowlistPicker } from './ModelAllowlistPicker'
+import { ResidencyLadder } from './ResidencyLadder'
 import styles from './RoutingPolicyCard.module.css'
 
 /** The three fields of the organisation's policy, as the card edits them. */
@@ -38,27 +53,44 @@ interface Props {
      *  under a self-hosted-only policy. Neither counted lost nor kept. */
     unresolvedModels: string[]
     lockedOut: string[]
+    /** The API refused the save for a reason that is not a lockout — a routed
+     *  alias with a route the new rung would refuse, say. Its own sentence,
+     *  shown as it came: the UI does not read it, it relays it. */
+    refusal: string | null
   }>
 }
 
-const RESIDENCY_OPTIONS: { value: Residency; label: string; consequence: string }[] = [
-  {
-    value: 'any',
-    label: 'Any model',
-    consequence:
-      'Requests can run on self-hosted models and on cloud-managed models such as AWS Bedrock.',
-  },
-  {
-    value: 'self_hosted_only',
-    label: 'Self-hosted only',
-    consequence:
-      'Requests to cloud-managed models such as Bedrock will be refused, even when the model is enabled.',
-  },
-]
+/**
+ * What a confirmation is for. Narrowing and widening are not the same question
+ * asked in two directions: one takes access away from people who have it, the
+ * other sends prompts somewhere they have never been. They get different
+ * titles, different bodies and differently weighted buttons, and `warnings` is
+ * the third case — the save already happened and the API had something to say
+ * about it.
+ */
+type ConfirmKind = 'none' | 'tighten' | 'loosen' | 'warnings'
+
+/** The organisation may stand on any rung. Nothing above it can forbid one. */
+const ORG_RUNGS = RESIDENCY_LADDER.map((r) => ({ value: r.value, deadReason: null }))
+
+/** Which classes a refusal covers, named. A count on its own leaves an
+ *  administrator opening the catalogue to find out what it was counting. */
+function refusedClassSummary(refused: AdminModel[]): string {
+  const classes = [...new Set(refused.map((m) => displayClassOf(m)))] as DisplayClass[]
+  const named = classes
+    .filter((c) => c !== 'unknown')
+    .map((c) => backendClassLabel(c).toLowerCase())
+  if (named.length === 0) return ''
+  return named.length === 1
+    ? `They are ${named[0]} models.`
+    : `They are ${named.slice(0, -1).join(', ')} and ${named[named.length - 1]} models.`
+}
 
 function toDraft(policy: RoutingPolicy | null): OrgPolicyDraft {
   return {
-    residency: policy?.residency ?? 'any',
+    // No policy read yet means no opinion, not "allow everything": the widest
+    // rung is never the one a blank form defaults to.
+    residency: policy?.residency ?? 'cloud_account_only',
     allowed_models: policy?.allowed_models ?? null,
     default_model: policy?.default_model ?? null,
   }
@@ -87,7 +119,7 @@ export function RoutingPolicyCard({
 }: Props) {
   const saved = useMemo(() => toDraft(policy), [policy])
   const [draft, setDraft] = useState<OrgPolicyDraft>(saved)
-  const [confirmOpen, setConfirmOpen] = useState(false)
+  const [confirmKind, setConfirmKind] = useState<ConfirmKind>('none')
   /** What the API said the new policy breaks. Written by the API, shown as it
    *  came: these name routed aliases that will start refusing. */
   const [warnings, setWarnings] = useState<string[]>([])
@@ -104,14 +136,49 @@ export function RoutingPolicyCard({
   /** Who the API said the last attempt would have locked out of every model.
    *  Non-empty means the save was refused and nothing changed. */
   const [lockedOut, setLockedOut] = useState<string[]>([])
+  /** A refusal the card has no structure for — the API's sentence, relayed. */
+  const [refusal, setRefusal] = useState<string | null>(null)
 
   // A reload or a save replaces what is stored; the form follows it rather than
   // keeping an edit the server has never heard of.
   useEffect(() => { setDraft(saved) }, [saved])
 
   const enabled = useMemo(() => models.filter((m) => m.enabled), [models])
-  const cloudEnabled = useMemo(
-    () => enabled.filter((m) => backendClassOf(m) === 'cloud_managed'),
+
+  /** Enabled models the draft rung refuses: what choosing it costs, counted
+   *  from the catalogue rather than described in the abstract. */
+  const refusedByDraft = useMemo(
+    () => enabled.filter((m) => !residencyPermits(draft.residency, displayClassOf(m))),
+    [enabled, draft.residency],
+  )
+
+  /** Enabled models the stored rung refuses and the draft one would not: what
+   *  loosening actually opens up. Empty is the ordinary case when a vendor key
+   *  has not been installed yet, and the confirmation says so rather than
+   *  claiming an effect it cannot point at. */
+  const openedByDraft = useMemo(
+    () =>
+      enabled.filter(
+        (m) =>
+          !residencyPermits(saved.residency, displayClassOf(m)) &&
+          residencyPermits(draft.residency, displayClassOf(m)),
+      ),
+    [enabled, saved.residency, draft.residency],
+  )
+
+  /** The vendors that would start receiving prompts, named. "Outside your
+   *  account" is not something an administrator can take to their security
+   *  team; "Anthropic" is. */
+  const openedVendors = useMemo(
+    () => [...new Set(openedByDraft.map((m) => m.provider))].map(vendorLabel).sort(),
+    [openedByDraft],
+  )
+
+  /** Enabled models no backend has reported a class for. They are refused
+   *  under every rung, including the loosest, so moving the ladder does not
+   *  change them and the card says that on its own line. */
+  const unknownEnabled = useMemo(
+    () => enabled.filter((m) => displayClassOf(m) === 'unknown'),
     [enabled],
   )
 
@@ -141,31 +208,50 @@ export function RoutingPolicyCard({
   const changed = !sameDraft(draft, saved)
 
   /** Tightening is anything that can take access away from someone who has it
-   *  now: a stricter residency, or a list where there was none, or a shorter
-   *  one. Those get a confirmation; widening does not. */
+   *  now: a higher rung, or a list where there was none, or a shorter one. */
   const tightening =
-    (draft.residency === 'self_hosted_only' && saved.residency !== 'self_hosted_only') ||
+    residencyRank(draft.residency) > residencyRank(saved.residency) ||
     (draft.allowed_models !== null && saved.allowed_models === null) ||
     (draft.allowed_models !== null &&
       saved.allowed_models !== null &&
       draft.allowed_models.length < saved.allowed_models.length)
+
+  /**
+   * Loosening the rung is its own kind of change, and the only one in the
+   * product where saying yes sends prompts out of the organisation's cloud
+   * account. It is confirmed even though nobody loses anything — a
+   * confirmation is not a punishment for narrowing, it is for a decision that
+   * is hard to see and hard to undo. Widening an allowlist is neither, and is
+   * not confirmed.
+   */
+  const loosening = residencyRank(draft.residency) < residencyRank(saved.residency)
+
+  /** Only the step onto the loosest rung crosses the account boundary. Dropping
+   *  from self-hosted-only to cloud-account-only is a widening, but everything
+   *  it opens is still inside the organisation's own account, so it does not
+   *  get the danger treatment. */
+  const leavingAccount = loosening && residencyRank(draft.residency) === 0
 
   const canSave = changed && !saving && !emptyAllowlist && !defaultOutsideAllowlist
 
   const commit = async () => {
     const result = await onChange(draft)
     setLockedOut(result.lockedOut)
-    if (result.lockedOut.length > 0) {
+    setRefusal(result.refusal)
+    if (result.lockedOut.length > 0 || result.refusal !== null) {
       // Refused: the form stays ahead of what is stored, and the box below
-      // says who would have lost everything.
-      setConfirmOpen(false)
+      // says either who would have lost everything, or — when the API refused
+      // for some other reason — what it said.
+      setConfirmKind('none')
       return
     }
     setWarnings(result.warnings)
     setAffected(result.affectedPrincipals)
     setOrgNarrowed(result.orgNarrowed)
     setUnresolved(result.unresolvedModels)
-    if (result.warnings.length === 0) setConfirmOpen(false)
+    // The save landed. Anything the API had to say about it keeps the modal
+    // open and turns it into the report; nothing to say closes it.
+    setConfirmKind(result.warnings.length > 0 ? 'warnings' : 'none')
   }
 
   const handleSave = () => {
@@ -175,8 +261,13 @@ export function RoutingPolicyCard({
     setOrgNarrowed(false)
     setUnresolved([])
     setLockedOut([])
+    setRefusal(null)
+    if (loosening) {
+      setConfirmKind('loosen')
+      return
+    }
     if (tightening) {
-      setConfirmOpen(true)
+      setConfirmKind('tighten')
       return
     }
     void commit()
@@ -198,9 +289,22 @@ export function RoutingPolicyCard({
           </p>
         </div>
         {policy && (
-          <span className={styles.updated}>
-            Changed {new Date(policy.updated_at).toLocaleDateString()}
-          </span>
+          <div className={styles.headMeta}>
+            {/* What is stored right now, not what the form is showing. An
+                administrator part-way through an edit still needs to be able
+                to read what is in force. */}
+            <span
+              className={`${styles.currentRung} ${
+                residencyRank(saved.residency) === 0 ? styles.currentRungEgress : ''
+              }`}
+            >
+              {residencyRank(saved.residency) === 0 && <EgressGlyph />}
+              {residencyLabel(saved.residency)}
+            </span>
+            <span className={styles.updated}>
+              Changed {new Date(policy.updated_at).toLocaleDateString()}
+            </span>
+          </div>
         )}
       </div>
 
@@ -217,46 +321,54 @@ export function RoutingPolicyCard({
         </div>
       ) : (
         <>
-          <fieldset className={styles.field}>
-            <legend className={styles.legend}>Where requests may run</legend>
-            <div className={styles.options} role="radiogroup" aria-label="Where requests may run">
-              {RESIDENCY_OPTIONS.map((opt) => {
-                const checked = draft.residency === opt.value
-                return (
-                  <label
-                    key={opt.value}
-                    className={`${styles.option} ${checked ? styles.optionChecked : ''}`}
-                  >
-                    <span className={styles.optionTop}>
-                      <input
-                        className={styles.radio}
-                        type="radio"
-                        name="residency"
-                        value={opt.value}
-                        checked={checked}
-                        disabled={saving}
-                        onChange={() => setDraft((p) => ({ ...p, residency: opt.value }))}
-                      />
-                      <span className={styles.optionLabel}>{opt.label}</span>
-                    </span>
-                    <span className={styles.optionConsequence}>{opt.consequence}</span>
-                  </label>
-                )
-              })}
-            </div>
-          </fieldset>
+          <ResidencyLadder
+            legend="Where requests may run"
+            name="residency"
+            value={draft.residency}
+            rungs={ORG_RUNGS}
+            disabled={saving}
+            showDefault
+            /* The organisation has nothing to inherit from, so no `inherit`
+               option is offered and the ladder can never emit null here. */
+            onChange={(residency) => {
+              if (residency !== null) setDraft((p) => ({ ...p, residency }))
+            }}
+          />
 
-          {draft.residency === 'self_hosted_only' && (
+          {/* What the chosen rung costs today, counted rather than described.
+              Only shown once it costs something: a line that always reads
+              "nothing is refused" is a line nobody checks. */}
+          {refusedByDraft.length > 0 && (
             <p className={styles.effect}>
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                 <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
                 <path d="M7 11V7a5 5 0 0 1 10 0v4" />
               </svg>
-              {cloudEnabled.length === 0
-                ? 'No cloud-managed models are enabled, so nothing is being refused right now.'
-                : `${cloudEnabled.length} enabled cloud-managed ${cloudEnabled.length === 1 ? 'model is' : 'models are'} refused by this policy.`}
+              {refusedByDraft.length === 1
+                ? '1 enabled model is refused by this policy.'
+                : `${refusedByDraft.length} enabled models are refused by this policy.`}{' '}
+              {refusedClassSummary(refusedByDraft)}
             </p>
           )}
+
+          {/* Unreported models are refused on every rung, so this is a fact
+              about the catalogue rather than about the choice above it. */}
+          {unknownEnabled.length > 0 && (
+            <p className={styles.effectQuiet}>
+              {unknownEnabled.length === 1
+                ? '1 enabled model has not reported where it runs'
+                : `${unknownEnabled.length} enabled models have not reported where they run`}
+              , so they are refused whichever option is chosen. They answer again as soon as a
+              backend reports them.
+            </p>
+          )}
+
+          {/* What a request may CARRY is no longer said here. Images and tool
+              calls are refused on every backend, before a route is resolved, so
+              the limit is not a consequence of this rung and reading it under
+              "where requests may run" implies it is. It is stated once on the
+              Models tab, and again on any route that binds the multimodal
+              signal, where it is actionable. */}
 
           <fieldset className={styles.field}>
             <legend className={styles.legend}>Which models may answer</legend>
@@ -397,6 +509,20 @@ export function RoutingPolicyCard({
             </p>
           )}
 
+          {/* A refusal with no structure behind it. The API's sentence names
+              the rung, the route and the model it conflicts with, so it is
+              shown whole rather than summarised into something vaguer. */}
+          {refusal !== null && (
+            <div className={styles.blocked} role="alert">
+              <p className={styles.warningsTitle}>Not saved.</p>
+              <p className={styles.warningsHint}>{refusal}</p>
+              <p className={styles.warningsHint}>
+                Repoint the route on the Aliases tab, or choose a rung that permits where it
+                points. Nothing has changed.
+              </p>
+            </div>
+          )}
+
           {lockedOut.length > 0 && (
             <div className={styles.blocked} role="alert">
               <p className={styles.warningsTitle}>
@@ -459,17 +585,29 @@ export function RoutingPolicyCard({
       )}
 
       <Modal
-        open={confirmOpen}
-        onClose={() => setConfirmOpen(false)}
-        title={warnings.length > 0 ? 'Policy saved' : 'Narrow what the organisation can reach?'}
+        open={confirmKind !== 'none'}
+        onClose={() => setConfirmKind('none')}
+        title={
+          confirmKind === 'warnings'
+            ? 'Policy saved'
+            : confirmKind === 'loosen'
+              ? leavingAccount
+                ? 'Allow prompts to leave your cloud account?'
+                : 'Widen where requests may run?'
+              : 'Narrow what the organisation can reach?'
+        }
         description={
-          warnings.length > 0
+          confirmKind === 'warnings'
             ? 'The policy has changed. These routes need your attention.'
-            : 'Everyone inherits this. A user or key that already has its own policy keeps it, but can never reach past the organisation.'
+            : confirmKind === 'loosen'
+              ? leavingAccount
+                ? "Requests will be allowed to run at a model vendor's own API, using your organisation's key."
+                : 'More of what is already enabled will be allowed to answer.'
+              : 'Everyone inherits this. A user or key that already has its own policy keeps it, but can never reach past the organisation.'
         }
       >
         <div className={styles.confirmBody}>
-          {warnings.length > 0 ? (
+          {confirmKind === 'warnings' && (
             <>
               <p className={styles.confirmText}>
                 {warnings.length === 1
@@ -486,26 +624,101 @@ export function RoutingPolicyCard({
                 never sent to another model instead.
               </p>
               <div className={styles.confirmFooter}>
-                <Button type="button" onClick={() => setConfirmOpen(false)}>Done</Button>
+                <Button type="button" onClick={() => setConfirmKind('none')}>Done</Button>
               </div>
             </>
-          ) : (
+          )}
+
+          {/* Loosening. The body is about where prompts go, not about who gains
+              what: the people reading this are answering to someone about the
+              account boundary, and that is the only fact that matters here. */}
+          {confirmKind === 'loosen' && (
             <>
-              {draft.residency === 'self_hosted_only' && cloudEnabled.length > 0 && (
+              {leavingAccount ? (
                 <>
                   <p className={styles.confirmText}>
-                    {cloudEnabled.length} enabled cloud-managed{' '}
-                    {cloudEnabled.length === 1 ? 'model stops' : 'models stop'} answering, including
-                    anyone using an alias that points at{' '}
-                    {cloudEnabled.length === 1 ? 'it' : 'them'}:
+                    Prompts, and the text of the files attached to them, are sent to a vendor over
+                    the public internet and handled under that vendor's terms — not under your
+                    cloud account's controls. Darkplum cannot see how the key is scoped at the
+                    vendor, and there is no spend limit in this product.
+                  </p>
+                  {openedVendors.length > 0 ? (
+                    <p className={styles.confirmText}>
+                      Enabled today, and refused until now:{' '}
+                      {openedByDraft.length === 1 ? '1 model' : `${openedByDraft.length} models`} at{' '}
+                      {openedVendors.join(' and ')}.
+                    </p>
+                  ) : (
+                    <p className={styles.confirmText}>
+                      No vendor models are enabled yet, so nothing changes today. Anything you
+                      enable afterwards is allowed by this policy without a second decision.
+                    </p>
+                  )}
+                  {openedByDraft.length > 0 && (
+                    <>
+                      <ul className={styles.confirmList}>
+                        {openedByDraft.slice(0, 5).map((m) => (
+                          <li key={m.id}>
+                            <code className={styles.confirmModel}>{m.model_id}</code>
+                          </li>
+                        ))}
+                      </ul>
+                      {openedByDraft.length > 5 && (
+                        <p className={styles.confirmMore}>and {openedByDraft.length - 5} more</p>
+                      )}
+                    </>
+                  )}
+                  {/* This dialog lists what changes by allowing prompts out of
+                      the account. What a request may carry does not change:
+                      images and tool calls are refused on every backend either
+                      way, so saying it here read as a vendor limit. */}
+                </>
+              ) : (
+                <p className={styles.confirmText}>
+                  {openedByDraft.length === 0
+                    ? 'Nothing enabled today is affected. The policy still applies to anything you enable later.'
+                    : `${openedByDraft.length === 1 ? '1 enabled model starts' : `${openedByDraft.length} enabled models start`} answering again. They all run inside your cloud account.`}
+                </p>
+              )}
+              <p className={styles.confirmText}>{POLICY_TIMING}</p>
+              <div className={styles.confirmFooter}>
+                <Button type="button" variant="ghost" onClick={() => setConfirmKind('none')}>
+                  Cancel
+                </Button>
+                <Button
+                  type="button"
+                  variant={leavingAccount ? 'danger' : 'primary'}
+                  onClick={() => void commit()}
+                  disabled={saving}
+                >
+                  {saving ? 'Saving…' : leavingAccount ? 'Allow external models' : 'Save policy'}
+                </Button>
+              </div>
+            </>
+          )}
+
+          {confirmKind === 'tighten' && (
+            <>
+              {refusedByDraft.length > 0 && (
+                <>
+                  <p className={styles.confirmText}>
+                    {refusedByDraft.length} enabled{' '}
+                    {refusedByDraft.length === 1 ? 'model stops' : 'models stop'} answering,
+                    including anyone using an alias that points at{' '}
+                    {refusedByDraft.length === 1 ? 'it' : 'them'}:
                   </p>
                   <ul className={styles.confirmList}>
-                    {cloudEnabled.slice(0, 5).map((m) => (
-                      <li key={m.id}><code className={styles.confirmModel}>{m.model_id}</code></li>
+                    {refusedByDraft.slice(0, 5).map((m) => (
+                      <li key={m.id}>
+                        <code className={styles.confirmModel}>{m.model_id}</code>
+                        <span className={styles.confirmClass}>
+                          {backendClassLabel(displayClassOf(m))}
+                        </span>
+                      </li>
                     ))}
                   </ul>
-                  {cloudEnabled.length > 5 && (
-                    <p className={styles.confirmMore}>and {cloudEnabled.length - 5} more</p>
+                  {refusedByDraft.length > 5 && (
+                    <p className={styles.confirmMore}>and {refusedByDraft.length - 5} more</p>
                   )}
                 </>
               )}
@@ -515,15 +728,15 @@ export function RoutingPolicyCard({
                   Everything else is refused, whoever asks for it.
                 </p>
               )}
-              {draft.residency === 'self_hosted_only' && cloudEnabled.length === 0 && draft.allowed_models === null && (
+              {refusedByDraft.length === 0 && draft.allowed_models === null && (
                 <p className={styles.confirmText}>
-                  No cloud-managed models are enabled today, so no one loses access right now. The
+                  Nothing enabled today is refused by this, so no one loses access right now. The
                   policy still applies to anything you enable later.
                 </p>
               )}
               <p className={styles.confirmText}>{POLICY_TIMING}</p>
               <div className={styles.confirmFooter}>
-                <Button type="button" variant="ghost" onClick={() => setConfirmOpen(false)}>
+                <Button type="button" variant="ghost" onClick={() => setConfirmKind('none')}>
                   Cancel
                 </Button>
                 <Button type="button" onClick={() => void commit()} disabled={saving}>

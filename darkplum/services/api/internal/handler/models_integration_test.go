@@ -45,7 +45,9 @@ func TestListModels_SelfHostedOnlyFiltersCloudManaged(t *testing.T) {
 	h := NewModelHandler("http://unused.invalid", "unused", pool)
 	r := newModelsTestRouter(h)
 
-	// residency = any (default): everything enabled shows up.
+	// residency = cloud_account_only (migration 016's fresh-install default):
+	// self_hosted and cloud_managed both show up (neither leaves the cloud
+	// account).
 	resp := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	r.ServeHTTP(resp, req)
@@ -62,15 +64,21 @@ func TestListModels_SelfHostedOnlyFiltersCloudManaged(t *testing.T) {
 	}
 	for _, want := range []string{"llama3", "claude-3-sonnet", "smart", "default"} {
 		if !ids[want] {
-			t.Errorf("residency=any: expected %q in model list, got %v", want, ids)
+			t.Errorf("residency=cloud_account_only: expected %q in model list, got %v", want, ids)
 		}
 	}
 	if ids["disabled-model"] {
-		t.Errorf("residency=any: disabled model leaked into list")
+		t.Errorf("residency=cloud_account_only: disabled model leaked into list")
 	}
 
 	// residency = self_hosted_only: cloud_managed model and its alias vanish.
-	if _, err := pool.Exec(ctx, `UPDATE routing_policy SET residency = 'self_hosted_only' WHERE id = true`); err != nil {
+	// Written directly to principal_routing_policies (the authoritative org
+	// residency table since migration 015) rather than the legacy
+	// routing_policy mirror: since migration 016, ModelHandler.getResidency
+	// reads the former, and the mirror no longer reflects a
+	// cloud_account_only/self_hosted_only distinction reliably for this
+	// purpose (it downgrades cloud_account_only to 'any').
+	if _, err := pool.Exec(ctx, `UPDATE principal_routing_policies SET residency = 'self_hosted_only' WHERE principal_type = 'org'`); err != nil {
 		t.Fatalf("set residency: %v", err)
 	}
 	resp = httptest.NewRecorder()
@@ -112,7 +120,8 @@ func TestSyncModels_PreservesEnabledAndDisplayNameUpdatesBackendClass(t *testing
 				// and backend_class should update; enabled/display_name must not.
 				{ID: "llama3", Object: "model", Created: 1, OwnedBy: "bedrock", BackendClass: backendClassCloudManaged},
 				// A brand new model with no backend_class field at all — must
-				// default to self_hosted, not be dropped or misclassified.
+				// default to external_api (the strictest known class), not be
+				// dropped or misclassified as safely in-cluster.
 				{ID: "new-model", Object: "model", Created: 1, OwnedBy: "vllm"},
 			},
 		})
@@ -153,8 +162,8 @@ func TestSyncModels_PreservesEnabledAndDisplayNameUpdatesBackendClass(t *testing
 	if newEnabled {
 		t.Errorf("new-model enabled = true, want false (schema default for newly discovered models)")
 	}
-	if newBackendClass != backendClassSelfHosted {
-		t.Errorf("new-model backend_class = %q, want self_hosted (default when gateway omits the field)", newBackendClass)
+	if newBackendClass != backendClassExternalAPI {
+		t.Errorf("new-model backend_class = %q, want external_api (strictest default when gateway omits the field)", newBackendClass)
 	}
 }
 
@@ -246,6 +255,8 @@ func TestSyncModels_NotRediscoveredSurvivesAndBecomesUnavailable(t *testing.T) {
 	if resp.Code != http.StatusOK {
 		t.Fatalf("admin list status = %d, body = %s", resp.Code, resp.Body.String())
 	}
+	// No X-Darkplum-Classes header on this request -- the default, bare-array
+	// shape (see ListAdminModels).
 	var admin []modelRow
 	if err := json.Unmarshal(resp.Body.Bytes(), &admin); err != nil {
 		t.Fatalf("decode admin list: %v", err)
@@ -517,6 +528,91 @@ func TestSyncModels_HappyPathUsesBatchUpsert(t *testing.T) {
 	}
 }
 
+// TestSyncModels_SendsClassesHeaderAndCapturesProviders covers item 3+7 of
+// PLAN v3.1: SyncModels must send darkplumClassesHeader to the gateway (so
+// an old api that never sends it never catalogues a vendor model at all --
+// the order-independence invariant), and must capture the gateway's
+// optional top-level "providers" status block for ListAdminModels to pass
+// through.
+func TestSyncModels_SendsClassesHeaderAndCapturesProviders(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+
+	var sawClassesHeader string
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sawClassesHeader = r.Header.Get(darkplumClassesHeader)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"object": "list",
+			"data": []openAIModelEntry{
+				{ID: "claude-3-opus", Object: "model", Created: 1, OwnedBy: "anthropic", BackendClass: backendClassExternalAPI},
+			},
+			"providers": []gatewayProviderStatus{
+				{Name: "anthropic", Configured: true, State: "ok", ModelCount: 1},
+				{Name: "openai", Configured: false, State: "not_configured", ModelCount: 0},
+			},
+		})
+	}))
+	defer gw.Close()
+
+	h := NewModelHandler(gw.URL, "unused", pool)
+	h.SyncModels(ctx)
+
+	if sawClassesHeader != backendClassExternalAPI {
+		t.Fatalf("SyncModels must send %s: %s to the gateway, got %q", darkplumClassesHeader, backendClassExternalAPI, sawClassesHeader)
+	}
+
+	h.providersMu.Lock()
+	providers := append([]gatewayProviderStatus{}, h.providers...)
+	h.providersMu.Unlock()
+	if len(providers) != 2 {
+		t.Fatalf("expected 2 cached providers, got %+v", providers)
+	}
+	byName := map[string]gatewayProviderStatus{}
+	for _, p := range providers {
+		byName[p.Name] = p
+	}
+	if !byName["anthropic"].Configured || byName["anthropic"].State != "ok" {
+		t.Errorf("expected anthropic configured/ok, got %+v", byName["anthropic"])
+	}
+	if byName["openai"].Configured {
+		t.Errorf("expected openai not configured, got %+v", byName["openai"])
+	}
+}
+
+// TestSyncModels_ProvidersSurviveAFailedResync proves a transient sync
+// failure (gateway unreachable) does not blank out the last known providers
+// status -- an admin viewing the Providers panel during a brief gateway blip
+// should not see it flash to "no providers reported".
+func TestSyncModels_ProvidersSurviveAFailedResync(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"object": "list",
+			"data":   []openAIModelEntry{},
+			"providers": []gatewayProviderStatus{
+				{Name: "anthropic", Configured: true, State: "ok", ModelCount: 3},
+				{Name: "openai", Configured: false, State: "not_configured", ModelCount: 0},
+			},
+		})
+	}))
+	h := NewModelHandler(gw.URL, "unused", pool)
+	h.SyncModels(ctx)
+	gw.Close() // now unreachable
+
+	h.SyncModels(ctx) // must fail quietly, not clear h.providers
+
+	h.providersMu.Lock()
+	providers := append([]gatewayProviderStatus{}, h.providers...)
+	h.providersMu.Unlock()
+	if len(providers) != 2 {
+		t.Fatalf("expected the last-known 2 providers to survive a failed sync, got %+v", providers)
+	}
+}
+
 // TestListModels_RoutedAlias_EndToEnd exercises the real SQL grouping in
 // ModelHandler.ListModels (not just the pure buildModelsList logic): a routed
 // alias created through RoutingHandler.PutAlias must show up in the
@@ -658,5 +754,98 @@ func TestListModels_BearerCallerIsFilteredByGateway(t *testing.T) {
 	}
 	if len(listResp.Data) != 3 {
 		t.Errorf("degraded list must be the unfiltered one (m1, m2, only-m2), got %d entries", len(listResp.Data))
+	}
+}
+
+// TestListModels_BearerCallerSeesExternalAPIWhenPolicyAndHeaderPermit is
+// jared's required test (PLAN v3.1): bearerModels must send
+// darkplumClassesHeader to the gateway so an API-key caller whose OWN policy
+// permits a vendor model can see it in GET /v1/models -- the same invariant
+// models.go documents for the session path (two /v1/models must agree). It
+// also proves the INBOUND capability gate is independent: the api still
+// hides that vendor model from a caller that didn't itself send the header,
+// even though the gateway is willing to report it.
+func TestListModels_BearerCallerSeesExternalAPIWhenPolicyAndHeaderPermit(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	insertModel(t, ctx, pool, "m1", backendClassSelfHosted, true)
+	insertModel(t, ctx, pool, "claude-3-opus", backendClassExternalAPI, true)
+	// The org must have opted into external calls (residency=any) for a
+	// vendor model to be reachable at all -- migration 016's fresh-install
+	// default (cloud_account_only) refuses external_api regardless of the
+	// capability header, since the header is a rollout-safety gate, not a
+	// policy override (see modelVisibleInList).
+	if _, err := pool.Exec(ctx, `UPDATE principal_routing_policies SET residency = NULL WHERE principal_type = 'org'`); err != nil {
+		t.Fatalf("set residency to any: %v", err)
+	}
+
+	var sawClassesHeader string
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		if req.URL.Path != "/v1/models" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		sawClassesHeader = req.Header.Get(darkplumClassesHeader)
+		w.Header().Set("Content-Type", "application/json")
+		// The gateway's own filter says this key's policy reaches both
+		// models, including the vendor one.
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"m1"},{"id":"claude-3-opus"}],"default_model":"m1"}`))
+	}))
+	defer gw.Close()
+
+	h := NewModelHandler(gw.URL, "service-key-unused", pool)
+	r := newModelsTestRouter(h)
+
+	// Caller sends the capability header itself: the vendor model must show.
+	resp := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer dp_user_key")
+	req.Header.Set(darkplumClassesHeader, backendClassExternalAPI)
+	r.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+	if sawClassesHeader != backendClassExternalAPI {
+		t.Fatalf("bearerModels must send %s: %s to the gateway, got %q", darkplumClassesHeader, backendClassExternalAPI, sawClassesHeader)
+	}
+	var listResp openAIModelsResponse
+	if err := json.Unmarshal(resp.Body.Bytes(), &listResp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	ids := map[string]bool{}
+	for _, e := range listResp.Data {
+		ids[e.ID] = true
+	}
+	if !ids["m1"] || !ids["claude-3-opus"] {
+		t.Fatalf("expected the vendor model visible when the caller sent the classes header, got %v", ids)
+	}
+
+	// Same caller, same gateway-side policy -- but this time the INBOUND
+	// request never sent the header. The api must still ask the gateway
+	// (bearerModels always sends it -- that's the api's own capability, not
+	// the caller's), but must hide the vendor model from ITS OWN response,
+	// since a caller that never named external_api cannot be shown one.
+	resp = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer dp_user_key")
+	r.ServeHTTP(resp, req)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", resp.Code, resp.Body.String())
+	}
+	if sawClassesHeader != backendClassExternalAPI {
+		t.Fatalf("bearerModels must always send the classes header to the gateway regardless of the inbound request, got %q", sawClassesHeader)
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &listResp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	ids = map[string]bool{}
+	for _, e := range listResp.Data {
+		ids[e.ID] = true
+	}
+	if !ids["m1"] {
+		t.Fatalf("expected m1 still present, got %v", ids)
+	}
+	if ids["claude-3-opus"] {
+		t.Fatalf("expected the vendor model hidden when the INBOUND request didn't send the classes header, got %v", ids)
 	}
 }

@@ -1,5 +1,7 @@
 package policy
 
+import "github.com/scalecraft/darkplum/gateway/internal/routing"
+
 // Principal levels for PolicyRow.Level and principal_routing_policies.
 // principal_type (migration 015). These are also the exact values the
 // "sources" object of GET /v1/policy/effective reports per field, plus
@@ -32,11 +34,12 @@ const KeyTypeService = "service"
 // Effective.
 type PolicyRow struct {
 	Level string
-	// Residency is nil (inherit) or a pointer to ResidencySelfHostedOnly.
-	// There is no explicit "any" value at user/api_key level: only org can
-	// mean "any" by being nil with nothing above it to inherit from —
-	// tightening only ever adds a self_hosted_only somewhere in the chain,
-	// never removes one a less specific level already set.
+	// Residency is nil (inherit) or a pointer to ResidencyCloudAccountOnly or
+	// ResidencySelfHostedOnly. There is no explicit "any" value at
+	// user/api_key level: only org can mean "any" by being nil with nothing
+	// above it to inherit from — tightening only ever adds a stricter value
+	// somewhere in the chain (see residencyRank), never loosens one a less
+	// specific level already set.
 	Residency *string
 	// AllowedModels is nil (inherit) or a pointer to the row's allowlist —
 	// concrete model ids only, never aliases. A non-nil pointer to an empty
@@ -93,6 +96,85 @@ func (e EffectivePolicy) Allows(model string) bool {
 	return false
 }
 
+// residencyRank orders residency values from loosest to strictest: any=0 <
+// cloud_account_only=1 < self_hosted_only=2. Used both by Effective's
+// strictest-wins chain merge and by ResidencyPermits' ceiling comparison.
+var residencyRank = map[string]int{
+	ResidencyAny:              0,
+	ResidencyCloudAccountOnly: 1,
+	ResidencySelfHostedOnly:   2,
+}
+
+// residencyByRank is the inverse of residencyRank, indexed by rank —
+// residencyByRank[residencyRank[v]] == v for every known v. Used to
+// normalise an out-of-range rank (see residencyRankOf) back to a canonical
+// wire value rather than leaking whatever unrecognised string produced it.
+var residencyByRank = []string{ResidencyAny, ResidencyCloudAccountOnly, ResidencySelfHostedOnly}
+
+// residencyRankOf returns v's rank, treating any value outside the three
+// known residency constants as the strictest known rank (self_hosted_only) —
+// the wire contract's "unknown residency value -> strictest" rule. This
+// function is pure and does not log; a caller loading rows from Postgres
+// that wants to warn about an unrecognised on-disk value (rather than
+// silently tightening it) does so itself once per snapshot load — see
+// pgstore.go's buildPrincipalPolicies.
+func residencyRankOf(v string) int {
+	if r, ok := residencyRank[v]; ok {
+		return r
+	}
+	return residencyRank[ResidencySelfHostedOnly]
+}
+
+// residencyForRank returns the canonical residency value for rank, clamping
+// an out-of-range rank to the strictest known value.
+func residencyForRank(rank int) string {
+	if rank < 0 || rank >= len(residencyByRank) {
+		return ResidencySelfHostedOnly
+	}
+	return residencyByRank[rank]
+}
+
+// isKnownResidency reports whether v is one of the three Residency*
+// constants. Used only for the "log once" diagnostic in pgstore.go's
+// buildPrincipalPolicies — enforcement itself never needs this, since
+// residencyRankOf already normalises an unknown value on every read.
+func isKnownResidency(v string) bool {
+	_, ok := residencyRank[v]
+	return ok
+}
+
+// classResidencyCeiling maps a backend class to the loosest residency rank
+// under which a route of that class remains permitted — i.e. the class is
+// allowed whenever residencyRankOf(residency) <= this value. self_hosted is
+// permitted under every residency, even the strictest; cloud_managed loses
+// self_hosted_only; external_api is permitted only under "any". An
+// unrecognised class has no entry, and ResidencyPermits refuses it under
+// every residency including "any" — the deny-unknown-class-under-ALL-
+// residencies rule (a route this gateway build cannot classify must never be
+// treated as permitted by default).
+var classResidencyCeiling = map[string]int{
+	routing.ClassSelfHosted:   residencyRank[ResidencySelfHostedOnly],
+	routing.ClassCloudManaged: residencyRank[ResidencyCloudAccountOnly],
+	routing.ClassExternalAPI:  residencyRank[ResidencyAny],
+}
+
+// ResidencyPermits reports whether a route of the given backend class
+// (routing.ClassSelfHosted/ClassCloudManaged/ClassExternalAPI) may be used
+// under the given residency policy value. This is the single implementation
+// of the residency ladder: any -> every known class; cloud_account_only ->
+// self_hosted and cloud_managed; self_hosted_only -> self_hosted only.
+// Callers should use this instead of comparing eff.Residency/route.Class
+// directly, both because it centralises the ladder and because an
+// unrecognised class is refused under every residency, including "any" —
+// the deny-when-uncertain rule a direct equality check would miss.
+func ResidencyPermits(residency, class string) bool {
+	ceiling, known := classResidencyCeiling[class]
+	if !known {
+		return false
+	}
+	return residencyRankOf(residency) <= ceiling
+}
+
 // Effective merges a principal's policy chain — ordered from least specific
 // to most specific, e.g. []PolicyRow{orgRow, userRow, apiKeyRow} — into a
 // single EffectivePolicy. This is the ONE merge implementation for the
@@ -105,9 +187,10 @@ func (e EffectivePolicy) Allows(model string) bool {
 //     chain. No level sets one -> nil (all models). Any level sets an empty
 //     slice -> the intersection stays empty (deny all) regardless of what
 //     less specific levels allow, exactly like any other tightening.
-//   - Residency: the strictest value in the chain — self_hosted_only if ANY
-//     level sets it, "any" otherwise. There is no way to loosen a
-//     self_hosted_only set by a less specific level.
+//   - Residency: the strictest (highest-ranked, see residencyRank) value set
+//     anywhere in the chain — any < cloud_account_only < self_hosted_only.
+//     There is no way to loosen a stricter value set by a less specific
+//     level; an unrecognised value is treated as the strictest known one.
 //   - DefaultModel: the first non-null value walking the chain from MOST
 //     specific to least specific (api_key overrides user overrides org) —
 //     unlike the other two fields, this is an override, not a tightening.
@@ -123,7 +206,12 @@ func Effective(chain []PolicyRow) EffectivePolicy {
 
 	var allowed *[]string
 	haveAllowedSource := false
-	haveResidencySource := false
+	// residencyBestRank tracks the highest (strictest) rank seen so far,
+	// starting below every real rank so the first row that sets Residency at
+	// all (even to "any" explicitly, e.g. an org row after migration 016)
+	// always wins the initial assignment and its Level is attributed as the
+	// source.
+	residencyBestRank := -1
 	haveDefaultSource := false
 
 	for i := len(chain) - 1; i >= 0; i-- {
@@ -155,11 +243,11 @@ func Effective(chain []PolicyRow) EffectivePolicy {
 			}
 		}
 
-		if row.Residency != nil && *row.Residency == ResidencySelfHostedOnly {
-			eff.Residency = ResidencySelfHostedOnly
-			if !haveResidencySource {
+		if row.Residency != nil {
+			if rank := residencyRankOf(*row.Residency); rank > residencyBestRank {
+				residencyBestRank = rank
+				eff.Residency = residencyForRank(rank)
 				eff.Sources.Residency = row.Level
-				haveResidencySource = true
 			}
 		}
 

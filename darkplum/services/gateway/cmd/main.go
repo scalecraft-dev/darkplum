@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -20,7 +21,10 @@ import (
 	"github.com/scalecraft/darkplum/gateway/internal/middleware"
 	"github.com/scalecraft/darkplum/gateway/internal/policy"
 	"github.com/scalecraft/darkplum/gateway/internal/provider"
+	"github.com/scalecraft/darkplum/gateway/internal/provider/anthropic"
+	"github.com/scalecraft/darkplum/gateway/internal/provider/credsource"
 	"github.com/scalecraft/darkplum/gateway/internal/provider/mock"
+	"github.com/scalecraft/darkplum/gateway/internal/provider/openai"
 	"github.com/scalecraft/darkplum/gateway/internal/provider/openaicompat"
 	"github.com/scalecraft/darkplum/gateway/internal/recorder"
 	"github.com/scalecraft/darkplum/gateway/internal/router"
@@ -48,11 +52,38 @@ func main() {
 
 	// reg is the dispatch-time provider registry: routing.Route.ProviderKey ->
 	// provider.Provider. Entries for statically-configured backends (mock,
-	// vllm-default, extra vLLMs, LM Studio) are set once below; the Bedrock
-	// entry is set lazily by routing.NewBedrockSource's onReady callback the
-	// first time its client construction succeeds (which may be on a later
-	// discovery tick, not necessarily at startup).
+	// vllm-default, extra vLLMs, LM Studio, anthropic) are set once below;
+	// the Bedrock entry is set lazily by routing.NewBedrockSource's onReady
+	// callback the first time its client construction succeeds (which may be
+	// on a later discovery tick, not necessarily at startup).
 	reg := provider.NewRegistry()
+
+	// providerStatus backs GET /v1/models' `providers` array (service-key +
+	// X-Darkplum-Classes: external_api callers only). Seeded with both known
+	// vendor names now — before either provider's Source is constructed
+	// below — so the response always lists both (see
+	// provider.NewStatusRegistry) even on a build that has wired in neither.
+	// Constructed here (rather than just before NewChatHandler, as originally
+	// scaffolded) because routing.NewAnthropicSource needs it to report its
+	// own state on every discovery tick.
+	providerStatus := provider.NewStatusRegistry("anthropic", "openai")
+
+	// Policy store: models.enabled, model_aliases, routing_policy, and (since
+	// migration 017) vendor_provider_settings. Fails closed (503
+	// policy_unavailable) until the first successful load — which may not
+	// happen until the api runs migration 010 against a freshly onboarded
+	// database — then keeps serving the last-good snapshot on later refresh
+	// failures, up to POLICY_MAX_STALENESS_SECONDS. Constructed here, before
+	// the routing sources below, because NewAnthropicSource/NewOpenAISource's
+	// filter functions read the live snapshot's VendorFilters on every
+	// discovery tick (see routing.NewVendorFilterFunc).
+	polStore := policy.NewPgStore(dbPool, time.Duration(cfg.PolicyMaxStalenessSeconds)*time.Second)
+	polStore.Run(ctx, time.Duration(cfg.PolicyRefreshSeconds)*time.Second)
+	if _, loaded := polStore.Current(); loaded {
+		log.Printf("policy: initial load succeeded (refreshing every %ds)", cfg.PolicyRefreshSeconds)
+	} else {
+		log.Printf("policy: WARNING initial load failed — chat completions will 503 policy_unavailable until a refresh succeeds (retrying every %ds)", cfg.PolicyRefreshSeconds)
+	}
 
 	// sources drives routing.Manager's periodic discovery. Registration order
 	// is significant: it is the tie-break among self-hosted sources that
@@ -123,6 +154,41 @@ func main() {
 		sources = append(sources, routing.NewBedrockSource(cfg.BedrockRegion, cfg.BedrockModelFilter, onReady))
 	}
 
+	// Anthropic. Unlike Bedrock, provider construction never fails at
+	// startup (it wraps a file-backed credsource.Source, not a
+	// network-dependent SDK config load), so it is built and registered
+	// unconditionally — there is no ANTHROPIC_ENABLED flag. Whether it ever
+	// contributes a routable model depends entirely on whether the key file
+	// is present, the filter is set, and discovery succeeds, all of which
+	// anthropicCreds/anthropicProv/NewAnthropicSource re-check on every
+	// discovery tick without a restart. A gateway with the
+	// darkplum-provider-keys Secret never mounted at all runs exactly as
+	// before: not_configured, zero models, zero vendor HTTP calls.
+	anthropicKeyPath := filepath.Join(cfg.ProviderKeysDir, "anthropic-api-key")
+	anthropicCreds := credsource.New(anthropicKeyPath)
+	anthropicProv := anthropic.New(anthropicCreds, anthropic.Config{
+		DefaultMaxTokens: cfg.AnthropicDefaultMaxTokens,
+		BaseURL:          cfg.AnthropicBaseURL,
+		Status:           providerStatus,
+	})
+	reg.Set("anthropic", anthropicProv)
+	anthropicFilter := routing.NewVendorFilterFunc("anthropic", cfg.AnthropicModelFilter, cfg.AnthropicModelFilterSetAt, policyVendorFilterLookup{polStore})
+	sources = append(sources, routing.NewAnthropicSource(anthropicCreds, anthropicProv, anthropicFilter, providerStatus))
+
+	// OpenAI. Same unconditional-construction reasoning as Anthropic above —
+	// there is no OPENAI_ENABLED flag either; whether it ever contributes a
+	// routable model depends entirely on the key file, the filter, and
+	// discovery, all re-checked on every tick without a restart.
+	openAIKeyPath := filepath.Join(cfg.ProviderKeysDir, "openai-api-key")
+	openAICreds := credsource.New(openAIKeyPath)
+	openAIProv := openai.New(openAICreds, openai.Config{
+		BaseURL: cfg.OpenAIBaseURL,
+		Status:  providerStatus,
+	})
+	reg.Set("openai", openAIProv)
+	openAIFilter := routing.NewVendorFilterFunc("openai", cfg.OpenAIModelFilter, cfg.OpenAIModelFilterSetAt, policyVendorFilterLookup{polStore})
+	sources = append(sources, routing.NewOpenAISource(openAICreds, openAIProv, openAIFilter, providerStatus))
+
 	sourceDescriptions := make([]string, 0, len(sources))
 	for _, s := range sources {
 		sourceDescriptions = append(sourceDescriptions, fmt.Sprintf("%s(%s/%s)", s.Name, s.Kind, s.Class))
@@ -134,25 +200,16 @@ func main() {
 	log.Printf("gateway: initial discovery complete, %d models routable (refreshing every %ds, last-good TTL %ds)",
 		len(routeMgr.Snapshot().IDs()), cfg.DiscoveryIntervalSeconds, cfg.RouteLastGoodTTLSeconds)
 
-	// Policy store: models.enabled, model_aliases, routing_policy. Fails
-	// closed (503 policy_unavailable) until the first successful load — which
-	// may not happen until the api runs migration 010 against a freshly
-	// onboarded database — then keeps serving the last-good snapshot on later
-	// refresh failures, up to POLICY_MAX_STALENESS_SECONDS.
-	polStore := policy.NewPgStore(dbPool, time.Duration(cfg.PolicyMaxStalenessSeconds)*time.Second)
-	polStore.Run(ctx, time.Duration(cfg.PolicyRefreshSeconds)*time.Second)
-	if _, loaded := polStore.Current(); loaded {
-		log.Printf("policy: initial load succeeded (refreshing every %ds)", cfg.PolicyRefreshSeconds)
-	} else {
-		log.Printf("policy: WARNING initial load failed — chat completions will 503 policy_unavailable until a refresh succeeds (retrying every %ds)", cfg.PolicyRefreshSeconds)
-	}
-
 	// Build upstream health entries for observability.
-	// Only openai-compatible HTTP upstreams are probed (vllm, lmstudio). Mock and
-	// Bedrock are excluded: mock has no HTTP endpoint, and Bedrock reachability is
-	// governed by IAM/VPC — a failed /v1/models probe there would be meaningless.
-	// The checker result is included in the /health response body but NEVER used
-	// to flip the pod to unready.
+	// Only openai-compatible HTTP upstreams are probed (vllm, lmstudio). Mock,
+	// Bedrock, Anthropic, and OpenAI are excluded: mock has no HTTP endpoint,
+	// Bedrock reachability is governed by IAM/VPC, and each vendor's own
+	// discovery-tick state (not_configured/filter_missing/auth_failed/
+	// unreachable/ok) is already surfaced richly through providerStatus's
+	// `providers` block on GET /v1/models — a bare up/down health.Checker
+	// probe here would tell an operator strictly less. The checker result is
+	// included in the /health response body but NEVER used to flip the pod
+	// to unready.
 	var healthEntries []health.Entry
 	if !mockMode {
 		healthEntries = append(healthEntries, health.Entry{
@@ -189,11 +246,40 @@ func main() {
 	log.Printf("gateway: routed-alias classifiers configured: timeout=%s breaker_failures=%d breaker_open=%s semantic_router_url=%q semantic_router_min_confidence=%.2f",
 		classifierTimeout, cfg.ClassifierBreakerFailures, classifierBreakerOpen, cfg.SemanticRouterURL, cfg.SemanticRouterMinConfidence)
 
-	chatHandler := handler.NewChatHandler(reg, routeMgr, polStore, rulesClassifier, semanticClassifier)
+	// providerStatus was constructed earlier (before the routing sources) —
+	// routing.NewAnthropicSource and routing.NewOpenAISource both needed it,
+	// each reporting into it from its own discovery Source on every tick.
+	chatHandler := handler.NewChatHandler(reg, routeMgr, polStore, rulesClassifier, semanticClassifier, providerStatus)
+
+	// providersHandler serves the two machine-only routes the api calls (with
+	// the service key) to verify and activate a vendor key an admin installs
+	// from Admin > Models — see internal/handler/providers.go. Built from the
+	// SAME anthropicCreds/anthropicProv/openAICreds/openAIProv instances wired
+	// into the vendor's routing.Source above, so "verify" and what
+	// routing.Manager's own discovery tick catalogues can never diverge. ctx
+	// is the gateway's root context, so its per-vendor refresh-hint loops stop
+	// cleanly on shutdown.
+	providersHandler := handler.NewProvidersHandler(ctx, routeMgr, map[string]handler.ProviderVendorConfig{
+		"anthropic": {
+			Verifier:    anthropicProv,
+			Creds:       anthropicCreds,
+			Recheck:     anthropicCreds,
+			EnvVar:      "ANTHROPIC_MODEL_FILTER",
+			IsAuthError: anthropic.IsAuthError,
+		},
+		"openai": {
+			Verifier:    openAIProv,
+			Creds:       openAICreds,
+			Recheck:     openAICreds,
+			EnvVar:      "OPENAI_MODEL_FILTER",
+			IsAuthError: openai.IsAuthError,
+			PostFilter:  openai.FilterChatModels,
+		},
+	})
 
 	gin.SetMode(gin.ReleaseMode)
-	healthHandler := newHealthHandler(upstreamChecker, routeMgr, polStore, semanticClassifier)
-	httpRouter := buildRouter(chatHandler, middleware.APIKey(dbPool), middleware.Recording(rec), healthHandler)
+	healthHandler := newHealthHandler(upstreamChecker, routeMgr, polStore, semanticClassifier, providerStatus)
+	httpRouter := buildRouter(chatHandler, providersHandler, middleware.APIKey(dbPool), middleware.Recording(rec), healthHandler)
 
 	addr := ":" + cfg.Port
 	srv := &http.Server{
@@ -237,7 +323,7 @@ func main() {
 // upstream. apiKeyMW/recordingMW are gin.HandlerFunc rather than concrete
 // dependencies so tests can substitute no-op fakes for the auth/audit
 // machinery, which already has its own package-level tests.
-func buildRouter(chatHandler *handler.ChatHandler, apiKeyMW, recordingMW, healthHandler gin.HandlerFunc) *gin.Engine {
+func buildRouter(chatHandler *handler.ChatHandler, providersHandler *handler.ProvidersHandler, apiKeyMW, recordingMW, healthHandler gin.HandlerFunc) *gin.Engine {
 	engine := gin.New()
 	engine.Use(gin.Logger())
 	engine.Use(gin.Recovery())
@@ -265,12 +351,21 @@ func buildRouter(chatHandler *handler.ChatHandler, apiKeyMW, recordingMW, health
 	v1.POST("/policy/effective", chatHandler.HandleEffectivePolicyOverride)
 	v1.POST("/policy/impact", chatHandler.HandleEffectivePolicyImpact)
 
-	// Only six endpoints are served under /v1. There is no reverse-proxy
+	// POST /v1/providers/:vendor/verify and .../refresh are likewise
+	// service-key-only, dispatch to no model, and produce no
+	// inference_events row — kept out of the recorded group for the same
+	// reason as the five routes above. Their request bodies (a candidate
+	// vendor key) must never be logged: recordingMW never wraps them, and
+	// gin.Logger() above only logs method/path/status/latency, never a body.
+	v1.POST("/providers/:vendor/verify", providersHandler.HandleVerify)
+	v1.POST("/providers/:vendor/refresh", providersHandler.HandleRefresh)
+
+	// Only eight endpoints are served under /v1. There is no reverse-proxy
 	// passthrough: the previous behaviour forwarded every other
 	// GET/DELETE/PUT/PATCH /v1/* request straight to the default vLLM
 	// upstream with no policy check — an open allowlist onto a third party's
 	// route table that also leaked GET /v1/models/{id} metadata for arbitrary
-	// ids. Every other /v1/* path, and every other method on these six
+	// ids. Every other /v1/* path, and every other method on these eight
 	// paths, falls through to the NoRoute handler below.
 	recorded := v1.Group("")
 	recorded.Use(recordingMW)
@@ -323,6 +418,51 @@ type policyHealthStatus interface {
 	Current() (policy.Snapshot, bool)
 }
 
+// vendorProviderHealthStatus is the subset of *provider.StatusRegistry that
+// newHealthHandler needs — just Snapshot, mirroring the same interface
+// internal/handler/chat.go's providerStatusSource already uses for GET
+// /v1/models' `providers` array. Defined here (rather than importing that
+// unexported handler-package type) so tests can substitute a fake without a
+// real registry.
+type vendorProviderHealthStatus interface {
+	Snapshot() []provider.ProviderStatus
+}
+
+// healthProviderStatus is /health's OWN reduced view of one vendor's status
+// — name, configured, state, model_count, last_sync_at ONLY. /health is
+// unauthenticated, so unlike GET /v1/models' `providers` array (service key
+// + X-Darkplum-Classes: external_api only), it must never expose a filter
+// pattern, filter_source, or env_filter_set_at: a filter glob can itself be
+// sensitive naming detail (e.g. an internal model codename), and there is no
+// operational reason an unauthenticated liveness probe needs it. Built by
+// reducing provider.ProviderStatus field-by-field rather than embedding it,
+// so a future field added to ProviderStatus does not silently leak onto this
+// endpoint by default.
+type healthProviderStatus struct {
+	Name       string     `json:"name"`
+	Configured bool       `json:"configured"`
+	State      string     `json:"state"`
+	ModelCount int        `json:"model_count"`
+	LastSyncAt *time.Time `json:"last_sync_at"`
+}
+
+// reduceProviderStatusForHealth converts a full ProviderStatus into
+// /health's reduced DTO. Never nil (mirrors StatusRegistry.Snapshot's own
+// "never nil" contract) so the JSON array is always `[]`, never `null`.
+func reduceProviderStatusForHealth(full []provider.ProviderStatus) []healthProviderStatus {
+	out := make([]healthProviderStatus, 0, len(full))
+	for _, p := range full {
+		out = append(out, healthProviderStatus{
+			Name:       p.Name,
+			Configured: p.Configured,
+			State:      p.State,
+			ModelCount: p.ModelCount,
+			LastSyncAt: p.LastSyncAt,
+		})
+	}
+	return out
+}
+
 // newHealthHandler builds the /health handler. /health is the liveness AND
 // readiness probe endpoint: it always returns 200 as long as the process is
 // healthy — upstream reachability, routing source state, policy staleness,
@@ -341,7 +481,20 @@ type policyHealthStatus interface {
 // log by routing.Manager.Refresh. Similarly, semanticClassifier.HealthStatus
 // is a cached, rate-limited probe (see SemanticRouterClassifier) — this
 // handler never triggers a network call itself.
-func newHealthHandler(upstreamChecker *health.Checker, routeMgr *routing.Manager, polStore policyHealthStatus, semanticClassifier semanticRouterHealthStatus) gin.HandlerFunc {
+//
+// providerStatus (may be nil, e.g. in a test that doesn't care about it)
+// backs a read-only `providers` array — the SAME closed-vocabulary shape
+// (name, configured, state, model_count, last_sync_at) GET /v1/models
+// already exposes to a service key that sent the classes header — added here
+// so an operator can see vendor discovery state (not_configured/
+// filter_missing/auth_failed/filter_matched_nothing/unreachable/ok) on the
+// unauthenticated liveness probe without needing a service key. Like every
+// other field on this endpoint, it NEVER carries a model id or a filter
+// pattern (ProviderStatus itself has no room for either), and it NEVER
+// affects the response status: a vendor in auth_failed or unreachable state
+// is still just an observability fact, not a reason to fail liveness/
+// readiness.
+func newHealthHandler(upstreamChecker *health.Checker, routeMgr *routing.Manager, polStore policyHealthStatus, semanticClassifier semanticRouterHealthStatus, providerStatus vendorProviderHealthStatus) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		upstreams := upstreamChecker.Check(c.Request.Context())
 		upstreamBody := make(map[string]string, len(upstreams))
@@ -374,6 +527,18 @@ func newHealthHandler(upstreamChecker *health.Checker, routeMgr *routing.Manager
 		srBreakerOpen, srConsecutiveFailures := semanticClassifier.Status()
 		srHealthStatus := semanticClassifier.HealthStatus(c.Request.Context())
 
+		// providers is read-only diagnostics — see this handler's doc
+		// comment and healthProviderStatus's: this is the REDUCED DTO, never
+		// the full provider.ProviderStatus GET /v1/models exposes to a
+		// service key, so filter/filter_source/env_filter_set_at never reach
+		// this unauthenticated endpoint. nil providerStatus (e.g. a test that
+		// doesn't care about it) or an empty registry both marshal as `[]`,
+		// never `null`.
+		providers := []healthProviderStatus{}
+		if providerStatus != nil {
+			providers = reduceProviderStatusForHealth(providerStatus.Snapshot())
+		}
+
 		c.JSON(http.StatusOK, gin.H{
 			"status":    "ok",
 			"upstreams": upstreamBody,
@@ -394,8 +559,28 @@ func newHealthHandler(upstreamChecker *health.Checker, routeMgr *routing.Manager
 				"stale":       policyStatus.Stale,
 				"principals":  principals,
 			},
+			"providers": providers,
 		})
 	}
+}
+
+// policyVendorFilterLookup adapts *policy.PgStore to
+// routing.NewVendorFilterFunc's vendorFilterPolicySource seam. Defined here
+// (rather than in internal/routing) because internal/policy already imports
+// internal/routing (for residency/backend-class checks — see
+// policy/effective.go), so routing importing policy directly would cycle;
+// this small adapter is the one place that needs to know both shapes.
+type policyVendorFilterLookup struct {
+	store *policy.PgStore
+}
+
+func (p policyVendorFilterLookup) VendorFilter(vendor string) (filter []string, setAt time.Time, ok bool) {
+	snap, loaded := p.store.Current()
+	if !loaded {
+		return nil, time.Time{}, false
+	}
+	row, ok := snap.VendorFilters[vendor]
+	return row.Filter, row.SetAt, ok
 }
 
 // nullableString returns nil for an empty string so it serialises as JSON

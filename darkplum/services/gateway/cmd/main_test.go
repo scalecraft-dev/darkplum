@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -78,7 +79,38 @@ func testChatHandler() *handler.ChatHandler {
 			loaded: true,
 		},
 		rules, rules,
+		provider.NewStatusRegistry("anthropic", "openai"),
 	)
+}
+
+// fakeVerifier is a vendorKeyVerifier-shaped fake (structurally, since
+// vendorKeyVerifier is unexported to internal/handler) letting buildRouter's
+// route-table tests exercise POST /v1/providers/:vendor/verify|refresh
+// without a real vendor client.
+type fakeVerifier struct {
+	verifyIDs []string
+	verifyErr error
+	discIDs   map[string]bool
+	discErr   error
+}
+
+func (f fakeVerifier) VerifyKey(_ context.Context, _ string) ([]string, error) {
+	return f.verifyIDs, f.verifyErr
+}
+func (f fakeVerifier) DiscoverModels(_ context.Context) (map[string]bool, error) {
+	return f.discIDs, f.discErr
+}
+
+type fakeVendorCreds struct{ err error }
+
+func (f fakeVendorCreds) Key() (string, uint64, error) { return "sk-x", 1, f.err }
+
+func testProvidersHandler() *handler.ProvidersHandler {
+	verifier := fakeVerifier{verifyIDs: []string{"claude-x"}, discIDs: map[string]bool{"claude-x": true}}
+	return handler.NewProvidersHandler(context.Background(), routing.NewManager(nil, 0), map[string]handler.ProviderVendorConfig{
+		"anthropic": {Verifier: verifier, Creds: fakeVendorCreds{}},
+		"openai":    {Verifier: verifier, Creds: fakeVendorCreds{}},
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -86,7 +118,7 @@ func testChatHandler() *handler.ChatHandler {
 // ---------------------------------------------------------------------------
 
 func TestBuildRouter_ListModels(t *testing.T) {
-	router := buildRouter(testChatHandler(), noopMiddleware, noopMiddleware, stubHealthHandler)
+	router := buildRouter(testChatHandler(), testProvidersHandler(), noopMiddleware, noopMiddleware, stubHealthHandler)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
@@ -98,7 +130,7 @@ func TestBuildRouter_ListModels(t *testing.T) {
 }
 
 func TestBuildRouter_ChatCompletions(t *testing.T) {
-	router := buildRouter(testChatHandler(), noopMiddleware, noopMiddleware, stubHealthHandler)
+	router := buildRouter(testChatHandler(), testProvidersHandler(), noopMiddleware, noopMiddleware, stubHealthHandler)
 
 	body, _ := json.Marshal(map[string]any{
 		"model":    "llama-3-8b",
@@ -119,7 +151,7 @@ func TestBuildRouter_ChatCompletions(t *testing.T) {
 // unknown-endpoint 404 — it must 400 for an alias that isn't routed, not 404
 // for being an unrecognised path.
 func TestBuildRouter_RoutingDryrun(t *testing.T) {
-	router := buildRouter(testChatHandler(), noopMiddleware, noopMiddleware, stubHealthHandler)
+	router := buildRouter(testChatHandler(), testProvidersHandler(), noopMiddleware, noopMiddleware, stubHealthHandler)
 
 	body, _ := json.Marshal(map[string]any{"alias": "llama-3-8b", "text": "hello"})
 	w := httptest.NewRecorder()
@@ -143,7 +175,7 @@ func TestBuildRouter_RoutingDryrun(t *testing.T) {
 // KeyTypeService) exercises the 403 branch here; the 200 shape itself is
 // covered by internal/handler's own tests.
 func TestBuildRouter_PolicyEffective(t *testing.T) {
-	router := buildRouter(testChatHandler(), noopMiddleware, noopMiddleware, stubHealthHandler)
+	router := buildRouter(testChatHandler(), testProvidersHandler(), noopMiddleware, noopMiddleware, stubHealthHandler)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/v1/policy/effective?user_id=11111111-1111-1111-1111-111111111111", nil)
@@ -159,7 +191,7 @@ func TestBuildRouter_PolicyEffective(t *testing.T) {
 }
 
 func TestBuildRouter_Health(t *testing.T) {
-	router := buildRouter(testChatHandler(), noopMiddleware, noopMiddleware, stubHealthHandler)
+	router := buildRouter(testChatHandler(), testProvidersHandler(), noopMiddleware, noopMiddleware, stubHealthHandler)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
@@ -184,7 +216,7 @@ type openAIErrorBody struct {
 }
 
 func TestBuildRouter_UnknownV1Endpoints_404WithOpenAIEnvelope(t *testing.T) {
-	router := buildRouter(testChatHandler(), noopMiddleware, noopMiddleware, stubHealthHandler)
+	router := buildRouter(testChatHandler(), testProvidersHandler(), noopMiddleware, noopMiddleware, stubHealthHandler)
 
 	cases := []struct {
 		name   string
@@ -259,7 +291,7 @@ func TestNewHealthHandler_IncludesRoutingAndPolicyStatus(t *testing.T) {
 
 	upstreamChecker := health.NewChecker(nil)
 	semanticClassifier := router.NewSemanticRouterClassifier("", 0.6, time.Second, 5, 30*time.Second)
-	h := newHealthHandler(upstreamChecker, routeMgr, polStore, semanticClassifier)
+	h := newHealthHandler(upstreamChecker, routeMgr, polStore, semanticClassifier, nil)
 
 	router := gin.New()
 	router.GET("/health", h)
@@ -402,7 +434,7 @@ func TestNewHealthHandler_ReportsLoadedPrincipalCounts(t *testing.T) {
 	routeMgr := routing.NewManager(nil, 0)
 	upstreamChecker := health.NewChecker(nil)
 	semanticClassifier := router.NewSemanticRouterClassifier("", 0.6, time.Second, 5, 30*time.Second)
-	h := newHealthHandler(upstreamChecker, routeMgr, fake, semanticClassifier)
+	h := newHealthHandler(upstreamChecker, routeMgr, fake, semanticClassifier, nil)
 
 	router := gin.New()
 	router.GET("/health", h)
@@ -429,8 +461,173 @@ func TestNewHealthHandler_ReportsLoadedPrincipalCounts(t *testing.T) {
 	}
 }
 
+// TestNewHealthHandler_NilProviderStatusOmitsNothingButEmptyArray covers the
+// nil providerStatus case (mirrors how every other newHealthHandler test in
+// this file passes nil) — /health must still return a well-formed (empty,
+// never null) providers array rather than panicking or omitting the key.
+func TestNewHealthHandler_NilProviderStatusOmitsNothingButEmptyArray(t *testing.T) {
+	routeMgr := routing.NewManager(nil, 0)
+	upstreamChecker := health.NewChecker(nil)
+	polStore := policy.NewPgStore(nil, 900*time.Second)
+	semanticClassifier := router.NewSemanticRouterClassifier("", 0.6, time.Second, 5, 30*time.Second)
+	h := newHealthHandler(upstreamChecker, routeMgr, polStore, semanticClassifier, nil)
+
+	router := gin.New()
+	router.GET("/health", h)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/health", nil))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var body struct {
+		Providers []gin.H `json:"providers"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v; body=%s", err, w.Body.String())
+	}
+	if body.Providers == nil {
+		t.Error("expected providers to be an empty array (`[]`), not null/absent, when providerStatus is nil")
+	}
+	if len(body.Providers) != 0 {
+		t.Errorf("expected no providers, got %+v", body.Providers)
+	}
+}
+
+// TestNewHealthHandler_IncludesProviders is item 4 (guilfoyle H2)'s
+// regression test: /health's `providers` array must surface the SAME
+// closed-vocabulary vendor status GET /v1/models already exposes to a
+// service key — name, configured, state, model_count, last_sync_at, and
+// NOTHING else (no model ids, no filter patterns) — and it must never affect
+// the response status even when a vendor is in a failure state.
+func TestNewHealthHandler_IncludesProviders(t *testing.T) {
+	reg := provider.NewStatusRegistry("anthropic", "openai")
+	reg.Report("anthropic", provider.ProviderStatus{Configured: true, State: provider.ProviderStateOK, ModelCount: 3})
+	reg.Report("openai", provider.ProviderStatus{Configured: true, State: provider.ProviderStateAuthFailed})
+
+	routeMgr := routing.NewManager(nil, 0)
+	upstreamChecker := health.NewChecker(nil)
+	polStore := policy.NewPgStore(nil, 900*time.Second)
+	semanticClassifier := router.NewSemanticRouterClassifier("", 0.6, time.Second, 5, 30*time.Second)
+	h := newHealthHandler(upstreamChecker, routeMgr, polStore, semanticClassifier, reg)
+
+	router := gin.New()
+	router.GET("/health", h)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/health", nil))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected /health to always return 200 regardless of vendor state, got %d", w.Code)
+	}
+
+	var body struct {
+		Providers []struct {
+			Name       string  `json:"name"`
+			Configured bool    `json:"configured"`
+			State      string  `json:"state"`
+			ModelCount int     `json:"model_count"`
+			LastSyncAt *string `json:"last_sync_at"`
+		} `json:"providers"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v; body=%s", err, w.Body.String())
+	}
+	if len(body.Providers) != 2 {
+		t.Fatalf("expected both vendors listed, got %+v", body.Providers)
+	}
+	byName := make(map[string]bool)
+	for _, p := range body.Providers {
+		byName[p.Name] = true
+		switch p.Name {
+		case "anthropic":
+			if p.State != "ok" || p.ModelCount != 3 || !p.Configured {
+				t.Errorf("anthropic entry = %+v, want state=ok model_count=3 configured=true", p)
+			}
+		case "openai":
+			if p.State != "auth_failed" || p.ModelCount != 0 {
+				t.Errorf("openai entry = %+v, want state=auth_failed model_count=0", p)
+			}
+		}
+	}
+	if !byName["anthropic"] || !byName["openai"] {
+		t.Fatalf("expected both anthropic and openai listed, got %+v", body.Providers)
+	}
+
+	// Privacy rule: /health is unauthenticated, so — exactly like routing
+	// source status — providers must never carry a model id or a filter
+	// pattern, only counts/state.
+	raw := w.Body.String()
+	for _, needle := range []string{"llama", "gpt-", "claude-", "ANTHROPIC_MODEL_FILTER", "OPENAI_MODEL_FILTER"} {
+		if strings.Contains(raw, needle) {
+			t.Errorf("unauthenticated /health providers array must not contain %q, got: %s", needle, raw)
+		}
+	}
+}
+
+// TestNewHealthHandler_ProvidersOmitsFilterFields is the v2.1 UI-key-install
+// regression guard: GET /v1/models' `providers` array carries
+// filter/filter_source/env_filter_set_at (service key + classes header
+// only), but /health is unauthenticated and MUST switch to its own reduced
+// DTO — this asserts a vendor status carrying all three of those fields
+// never lets any of them reach the /health response body, by field name OR
+// by value.
+func TestNewHealthHandler_ProvidersOmitsFilterFields(t *testing.T) {
+	envSetAt := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	reg := provider.NewStatusRegistry("anthropic", "openai")
+	reg.Report("anthropic", provider.ProviderStatus{
+		Configured:     true,
+		State:          provider.ProviderStateOK,
+		ModelCount:     2,
+		FilterSource:   "db",
+		Filter:         []string{"claude-opus-secret-codename-*"},
+		EnvFilterSetAt: &envSetAt,
+	})
+
+	routeMgr := routing.NewManager(nil, 0)
+	upstreamChecker := health.NewChecker(nil)
+	polStore := policy.NewPgStore(nil, 900*time.Second)
+	semanticClassifier := router.NewSemanticRouterClassifier("", 0.6, time.Second, 5, 30*time.Second)
+	h := newHealthHandler(upstreamChecker, routeMgr, polStore, semanticClassifier, reg)
+
+	router := gin.New()
+	router.GET("/health", h)
+	w := httptest.NewRecorder()
+	router.ServeHTTP(w, httptest.NewRequest(http.MethodGet, "/health", nil))
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	raw := w.Body.String()
+	for _, needle := range []string{
+		"filter_source", "env_filter_set_at", `"filter"`,
+		"claude-opus-secret-codename", "\"db\"",
+	} {
+		if strings.Contains(raw, needle) {
+			t.Errorf("/health must never expose %q, got: %s", needle, raw)
+		}
+	}
+
+	var body struct {
+		Providers []map[string]any `json:"providers"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v; body=%s", err, raw)
+	}
+	if len(body.Providers) != 2 {
+		t.Fatalf("expected both vendors listed, got %+v", body.Providers)
+	}
+	for _, p := range body.Providers {
+		for _, key := range []string{"filter", "filter_source", "env_filter_set_at"} {
+			if _, present := p[key]; present {
+				t.Errorf("/health provider entry must not have key %q, got %+v", key, p)
+			}
+		}
+	}
+}
+
 func TestBuildRouter_NonV1UnknownPath_GenericJSON404(t *testing.T) {
-	router := buildRouter(testChatHandler(), noopMiddleware, noopMiddleware, stubHealthHandler)
+	router := buildRouter(testChatHandler(), testProvidersHandler(), noopMiddleware, noopMiddleware, stubHealthHandler)
 
 	w := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/totally-unrelated", nil)

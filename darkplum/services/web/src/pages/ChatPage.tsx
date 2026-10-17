@@ -26,7 +26,8 @@ import {
   type Conversation,
 } from '../lib/conversations'
 import { saveBlob } from '../lib/download'
-import type { ChatMessage } from '../types'
+import { chatTagline, pickDefaultModel } from '../lib/modelChoice'
+import type { BackendClass, ChatMessage } from '../types'
 import { useAuth } from '../context/AuthContext'
 import { useToast } from '../components/Toast'
 import { useModels } from '../hooks/useModels'
@@ -80,6 +81,11 @@ interface Attempt {
   servedModel: string | null
   route: string | null
   reason: string | null
+  /** Where the gateway said it ran, and who served it. The only source for
+   *  this: a routed alias resolves after the request has left, so nothing on
+   *  this side can work it out from the model that was picked. */
+  backendClass: BackendClass | null
+  provider: string | null
 }
 
 export function ChatPage() {
@@ -126,6 +132,13 @@ export function ChatPage() {
     () => new Set(models.filter((m) => m.alias_kind === 'routed').map((m) => m.id)),
     [models],
   )
+  /** Who owns each entry on offer. On an external model that is the vendor,
+   *  which is who a failure card names when the gateway's own provider header
+   *  did not reach us. */
+  const modelOwners = useMemo(
+    () => new Map(models.map((m) => [m.id, m.owned_by])),
+    [models],
+  )
   const modelsReady = models.length > 0
   /** The default below is a convenience for the first visit only. Once it has
    *  fired, an empty selection is a deliberate one and stays empty. */
@@ -142,16 +155,16 @@ export function ChatPage() {
         : 'empty'
 
   /** The first visit starts on the model the policy nominates — the first
-   *  non-null default walking key → user → organisation. Without one, the first
-   *  entry on offer. Once this has fired, an empty selection is a deliberate
-   *  one and stays empty. */
+   *  non-null default walking key → user → organisation. Without one,
+   *  pickDefaultModel chooses by where the prompt goes rather than by where the
+   *  entry happens to fall in the list. Once this has fired, an empty selection
+   *  is a deliberate one and stays empty. */
   useEffect(() => {
     if (modelsReady && !model && !autoPickedRef.current && pendingModel === null) {
       autoPickedRef.current = true
-      const preferred = defaultModel && modelIds.includes(defaultModel) ? defaultModel : models[0].id
-      setModel(preferred)
+      setModel(pickDefaultModel(models, defaultModel))
     }
-  }, [modelsReady, model, models, modelIds, defaultModel, pendingModel])
+  }, [modelsReady, model, models, defaultModel, pendingModel])
 
   /** A conversation reopens on the model it was last used with — but only if
    *  that model is still on offer. When it is gone the picker is left empty for
@@ -164,6 +177,10 @@ export function ChatPage() {
   }, [pendingModel, modelsReady, modelIds])
 
   const active = conversations.find((c) => c.id === activeId) ?? null
+  /** The entry the picker is on, for anything that has to describe it — the
+   *  empty state's tagline above all, which sits one line under the picker's
+   *  own "leaves your cloud account" and must not contradict it. */
+  const selectedModel = models.find((m) => m.id === model) ?? null
   const messages = active?.messages ?? []
   const threadLoading = Boolean(active && loadingId === active.id)
 
@@ -491,6 +508,8 @@ export function ChatPage() {
           servedModel: null,
           route: null,
           reason: null,
+          backendClass: null,
+          provider: null,
         }
         await streamChat(
           toWireMessages(messagesToSend),
@@ -518,6 +537,8 @@ export function ChatPage() {
             attempt.servedModel = meta.model
             attempt.route = meta.route
             attempt.reason = meta.routerReason
+            attempt.backendClass = meta.backendClass
+            attempt.provider = meta.provider
           },
         )
         abortRef.current = null
@@ -565,11 +586,19 @@ export function ChatPage() {
         // The failure lives in component state only — it is never part of the
         // conversation, so it is never stored or replayed to a model.
         const err = result.error
-        const code = err instanceof ChatError ? err.code : undefined
+        const chatErr = err instanceof ChatError ? err : null
+        const code = chatErr?.code
         setFailure({
           message: err ? err.message : 'The message was not sent',
           code,
           model: sendModel,
+          // Who the gateway said served it, falling back to the owner of the
+          // entry that was picked. A routed alias is owned by no vendor, and
+          // the header is the only thing that knows what it resolved to — so
+          // the header goes first and the catalogue is the fallback.
+          vendor: result.provider ?? modelOwners.get(sendModel) ?? null,
+          param: chatErr?.param ?? null,
+          retryAfterSeconds: chatErr?.retryAfterSeconds ?? null,
         })
         setConversations((prev) =>
           prev.map((c) => (c.id === target.id ? { ...c, messages: messagesToSend } : c)),
@@ -635,6 +664,12 @@ export function ChatPage() {
           // as long as this copy of the conversation does.
           route: result.route,
           routerReason: result.reason,
+          // Same lifetime as the route: the gateway's headers, kept for as
+          // long as this copy of the conversation is on screen. Not stored,
+          // so a reloaded thread says nothing about where a turn ran rather
+          // than claiming something it cannot know.
+          backendClass: result.backendClass,
+          provider: result.provider,
           rerouted,
         },
       ]
@@ -669,7 +704,7 @@ export function ChatPage() {
         }
       }
     },
-    [streaming, model, routedAliases, reconcileModels],
+    [streaming, model, routedAliases, modelOwners, reconcileModels],
   )
 
   const handleSend = useCallback(
@@ -861,7 +896,7 @@ export function ChatPage() {
           <div className={styles.emptyState}>
             <h2 className={styles.emptyTitle}>darkplum</h2>
             {modelsState !== 'error' && modelsState !== 'empty' && (
-              <p className={styles.emptyTagline}>Private AI, running in your infrastructure.</p>
+              <p className={styles.emptyTagline}>{chatTagline(selectedModel)}</p>
             )}
 
             {modelsState === 'ready' && (

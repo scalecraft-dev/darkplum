@@ -1,6 +1,11 @@
 import { useCallback, useEffect, useState } from 'react'
 import { getMyPolicyEffective } from '../lib/api'
-import { POLICY_RULE, policyLimits, residencyLabel, sourceLabelForSelf } from '../lib/policy'
+import {
+  POLICY_RULE,
+  policyLimits,
+  residencyLabelForSelf,
+  sourceLabelForSelf,
+} from '../lib/policy'
 import { formatModelName } from '../lib/formatModelName'
 import type { EffectivePolicy, Model } from '../types'
 import { Button, Modal } from '../components/ui'
@@ -132,9 +137,7 @@ export function ModelAccessNotice({ models, suppressError = false }: Props) {
 
             <dt>Where they run</dt>
             <dd>
-              {policy.residency === 'self_hosted_only'
-                ? 'Self-hosted only — nothing leaves your infrastructure'
-                : residencyLabel(policy.residency)}
+              {residencyLabelForSelf(policy.residency)}
               {policy.sources?.residency && (
                 <span className={styles.source}>{sourceLabelForSelf(policy.sources.residency)}</span>
               )}

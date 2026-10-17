@@ -1,10 +1,17 @@
 import { useMemo, useState } from 'react'
 import type { AdminModel, ModelAlias } from '../types'
 import { aliasTargetIds } from '../lib/policy'
-import { backendClassLabel, backendClassOf, isReachable } from '../lib/modelRouting'
+import {
+  backendClassLabel,
+  backendClassTooltip,
+  backendClassVariant,
+  displayClassOf,
+  isEgress,
+  isReachable,
+} from '../lib/modelRouting'
 import { formatModelName } from '../lib/formatModelName'
 import { useToast } from '../components/Toast'
-import { Badge } from '../components/ui'
+import { Badge, ClassGlyph } from '../components/ui'
 import styles from './ModelAllowlistPicker.module.css'
 
 interface Props {
@@ -54,6 +61,14 @@ export function ModelAllowlistPicker({ models, aliases, value, onChange, label }
         formatModelName(m.model_id).toLowerCase().includes(q),
     )
   }, [enabled, search])
+
+  /** How many ticked models call a vendor API. Counted from the catalogue, so
+   *  an id left in the list after its model disappeared is not counted as
+   *  anything — it is not reachable either. */
+  const tickedEgress = useMemo(
+    () => enabled.filter((m) => value.includes(m.model_id) && isEgress(displayClassOf(m))).length,
+    [enabled, value],
+  )
 
   const toggle = (modelId: string) => {
     const next = value.includes(modelId)
@@ -111,7 +126,7 @@ export function ModelAllowlistPicker({ models, aliases, value, onChange, label }
           </li>
         ) : (
           filtered.map((m) => {
-            const cls = backendClassOf(m)
+            const cls = displayClassOf(m)
             return (
               <li key={m.id} className={styles.modelItem}>
                 <label className={styles.modelLabel}>
@@ -128,7 +143,17 @@ export function ModelAllowlistPicker({ models, aliases, value, onChange, label }
                     <code className={styles.modelId}>{m.model_id}</code>
                   </span>
                   <span className={styles.modelFlags}>
-                    <Badge variant={cls === 'cloud_managed' ? 'info' : 'neutral'} bordered>
+                    {/* An allowlist is written model by model, so the class
+                        rides on every row: ticking a vendor model is a
+                        decision about egress and must never look like ticking
+                        a local one. */}
+                    <Badge
+                      variant={backendClassVariant(cls)}
+                      bordered
+                      dashed={cls === 'unknown'}
+                      title={backendClassTooltip(cls)}
+                    >
+                      <ClassGlyph cls={cls} />
                       {backendClassLabel(cls)}
                     </Badge>
                     {!isReachable(m) && <Badge variant="warning" bordered>Not reachable</Badge>}
@@ -140,8 +165,18 @@ export function ModelAllowlistPicker({ models, aliases, value, onChange, label }
         )}
       </ul>
 
+      {/* The tally, and the one thing about it worth calling out: an allowlist
+          is read as a safety measure, so a list that includes models outside
+          the account should say so where it is being written, not later. */}
       <p className={styles.count} role="status" aria-live="polite">
         {value.length} of {enabled.length} enabled models ticked
+        {tickedEgress > 0 && (
+          <span className={styles.countEgress}>
+            {' · '}
+            {tickedEgress === 1 ? '1 sends prompts' : `${tickedEgress} send prompts`} outside your
+            cloud account
+          </span>
+        )}
       </p>
     </div>
   )

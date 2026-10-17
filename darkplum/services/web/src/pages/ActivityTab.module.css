@@ -141,6 +141,16 @@
   font-family: var(--font-mono);
 }
 
+/* The outcome, and the one thing about it worth a second badge. Wraps rather
+   than truncates: an egress marker that falls off the end of a cell is a
+   marker that is not there. */
+.actionCell {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1);
+}
+
 .detailText {
   color: var(--fg-muted);
   font-size: var(--fs-xs);

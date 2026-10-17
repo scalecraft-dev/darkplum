@@ -35,15 +35,55 @@ func NewChatHandler(gatewayURL, serviceKey string) *ChatHandler {
 	}
 }
 
-type chatMessage struct {
-	Role    string          `json:"role"`
-	Content json.RawMessage `json:"content"`
+// chatEnvelope is the little of a chat request this proxy reads. Everything
+// else in the body -- max_tokens, temperature, top_p, stop, and fields the
+// gateway refuses by name such as tools -- is carried through untouched: the
+// gateway is the one place that decides what a request may contain, and it can
+// only do that for fields it actually receives.
+type chatEnvelope struct {
+	Messages []json.RawMessage `json:"messages"`
+	Stream   bool              `json:"stream,omitempty"`
 }
 
-type chatRequest struct {
-	Model    string        `json:"model"`
-	Messages []chatMessage `json:"messages"`
-	Stream   bool          `json:"stream,omitempty"`
+// withSystemPrompt returns body with the platform system prompt prepended to
+// messages, unless the caller already leads with a system message. Only the
+// "messages" member is rewritten; every other member, and every member of each
+// message, is preserved byte for byte.
+func withSystemPrompt(body []byte) (modified []byte, stream bool, err error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return nil, false, err
+	}
+	var env chatEnvelope
+	if err := json.Unmarshal(body, &env); err != nil {
+		return nil, false, err
+	}
+
+	hasSystemMsg := false
+	if len(env.Messages) > 0 {
+		var first struct {
+			Role string `json:"role"`
+		}
+		if err := json.Unmarshal(env.Messages[0], &first); err != nil {
+			return nil, false, err
+		}
+		hasSystemMsg = first.Role == "system"
+	}
+	if !hasSystemMsg {
+		system, err := json.Marshal(map[string]string{"role": "system", "content": resolvedSystemPrompt()})
+		if err != nil {
+			return nil, false, err
+		}
+		env.Messages = append([]json.RawMessage{system}, env.Messages...)
+	}
+
+	messages, err := json.Marshal(env.Messages)
+	if err != nil {
+		return nil, false, err
+	}
+	fields["messages"] = messages
+	modified, err = json.Marshal(fields)
+	return modified, env.Stream, err
 }
 
 func resolvedSystemPrompt() string {
@@ -55,7 +95,24 @@ func resolvedSystemPrompt() string {
 //
 // Injects the system prompt and service API key, then proxies to the gateway,
 // streaming the response back to the browser.
+//
+// Clears this response's write deadline (http.ResponseController,
+// SetWriteDeadline(zero) -- "no deadline") before writing anything: the
+// server's WriteTimeout (cmd/main.go, 120s) is a fine default for every other
+// endpoint, but a frontier model's completion can legitimately take longer
+// than that to fully stream, and Go's net/http applies WriteTimeout to the
+// entire response, not per-write -- so without this, a slow-but-healthy
+// generation gets its connection cut mid-stream at the 120s mark. This is
+// scoped to this one handler/route; every other endpoint keeps the server's
+// WriteTimeout. A ResponseWriter that doesn't support SetWriteDeadline (e.g.
+// httptest.NewRecorder in a unit test, never a real net/http server) returns
+// http.ErrNotSupported here, which is not a proxy failure and is only logged
+// at debug level.
 func (h *ChatHandler) ProxyChat(c *gin.Context) {
+	if err := http.NewResponseController(c.Writer).SetWriteDeadline(time.Time{}); err != nil {
+		slog.DebugContext(c.Request.Context(), "chat proxy: clear write deadline unsupported by response writer", "err", err)
+	}
+
 	body, err := io.ReadAll(c.Request.Body)
 	if err != nil {
 		slog.ErrorContext(c.Request.Context(), "read request body", "err", err)
@@ -63,26 +120,10 @@ func (h *ChatHandler) ProxyChat(c *gin.Context) {
 		return
 	}
 
-	var req chatRequest
-	if err := json.Unmarshal(body, &req); err != nil {
+	modified, stream, err := withSystemPrompt(body)
+	if err != nil {
 		slog.ErrorContext(c.Request.Context(), "parse request body", "err", err)
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
-		return
-	}
-
-	hasSystemMsg := len(req.Messages) > 0 && req.Messages[0].Role == "system"
-	if !hasSystemMsg {
-		systemContent, _ := json.Marshal(resolvedSystemPrompt())
-		req.Messages = append([]chatMessage{{
-			Role:    "system",
-			Content: systemContent,
-		}}, req.Messages...)
-	}
-
-	modified, err := json.Marshal(req)
-	if err != nil {
-		slog.ErrorContext(c.Request.Context(), "marshal modified request", "err", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal error"})
 		return
 	}
 
@@ -137,13 +178,24 @@ func (h *ChatHandler) ProxyChat(c *gin.Context) {
 		"X-Darkplum-Model",
 		"X-Darkplum-Route",
 		"X-Darkplum-Router-Reason",
+		// Backend class (self_hosted|cloud_managed|external_api) and provider
+		// kind (vllm|lmstudio|bedrock|anthropic|openai|mock) the request
+		// actually resolved to -- set by the gateway before its first response
+		// byte, same as the routing headers above, so the webchat can render
+		// residency provenance ("sent to Anthropic — leaves your cloud
+		// account") without a second round trip.
+		"X-Darkplum-Backend-Class",
+		"X-Darkplum-Provider",
+		// A vendor's rate limit reaches the caller as 429 with the vendor's own
+		// Retry-After, so an SDK's backoff engages instead of hammering.
+		"Retry-After",
 	} {
 		if v := resp.Header.Get(header); v != "" {
 			c.Header(header, v)
 		}
 	}
 
-	if flusher, ok := c.Writer.(http.Flusher); ok && req.Stream {
+	if flusher, ok := c.Writer.(http.Flusher); ok && stream {
 		buf := make([]byte, 4096)
 		for {
 			n, readErr := resp.Body.Read(buf)

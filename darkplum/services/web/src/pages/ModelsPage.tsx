@@ -9,26 +9,84 @@ import {
   listPolicyPrincipals,
   putModelAlias,
   setModelDisplayName,
+  setVendorFilter,
   toggleModel,
   updateRoutingPolicy,
 } from '../lib/api'
 import { formatModelName } from '../lib/formatModelName'
-import { UNREACHABLE_HINT, backendClassLabel, backendClassOf, isReachable } from '../lib/modelRouting'
-import { orgPolicyRestricted } from '../lib/policy'
-import type { AdminModel, ModelAlias, ModelAliasInput, PolicyPrincipal, Residency, RoutingPolicy } from '../types'
+import {
+  UNKNOWN_CLASS_HINT,
+  UNREACHABLE_HINT,
+  UNSUPPORTED_CONTENT_NOTE,
+  backendClassLabel,
+  backendClassTooltip,
+  backendClassVariant,
+  compareProviders,
+  displayClassOf,
+  isEgress,
+  isReachable,
+  isVendorProvider,
+  providerLabel,
+  vendorLabel,
+} from '../lib/modelRouting'
+import {
+  DEFAULT_RESIDENCY,
+  orgPolicyRestricted,
+  residencyLabel,
+  residencyPermits,
+} from '../lib/policy'
+import { canInstallKeyOverTransport, installPhase, keyTransportHelp } from '../lib/vendorKeys'
+import type { KeyTransportHelp } from '../lib/vendorKeys'
+import type {
+  AdminModel,
+  DisplayClass,
+  ModelAlias,
+  ModelAliasInput,
+  PolicyPrincipal,
+  ProviderStatus,
+  Residency,
+  RoutingPolicy,
+  VendorName,
+} from '../types'
 import { useToast } from '../components/Toast'
-import { Badge, Tab, TabList, TabPanel, Table, TableEmpty } from '../components/ui'
+import {
+  Badge,
+  Button,
+  ClassGlyph,
+  EgressGlyph,
+  LockGlyph,
+  Tab,
+  TabList,
+  TabPanel,
+  Table,
+  TableEmpty,
+  UnknownGlyph,
+  UnreachableGlyph,
+} from '../components/ui'
 import { CopyButton } from '../components/ui/CopyButton'
 import { Skeleton } from '../components/ui/Skeleton'
 import { AccessOverviewSection } from './AccessOverviewSection'
 import { AliasesSection } from './AliasesSection'
 import { RoutingPolicyCard, type OrgPolicyDraft } from './RoutingPolicyCard'
+import { VendorEnableModal } from './VendorEnableModal'
+import { VendorInstallModal, type Outcome, type VendorInstallMode } from './VendorInstallModal'
+import { VendorStatusSection } from './VendorStatusSection'
 import pageStyles from './PageLayout.module.css'
 import styles from './ModelsPage.module.css'
 
 /** Access overview page size. The API caps a page at 200; a smaller first
  *  page keeps the section quick to paint, and "Show more" fetches the rest. */
 const PRINCIPALS_PAGE = 100
+
+/** How often the catalogue is re-read while a vendor key or filter is landing.
+ *  The api syncs on the same cadence over that window, so this is not a poll
+ *  against a value that cannot have changed. */
+const INSTALLING_POLL_MS = 5_000
+
+/** A vendor with no stored filter, as one array rather than a fresh literal:
+ *  the key modal seeds its checklist from this and must not re-seed because a
+ *  poll handed it a new empty array. */
+const EMPTY_FILTER: string[] = []
 
 type Filter = 'all' | 'enabled' | 'disabled'
 
@@ -42,16 +100,6 @@ const TAB_SCOPE = 'models-page'
 
 function tabFromParam(value: string | null): TabKey {
   return value === 'aliases' || value === 'policy' ? value : 'models'
-}
-
-const PROVIDER_LABELS: Record<string, string> = {
-  bedrock: 'AWS Bedrock',
-  vllm: 'Local',
-  lmstudio: 'LM Studio',
-}
-
-function providerLabel(provider: string): string {
-  return PROVIDER_LABELS[provider] ?? provider
 }
 
 /** Extract the vendor from a Bedrock inference profile ID.
@@ -68,31 +116,76 @@ function extractVendor(modelId: string): string {
   return ''
 }
 
-function vendorLabel(vendor: string): string {
-  if (!vendor) return 'Other'
-  return vendor.charAt(0).toUpperCase() + vendor.slice(1)
+/** A Bedrock sub-group heading. Unlike a vendor provider, this is the company
+ *  that made the weights, not the company being called. */
+function bedrockVendorHeading(vendor: string): string {
+  return vendor ? vendorLabel(vendor) : 'Other'
 }
 
 // ---------------------------------------------------------------------------
-// Badge glyphs — the state is never carried by colour alone.
+// Why a row is refused
+//
+// One function, so the badge, the hint and the counts on this page can never
+// disagree about a rule the gateway enforces once. The order matters: a model
+// that is off is not "blocked by policy", it is off, and telling an
+// administrator to change the policy would be sending them to the wrong screen.
 // ---------------------------------------------------------------------------
 
-function LockGlyph() {
-  return (
-    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className={styles.badgeIcon}>
-      <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
-      <path d="M7 11V7a5 5 0 0 1 10 0v4" />
-    </svg>
-  )
-}
+type RowFlag =
+  | { kind: 'disabled_by_policy'; hint: string }
+  | { kind: 'blocked'; hint: string }
+  | { kind: 'unknown'; hint: string }
+  | { kind: 'unreachable'; hint: string }
+  | null
 
-function UnreachableGlyph() {
-  return (
-    <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true" className={styles.badgeIcon}>
-      <circle cx="12" cy="12" r="10" />
-      <line x1="4.93" y1="4.93" x2="19.07" y2="19.07" />
-    </svg>
-  )
+function rowFlag(
+  m: AdminModel,
+  residency: Residency,
+  allowedModels: string[] | null,
+): RowFlag {
+  const cls = displayClassOf(m)
+  const permitted = residencyPermits(residency, cls)
+  const onAllowlist = allowedModels === null || allowedModels.includes(m.model_id)
+
+  // A disabled row is not being refused by anything — it is off. It still
+  // earns a note when turning it on would not be enough, because "enable it
+  // and it works" is the reasonable assumption and it would be wrong.
+  if (!m.enabled) {
+    if (cls === 'unknown') return { kind: 'unknown', hint: UNKNOWN_CLASS_HINT }
+    if (!permitted) {
+      return {
+        kind: 'disabled_by_policy',
+        hint: `Turning this on is not enough: "${residencyLabel(residency)}" refuses ${backendClassLabel(cls).toLowerCase()} models.`,
+      }
+    }
+    if (!onAllowlist) {
+      return {
+        kind: 'disabled_by_policy',
+        hint: "Turning this on is not enough: it is not on the organisation's allowed list.",
+      }
+    }
+    return null
+  }
+
+  // Enabled, and refused anyway. The unknown class is its own answer: the fix
+  // is a backend reporting it, not a policy change.
+  if (cls === 'unknown') return { kind: 'unknown', hint: UNKNOWN_CLASS_HINT }
+  if (!permitted) {
+    return {
+      kind: 'blocked',
+      hint: `Enabled, but refused: "${residencyLabel(residency)}" does not permit ${backendClassLabel(cls).toLowerCase()} models.`,
+    }
+  }
+  if (!onAllowlist) {
+    return {
+      kind: 'blocked',
+      hint: "Enabled, but not on the organisation's allowed list, so refused.",
+    }
+  }
+  // A policy refusal outranks an unreachable backend: it still refuses the
+  // request once the backend comes back.
+  if (!isReachable(m)) return { kind: 'unreachable', hint: UNREACHABLE_HINT }
+  return null
 }
 
 // ---------------------------------------------------------------------------
@@ -227,15 +320,37 @@ interface ProviderSectionProps {
   residency: Residency
   /** The organisation's allowlist, or null when every enabled model is allowed. */
   allowedModels: string[] | null
+  /** True for a vendor whose key works and whose models are all still off:
+   *  the one moment the first-run banner belongs on this card. */
+  firstRun: boolean
+  onReviewAndEnable: (vendor: VendorName) => void
   onToggle: (model: AdminModel) => void
   onRename: (model: AdminModel, displayName: string | null) => Promise<void>
 }
 
-function ProviderSection({ provider, models, togglingIds, residency, allowedModels, onToggle, onRename }: ProviderSectionProps) {
+function ProviderSection({
+  provider,
+  models,
+  togglingIds,
+  residency,
+  allowedModels,
+  firstRun,
+  onReviewAndEnable,
+  onToggle,
+  onRename,
+}: ProviderSectionProps) {
   const [collapsed, setCollapsed] = useState(false)
 
   const enabledCount = models.filter((m) => m.enabled).length
   const unreachableCount = models.filter((m) => !isReachable(m)).length
+
+  /** The class of this provider's models. Providers are homogeneous in
+   *  practice, so one badge on the header says it for every row beneath —
+   *  and where they are not, the per-row badge still tells the truth. */
+  const headerClass: DisplayClass = useMemo(() => {
+    const classes = new Set(models.map((m) => displayClassOf(m)))
+    return classes.size === 1 ? [...classes][0] : 'unknown'
+  }, [models])
 
   // For Bedrock, sub-group by vendor
   const isBedrock = provider === 'bedrock'
@@ -254,25 +369,13 @@ function ProviderSection({ provider, models, togglingIds, residency, allowedMode
 
   const renderModelRow = (m: AdminModel) => {
     const displayName = m.display_name ?? formatModelName(m.model_id)
-    const cls = backendClassOf(m)
-    // Enabled, but the organisation's policy refuses it anyway: residency
-    // refuses cloud-managed models; an allowlist refuses anything not on it.
-    const residencyBlocked = m.enabled && residency === 'self_hosted_only' && cls === 'cloud_managed'
-    const allowlistBlocked = m.enabled && allowedModels !== null && !allowedModels.includes(m.model_id)
-    const blocked = residencyBlocked || allowlistBlocked
+    const cls = displayClassOf(m)
+    const flag = rowFlag(m, residency, allowedModels)
     // Configured, but the gateway has not seen its backend for a few minutes.
+    // Counted apart from the flag, which reports only the top problem.
     const unreachable = !isReachable(m)
-    // One hint per row. A policy refusal outranks an unreachable backend: it
-    // still refuses the request once the backend comes back.
-    const hint = residencyBlocked
-      ? 'Enabled, but refused while routing is self-hosted only.'
-      : allowlistBlocked
-        ? "Enabled, but not on the organisation's allowed list, so refused."
-        : unreachable
-          ? UNREACHABLE_HINT
-          : null
     return (
-      <tr key={m.id} className={blocked || unreachable ? styles.rowFlagged : ''}>
+      <tr key={m.id} className={flag ? styles.rowFlagged : ''}>
         <td>
           <div className={styles.modelCell}>
             <DisplayNameCell model={m} onRename={onRename} />
@@ -285,7 +388,13 @@ function ProviderSection({ provider, models, togglingIds, residency, allowedMode
           </div>
         </td>
         <td>
-          <Badge variant={cls === 'cloud_managed' ? 'info' : 'neutral'} bordered>
+          <Badge
+            variant={backendClassVariant(cls)}
+            bordered
+            dashed={cls === 'unknown'}
+            title={backendClassTooltip(cls)}
+          >
+            <ClassGlyph cls={cls} />
             {backendClassLabel(cls)}
           </Badge>
         </td>
@@ -296,10 +405,25 @@ function ProviderSection({ provider, models, togglingIds, residency, allowedMode
               <Badge variant={m.enabled ? 'success' : 'neutral'}>
                 {m.enabled ? 'Enabled' : 'Disabled'}
               </Badge>
-              {blocked && (
+              {flag?.kind === 'blocked' && (
                 <Badge variant="warning" bordered>
                   <LockGlyph />
                   Blocked by policy
+                </Badge>
+              )}
+              {/* A row that is off and would still be refused if turned on.
+                  Named differently from a live refusal, because nothing is
+                  being refused yet — this is about what would happen. */}
+              {flag?.kind === 'disabled_by_policy' && (
+                <Badge variant="neutral" bordered>
+                  <LockGlyph />
+                  Blocked by policy
+                </Badge>
+              )}
+              {flag?.kind === 'unknown' && (
+                <Badge variant="neutral" bordered dashed>
+                  <UnknownGlyph />
+                  Not reported
                 </Badge>
               )}
               {unreachable && (
@@ -309,7 +433,7 @@ function ProviderSection({ provider, models, togglingIds, residency, allowedMode
                 </Badge>
               )}
             </div>
-            {hint && <span className={styles.statusHint}>{hint}</span>}
+            {flag && <span className={styles.statusHint}>{flag.hint}</span>}
           </div>
         </td>
         <td className={styles.statusCol}>
@@ -342,6 +466,18 @@ function ProviderSection({ provider, models, togglingIds, residency, allowedMode
         >
           <div className={styles.providerHeaderLeft}>
             <span className={styles.providerName}>{providerLabel(provider)}</span>
+            {/* Where everything under this header runs. On the header rather
+                than only per row, because the decision an administrator makes
+                here — expand this card at all? — is about the whole group. */}
+            <Badge
+              variant={backendClassVariant(headerClass)}
+              bordered
+              dashed={headerClass === 'unknown'}
+              title={backendClassTooltip(headerClass)}
+            >
+              <ClassGlyph cls={headerClass} />
+              {backendClassLabel(headerClass)}
+            </Badge>
             <span className={styles.providerCount}>
               {enabledCount} of {models.length} enabled
             </span>
@@ -367,12 +503,43 @@ function ProviderSection({ provider, models, togglingIds, residency, allowedMode
         </div>
 
         <div className={collapsed ? styles.providerBodyCollapsed : styles.providerBody}>
+          {/* The one moment this banner is worth showing: the key works, the
+              models are here, and not one of them is on. It disappears the
+              instant any of them is — including when it is turned on from the
+              row switch rather than from the button. */}
+          {firstRun && (
+            <div className={styles.firstRun}>
+              <div className={styles.firstRunText}>
+                <p className={styles.firstRunTitle}>
+                  {providerLabel(provider)} is connected, and none of its models are on yet.
+                </p>
+                <p className={styles.firstRunBody}>
+                  Turning these on sends prompts to {providerLabel(provider)}, outside your cloud
+                  account. Review what that means and pick which models before anything changes.
+                </p>
+              </div>
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={() => onReviewAndEnable(provider as VendorName)}
+              >
+                Review and enable
+              </Button>
+            </div>
+          )}
+
+          {/* The note about what a request may carry used to hang here, on each
+              vendor card. It is not a vendor limit any more — tool calls and
+              images are refused on every backend — so repeating it per vendor
+              said the opposite of what is true. It is stated once, above the
+              catalogue. */}
+
           {vendorGroups ? (
             // Bedrock: render sub-groups with vendor headings
             vendorGroups.map(([vendor, vendorModels]) => (
               <div key={vendor}>
-                <div className={styles.vendorHeading}>{vendorLabel(vendor)}</div>
-                <Table label={`${vendorLabel(vendor)} models on ${providerLabel(provider)}`}>
+                <div className={styles.vendorHeading}>{bedrockVendorHeading(vendor)}</div>
+                <Table label={`${bedrockVendorHeading(vendor)} models on ${providerLabel(provider)}`}>
                   <thead>
                     <tr>
                       <th>Model</th>
@@ -463,6 +630,30 @@ export function ModelsPage() {
   )
 
   const [models, setModels] = useState<AdminModel[]>([])
+  /** Vendor status, from the same response as the catalogue: the gateway
+   *  reports both in one sync, so reading them apart could show a vendor as
+   *  connected next to a catalogue that predates the key. */
+  const [providers, setProviders] = useState<ProviderStatus[]>([])
+  /** What the gateway behind this api can do. Decides whether the vendor card
+   *  offers a form or the command line — never a form that fails on submit. */
+  const [providerFeatures, setProviderFeatures] = useState<string[]>([])
+  /** Whether the api would accept a key over this page's transport. Null until
+   *  it has answered, and on an api that predates the field — read through
+   *  canInstallKeyOverTransport, which falls back to the browser's own view. */
+  const [keyTransportOk, setKeyTransportOk] = useState<boolean | null>(null)
+  /** The last removal's warnings, by vendor. Held on the page rather than in
+   *  the modal because the modal closes on success and the card is where the
+   *  removal is watched; cleared when that vendor gets a key again. */
+  const [removalWarnings, setRemovalWarnings] = useState<Partial<Record<VendorName, string[]>>>({})
+  /** Which vendor's key modal is open, and which errand it is on. One at a
+   *  time: they all write the same two objects. */
+  const [managing, setManaging] = useState<{ vendor: VendorName; mode: VendorInstallMode } | null>(
+    null,
+  )
+  /** Which vendor's "Review and enable" is open, or null. One at a time: it
+   *  writes the organisation's policy, and two of those racing is not a state
+   *  worth supporting. */
+  const [enablingVendor, setEnablingVendor] = useState<VendorName | null>(null)
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState('')
   const [filter, setFilter] = useState<Filter>('all')
@@ -483,13 +674,24 @@ export function ModelsPage() {
   const [principalsLoadingMore, setPrincipalsLoadingMore] = useState(false)
   const [principalsError, setPrincipalsError] = useState<string | null>(null)
 
-  const residency: Residency = policy?.residency ?? 'any'
+  /**
+   * The rung every "would this be refused?" question on this page is answered
+   * against. Until the policy has loaded there is no answer, and the fallback
+   * must not be the loosest rung: that would paint a vendor model as permitted
+   * for the first frame after a reload, which is the one thing the class
+   * labelling exists to prevent. The api's own default is the safe assumption,
+   * and it never returns null for the organisation.
+   */
+  const residency: Residency = policy?.residency ?? DEFAULT_RESIDENCY
   const allowedModels: string[] | null = policy?.allowed_models ?? null
 
   const loadModels = useCallback(async () => {
     try {
-      const data = await listAdminModels()
-      setModels(data)
+      const result = await listAdminModels()
+      setModels(result.models)
+      setProviders(result.providers)
+      setProviderFeatures(result.providerFeatures)
+      setKeyTransportOk(result.keyInstallTransportOk)
     } catch (err) {
       toast((err as Error).message, 'error')
     } finally {
@@ -579,6 +781,8 @@ export function ModelsPage() {
     orgNarrowed: boolean
     unresolvedModels: string[]
     lockedOut: string[]
+    /** A 409 that was not a lockout — the API's own sentence, shown as it came. */
+    refusal: string | null
   }> => {
     setPolicySaving(true)
     try {
@@ -599,8 +803,15 @@ export function ModelsPage() {
         orgNarrowed: updated.org_narrowed ?? false,
         unresolvedModels: updated.unresolved_models ?? [],
         lockedOut: [],
+        refusal: null,
       }
     } catch (err) {
+      // A 409 used to mean exactly one thing: this policy would leave someone
+      // with no model. It can now also mean a routed alias has a route the new
+      // rung refuses. The two are told apart by the STRUCTURED `locked_out`
+      // field, never by the sentence — a 409 without it is reported in the
+      // card as the API worded it, rather than being announced as a lockout
+      // that did not happen.
       if (err instanceof ApiError && err.status === 409) {
         const lockedOut = err.lockedOut()
         return {
@@ -608,11 +819,19 @@ export function ModelsPage() {
           affectedPrincipals: 0,
           orgNarrowed: false,
           unresolvedModels: [],
-          lockedOut: lockedOut.length > 0 ? lockedOut : ['(organisation)'],
+          lockedOut,
+          refusal: lockedOut.length > 0 ? null : (err as Error).message,
         }
       }
       toast((err as Error).message, 'error')
-      return { warnings: [], affectedPrincipals: 0, orgNarrowed: false, unresolvedModels: [], lockedOut: [] }
+      return {
+        warnings: [],
+        affectedPrincipals: 0,
+        orgNarrowed: false,
+        unresolvedModels: [],
+        lockedOut: [],
+        refusal: null,
+      }
     } finally {
       setPolicySaving(false)
     }
@@ -708,25 +927,174 @@ export function ModelsPage() {
       if (!groups.has(m.provider)) groups.set(m.provider, [])
       groups.get(m.provider)!.push(m)
     }
-    // Sort: vllm (local) first, then bedrock, then others
-    const order = ['vllm', 'bedrock']
-    return [...groups.entries()].sort(([a], [b]) => {
-      const ai = order.indexOf(a)
-      const bi = order.indexOf(b)
-      if (ai === -1 && bi === -1) return a.localeCompare(b)
-      if (ai === -1) return 1
-      if (bi === -1) return -1
-      return ai - bi
-    })
+    // Closest to the organisation first, furthest last — the same order the
+    // residency ladder reads in, so the two screens agree about which end of
+    // the range is which.
+    return [...groups.entries()].sort(([a], [b]) => compareProviders(a, b))
   }, [filtered])
 
   const totalEnabled = models.filter((m) => m.enabled).length
   const totalUnreachable = models.filter((m) => !isReachable(m)).length
 
+  /**
+   * Vendors whose key works and whose models are every one of them still off.
+   *
+   * Computed from the unfiltered catalogue, never from what the search box has
+   * left on screen: a banner that appears because someone typed a word, or
+   * disappears because they did, is not a banner anyone can trust.
+   */
+  const firstRunVendors = useMemo(() => {
+    const set = new Set<VendorName>()
+    for (const p of providers) {
+      if (p.state !== 'ok') continue
+      const theirs = models.filter((m) => m.provider === p.name)
+      if (theirs.length > 0 && theirs.every((m) => !m.enabled)) set.add(p.name)
+    }
+    return set
+  }, [providers, models])
+
+  /** Vendors with at least one catalogued model that is not on yet — the only
+   *  case where "Review and enable" has anything to do. Computed from the
+   *  whole catalogue, never from what the search box has left on screen. */
+  const enableableVendors = useMemo(() => {
+    const set = new Set<VendorName>()
+    for (const p of providers) {
+      if (models.some((m) => m.provider === p.name && !m.enabled)) set.add(p.name)
+    }
+    return set
+  }, [providers, models])
+
+  /** The catalogue rows the key modal needs: what Change models starts from,
+   *  and what a removal has to turn off first. */
+  const managingModels = useMemo(
+    () => (managing ? models.filter((m) => m.provider === managing.vendor) : []),
+    [managing, models],
+  )
+
+  /** Everything the open modal works on, read from the live catalogue so a
+   *  toggle made behind it is reflected when it is reopened. */
+  const enablingModels = useMemo(
+    () => (enablingVendor ? models.filter((m) => m.provider === enablingVendor) : []),
+    [enablingVendor, models],
+  )
+
+  /**
+   * While a key or a filter is on its way to the gateway, this page re-reads
+   * itself every few seconds.
+   *
+   * The api ticks its own sync faster over the same window, so what is being
+   * polled is genuinely moving. Nothing here is derived from a local timer:
+   * the window comes from `installing_until` on the response, which is why
+   * reloading mid-install picks the wait up rather than restarting it, and why
+   * a second tab shows the same progress.
+   */
+  const inFlight = useMemo(
+    () =>
+      providers.some((p) => {
+        const phase = installPhase(p, Date.now())
+        // A removal is polled for the same reason as an install: the card
+        // settles when the gateway reports the key gone, not on a timer.
+        return phase === 'installing' || phase === 'removing'
+      }),
+    [providers],
+  )
+  useEffect(() => {
+    if (!inFlight) return
+    const id = setInterval(() => void loadModels(), INSTALLING_POLL_MS)
+    return () => clearInterval(id)
+  }, [inFlight, loadModels])
+
+  /** Stores the filter the command line set, so this page becomes the writer
+   *  of record for it. Rejects with the api's own message; the card shows it
+   *  beside the button that was pressed. */
+  const handleAdoptFilter = useCallback(
+    async (vendor: VendorName, filter: string[]) => {
+      await setVendorFilter(vendor, filter)
+      toast(`${vendorLabel(vendor)} model selection is now managed here`, 'success')
+      await loadModels()
+    },
+    [loadModels, toast],
+  )
+
+  /** What the key modal did. The catalogue and the vendor block are reloaded
+   *  in every case: all three outcomes change one or both. */
+  const handleVendorOutcome = useCallback(
+    (outcome: Outcome) => {
+      const vendor = managing?.vendor
+      const name = vendor ? vendorLabel(vendor) : 'The vendor'
+      if (outcome.kind === 'installed') {
+        toast(
+          outcome.admitted.length === 1
+            ? `${name} key stored — 1 model will appear shortly`
+            : `${name} key stored — ${outcome.admitted.length} models will appear shortly`,
+          'success',
+        )
+        // Non-fatal: the key is in. Said once, as its own line, so it is not
+        // mistaken for a failed install.
+        for (const warning of outcome.warnings) toast(warning, 'error')
+        // A key replaces whatever the last removal said about this vendor.
+        if (vendor) setRemovalWarnings((prev) => ({ ...prev, [vendor]: [] }))
+      } else if (outcome.kind === 'removed') {
+        toast(`${name} key removed — your model selection is kept`, 'success')
+        // Not toasted: they belong beside the "Removing" card for as long as
+        // the removal takes, and a toast is gone in seconds.
+        if (vendor) setRemovalWarnings((prev) => ({ ...prev, [vendor]: outcome.warnings }))
+      }
+      void loadModels()
+    },
+    [loadModels, managing, toast],
+  )
+
+  /**
+   * The policy write the modal makes: the whole row, with only the rung
+   * changed. It is a PUT, so the two fields it is not touching have to be
+   * carried through — dropping them here would silently clear an allowlist as
+   * a side effect of enabling a model.
+   */
+  const handleVendorPolicy = useCallback(
+    async (residencyValue: Residency) => {
+      const updated = await updateRoutingPolicy({
+        residency: residencyValue,
+        allowed_models: policy?.allowed_models ?? null,
+        default_model: policy?.default_model ?? null,
+      })
+      setPolicy(updated)
+      void loadAliases()
+      void loadPrincipals()
+    },
+    [policy, loadAliases, loadPrincipals],
+  )
+
+  /** Enables one model for the modal. Throws with the API's own message so a
+   *  partial run can name exactly which model failed and why. */
+  const handleVendorEnable = useCallback(async (model: AdminModel) => {
+    const updated = await toggleModel(model.id, true)
+    setModels((prev) => prev.map((m) => (m.id === updated.id ? updated : m)))
+  }, [])
+
   /** The same test the policy card uses to mark itself restricted. On the
    *  catalogue tab it is the reason a row can be enabled and still refused, so
    *  it is said there too rather than only on the tab that owns it. */
   const policyRestricted = orgPolicyRestricted(policy)
+
+  /**
+   * Whether a key may be typed into this page at all.
+   *
+   * The api refuses one over plain HTTP and says so up front on the models
+   * response; an api that predates the field says nothing, and the browser's
+   * own isSecureContext answers instead. Either way the decision is made once,
+   * here, and the card and the modal read the same answer — one of them
+   * offering a form the other would refuse is the state worth preventing.
+   */
+  const keyTransportAllowed = canInstallKeyOverTransport(keyTransportOk, window.isSecureContext)
+  /** And which of the two faults it is when it is not allowed — the page's
+   *  scheme or the api's own setting. Read from the same three facts, in the
+   *  same place, so the card and the modal never diagnose it differently. */
+  const keyTransportFault = keyTransportHelp(
+    keyTransportOk,
+    window.isSecureContext,
+    window.location.hostname,
+  )
 
   /** Switching tabs from a link INSIDE a panel unmounts that panel, and the
    *  focused link with it — the browser then drops focus to <body>. The tab
@@ -791,6 +1159,13 @@ export function ModelsPage() {
           models={models}
           filtered={filtered}
           providerGroups={providerGroups}
+          providers={providers}
+          providerFeatures={providerFeatures}
+          transportOk={keyTransportAllowed}
+          transportHelp={keyTransportFault}
+          removalWarnings={removalWarnings}
+          firstRunVendors={firstRunVendors}
+          enableableVendors={enableableVendors}
           loading={loading}
           search={search}
           filter={filter}
@@ -805,6 +1180,10 @@ export function ModelsPage() {
           onFilter={setFilter}
           onToggle={handleToggle}
           onRename={handleRename}
+          onReviewAndEnable={setEnablingVendor}
+          onManageVendor={(vendor, mode) => setManaging({ vendor, mode })}
+          onCheckAgain={() => void loadModels()}
+          onAdoptFilter={handleAdoptFilter}
         />
       </TabPanel>
 
@@ -844,6 +1223,49 @@ export function ModelsPage() {
           onLoadMore={() => void loadMorePrincipals()}
         />
       </TabPanel>
+
+      {/* Outside every TabPanel. A modal renders into a portal, so putting it
+          inside a panel would leave it mounted-but-hidden when the panel is —
+          and a dialog that exists in a hidden subtree is a focus trap nobody
+          can see. Its state names the vendor, so the open tab is irrelevant. */}
+      {enablingVendor !== null && (
+        <VendorEnableModal
+          open
+          vendor={enablingVendor}
+          models={enablingModels}
+          policy={{
+            residency,
+            allowed_models: allowedModels,
+            default_model: policy?.default_model ?? null,
+          }}
+          onClose={() => setEnablingVendor(null)}
+          onSavePolicy={handleVendorPolicy}
+          onEnable={handleVendorEnable}
+          onDone={() => void loadModels()}
+        />
+      )}
+
+      {/* Beside the enable modal and for the same reason: a dialog lives in a
+          portal, so one rendered inside a TabPanel would stay mounted in a
+          hidden subtree when the panel closed — a focus trap with nothing on
+          screen. Its own state names the vendor and the errand, so which tab
+          is open has nothing to do with it. */}
+      {managing !== null && (
+        <VendorInstallModal
+          open
+          vendor={managing.vendor}
+          mode={managing.mode}
+          currentModelIds={managingModels.map((m) => m.model_id)}
+          currentFilter={
+            providers.find((p) => p.name === managing.vendor)?.filter ?? EMPTY_FILTER
+          }
+          enabledModelIds={managingModels.filter((m) => m.enabled).map((m) => m.model_id)}
+          transportOk={keyTransportAllowed}
+          transportHelp={keyTransportFault}
+          onClose={() => setManaging(null)}
+          onDone={handleVendorOutcome}
+        />
+      )}
     </div>
   )
 }
@@ -856,6 +1278,13 @@ interface ModelsTabProps {
   models: AdminModel[]
   filtered: AdminModel[]
   providerGroups: [string, AdminModel[]][]
+  providers: ProviderStatus[]
+  providerFeatures: string[]
+  transportOk: boolean
+  transportHelp: KeyTransportHelp | null
+  removalWarnings: Partial<Record<VendorName, string[]>>
+  firstRunVendors: Set<VendorName>
+  enableableVendors: Set<VendorName>
   loading: boolean
   search: string
   filter: Filter
@@ -870,12 +1299,23 @@ interface ModelsTabProps {
   onFilter: (value: Filter) => void
   onToggle: (model: AdminModel) => void
   onRename: (model: AdminModel, displayName: string | null) => Promise<void>
+  onReviewAndEnable: (vendor: VendorName) => void
+  onManageVendor: (vendor: VendorName, mode: VendorInstallMode) => void
+  onCheckAgain: () => void
+  onAdoptFilter: (vendor: VendorName, filter: string[]) => Promise<void>
 }
 
 function ModelsTab({
   models,
   filtered,
   providerGroups,
+  providers,
+  providerFeatures,
+  transportOk,
+  transportHelp,
+  removalWarnings,
+  firstRunVendors,
+  enableableVendors,
   loading,
   search,
   filter,
@@ -890,7 +1330,15 @@ function ModelsTab({
   onFilter,
   onToggle,
   onRename,
+  onReviewAndEnable,
+  onManageVendor,
+  onCheckAgain,
+  onAdoptFilter,
 }: ModelsTabProps) {
+  /** Enabled models that send prompts out of the account. Counted from the
+   *  whole catalogue, like the other summary counts, not from the filter. */
+  const egressEnabled = models.filter((m) => m.enabled && isEgress(displayClassOf(m))).length
+
   return (
     <>
       {/* The catalogue on its own reads as "everything here is reachable". When
@@ -919,9 +1367,30 @@ function ModelsTab({
         </p>
       )}
 
+      {/* Whether a vendor can be reached at all decides whether half the
+          catalogue below means anything, so it is answered before it. */}
+      <VendorStatusSection
+        providers={providers}
+        providerFeatures={providerFeatures}
+        transportOk={transportOk}
+        transportHelp={transportHelp}
+        removalWarnings={removalWarnings}
+        loading={loading}
+        enableableVendors={enableableVendors}
+        onManage={onManageVendor}
+        onReviewAndEnable={onReviewAndEnable}
+        onCheckAgain={onCheckAgain}
+        onAdoptFilter={onAdoptFilter}
+      />
+
       {/* Named for anyone navigating by heading, like the other two tabs; the
           visible name is the tab itself. */}
       <h2 className={styles.srOnly}>Available models</h2>
+
+      {/* One standing limit on every model below, whoever serves it — said once
+          here rather than on each provider's card, which made a product-wide
+          refusal read as something one vendor does. */}
+      <p className={styles.catalogueNote}>{UNSUPPORTED_CONTENT_NOTE}</p>
 
       {/* Search + filters */}
       <div className={styles.toolbar}>
@@ -967,6 +1436,16 @@ function ModelsTab({
           <span className={styles.summaryText}>
             {totalEnabled} of {models.length} models enabled
           </span>
+          {/* Counted separately and said plainly. An administrator asked "how
+              much of this leaves our account?" should not have to read every
+              row's badge to find out. */}
+          {egressEnabled > 0 && (
+            <span className={styles.summaryFlag}>
+              <EgressGlyph />
+              {egressEnabled} {egressEnabled === 1 ? 'sends prompts' : 'send prompts'} outside your
+              cloud account
+            </span>
+          )}
           {totalUnreachable > 0 && (
             <span className={styles.summaryFlag}>
               <UnreachableGlyph />
@@ -1053,6 +1532,8 @@ function ModelsTab({
             togglingIds={togglingIds}
             residency={residency}
             allowedModels={allowedModels}
+            firstRun={isVendorProvider(provider) && firstRunVendors.has(provider)}
+            onReviewAndEnable={onReviewAndEnable}
             onToggle={onToggle}
             onRename={onRename}
           />

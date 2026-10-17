@@ -1,10 +1,13 @@
 package routing
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestApplyGlobFilter_EmptyPatternsReturnsAll(t *testing.T) {
 	ids := []string{"us.anthropic.claude-3-5-sonnet", "us.meta.llama3-70b"}
-	out, err := ApplyGlobFilter(ids, nil)
+	out, err := ApplyGlobFilter(ids, nil, "BEDROCK_MODEL_FILTER")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -19,7 +22,7 @@ func TestApplyGlobFilter_MatchesSubset(t *testing.T) {
 		"us.meta.llama3-70b-instruct-v1:0",
 		"us.mistral.mistral-large-v1:0",
 	}
-	out, err := ApplyGlobFilter(ids, []string{"us.anthropic.*", "us.meta.*"})
+	out, err := ApplyGlobFilter(ids, []string{"us.anthropic.*", "us.meta.*"}, "BEDROCK_MODEL_FILTER")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -37,7 +40,7 @@ func TestApplyGlobFilter_MatchesSubset(t *testing.T) {
 
 func TestApplyGlobFilter_NoMatchesReturnsEmpty(t *testing.T) {
 	ids := []string{"us.mistral.mistral-large-v1:0"}
-	out, err := ApplyGlobFilter(ids, []string{"us.anthropic.*"})
+	out, err := ApplyGlobFilter(ids, []string{"us.anthropic.*"}, "BEDROCK_MODEL_FILTER")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -47,8 +50,26 @@ func TestApplyGlobFilter_NoMatchesReturnsEmpty(t *testing.T) {
 }
 
 func TestApplyGlobFilter_InvalidPatternErrors(t *testing.T) {
-	_, err := ApplyGlobFilter([]string{"anything"}, []string{"["})
+	_, err := ApplyGlobFilter([]string{"anything"}, []string{"["}, "BEDROCK_MODEL_FILTER")
 	if err == nil {
 		t.Fatal("expected an error for a malformed glob pattern")
+	}
+}
+
+// TestApplyGlobFilter_ErrorNamesTheCallersEnvVar asserts the parameterised
+// env var name (added for the future ANTHROPIC_MODEL_FILTER/
+// OPENAI_MODEL_FILTER callers, which share this helper with Bedrock) shows up
+// verbatim in the error, not a hardcoded "BEDROCK_MODEL_FILTER" regardless of
+// caller.
+func TestApplyGlobFilter_ErrorNamesTheCallersEnvVar(t *testing.T) {
+	_, err := ApplyGlobFilter([]string{"anything"}, []string{"["}, "ANTHROPIC_MODEL_FILTER")
+	if err == nil {
+		t.Fatal("expected an error for a malformed glob pattern")
+	}
+	if !strings.Contains(err.Error(), "ANTHROPIC_MODEL_FILTER") {
+		t.Errorf("expected the error to name ANTHROPIC_MODEL_FILTER, got %v", err)
+	}
+	if strings.Contains(err.Error(), "BEDROCK_MODEL_FILTER") {
+		t.Errorf("expected no hardcoded BEDROCK_MODEL_FILTER in the error, got %v", err)
 	}
 }
