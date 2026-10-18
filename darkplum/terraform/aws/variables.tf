@@ -11,9 +11,14 @@ variable "aws_profile" {
 }
 
 variable "cluster_name" {
-  description = "Name of the EKS cluster. Used as a prefix for related resources."
+  description = "Name of the EKS cluster. Used as a prefix for related resources, including the RDS instance and its final snapshot, which is why the shape is restricted."
   type        = string
   default     = "darkplum"
+
+  validation {
+    condition     = can(regex("^[a-z][a-z0-9-]{0,38}[a-z0-9]$", var.cluster_name)) && !strcontains(var.cluster_name, "--")
+    error_message = "cluster_name must be 2-40 characters of lowercase letters, digits and single hyphens, starting with a letter and not ending with a hyphen (RDS identifier rules)."
+  }
 }
 
 variable "cluster_version" {
@@ -73,6 +78,42 @@ variable "served_model_name" {
   description = "Short model name exposed on the OpenAI-compatible API."
   type        = string
   default     = "mistral-7b"
+}
+
+variable "db_backup_retention_days" {
+  description = <<-EOT
+    Days of automated RDS backups to keep. Point-in-time recovery reaches back
+    this far. 7 is the floor for anything holding real conversations and
+    library items; AWS allows 1-35.
+  EOT
+  type        = number
+  default     = 7
+
+  validation {
+    condition     = var.db_backup_retention_days >= 1 && var.db_backup_retention_days <= 35
+    error_message = "db_backup_retention_days must be between 1 and 35."
+  }
+}
+
+variable "db_deletion_protection" {
+  description = <<-EOT
+    Refuse to delete the RDS instance until this is set to false and applied.
+    Protects against an accidental `terraform destroy` or console deletion
+    taking every conversation, library item and setting with it. `make destroy`
+    turns it off itself immediately before destroying.
+  EOT
+  type        = bool
+  default     = true
+}
+
+variable "db_skip_final_snapshot" {
+  description = <<-EOT
+    Skip the final RDS snapshot on destroy. Leave false so a teardown keeps a
+    last copy of the database (named <cluster_name>-db-final-<id>; delete it
+    yourself once you are sure). Set true only for throwaway installs.
+  EOT
+  type        = bool
+  default     = false
 }
 
 variable "bedrock_region" {

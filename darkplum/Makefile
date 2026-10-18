@@ -406,9 +406,27 @@ destroy: ## Tear down all resources
 		kubectl delete namespace darkplum-system --force --grace-period=0 2>/dev/null || true
 	@kubectl delete namespace $(NAMESPACE) --timeout=120s 2>/dev/null || \
 		kubectl delete namespace $(NAMESPACE) --force --grace-period=0 2>/dev/null || true
+	@# The database refuses deletion while deletion_protection is on. Flip it
+	@# off with a targeted apply, but only when the instance is actually in
+	@# state: on a re-run after a partial destroy, -target would otherwise
+	@# plan a CREATE of a fresh database just to destroy it again. A failed
+	@# flip stops the target here rather than carrying on to a destroy that
+	@# would fail later with a less obvious message.
+	@cd $(TF_DIR) && if terraform state list 2>/dev/null | grep -qx 'module.rds.aws_db_instance.this'; then \
+		snapshot=$$(terraform output -raw rds_final_snapshot_identifier 2>/dev/null || true); \
+		if [ -z "$$snapshot" ]; then \
+			echo "WARNING: db_skip_final_snapshot is true. The database will be deleted with NO snapshot. Ctrl-C within 10s to stop."; sleep 10; \
+		fi; \
+		echo "Turning off RDS deletion protection..."; \
+		terraform apply -auto-approve -input=false -var db_deletion_protection=false -target=module.rds.aws_db_instance.this || exit 1; \
+		echo "$$snapshot" > .destroy-snapshot; \
+	fi
 	@echo "Destroying infrastructure (this takes 10-15 minutes)..."
 	@cd $(TF_DIR) && terraform destroy -auto-approve -input=false
 	@echo "All resources destroyed."
+	@cd $(TF_DIR) && if [ -s .destroy-snapshot ]; then \
+		echo "The database was kept as snapshot $$(cat .destroy-snapshot). It costs storage until you delete it: aws rds delete-db-snapshot --db-snapshot-identifier $$(cat .destroy-snapshot)"; \
+	fi; rm -f .destroy-snapshot
 
 verify-bedrock-iam: ## Prove the gateway's IAM role allows only the configured Bedrock models (Layer 1 check)
 	@ROLE=$$(cd $(TF_DIR) && terraform output -json | jq -r '.gateway_role_arn.value // empty'); \

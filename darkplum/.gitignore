@@ -15,3 +15,6 @@ crash.*.log
 
 # OS cruft
 .DS_Store
+
+# Scratch file make destroy uses to carry the snapshot name past terraform destroy.
+terraform/aws/.destroy-snapshot

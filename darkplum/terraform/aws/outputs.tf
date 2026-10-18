@@ -42,6 +42,11 @@ output "rds_endpoint" {
   value       = module.rds.endpoint
 }
 
+output "rds_final_snapshot_identifier" {
+  description = "Snapshot a destroy leaves behind (null when db_skip_final_snapshot = true)."
+  value       = module.rds.final_snapshot_identifier
+}
+
 output "inference_backend" {
   description = "Gateway Provider backend for hosted models on this cloud (bedrock | vertex)."
   value       = local.inference_backend

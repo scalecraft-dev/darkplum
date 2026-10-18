@@ -167,5 +167,8 @@ module "rds" {
   subnet_ids                 = module.vpc.private_subnets
   allowed_security_group_ids = [module.eks.cluster_primary_security_group_id]
   instance_class             = "db.t4g.micro"
+  backup_retention_period    = var.db_backup_retention_days
+  deletion_protection        = var.db_deletion_protection
+  skip_final_snapshot        = var.db_skip_final_snapshot
   tags                       = local.tags
 }

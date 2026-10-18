@@ -22,6 +22,13 @@
 # served_model_name = "mistral-7b"
 # model_revision    = "main"   # pin a commit SHA from the model's Hugging Face repo
 
+# Database durability. The defaults keep a week of automated backups, take a
+# final snapshot on destroy and refuse deletion until protection is turned off.
+# Loosen only for a throwaway install.
+# db_backup_retention_days = 7
+# db_deletion_protection   = true
+# db_skip_final_snapshot   = false
+
 # Bedrock (Layer 1 IAM allowlist — the gateway can ONLY invoke models matching
 # these patterns; they also become the gateway's catalog filter). Open-weight
 # families (Llama, Mistral) are included by default alongside Claude. Model
