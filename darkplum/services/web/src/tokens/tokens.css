@@ -11,19 +11,19 @@
   /* Hue ~60, ~2-3% saturation. Lightness order is preserved from the slate
      palette: base = code < primary < surface < raised = user-message < hover.
      --bg-base drives the sidebar / conversation rail and inset wells, so it
-     takes the recessed #1F1E1B (claude.ai's sidebar), not #141413: the rail
+     takes the recessed #1F1E1D (claude.ai's sidebar), not #141413: the rail
      sits darker than the canvas exactly as on claude.ai. --bg-surface is the
      card / input / composer / table-header layer ON the canvas, so it must sit
      above #262624; #2B2A27 is a step between canvas and raised (cards also
      carry a border). Code shares the recessed tier: #141413 next to a
      #30302E code-block header was too hard a jump. */
-  --bg-base: #1F1E1B;
+  --bg-base: #1F1E1D;
   --bg-primary: #262624;
   --bg-surface: #2B2A27;
   --bg-surface-raised: #30302E;
   --bg-surface-hover: #3E3D3A;
   --bg-user-message: #30302E;
-  --bg-code: #1F1E1B;
+  --bg-code: #1F1E1D;
 
   /* --- Foreground / text --- */
   /* Warm grays matched to the warm backgrounds (claude.ai text-100/200/300).
