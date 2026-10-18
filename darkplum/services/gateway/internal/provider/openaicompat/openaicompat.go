@@ -132,14 +132,26 @@ func (p *OpenAICompatProvider) Kind() string { return p.kind }
 // Request/response shapes (OpenAI-compatible subset)
 // ---------------------------------------------------------------------------
 
+// compatWireMessage is one request turn on the wire. Content is a pointer so
+// an assistant turn that only carries tool_calls renders "content": null.
+type compatWireMessage struct {
+	Role       string              `json:"role"`
+	Content    *string             `json:"content"`
+	ToolCalls  []provider.ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string              `json:"tool_call_id,omitempty"`
+	Name       string              `json:"name,omitempty"`
+}
+
 type compatRequest struct {
-	Model       string             `json:"model"`
-	Messages    []provider.Message `json:"messages"`
-	Stream      bool               `json:"stream"`
-	MaxTokens   int                `json:"max_tokens,omitempty"`
-	Temperature *float64           `json:"temperature,omitempty"`
-	TopP        *float64           `json:"top_p,omitempty"`
-	Stop        []string           `json:"stop,omitempty"`
+	Model       string              `json:"model"`
+	Messages    []compatWireMessage `json:"messages"`
+	Stream      bool                `json:"stream"`
+	MaxTokens   int                 `json:"max_tokens,omitempty"`
+	Temperature *float64            `json:"temperature,omitempty"`
+	TopP        *float64            `json:"top_p,omitempty"`
+	Stop        []string            `json:"stop,omitempty"`
+	Tools       []provider.Tool     `json:"tools,omitempty"`
+	ToolChoice  json.RawMessage     `json:"tool_choice,omitempty"`
 }
 
 type compatResponse struct {
@@ -159,8 +171,9 @@ type compatChoice struct {
 }
 
 type compatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role      string              `json:"role"`
+	Content   string              `json:"content"`
+	ToolCalls []provider.ToolCall `json:"tool_calls"`
 }
 
 type compatDelta struct {
@@ -239,8 +252,10 @@ func (p *OpenAICompatProvider) Complete(ctx context.Context, req provider.ChatRe
 
 	choice := cr.Choices[0]
 	content := ""
+	var toolCalls []provider.ToolCall
 	if choice.Message != nil {
 		content = choice.Message.Content
+		toolCalls = normalizeToolCalls(choice.Message.ToolCalls)
 	}
 
 	finishReason := ""
@@ -252,6 +267,7 @@ func (p *OpenAICompatProvider) Complete(ctx context.Context, req provider.ChatRe
 		ID:           cr.ID,
 		Model:        cr.Model,
 		Content:      content,
+		ToolCalls:    toolCalls,
 		FinishReason: finishReason,
 	}
 	if cr.Usage != nil {
@@ -487,9 +503,28 @@ func (p *OpenAICompatProvider) adaptNonStreamingResponse(resp *http.Response, w 
 		stats.CacheReadTokens = cr.Usage.cachedTokens()
 	}
 
-	deltaChunk, err := provider.BuildStreamingChunkSSE(cr.ID, cr.Model, content)
-	if err != nil {
-		return nil, fmt.Errorf("openaicompat(%s): building synthesized delta chunk: %w", p.name, err)
+	// Content chunk first (always, as before, unless the turn is only tool
+	// calls), then each call as a start fragment plus an arguments fragment.
+	var frames [][]byte
+	toolCalls := normalizeToolCalls(choice.Message.ToolCalls)
+	if content != "" || len(toolCalls) == 0 {
+		deltaChunk, err := provider.BuildStreamingChunkSSE(cr.ID, cr.Model, content)
+		if err != nil {
+			return nil, fmt.Errorf("openaicompat(%s): building synthesized delta chunk: %w", p.name, err)
+		}
+		frames = append(frames, deltaChunk)
+	}
+	for i, tc := range toolCalls {
+		for _, d := range []provider.ToolCallDelta{
+			provider.NewToolCallStartDelta(i, tc.ID, tc.Function.Name),
+			provider.NewToolCallArgumentsDelta(i, tc.Function.Arguments),
+		} {
+			frame, err := provider.BuildToolCallDeltaSSE(cr.ID, cr.Model, d)
+			if err != nil {
+				return nil, fmt.Errorf("openaicompat(%s): building synthesized tool-call chunk: %w", p.name, err)
+			}
+			frames = append(frames, frame)
+		}
 	}
 	finalChunk, err := provider.BuildFinalChunkSSE(cr.ID, cr.Model, finishReason, stats)
 	if err != nil {
@@ -498,8 +533,10 @@ func (p *OpenAICompatProvider) adaptNonStreamingResponse(resp *http.Response, w 
 
 	// Nothing has been written to w until this point, so every error path
 	// above leaves w untouched.
-	if _, err := w.Write(deltaChunk); err != nil {
-		return nil, fmt.Errorf("openaicompat(%s): writing synthesized delta chunk: %w", p.name, err)
+	for _, frame := range frames {
+		if _, err := w.Write(frame); err != nil {
+			return nil, fmt.Errorf("openaicompat(%s): writing synthesized delta chunk: %w", p.name, err)
+		}
 	}
 	if _, err := w.Write(finalChunk); err != nil {
 		return nil, fmt.Errorf("openaicompat(%s): writing synthesized final chunk: %w", p.name, err)
@@ -520,14 +557,40 @@ func (p *OpenAICompatProvider) adaptNonStreamingResponse(resp *http.Response, w 
 // ---------------------------------------------------------------------------
 
 func (p *OpenAICompatProvider) buildRequestBody(req provider.ChatRequest, stream bool) ([]byte, error) {
+	messages := make([]compatWireMessage, 0, len(req.Messages))
+	for _, m := range req.Messages {
+		wm := compatWireMessage{Role: m.Role, ToolCallID: m.ToolCallID, Name: m.Name}
+		if m.Content == "" && len(m.ToolCalls) > 0 {
+			wm.Content = nil // renders "content": null
+		} else {
+			c := m.Content
+			wm.Content = &c
+		}
+		for _, tc := range m.ToolCalls {
+			if tc.Type == "" {
+				tc.Type = "function"
+			}
+			if strings.TrimSpace(tc.Function.Arguments) == "" {
+				tc.Function.Arguments = "{}"
+			}
+			wm.ToolCalls = append(wm.ToolCalls, tc)
+		}
+		messages = append(messages, wm)
+	}
 	cr := compatRequest{
 		Model:       req.Model,
-		Messages:    req.Messages,
+		Messages:    messages,
 		Stream:      stream,
 		MaxTokens:   req.MaxTokens,
 		Temperature: req.Temperature,
 		TopP:        req.TopP,
 		Stop:        req.Stop,
+	}
+	if len(req.Tools) > 0 {
+		cr.Tools = req.Tools
+	}
+	if kind, _, _ := provider.ToolChoiceKind(req.ToolChoice); kind != "" {
+		cr.ToolChoice = req.ToolChoice
 	}
 	b, err := json.Marshal(cr)
 	if err != nil {
@@ -559,6 +622,26 @@ func (p *OpenAICompatProvider) upstreamError(statusCode int, body []byte) error 
 			p.name, statusCode, errResp.Error.Message, errResp.Error.Type)
 	}
 	return fmt.Errorf("openaicompat(%s): upstream returned %d: %s", p.name, statusCode, string(body))
+}
+
+// SupportsTools makes this a tool-capable backend (provider.ToolCapable).
+func (p *OpenAICompatProvider) SupportsTools() bool { return true }
+
+// normalizeToolCalls defaults a missing type to "function" and drops nothing
+// else: ids, names and argument strings are relayed exactly as the upstream
+// sent them.
+func normalizeToolCalls(in []provider.ToolCall) []provider.ToolCall {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]provider.ToolCall, len(in))
+	for i, tc := range in {
+		if tc.Type == "" {
+			tc.Type = "function"
+		}
+		out[i] = tc
+	}
+	return out
 }
 
 // compile-time interface check.

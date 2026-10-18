@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 )
 
@@ -44,6 +45,19 @@ type ChatRequest struct {
 	// Stop is forwarded to every provider when the caller set it. Empty
 	// (nil/zero-length) means the caller did not set `stop`.
 	Stop []string
+	// Tools and ToolChoice are client-executed tool calling (see tools.go).
+	// Both are validated by the handler and only ever reach a provider that
+	// reports ToolCapable. ToolChoice is the raw OpenAI value ("auto",
+	// "none", "required" or a named function) or empty when the caller sent
+	// none/null. Tools are ALWAYS forwarded when present, "none" included:
+	// a history that already carries tool turns is only valid to every
+	// backend with the tool definitions alongside it. A provider renders
+	// "none" in its backend's own way (OpenAI-shaped backends take it
+	// verbatim; Anthropic has tool_choice {type:"none"}; Bedrock Converse
+	// has no equivalent and keeps the definitions with automatic choice,
+	// which is the closest it offers -- see each provider).
+	Tools      []Tool
+	ToolChoice json.RawMessage
 }
 
 // Message is a single turn in a conversation. Content can be a plain string
@@ -52,6 +66,14 @@ type ChatRequest struct {
 type Message struct {
 	Role    string `json:"role"`
 	Content string `json:"content"`
+	// ToolCalls is set on an assistant turn that asked for tools to be run
+	// (request history). Content is usually empty on such a turn.
+	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
+	// ToolCallID is set on a role:tool turn and names the assistant
+	// tool_calls entry this turn is the result of.
+	ToolCallID string `json:"tool_call_id,omitempty"`
+	// Name is the optional OpenAI participant/function name on a turn.
+	Name string `json:"name,omitempty"`
 	// HasNonTextContent is true when the original content was an array of
 	// content blocks containing at least one non-"text" block (e.g.
 	// image_url). Content itself already drops non-text blocks when
@@ -64,14 +86,28 @@ type Message struct {
 
 func (m *Message) UnmarshalJSON(data []byte) error {
 	type plain struct {
-		Role    string          `json:"role"`
-		Content json.RawMessage `json:"content"`
+		Role       string          `json:"role"`
+		Content    json.RawMessage `json:"content"`
+		ToolCalls  []ToolCall      `json:"tool_calls"`
+		ToolCallID string          `json:"tool_call_id"`
+		Name       string          `json:"name"`
 	}
 	var p plain
 	if err := json.Unmarshal(data, &p); err != nil {
 		return err
 	}
 	m.Role = p.Role
+	m.ToolCalls = p.ToolCalls
+	m.ToolCallID = p.ToolCallID
+	m.Name = p.Name
+
+	// Absent or null content (an assistant tool_calls turn is sent with
+	// "content": null by every OpenAI SDK) is empty, not the literal text
+	// "null".
+	if trimmed := strings.TrimSpace(string(p.Content)); trimmed == "" || trimmed == "null" {
+		m.Content = ""
+		return nil
+	}
 
 	// Try string first.
 	var s string
@@ -114,6 +150,9 @@ type ChatResponse struct {
 	CacheReadTokens     int
 	CacheCreationTokens int
 	FinishReason        string
+	// ToolCalls is what the model asked the caller to run; FinishReason is
+	// "tool_calls" when non-empty.
+	ToolCalls []ToolCall
 }
 
 // StreamStats holds the token-count and finish metadata extracted from the
@@ -154,13 +193,17 @@ type completionChoice struct {
 }
 
 type choiceMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role string `json:"role"`
+	// Content is null, not "", on a turn that only carries tool_calls --
+	// the shape OpenAI SDKs expect.
+	Content   *string    `json:"content"`
+	ToolCalls []ToolCall `json:"tool_calls,omitempty"`
 }
 
 type choiceDelta struct {
-	Role    string `json:"role,omitempty"`
-	Content string `json:"content,omitempty"`
+	Role      string          `json:"role,omitempty"`
+	Content   string          `json:"content,omitempty"`
+	ToolCalls []ToolCallDelta `json:"tool_calls,omitempty"`
 }
 
 type usageInfo struct {
@@ -183,8 +226,9 @@ func BuildCompletionJSON(resp *ChatResponse) ([]byte, error) {
 			{
 				Index: 0,
 				Message: &choiceMessage{
-					Role:    "assistant",
-					Content: resp.Content,
+					Role:      "assistant",
+					Content:   completionContent(resp),
+					ToolCalls: resp.ToolCalls,
 				},
 				FinishReason: &finishReason,
 			},
@@ -196,6 +240,43 @@ func BuildCompletionJSON(resp *ChatResponse) ([]byte, error) {
 		},
 	}
 	return json.Marshal(completion)
+}
+
+// completionContent is the message content for a non-streaming response:
+// null when the turn is only tool calls, the text otherwise ("" included).
+func completionContent(resp *ChatResponse) *string {
+	if resp.Content == "" && len(resp.ToolCalls) > 0 {
+		return nil
+	}
+	c := resp.Content
+	return &c
+}
+
+// BuildToolCallDeltaSSE builds a single SSE data line carrying one tool-call
+// fragment in the OpenAI chat.completion.chunk shape (delta.tool_calls with
+// index/id/type/function). No role is set: an SDK stream accumulator
+// concatenates string fields across deltas, and OpenAI itself sends the role
+// only on a stream's first chunk.
+func BuildToolCallDeltaSSE(id, model string, delta ToolCallDelta) ([]byte, error) {
+	noReason := (*string)(nil)
+	chunk := openAICompletion{
+		ID:      id,
+		Object:  "chat.completion.chunk",
+		Created: time.Now().Unix(),
+		Model:   model,
+		Choices: []completionChoice{
+			{
+				Index:        0,
+				Delta:        &choiceDelta{ToolCalls: []ToolCallDelta{delta}},
+				FinishReason: noReason,
+			},
+		},
+	}
+	data, err := json.Marshal(chunk)
+	if err != nil {
+		return nil, err
+	}
+	return fmt.Appendf(nil, "data: %s\n\n", data), nil
 }
 
 // BuildStreamingChunkSSE builds a single SSE data line carrying a content

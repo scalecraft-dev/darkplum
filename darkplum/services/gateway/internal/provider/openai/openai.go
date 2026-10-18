@@ -22,6 +22,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/scalecraft/darkplum/gateway/internal/provider"
@@ -129,12 +130,34 @@ func (p *Provider) newRequest(ctx context.Context, key string, body []byte) (*ht
 func buildRequestBody(req provider.ChatRequest, stream bool, drop droppedParams) ([]byte, error) {
 	messages := make([]chatMessage, 0, len(req.Messages))
 	for _, m := range req.Messages {
-		messages = append(messages, chatMessage{Role: m.Role, Content: m.Content})
+		cm := chatMessage{Role: m.Role, ToolCallID: m.ToolCallID, Name: m.Name}
+		if m.Content == "" && len(m.ToolCalls) > 0 {
+			cm.Content = nil // renders "content": null
+		} else {
+			c := m.Content
+			cm.Content = &c
+		}
+		for _, tc := range m.ToolCalls {
+			if tc.Type == "" {
+				tc.Type = "function"
+			}
+			if strings.TrimSpace(tc.Function.Arguments) == "" {
+				tc.Function.Arguments = "{}"
+			}
+			cm.ToolCalls = append(cm.ToolCalls, tc)
+		}
+		messages = append(messages, cm)
 	}
 
 	body := chatRequest{
 		Model:    req.Model,
 		Messages: messages,
+	}
+	if len(req.Tools) > 0 {
+		body.Tools = req.Tools
+	}
+	if kind, _, _ := provider.ToolChoiceKind(req.ToolChoice); kind != "" {
+		body.ToolChoice = req.ToolChoice
 	}
 	if req.MaxTokens > 0 {
 		mt := req.MaxTokens
@@ -261,6 +284,14 @@ func toChatResponse(cr *chatCompletionResponse) (*provider.ChatResponse, error) 
 		Content:      content,
 		FinishReason: mapFinishReason(finishReason),
 	}
+	if choice.Message != nil {
+		for _, tc := range choice.Message.ToolCalls {
+			if tc.Type == "" {
+				tc.Type = "function"
+			}
+			resp.ToolCalls = append(resp.ToolCalls, tc)
+		}
+	}
 	if cr.Usage != nil {
 		resp.PromptTokens = cr.Usage.PromptTokens
 		resp.CompletionTokens = cr.Usage.CompletionTokens
@@ -268,5 +299,8 @@ func toChatResponse(cr *chatCompletionResponse) (*provider.ChatResponse, error) 
 	}
 	return resp, nil
 }
+
+// SupportsTools makes this a tool-capable backend (provider.ToolCapable).
+func (p *Provider) SupportsTools() bool { return true }
 
 var _ provider.Provider = (*Provider)(nil)

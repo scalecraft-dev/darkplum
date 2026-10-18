@@ -105,7 +105,7 @@ func TestTranslateRequest_NoSystemMessage(t *testing.T) {
 func TestTranslateRequest_UnknownRolesDropped(t *testing.T) {
 	req := provider.ChatRequest{
 		Messages: []provider.Message{
-			{Role: "tool", Content: "tool result"},
+			{Role: "function", Content: "legacy function result"},
 			{Role: "user", Content: "What do you think?"},
 		},
 	}
@@ -116,7 +116,7 @@ func TestTranslateRequest_UnknownRolesDropped(t *testing.T) {
 	}
 
 	if len(messages) != 1 {
-		t.Fatalf("expected 1 message (tool role dropped), got %d", len(messages))
+		t.Fatalf("expected 1 message (unknown role dropped), got %d", len(messages))
 	}
 	if messages[0].Role != types.ConversationRoleUser {
 		t.Errorf("expected user role, got %q", messages[0].Role)
@@ -507,7 +507,7 @@ func TestTranslateStreamEvent_ContentBlockDelta(t *testing.T) {
 	stats := &provider.StreamStats{}
 	var buf bytes.Buffer
 
-	done, err := translateStreamEvent(event, "test-id", "model-x", stats, &buf)
+	done, err := translateStreamEvent(event, "test-id", "model-x", stats, &buf, nil)
 	if err != nil {
 		t.Fatalf("translateStreamEvent returned error: %v", err)
 	}
@@ -559,7 +559,7 @@ func TestTranslateStreamEvent_ContentBlockDeltaEmptyTextIsNoOp(t *testing.T) {
 	stats := &provider.StreamStats{}
 	var buf bytes.Buffer
 
-	done, err := translateStreamEvent(event, "id", "model", stats, &buf)
+	done, err := translateStreamEvent(event, "id", "model", stats, &buf, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -578,7 +578,7 @@ func TestTranslateStreamEvent_MessageStart(t *testing.T) {
 	stats := &provider.StreamStats{}
 	var buf bytes.Buffer
 
-	_, err := translateStreamEvent(event, "id", "model", stats, &buf)
+	_, err := translateStreamEvent(event, "id", "model", stats, &buf, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -594,7 +594,7 @@ func TestTranslateStreamEvent_MessageStop(t *testing.T) {
 	stats := &provider.StreamStats{}
 	var buf bytes.Buffer
 
-	done, err := translateStreamEvent(event, "id", "model", stats, &buf)
+	done, err := translateStreamEvent(event, "id", "model", stats, &buf, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -634,7 +634,7 @@ func TestTranslateStreamEvent_MetadataCapturesUsage(t *testing.T) {
 	stats := &provider.StreamStats{}
 	var buf bytes.Buffer
 
-	done, err := translateStreamEvent(event, "id", "model", stats, &buf)
+	done, err := translateStreamEvent(event, "id", "model", stats, &buf, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -659,7 +659,7 @@ func TestTranslateStreamEvent_ContentBlockStartStopAreNoOps(t *testing.T) {
 		Value: types.ContentBlockStartEvent{},
 	}
 	var buf1 bytes.Buffer
-	if _, err := translateStreamEvent(startEvent, "id", "model", stats, &buf1); err != nil {
+	if _, err := translateStreamEvent(startEvent, "id", "model", stats, &buf1, nil); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if buf1.Len() != 0 {
@@ -670,7 +670,7 @@ func TestTranslateStreamEvent_ContentBlockStartStopAreNoOps(t *testing.T) {
 		Value: types.ContentBlockStopEvent{},
 	}
 	var buf2 bytes.Buffer
-	if _, err := translateStreamEvent(stopEvent, "id", "model", stats, &buf2); err != nil {
+	if _, err := translateStreamEvent(stopEvent, "id", "model", stats, &buf2, nil); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if buf2.Len() != 0 {
@@ -825,7 +825,7 @@ func TestTranslateStreamEvent_MetadataCapturesCacheTokens(t *testing.T) {
 		},
 	}
 	stats := &provider.StreamStats{}
-	if _, err := translateStreamEvent(event, "id", "model", stats, &bytes.Buffer{}); err != nil {
+	if _, err := translateStreamEvent(event, "id", "model", stats, &bytes.Buffer{}, nil); err != nil {
 		t.Fatal(err)
 	}
 	if stats.PromptTokens != 80 || stats.CacheReadTokens != 30 || stats.CacheCreationTokens != 8 {

@@ -139,18 +139,46 @@ func (p *Provider) Stream(ctx context.Context, req provider.ChatRequest, w io.Wr
 			stats.FinishReason = mapFinishReason(*choice.FinishReason)
 		}
 
-		if content == "" {
+		var toolDeltas []provider.ToolCallDelta
+		if choice.Delta != nil {
+			for _, d := range choice.Delta.ToolCalls {
+				if d.ID == "" && (d.Function == nil || (d.Function.Name == "" && d.Function.Arguments == "")) {
+					continue // nothing to render
+				}
+				if d.ID != "" && d.Type == "" {
+					d.Type = "function"
+				}
+				toolDeltas = append(toolDeltas, d)
+			}
+		}
+
+		if content == "" && len(toolDeltas) == 0 {
 			// Skip empty deltas and role-only chunks — there is nothing to
 			// render.
 			continue
 		}
 
-		sseChunk, buildErr := provider.BuildStreamingChunkSSE(completionID, stats.Model, content)
-		if buildErr != nil {
-			return nil, fmt.Errorf("openai: building streaming chunk: %w", buildErr)
+		var out [][]byte
+		if content != "" {
+			sseChunk, buildErr := provider.BuildStreamingChunkSSE(completionID, stats.Model, content)
+			if buildErr != nil {
+				return nil, fmt.Errorf("openai: building streaming chunk: %w", buildErr)
+			}
+			out = append(out, sseChunk)
 		}
-		if _, writeErr := w.Write(sseChunk); writeErr != nil {
-			return nil, fmt.Errorf("openai: writing streaming chunk: %w", writeErr)
+		// Tool-call fragments keep the vendor's index and arrival order, so
+		// parallel calls reassemble correctly on the client.
+		for _, d := range toolDeltas {
+			sseChunk, buildErr := provider.BuildToolCallDeltaSSE(completionID, stats.Model, d)
+			if buildErr != nil {
+				return nil, fmt.Errorf("openai: building tool-call chunk: %w", buildErr)
+			}
+			out = append(out, sseChunk)
+		}
+		for _, sseChunk := range out {
+			if _, writeErr := w.Write(sseChunk); writeErr != nil {
+				return nil, fmt.Errorf("openai: writing streaming chunk: %w", writeErr)
+			}
 		}
 		if canFlush {
 			flusher.Flush()

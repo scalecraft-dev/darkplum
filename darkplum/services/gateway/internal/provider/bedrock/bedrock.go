@@ -17,6 +17,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -127,15 +128,20 @@ func (p *BedrockProvider) Complete(ctx context.Context, req provider.ChatRequest
 	if err != nil {
 		return nil, err
 	}
+	toolConfig, err := translateToolConfig(req)
+	if err != nil {
+		return nil, err
+	}
 
 	out, err := p.client.Converse(ctx, &bedrockruntime.ConverseInput{
 		ModelId:         aws.String(req.Model),
 		Messages:        messages,
 		System:          system,
 		InferenceConfig: inferenceConfig,
+		ToolConfig:      toolConfig,
 	})
 	if err != nil {
-		return nil, p.wrapError(req.Model, err)
+		return nil, p.wrapError(req.Model, err, toolConfig != nil)
 	}
 	p.retention.setRefused(req.Model, false)
 
@@ -161,15 +167,20 @@ func (p *BedrockProvider) Stream(ctx context.Context, req provider.ChatRequest, 
 	if err != nil {
 		return nil, err
 	}
+	toolConfig, err := translateToolConfig(req)
+	if err != nil {
+		return nil, err
+	}
 
 	out, err := p.client.ConverseStream(ctx, &bedrockruntime.ConverseStreamInput{
 		ModelId:         aws.String(req.Model),
 		Messages:        messages,
 		System:          system,
 		InferenceConfig: inferenceConfig,
+		ToolConfig:      toolConfig,
 	})
 	if err != nil {
-		return nil, p.wrapError(req.Model, err)
+		return nil, p.wrapError(req.Model, err, toolConfig != nil)
 	}
 	p.retention.setRefused(req.Model, false)
 	defer out.Close()
@@ -185,6 +196,7 @@ func (p *BedrockProvider) Stream(ctx context.Context, req provider.ChatRequest, 
 	// process, not cryptographically random (which is fine for a correlation ID).
 	completionID := fmt.Sprintf("bedrock-%p", stats)
 
+	var toolState toolStreamState
 	var streamErr error
 loop:
 	for {
@@ -201,7 +213,7 @@ loop:
 			// Converse sends the trailing Metadata event (token usage) *after*
 			// MessageStop, and breaking early would silently drop streaming
 			// usage. The loop instead exits when the events channel closes.
-			_, err := translateStreamEvent(event, completionID, req.Model, stats, w)
+			_, err := translateStreamEvent(event, completionID, req.Model, stats, w, &toolState)
 			if err != nil {
 				slog.Error("bedrock: error translating stream event", "err", err)
 				streamErr = err
@@ -218,7 +230,7 @@ loop:
 	// surfaces via Err() after the events channel closes, not as an event —
 	// must not be swallowed.
 	if err := out.Err(); err != nil {
-		return stats, p.wrapError(req.Model, err)
+		return stats, p.wrapError(req.Model, err, toolConfig != nil)
 	}
 	if streamErr != nil {
 		return stats, fmt.Errorf("bedrock: translate error: %w", streamErr)
@@ -237,7 +249,7 @@ loop:
 // wrapError classifies the data-retention refusal (a typed, scrubbed error and
 // a per-model flag for GET /v1/models availability) and otherwise defers to
 // wrapBedrockError.
-func (p *BedrockProvider) wrapError(model string, err error) error {
+func (p *BedrockProvider) wrapError(model string, err error, hadTools bool) error {
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) && isDataRetentionValidation(apiErr.ErrorCode(), apiErr.ErrorMessage()) {
 		mode, _ := p.retention.accountMode()
@@ -246,8 +258,30 @@ func (p *BedrockProvider) wrapError(model string, err error) error {
 			"model", model, "account_mode", mode, "required_mode", provider.RequiredDataRetentionMode)
 		return &DataRetentionError{Model: model, AccountMode: mode, RequiredMode: provider.RequiredDataRetentionMode, Cause: err}
 	}
+	if hadTools && errors.As(err, &apiErr) && isToolsUnsupportedValidation(apiErr.ErrorCode(), apiErr.ErrorMessage()) {
+		slog.Warn("bedrock: model does not support tool calling", "model", model, "message", apiErr.ErrorMessage())
+		statusCode, body := TranslateBedrockError("ValidationException",
+			fmt.Sprintf("model %q does not support tool calling (tools / tool_choice); resend without tools or choose a tool-capable model", model))
+		return &BedrockAPIError{StatusCode: statusCode, Body: body, Cause: err}
+	}
 	return wrapBedrockError(err)
 }
+
+// isToolsUnsupportedValidation reports whether a Converse error is the
+// ValidationException a model without tool support returns for a request
+// carrying toolConfig (wording varies by model: "This model doesn't support
+// tool use", "...does not support tool_choice", ...). Pairing errors about
+// toolUse/toolResult blocks do not mention support and are left alone.
+func isToolsUnsupportedValidation(code, message string) bool {
+	if code != "ValidationException" {
+		return false
+	}
+	m := strings.ToLower(message)
+	return strings.Contains(m, "tool") && (strings.Contains(m, "support") || strings.Contains(m, "not available"))
+}
+
+// SupportsTools implements provider.ToolCapable.
+func (p *BedrockProvider) SupportsTools() bool { return true }
 
 // wrapBedrockError converts a Bedrock SDK error into a BedrockAPIError that
 // carries the HTTP status code and OpenAI-compatible body, so the gateway HTTP
@@ -306,3 +340,4 @@ func (e *BedrockAPIError) RetryAfterSeconds() int { return 0 }
 var _ provider.Provider = (*BedrockProvider)(nil)
 var _ provider.APIError = (*BedrockAPIError)(nil)
 var _ provider.Regional = (*BedrockProvider)(nil)
+var _ provider.ToolCapable = (*BedrockProvider)(nil)

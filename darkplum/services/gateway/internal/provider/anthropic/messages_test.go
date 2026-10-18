@@ -103,8 +103,8 @@ func TestNormalizeMessages(t *testing.T) {
 		},
 		{
 			name:    "unsupported role rejected",
-			in:      []provider.Message{msg("tool", "some tool result")},
-			wantErr: `role \"tool\" is not supported`,
+			in:      []provider.Message{msg("function", "some tool result")},
+			wantErr: `role \"function\" is not supported`,
 		},
 	}
 

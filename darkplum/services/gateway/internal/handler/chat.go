@@ -40,9 +40,10 @@ type openAIErrorBody struct {
 	Message string `json:"message"`
 	Type    string `json:"type"`
 	Code    string `json:"code,omitempty"`
-	// Param names the request field a 400 unsupported_parameter response
-	// refers to (e.g. "tools", "tool_choice", "response_format") — see
-	// unsupportedRequestParam. Empty/omitted for every other error code.
+	// Param names the request field a 400 unsupported_parameter or
+	// invalid_tools response refers to (e.g. "tools", "functions",
+	// "response_format", "messages") — see unsupportedRequestParam and
+	// provider.ValidateTools. Empty/omitted for every other error code.
 	Param string `json:"param,omitempty"`
 }
 
@@ -122,37 +123,39 @@ type chatCompletionRequest struct {
 	TopP        *float64           `json:"top_p,omitempty"`
 	Stop        stopField          `json:"stop,omitempty"`
 
+	// Tools and ToolChoice are client-executed tool calling (see
+	// provider/tools.go): validated by provider.ValidateTools, forwarded only
+	// to a provider that reports provider.ToolCapable, refused 400
+	// unsupported_parameter for any other backend once the route is known.
+	Tools      []provider.Tool `json:"tools,omitempty"`
+	ToolChoice json.RawMessage `json:"tool_choice,omitempty"`
+
 	// The fields below are inspected ONLY to produce an honest 400
 	// unsupported_parameter (see unsupportedRequestParam) — never forwarded
 	// to any provider.
-	Tools          []json.RawMessage    `json:"tools,omitempty"`
-	ToolChoice     json.RawMessage      `json:"tool_choice,omitempty"`
 	Functions      []json.RawMessage    `json:"functions,omitempty"`
 	FunctionCall   json.RawMessage      `json:"function_call,omitempty"`
 	ResponseFormat *responseFormatField `json:"response_format,omitempty"`
 }
 
 // unsupportedRequestParam inspects req for fields the gateway does not
-// implement on ANY backend today (tool calling, structured JSON output, and
-// multi-part image/audio content) and returns the OpenAI-style parameter
-// name to report in a 400 unsupported_parameter response, or "" if none of
-// them are present. This runs before route resolution, for EVERY request,
-// regardless of which class the resolved model belongs to — a caller must
-// get an honest, immediate 400 rather than have the parameter silently
-// dropped no matter which backend it lands on.
+// implement on ANY backend (the legacy functions API, structured JSON
+// output, and multi-part image/audio content) and returns the OpenAI-style
+// parameter name to report in a 400 unsupported_parameter response, or ""
+// if none of them are present. This runs before route resolution, for EVERY
+// request, regardless of which class the resolved model belongs to — a
+// caller must get an honest, immediate 400 rather than have the parameter
+// silently dropped no matter which backend it lands on.
 //
-// tools/functions are refused only when non-empty; tool_choice/function_call
-// are refused only when set to something other than "none" — an SDK that
-// always includes an empty/off default must not be penalised for it. Inert
-// fields (user, n, seed, logit_bias, metadata, top_p, stop, ...) are
+// tools/tool_choice are NOT here any more: they are supported per backend
+// (provider.ToolCapable) and refused after route resolution when the
+// resolved backend lacks support -- see the capability check in
+// HandleChatCompletions. functions is refused only when non-empty;
+// function_call only when set to something other than "none" — an SDK
+// that always includes an empty/off default must not be penalised for it.
+// Inert fields (user, n, seed, logit_bias, metadata, top_p, stop, ...) are
 // deliberately not inspected here.
 func unsupportedRequestParam(req chatCompletionRequest) string {
-	if len(req.Tools) > 0 {
-		return "tools"
-	}
-	if isSetAndNotNone(req.ToolChoice) {
-		return "tool_choice"
-	}
 	if len(req.Functions) > 0 {
 		return "functions"
 	}
@@ -168,6 +171,15 @@ func unsupportedRequestParam(req chatCompletionRequest) string {
 		}
 	}
 	return ""
+}
+
+// wantsTools reports whether the request involves tool calling at all: a
+// non-empty tools array, a tool_choice other than absent/null/"none", or a
+// history that already carries tool turns (which a backend without tool
+// support would mangle or drop). An SDK that always sends `"tools": []` or
+// `"tool_choice": "none"` on a plain conversation is not asking.
+func wantsTools(req chatCompletionRequest) bool {
+	return len(req.Tools) > 0 || isSetAndNotNone(req.ToolChoice) || provider.HasToolTurns(req.Messages)
 }
 
 // isSetAndNotNone reports whether raw is present and is neither JSON null
@@ -232,11 +244,13 @@ type providerStatusSource interface {
 //     try the caller's effective default_model first (see the
 //     default-model-resolution block below) — otherwise, and if that lookup
 //     found nothing, model is required (400)
-//  2. request-shape honesty (400 unsupported_parameter) — tools, tool_choice,
-//     functions, function_call, response_format of type json_schema, and any
-//     non-text content block are refused before route resolution, on EVERY
-//     route, since no backend implements any of them today (see
-//     unsupportedRequestParam)
+//  2. request-shape honesty (400 unsupported_parameter) — functions,
+//     function_call, response_format of type json_schema, and any non-text
+//     content block are refused before route resolution, on EVERY route,
+//     since no backend implements any of them (see unsupportedRequestParam);
+//     a malformed tools/tool_choice/tool turn is refused 400 invalid_tools
+//     (provider.ValidateTools). Whether the backend supports tools at all is
+//     checked in step 9.
 //  3. policy snapshot must be loaded, else fail closed (503 policy_unavailable)
 //  4. alias resolve (admin intent wins over a same-named discovered model; no
 //     chains). A routed alias additionally classifies the request here (step
@@ -251,7 +265,9 @@ type providerStatusSource interface {
 //     (self_hosted/cloud_managed/external_api) are enforced in one place
 //  8. model_not_allowed check (403) — the resolved id must be in the
 //     principal's effective allowlist
-//  9. dispatch
+//  9. tool capability (400 unsupported_parameter, param tools) when the
+//     request carries tools and the resolved backend is not
+//     provider.ToolCapable; then dispatch
 //
 // Steps 5-8 run unchanged regardless of how the target was resolved: a route
 // a routed alias's classifier picked goes through exactly the same
@@ -594,12 +610,13 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 		return
 	}
 
-	// Request-shape honesty: tools/tool_choice/functions/function_call/
-	// response_format(json_schema)/non-text content blocks are refused
-	// before route resolution, on EVERY route — not just external_api —
-	// because no backend today actually implements any of them; forwarding
-	// req.Model or dispatching first would mean the caller only sometimes
-	// gets told, depending on what the request happened to resolve to.
+	// Request-shape honesty: functions/function_call/response_format
+	// (json_schema)/non-text content blocks are refused before route
+	// resolution, on EVERY route — not just external_api — because no
+	// backend implements any of them; forwarding req.Model or dispatching
+	// first would mean the caller only sometimes gets told, depending on
+	// what the request happened to resolve to. (Tools are per backend and
+	// handled after resolution; see wantsTools and the capability check.)
 	if param := unsupportedRequestParam(req); param != "" {
 		c.Set("denial_code", "unsupported_parameter")
 		logDenial(c, "unsupported_parameter", req.Model, "", "")
@@ -608,6 +625,25 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 				Message: fmt.Sprintf("parameter %q is not supported by this gateway on any backend", param),
 				Type:    "invalid_request_error",
 				Code:    "unsupported_parameter",
+				Param:   param,
+			},
+		})
+		return
+	}
+
+	// Tool shape: a malformed tools array, tool_choice, or an unpaired
+	// tool turn is refused here with the field named, before any backend
+	// gets to reject it in its own words. Whether the resolved backend
+	// supports tools at all is decided after route resolution below.
+	if param, msg := provider.ValidateTools(req.Tools, req.ToolChoice, req.Messages); msg != "" {
+		c.Set("denial_code", "invalid_request")
+		c.Set("resolved_model", req.Model)
+		logDenial(c, "invalid_request", req.Model, "", "")
+		c.JSON(http.StatusBadRequest, openAIError{
+			Error: openAIErrorBody{
+				Message: msg,
+				Type:    "invalid_request_error",
+				Code:    "invalid_tools",
 				Param:   param,
 			},
 		})
@@ -799,6 +835,27 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 		return
 	}
 
+	// Tool support is per backend. A request carrying tools (or a
+	// tool_choice other than "none") for a backend that cannot take them is
+	// refused here -- the one place the backend is known -- rather than
+	// having the field dropped on the way to the provider. The denial code
+	// is the same unsupported_parameter the gateway has always used for
+	// fields no backend implements, so clients and the usage log need no
+	// new vocabulary.
+	if wantsTools(req) && !provider.SupportsTools(prov) {
+		c.Set("denial_code", "unsupported_parameter")
+		logDenial(c, "unsupported_parameter", req.Model, resolvedModel, route.Class)
+		c.JSON(http.StatusBadRequest, openAIError{
+			Error: openAIErrorBody{
+				Message: fmt.Sprintf("parameter %q is not supported by the backend serving model %q (%s)", "tools", resolvedModel, route.Kind),
+				Type:    "invalid_request_error",
+				Code:    "unsupported_parameter",
+				Param:   "tools",
+			},
+		})
+		return
+	}
+
 	// Write provider KIND to Gin context for the Recording middleware.
 	// Using Kind() when available ensures audit records store "vllm"/"lmstudio"
 	// rather than instance names like "vllm-default", which would fragment
@@ -829,6 +886,10 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 		Temperature: req.Temperature,
 		TopP:        req.TopP,
 		Stop:        []string(req.Stop),
+	}
+	if wantsTools(req) {
+		chatReq.Tools = req.Tools
+		chatReq.ToolChoice = req.ToolChoice
 	}
 
 	if req.Stream {

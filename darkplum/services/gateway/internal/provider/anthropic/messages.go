@@ -1,6 +1,9 @@
 package anthropic
 
 import (
+	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
 
 	"github.com/scalecraft/darkplum/gateway/internal/provider"
@@ -11,7 +14,27 @@ import (
 // sequence ready to hand to the Anthropic SDK.
 type normalizedRequest struct {
 	System string
-	Turns  []provider.Message
+	Turns  []turn
+}
+
+// turn is one normalized user or assistant turn. Content is the text part;
+// ToolUses is set on assistant turns, ToolResults on user turns.
+type turn struct {
+	Role        string
+	Content     string
+	ToolUses    []toolUse
+	ToolResults []toolResult
+}
+
+type toolUse struct {
+	ID    string
+	Name  string
+	Input json.RawMessage // always a JSON object
+}
+
+type toolResult struct {
+	ToolUseID string
+	Content   string
 }
 
 // normalizeMessages converts Darkplum's flat OpenAI-shaped message list into
@@ -31,12 +54,14 @@ type normalizedRequest struct {
 //     behaviour ("Consecutive user or assistant turns ... will be combined
 //     into a single turn"), so a merge Darkplum performs and a merge the API
 //     would have performed anyway never disagree about what the model reads.
-//  4. Any role other than "system", "user", or "assistant" is rejected
-//     (invalid_request) — request-shape honesty for tool/function-result
-//     turns is enforced earlier, at the handler (chat.go's
-//     unsupportedRequestParam), so this should never actually fire in
-//     practice; it exists so an unrecognised role fails loudly here too
-//     rather than being silently sent to the vendor as some other role.
+//  4. Tool calling: an assistant turn with tool_calls is kept even when its
+//     text is empty, and carries one parsed tool_use per call (arguments that
+//     are not a JSON object are rejected as invalid_request). A "tool" turn
+//     becomes a tool_result on a USER turn; consecutive tool turns and the
+//     user text that follows them merge into ONE user turn, tool_results
+//     first (the Messages API requires every tool_result for the preceding
+//     assistant tool_use blocks to lead the next user message). Any other role
+//     is rejected (invalid_request).
 //  5. The turn sequence must be non-empty and start with "user". A leading
 //     assistant turn is rejected (invalid_request) rather than silently
 //     dropped or given a synthetic user turn: darkplum-api always prepends a
@@ -55,20 +80,40 @@ type normalizedRequest struct {
 //     with a raw error message that might not be safe to relay verbatim.
 func normalizeMessages(messages []provider.Message) (normalizedRequest, error) {
 	var systemParts []string
-	turns := make([]provider.Message, 0, len(messages))
+	turns := make([]turn, 0, len(messages))
 
-	for _, m := range messages {
+	for i, m := range messages {
 		switch m.Role {
 		case "system":
 			if strings.TrimSpace(m.Content) == "" {
 				continue
 			}
 			systemParts = append(systemParts, m.Content)
-		case "user", "assistant":
+		case "user":
 			if strings.TrimSpace(m.Content) == "" {
 				continue
 			}
-			turns = append(turns, m)
+			turns = append(turns, turn{Role: "user", Content: m.Content})
+		case "assistant":
+			t := turn{Role: "assistant", Content: m.Content}
+			for j, tc := range m.ToolCalls {
+				input, err := parseToolArguments(tc.Function.Arguments)
+				if err != nil {
+					return normalizedRequest{}, newInvalidRequestError(
+						fmt.Sprintf("messages[%d].tool_calls[%d].function.arguments: %s", i, j, err),
+					)
+				}
+				t.ToolUses = append(t.ToolUses, toolUse{ID: tc.ID, Name: tc.Function.Name, Input: input})
+			}
+			if strings.TrimSpace(t.Content) == "" && len(t.ToolUses) == 0 {
+				continue
+			}
+			turns = append(turns, t)
+		case "tool":
+			turns = append(turns, turn{
+				Role:        "user",
+				ToolResults: []toolResult{{ToolUseID: m.ToolCallID, Content: m.Content}},
+			})
 		default:
 			return normalizedRequest{}, newInvalidRequestError(
 				"message role " + quote(m.Role) + " is not supported",
@@ -76,10 +121,19 @@ func normalizeMessages(messages []provider.Message) (normalizedRequest, error) {
 		}
 	}
 
-	merged := make([]provider.Message, 0, len(turns))
+	merged := make([]turn, 0, len(turns))
 	for _, t := range turns {
 		if n := len(merged); n > 0 && merged[n-1].Role == t.Role {
-			merged[n-1].Content = merged[n-1].Content + "\n\n" + t.Content
+			prev := &merged[n-1]
+			switch {
+			case strings.TrimSpace(t.Content) == "":
+			case strings.TrimSpace(prev.Content) == "":
+				prev.Content = t.Content
+			default:
+				prev.Content = prev.Content + "\n\n" + t.Content
+			}
+			prev.ToolUses = append(prev.ToolUses, t.ToolUses...)
+			prev.ToolResults = append(prev.ToolResults, t.ToolResults...)
 			continue
 		}
 		merged = append(merged, t)
@@ -105,4 +159,17 @@ func normalizeMessages(messages []provider.Message) (normalizedRequest, error) {
 // (avoids pulling in fmt.Sprintf("%q", ...) at every call site).
 func quote(s string) string {
 	return `"` + s + `"`
+}
+
+// parseToolArguments parses a tool call's JSON arguments string into the
+// object a tool_use block's input must be. Empty arguments mean no arguments.
+func parseToolArguments(args string) (json.RawMessage, error) {
+	if strings.TrimSpace(args) == "" {
+		return json.RawMessage("{}"), nil
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(args), &obj); err != nil || obj == nil {
+		return nil, errors.New("must be a JSON object")
+	}
+	return json.RawMessage(args), nil
 }

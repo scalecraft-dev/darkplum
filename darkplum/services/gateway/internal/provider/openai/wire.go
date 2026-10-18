@@ -1,12 +1,24 @@
 package openai
 
+import (
+	"encoding/json"
+
+	"github.com/scalecraft/darkplum/gateway/internal/provider"
+)
+
 // ---------------------------------------------------------------------------
 // Request shape (POST /v1/chat/completions)
 // ---------------------------------------------------------------------------
 
+// chatMessage is one request turn. Content is a pointer so an assistant turn
+// that only carries tool_calls renders "content": null (what OpenAI's own SDKs
+// send); every other turn renders its string, "" included.
 type chatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	Role       string              `json:"role"`
+	Content    *string             `json:"content"`
+	ToolCalls  []provider.ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string              `json:"tool_call_id,omitempty"`
+	Name       string              `json:"name,omitempty"`
 }
 
 // chatRequest is this package's own request builder — there is no
@@ -22,14 +34,16 @@ type chatMessage struct {
 // this is the one-time adaptive retry that has just dropped one of them —
 // see droppedParams).
 type chatRequest struct {
-	Model               string         `json:"model"`
-	Messages            []chatMessage  `json:"messages"`
-	MaxCompletionTokens *int           `json:"max_completion_tokens,omitempty"`
-	Temperature         *float64       `json:"temperature,omitempty"`
-	TopP                *float64       `json:"top_p,omitempty"`
-	Stop                []string       `json:"stop,omitempty"`
-	Stream              bool           `json:"stream,omitempty"`
-	StreamOptions       *streamOptions `json:"stream_options,omitempty"`
+	Model               string          `json:"model"`
+	Messages            []chatMessage   `json:"messages"`
+	MaxCompletionTokens *int            `json:"max_completion_tokens,omitempty"`
+	Temperature         *float64        `json:"temperature,omitempty"`
+	TopP                *float64        `json:"top_p,omitempty"`
+	Stop                []string        `json:"stop,omitempty"`
+	Stream              bool            `json:"stream,omitempty"`
+	StreamOptions       *streamOptions  `json:"stream_options,omitempty"`
+	Tools               []provider.Tool `json:"tools,omitempty"`
+	ToolChoice          json.RawMessage `json:"tool_choice,omitempty"`
 }
 
 type streamOptions struct {
@@ -58,8 +72,9 @@ type completionChoi struct {
 // dropped or treated as an error, matching the streaming path's identical
 // handling of a refusal delta.
 type completionMessage struct {
-	Content string `json:"content"`
-	Refusal string `json:"refusal"`
+	Content   string              `json:"content"`
+	Refusal   string              `json:"refusal"`
+	ToolCalls []provider.ToolCall `json:"tool_calls"`
 }
 
 type completionUsage struct {
@@ -104,6 +119,9 @@ type streamChoice struct {
 type streamDelta struct {
 	Content string `json:"content"`
 	Refusal string `json:"refusal"`
+	// ToolCalls are the streamed tool-call fragments (index, id, type,
+	// function.name, function.arguments), re-emitted by Stream.
+	ToolCalls []provider.ToolCallDelta `json:"tool_calls"`
 }
 
 // streamError is a mid-stream vendor error event: the connection stays open
@@ -129,18 +147,18 @@ type modelsListResponse struct {
 
 // mapFinishReason maps a Chat Completions API finish_reason to the
 // OpenAI-compatible finish_reason vocabulary this gateway's own surface
-// promises: stop|length|content_filter. tool_calls/function_call collapse to
-// stop — tool/function calling is refused before dispatch (request-shape
-// honesty, see internal/handler/chat.go's unsupportedRequestParam), so
-// neither should be reachable through this gateway in practice; any other
-// unrecognised value (present or future) also collapses to stop, the same
-// generic fallback internal/provider/anthropic uses.
+// promises: stop|length|content_filter|tool_calls. tool_calls passes through
+// (client-executed tool calling, see provider/tools.go); the legacy
+// function_call and any other unrecognised value (present or future) collapse
+// to stop, the same generic fallback internal/provider/anthropic uses.
 func mapFinishReason(reason string) string {
 	switch reason {
 	case "length":
 		return "length"
 	case "content_filter":
 		return "content_filter"
+	case "tool_calls":
+		return "tool_calls"
 	default:
 		return "stop"
 	}

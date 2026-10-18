@@ -11,7 +11,9 @@
 package anthropic
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -277,6 +279,23 @@ func (p *Provider) Stream(ctx context.Context, req provider.ChatRequest, w io.Wr
 	acc := sdk.Message{}
 	completionID := ""
 	model := req.Model
+	// Anthropic's content-block index counts every block (text included); the
+	// OpenAI tool_calls index counts tool calls only.
+	toolIndexByBlock := map[int64]int{}
+	toolArgsSent := map[int]bool{}
+
+	writeChunk := func(chunk []byte, buildErr error) error {
+		if buildErr != nil {
+			return fmt.Errorf("anthropic: building streaming chunk: %w", buildErr)
+		}
+		if _, writeErr := w.Write(chunk); writeErr != nil {
+			return fmt.Errorf("anthropic: writing streaming chunk: %w", writeErr)
+		}
+		if canFlush {
+			flusher.Flush()
+		}
+		return nil
+	}
 
 	for stream.Next() {
 		idleTimer.Reset(idleTimeout)
@@ -291,8 +310,41 @@ func (p *Provider) Stream(ctx context.Context, req provider.ChatRequest, w io.Wr
 			if string(e.Message.Model) != "" {
 				model = string(e.Message.Model)
 			}
+		case sdk.ContentBlockStartEvent:
+			if e.ContentBlock.Type != "tool_use" {
+				continue
+			}
+			idx := len(toolIndexByBlock)
+			toolIndexByBlock[e.Index] = idx
+			chunk, buildErr := provider.BuildToolCallDeltaSSE(completionID, model,
+				provider.NewToolCallStartDelta(idx, e.ContentBlock.ID, e.ContentBlock.Name))
+			if err := writeChunk(chunk, buildErr); err != nil {
+				return nil, err
+			}
+		case sdk.ContentBlockStopEvent:
+			// A tool with no arguments may stream no input_json_delta at all;
+			// OpenAI clients would then parse "" as the arguments. Send {}.
+			if idx, ok := toolIndexByBlock[e.Index]; ok && !toolArgsSent[idx] {
+				toolArgsSent[idx] = true
+				chunk, buildErr := provider.BuildToolCallDeltaSSE(completionID, model,
+					provider.NewToolCallArgumentsDelta(idx, "{}"))
+				if err := writeChunk(chunk, buildErr); err != nil {
+					return nil, err
+				}
+			}
 		case sdk.ContentBlockDeltaEvent:
 			switch d := e.Delta.AsAny().(type) {
+			case sdk.InputJSONDelta:
+				idx, ok := toolIndexByBlock[e.Index]
+				if !ok || d.PartialJSON == "" {
+					continue
+				}
+				toolArgsSent[idx] = true
+				chunk, buildErr := provider.BuildToolCallDeltaSSE(completionID, model,
+					provider.NewToolCallArgumentsDelta(idx, d.PartialJSON))
+				if err := writeChunk(chunk, buildErr); err != nil {
+					return nil, err
+				}
 			case sdk.TextDelta:
 				if d.Text == "" {
 					continue
@@ -308,7 +360,7 @@ func (p *Provider) Stream(ctx context.Context, req provider.ChatRequest, w io.Wr
 					flusher.Flush()
 				}
 			}
-			// Every other delta type (input_json_delta, thinking_delta,
+			// Every other delta type (thinking_delta,
 			// signature_delta, citations_delta) carries nothing the
 			// OpenAI-compatible surface renders; skipped by omission.
 		}
@@ -367,6 +419,7 @@ func buildParams(req provider.ChatRequest, norm normalizedRequest, maxTokens int
 	if norm.System != "" {
 		params.System = []sdk.TextBlockParam{{Text: norm.System}}
 	}
+	params.Tools, params.ToolChoice = toSDKTools(req)
 	if len(req.Stop) > 0 {
 		params.StopSequences = req.Stop
 	}
@@ -381,17 +434,109 @@ func buildParams(req provider.ChatRequest, norm normalizedRequest, maxTokens int
 	return params
 }
 
-func toSDKMessages(turns []provider.Message) []sdk.MessageParam {
+func toSDKMessages(turns []turn) []sdk.MessageParam {
 	out := make([]sdk.MessageParam, 0, len(turns))
 	for _, t := range turns {
-		block := sdk.NewTextBlock(t.Content)
+		var blocks []sdk.ContentBlockParamUnion
 		if t.Role == "assistant" {
-			out = append(out, sdk.NewAssistantMessage(block))
-		} else {
-			out = append(out, sdk.NewUserMessage(block))
+			if strings.TrimSpace(t.Content) != "" {
+				blocks = append(blocks, sdk.NewTextBlock(t.Content))
+			}
+			for _, u := range t.ToolUses {
+				blocks = append(blocks, sdk.NewToolUseBlock(u.ID, u.Input, u.Name))
+			}
+			out = append(out, sdk.NewAssistantMessage(blocks...))
+			continue
 		}
+		// tool_result blocks must lead the user message.
+		for _, r := range t.ToolResults {
+			content := r.Content
+			if strings.TrimSpace(content) == "" {
+				// Anthropic rejects an empty tool_result text block.
+				content = emptyToolResultText
+			}
+			blocks = append(blocks, sdk.NewToolResultBlock(r.ToolUseID, content, false))
+		}
+		if strings.TrimSpace(t.Content) != "" {
+			blocks = append(blocks, sdk.NewTextBlock(t.Content))
+		}
+		out = append(out, sdk.NewUserMessage(blocks...))
 	}
 	return out
+}
+
+// emptyToolResultText stands in for a role:tool turn with no content
+// (identical to the bedrock provider).
+const emptyToolResultText = "(empty result)"
+
+// SupportsTools implements provider.ToolCapable.
+func (p *Provider) SupportsTools() bool { return true }
+
+// toSDKTools translates the request's tools and tool_choice. tool_choice
+// "none" still sends the tool definitions (a history carrying tool_use /
+// tool_result blocks is rejected without them) and renders as tool_choice
+// {"type":"none"}. Absent tool_choice omits the field.
+func toSDKTools(req provider.ChatRequest) ([]sdk.ToolUnionParam, sdk.ToolChoiceUnionParam) {
+	var choice sdk.ToolChoiceUnionParam
+	if len(req.Tools) == 0 {
+		return nil, choice
+	}
+	kind, name, _ := provider.ToolChoiceKind(req.ToolChoice)
+	switch kind {
+	case "none":
+		choice = sdk.ToolChoiceUnionParam{OfNone: &sdk.ToolChoiceNoneParam{}}
+	case "auto":
+		choice = sdk.ToolChoiceUnionParam{OfAuto: &sdk.ToolChoiceAutoParam{}}
+	case "required":
+		choice = sdk.ToolChoiceUnionParam{OfAny: &sdk.ToolChoiceAnyParam{}}
+	case "function":
+		choice = sdk.ToolChoiceUnionParam{OfTool: &sdk.ToolChoiceToolParam{Name: name}}
+	}
+
+	tools := make([]sdk.ToolUnionParam, 0, len(req.Tools))
+	for _, t := range req.Tools {
+		tp := sdk.ToolParam{Name: t.Function.Name, InputSchema: toInputSchema(t.Function.Parameters)}
+		if t.Function.Description != "" {
+			tp.Description = sdk.String(t.Function.Description)
+		}
+		tools = append(tools, sdk.ToolUnionParam{OfTool: &tp})
+	}
+	return tools, choice
+}
+
+// toInputSchema maps a raw JSON Schema object onto the SDK's input_schema,
+// keeping every key (e.g. $defs, additionalProperties) as an extra field. A
+// missing/null schema becomes {"type":"object","properties":{}}.
+func toInputSchema(raw json.RawMessage) sdk.ToolInputSchemaParam {
+	schema := sdk.ToolInputSchemaParam{Properties: map[string]any{}}
+	var obj map[string]any
+	if len(raw) == 0 || json.Unmarshal(raw, &obj) != nil || obj == nil {
+		return schema
+	}
+	extras := map[string]any{}
+	for k, v := range obj {
+		switch k {
+		case "type":
+		case "properties":
+			if v != nil {
+				schema.Properties = v
+			}
+		case "required":
+			if list, ok := v.([]any); ok {
+				for _, r := range list {
+					if s, ok := r.(string); ok {
+						schema.Required = append(schema.Required, s)
+					}
+				}
+			}
+		default:
+			extras[k] = v
+		}
+	}
+	if len(extras) > 0 {
+		schema.ExtraFields = extras
+	}
+	return schema
 }
 
 // toChatResponse converts a complete (non-streaming) SDK Message into
@@ -401,9 +546,20 @@ func toSDKMessages(turns []provider.Message) []sdk.MessageParam {
 // input_tokens, cache_creation_input_tokens, and cache_read_input_tokens").
 func toChatResponse(msg *sdk.Message) *provider.ChatResponse {
 	var content strings.Builder
+	var toolCalls []provider.ToolCall
 	for _, block := range msg.Content {
-		if block.Type == "text" {
+		switch block.Type {
+		case "text":
 			content.WriteString(block.Text)
+		case "tool_use":
+			toolCalls = append(toolCalls, provider.ToolCall{
+				ID:   block.ID,
+				Type: "function",
+				Function: provider.ToolCallFunction{
+					Name:      block.Name,
+					Arguments: compactToolInput(block.Input),
+				},
+			})
 		}
 	}
 
@@ -417,7 +573,18 @@ func toChatResponse(msg *sdk.Message) *provider.ChatResponse {
 		CacheReadTokens:     int(usage.CacheReadInputTokens),
 		CacheCreationTokens: int(usage.CacheCreationInputTokens),
 		FinishReason:        mapFinishReason(msg.StopReason),
+		ToolCalls:           toolCalls,
 	}
+}
+
+// compactToolInput renders a tool_use input as compact JSON; an absent or
+// invalid input is the empty object.
+func compactToolInput(input json.RawMessage) string {
+	var buf bytes.Buffer
+	if len(input) == 0 || json.Compact(&buf, input) != nil || buf.String() == "null" {
+		return "{}"
+	}
+	return buf.String()
 }
 
 // mapFinishReason maps a Messages API stop_reason to the OpenAI-compatible
@@ -431,13 +598,14 @@ func mapFinishReason(reason sdk.StopReason) string {
 		return "length"
 	case sdk.StopReasonRefusal:
 		return "content_filter"
+	case sdk.StopReasonToolUse:
+		return "tool_calls"
 	case sdk.StopReasonEndTurn, sdk.StopReasonStopSequence:
 		return "stop"
 	default:
-		// tool_use, pause_turn, model_context_window_exceeded, and any future
-		// value all map to the same generic "stop" — none of them has a
-		// closer OpenAI-compatible equivalent, and none is reachable through
-		// this gateway today (tools are refused before dispatch).
+		// pause_turn, model_context_window_exceeded, and any future value all
+		// map to the same generic "stop" — none of them has a closer
+		// OpenAI-compatible equivalent.
 		return "stop"
 	}
 }
