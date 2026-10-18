@@ -1,4 +1,4 @@
-import type { User, ApiKey, ChatMessage, ActivityEvent, AliasRouteTest, BackendClass, InferenceEvent, InferencePurpose, UsageBucket, UsageSummary, UserUsageSummary, KeyUsageSummary, Model, AdminModel, AdminModelsResult, ModelAlias, ModelAliasInput, ProviderStatus, Residency, RoutingPolicy, PrincipalPolicy, EffectivePolicy, PolicyPreview, PolicyPrincipalsPage, ConversationSummary, ConversationFull, ConversationMessage, ConversationMessageInput, VendorName, SpendGroupBy, SpendReport, SpendTimelineGroupBy, ProviderBilling, ReconciliationGroupBy, ReconciliationReport, ModelPricesResult, ModelPrice, ModelPriceInput } from '../types'
+import type { User, ApiKey, ChatMessage, ActivityEvent, AliasRouteTest, BackendClass, InferenceEvent, InferencePurpose, UsageBucket, UsageSummary, UserUsageSummary, KeyUsageSummary, Model, AdminModel, AdminModelsResult, ModelAlias, ModelAliasInput, ProviderStatus, Residency, RoutingPolicy, PrincipalPolicy, EffectivePolicy, PolicyPreview, PolicyPrincipalsPage, ConversationSummary, ConversationFull, ConversationMessage, ConversationMessageInput, VendorName, SpendGroupBy, SpendReport, SpendTimelineGroupBy, ProviderBilling, ReconciliationGroupBy, ReconciliationReport, ModelPricesResult, ModelPrice, ModelPriceInput , SystemPromptSetting } from '../types'
 import { parseRetryAfter } from './modelRouting'
 import { ROUTES, buildPath, type QueryValue, type Route } from './routes'
 
@@ -688,6 +688,15 @@ export function deleteModelAlias(alias: string): Promise<void> {
 
 export function getRoutingPolicy(): Promise<RoutingPolicy> {
   return request<RoutingPolicy>(ROUTES.getRoutingPolicy)
+}
+
+export function getSystemPrompt(): Promise<SystemPromptSetting> {
+  return request<SystemPromptSetting>(ROUTES.getSystemPrompt)
+}
+
+/** null (or blank) restores the built-in default. */
+export function updateSystemPrompt(systemPrompt: string | null): Promise<SystemPromptSetting> {
+  return request<SystemPromptSetting>(ROUTES.updateSystemPrompt, { body: { system_prompt: systemPrompt } })
 }
 
 /** The response carries `warnings` when the new policy leaves routed aliases

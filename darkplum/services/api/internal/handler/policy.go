@@ -35,6 +35,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -224,6 +225,7 @@ type gatewayEffectivePolicy struct {
 	DefaultModel    *string               `json:"default_model"`
 	Sources         map[string]string     `json:"sources"`
 	ReachableModels []string              `json:"reachable_models"`
+	LockedOut       bool                  `json:"locked_out"`
 	Keys            []gatewayKeyEffective `json:"keys,omitempty"`
 }
 
@@ -280,6 +282,11 @@ func newGatewayEffectiveClient(gatewayURL, serviceKey string) *gatewayEffectiveC
 // or misbehaving -- callers decide per endpoint whether that becomes a 502
 // (admin effective/preview endpoints) or a warned-and-degraded fallback
 // (ListModels).
+// kick asks the gateway to reload policy now; see kickGatewayPolicy.
+func (g *gatewayEffectiveClient) kick(ctx context.Context) {
+	kickGatewayPolicy(ctx, g.client, g.gatewayURL, g.serviceKey)
+}
+
 func (g *gatewayEffectiveClient) effective(ctx context.Context, userID string, apiKeyID *string) (*gatewayEffectivePolicy, error) {
 	ctx, cancel := context.WithTimeout(ctx, gatewayEffectiveTimeout)
 	defer cancel()
@@ -372,10 +379,11 @@ type gatewayPolicyImpactPrincipal struct {
 // /v1/policy/impact response. OrgLockedOut is the "empty org allowlist" case
 // (everyone is locked out, so LockedOut is not enumerated).
 type gatewayPolicyImpact struct {
-	OrgLockedOut bool                           `json:"org_locked_out"`
-	LockedOut    []gatewayPolicyImpactPrincipal `json:"locked_out"`
-	OrgNarrowed  bool                           `json:"org_narrowed"`
-	Narrowed     []gatewayPolicyImpactPrincipal `json:"narrowed"`
+	OrgLockedOut     bool                           `json:"org_locked_out"`
+	LockedOut        []gatewayPolicyImpactPrincipal `json:"locked_out"`
+	AlreadyLockedOut []gatewayPolicyImpactPrincipal `json:"already_locked_out"`
+	OrgNarrowed      bool                           `json:"org_narrowed"`
+	Narrowed         []gatewayPolicyImpactPrincipal `json:"narrowed"`
 	// UnresolvedModels: enabled, allowed models of unknown class under a
 	// self_hosted_only proposal -- reported to the admin, not counted.
 	UnresolvedModels []string `json:"unresolved_models"`
@@ -548,11 +556,13 @@ func keyNamesByID(ctx context.Context, db *pgxpool.Pool, ids []string) (map[stri
 // populated for a user-principal write (every non-revoked key that user
 // owns, under the same override) and empty for an api_key-principal write
 // (only the key itself is affected) -- exactly DESIGN4's "keys" contract.
-func (h *PolicyHandler) validateAndPreviewWrite(ctx context.Context, principalType, targetID, ownerUserID string, req policyObject) (*gatewayEffectivePolicy, error) {
+func (h *PolicyHandler) validateAndPreviewWrite(ctx context.Context, principalType, targetID, ownerUserID string, req *policyObject) (*gatewayEffectivePolicy, error) {
 	if !validPrincipalResidency(req.Residency) {
 		return nil, errors.New("residency must be null, 'cloud_account_only', or 'self_hosted_only'")
 	}
 	if req.AllowedModels != nil {
+		deduped := dedupeStrings(*req.AllowedModels)
+		req.AllowedModels = &deduped
 		if err := validateAllowedModelIDs(ctx, h.db, *req.AllowedModels); err != nil {
 			return nil, err
 		}
@@ -564,7 +574,7 @@ func (h *PolicyHandler) validateAndPreviewWrite(ctx context.Context, principalTy
 	} else {
 		userID = targetID
 	}
-	eff, err := h.gateway.effectiveWithOverride(ctx, userID, apiKeyID, &gatewayPolicyOverride{Level: principalType, Policy: &req})
+	eff, err := h.gateway.effectiveWithOverride(ctx, userID, apiKeyID, &gatewayPolicyOverride{Level: principalType, Policy: req})
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", errGatewayUnavailable, err)
 	}
@@ -578,6 +588,20 @@ func (h *PolicyHandler) validateAndPreviewWrite(ctx context.Context, principalTy
 	return eff, nil
 }
 
+// effectiveLockedOut is the one definition of "locked out" the api applies
+// to a gateway effective-policy answer: the gateway's own verdict (empty
+// allowlist, or nothing reachable while at least one model is enabled and
+// routable -- see the gateway's lockedOut), computed where policy is merged
+// so the api never disagrees with it. The explicit-empty case is kept here
+// too so an older gateway that does not send locked_out still refuses the
+// one state it always refused.
+func effectiveLockedOut(eff *gatewayEffectivePolicy) bool {
+	if eff.AllowedModels != nil && len(*eff.AllowedModels) == 0 {
+		return true
+	}
+	return eff.LockedOut
+}
+
 // lockedOutFromEffective collects every locked-out principal from a
 // validateAndPreviewWrite result: the target itself (named selfName -- "
 // (user)" for a user write, the key's own name for an api_key write) if its
@@ -585,7 +609,7 @@ func (h *PolicyHandler) validateAndPreviewWrite(ctx context.Context, principalTy
 // (only ever non-empty for a user-principal write) that is likewise empty.
 func lockedOutFromEffective(ctx context.Context, db *pgxpool.Pool, eff *gatewayEffectivePolicy, selfID, selfName string) ([]lockedOutKey, error) {
 	var out []lockedOutKey
-	if eff.AllowedModels != nil && len(*eff.AllowedModels) == 0 {
+	if effectiveLockedOut(eff) {
 		out = append(out, lockedOutKey{ID: selfID, Name: selfName})
 	}
 	if len(eff.Keys) == 0 {
@@ -593,7 +617,7 @@ func lockedOutFromEffective(ctx context.Context, db *pgxpool.Pool, eff *gatewayE
 	}
 	ids := make([]string, 0, len(eff.Keys))
 	for _, k := range eff.Keys {
-		if k.Effective.AllowedModels != nil && len(*k.Effective.AllowedModels) == 0 {
+		if effectiveLockedOut(&k.Effective) {
 			ids = append(ids, k.APIKeyID)
 		}
 	}
@@ -687,7 +711,7 @@ func (h *PolicyHandler) PutUserPolicy(c *gin.Context) {
 		return
 	}
 
-	eff, err := h.validateAndPreviewWrite(ctx, principalTypeUser, id, "", req)
+	eff, err := h.validateAndPreviewWrite(ctx, principalTypeUser, id, "", &req)
 	if err != nil {
 		if errors.Is(err, errGatewayUnavailable) {
 			c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
@@ -704,7 +728,7 @@ func (h *PolicyHandler) PutUserPolicy(c *gin.Context) {
 	}
 	if len(lockedOut) > 0 {
 		c.JSON(http.StatusConflict, gin.H{
-			"error":      "this policy would leave the user (or a key it owns) with no allowed model",
+			"error":      "this policy would leave the user (or a key it owns) with no reachable model (allowed, enabled and permitted by residency)",
 			"locked_out": lockedOutNames(lockedOut),
 		})
 		return
@@ -750,7 +774,7 @@ func (h *PolicyHandler) PutAPIKeyPolicy(c *gin.Context) {
 		return
 	}
 
-	eff, err := h.validateAndPreviewWrite(ctx, principalTypeAPIKey, id, info.UserID, req)
+	eff, err := h.validateAndPreviewWrite(ctx, principalTypeAPIKey, id, info.UserID, &req)
 	if err != nil {
 		if errors.Is(err, errGatewayUnavailable) {
 			c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
@@ -848,6 +872,7 @@ func (h *PolicyHandler) recordPrincipalWrite(c *gin.Context, principalType, id s
 }
 
 func (h *PolicyHandler) recordPrincipalChanged(c *gin.Context, principalType, id string, before *policyObject, after *policyObject) {
+	h.gateway.kick(c.Request.Context())
 	evt := activity.FromContext(c, activity.RoutingPolicyPrincipalChanged)
 	evt.TargetType = activity.StrPtr(principalType)
 	evt.TargetID = activity.StrPtr(id)
@@ -1103,7 +1128,7 @@ func (h *PolicyHandler) PreviewUserPolicy(c *gin.Context) {
 		KeysAffected: make([]previewKeyImpact, 0, len(after.Keys)),
 		WouldLockOut: []string{},
 	}
-	if after.AllowedModels != nil && len(*after.AllowedModels) == 0 {
+	if effectiveLockedOut(after) {
 		resp.WouldLockOut = append(resp.WouldLockOut, "(user)")
 	}
 	for _, k := range after.Keys {
@@ -1111,7 +1136,7 @@ func (h *PolicyHandler) PreviewUserPolicy(c *gin.Context) {
 		resp.KeysAffected = append(resp.KeysAffected, previewKeyImpact{
 			ID: k.APIKeyID, Name: name, Before: beforeByKey[k.APIKeyID], After: k.Effective.AllowedModels,
 		})
-		if k.Effective.AllowedModels != nil && len(*k.Effective.AllowedModels) == 0 {
+		if effectiveLockedOut(&k.Effective) {
 			resp.WouldLockOut = append(resp.WouldLockOut, name)
 		}
 	}
@@ -1175,7 +1200,7 @@ func (h *PolicyHandler) PreviewAPIKeyPolicy(c *gin.Context) {
 		KeysAffected: []previewKeyImpact{{ID: id, Name: info.Name, Before: before.AllowedModels, After: after.AllowedModels}},
 		WouldLockOut: []string{},
 	}
-	if after.AllowedModels != nil && len(*after.AllowedModels) == 0 {
+	if effectiveLockedOut(after) {
 		resp.WouldLockOut = append(resp.WouldLockOut, info.Name)
 	}
 	c.JSON(http.StatusOK, resp)
@@ -1197,7 +1222,7 @@ type principalListEntry struct {
 	Owner           *string      `json:"owner"`
 	Policy          policyObject `json:"policy"`
 	UpdatedAt       time.Time    `json:"updated_at"`
-	ReachableModels []string     `json:"reachable_models,omitempty"`
+	ReachableModels []string     `json:"reachable_models"`
 	EffectiveError  string       `json:"effective_error,omitempty"`
 }
 
@@ -1213,21 +1238,24 @@ type principalListEntry struct {
 func (h *PolicyHandler) ListPrincipalPolicies(c *gin.Context) {
 	limit := principalsListDefaultLimit
 	if v := c.Query("limit"); v != "" {
-		if n, err := parsePositiveInt(v); err == nil {
-			limit = n
+		n, err := parsePositiveInt(v)
+		if err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "limit must be a positive integer"})
+			return
 		}
+		limit = n
 	}
 	if limit > principalsListMaxLimit {
 		limit = principalsListMaxLimit
 	}
-	if limit <= 0 {
-		limit = principalsListDefaultLimit
-	}
 	offset := 0
 	if v := c.Query("offset"); v != "" {
-		if n, err := parsePositiveInt(v); err == nil {
-			offset = n
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "offset must be a non-negative integer"})
+			return
 		}
+		offset = n
 	}
 
 	ctx := c.Request.Context()
@@ -1322,7 +1350,12 @@ func (h *PolicyHandler) ListPrincipalPolicies(c *gin.Context) {
 }
 
 func parsePositiveInt(s string) (int, error) {
-	var n int
-	_, err := fmt.Sscanf(s, "%d", &n)
-	return n, err
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return 0, err
+	}
+	if n <= 0 {
+		return 0, fmt.Errorf("must be positive")
+	}
+	return n, nil
 }

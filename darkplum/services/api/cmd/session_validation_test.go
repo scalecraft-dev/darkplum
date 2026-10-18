@@ -47,9 +47,16 @@ func svInsertUser(t *testing.T, deps routerDeps, email, role string) string {
 	return id
 }
 
+// svToken mints an access token bound to a live session row when the user
+// exists; for a ghost user (no row to reference) it mints a sid-less token,
+// which exercises the user-gone path exactly as a stale real token would.
 func svToken(t *testing.T, deps routerDeps, id, email, role string) string {
 	t.Helper()
-	tok, err := auth.SignSessionJWT(id, email, "U", role, deps.authCfg.Secret, time.Hour)
+	sid := ""
+	if s, _, err := auth.InsertSession(context.Background(), deps.pool, id); err == nil {
+		sid = s
+	}
+	tok, err := auth.SignSessionJWT(sid, id, email, "U", role, deps.authCfg.Secret, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}

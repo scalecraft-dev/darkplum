@@ -36,6 +36,10 @@ const (
 	routeDescriptionMaxLen = 500 // mirrors model_alias_routes.description's CHECK
 	routeKeywordMaxLen     = 64  // mirrors migration 013's "each keyword <= 64 chars"
 	routeKeywordsMaxCount  = 32  // mirrors model_alias_routes.keywords' cardinality CHECK
+	// routesMaxCount bounds a routed alias: every route is embedded in every
+	// /v1/models response and listed in the chat model picker, and no
+	// classifier distinguishes dozens of intents usefully.
+	routesMaxCount = 32
 
 	aliasTestMaxTextBytes = 16 * 1024 // 16 KiB, per DESIGN3's /model-aliases/:alias/test contract
 
@@ -138,6 +142,12 @@ type RoutingHandler struct {
 // NewRoutingHandler returns a RoutingHandler backed by db. gatewayURL and
 // serviceKey are used by TestAlias to call the gateway's routing dryrun
 // endpoint with the service credential.
+// kickGateway asks the gateway to reload policy (aliases included) now; see
+// kickGatewayPolicy.
+func (h *RoutingHandler) kickGateway(ctx context.Context) {
+	kickGatewayPolicy(ctx, &http.Client{Timeout: gatewayRefreshTimeout}, h.gatewayURL, h.serviceKey)
+}
+
 func NewRoutingHandler(db *pgxpool.Pool, rec *activity.Recorder, gatewayURL, serviceKey string) *RoutingHandler {
 	return &RoutingHandler{
 		db:                 db,
@@ -390,6 +400,9 @@ func validateRoutedAliasShape(req putAliasRequest) ([]putAliasRouteInput, error)
 	if len(req.Routes) == 0 {
 		return nil, errors.New("at least one route is required")
 	}
+	if len(req.Routes) > routesMaxCount {
+		return nil, fmt.Errorf("at most %d routes are allowed", routesMaxCount)
+	}
 
 	seenNames := make(map[string]bool, len(req.Routes))
 	normalized := make([]putAliasRouteInput, len(req.Routes))
@@ -413,11 +426,17 @@ func validateRoutedAliasShape(req putAliasRequest) ([]putAliasRouteInput, error)
 		}
 
 		normKeywords := make([]string, 0, len(rt.Keywords))
+		seenKeywords := make(map[string]bool, len(rt.Keywords))
 		for _, kw := range rt.Keywords {
 			nk, ok := normalizeKeyword(kw)
 			if !ok {
 				return nil, fmt.Errorf("routes[%d]: keyword %q must be non-empty and at most %d characters", i, kw, routeKeywordMaxLen)
 			}
+			// "dup", "DUP" and " dup " all normalise to one keyword.
+			if seenKeywords[nk] {
+				continue
+			}
+			seenKeywords[nk] = true
 			normKeywords = append(normKeywords, nk)
 		}
 
@@ -585,6 +604,22 @@ func (h *RoutingHandler) putStaticAlias(c *gin.Context, tx pgx.Tx, alias string,
 		return
 	}
 
+	// 409: the same residency rule the routed path applies -- an alias to
+	// a model the org's residency refuses would be accepted here and then
+	// refused on every chat. Read from the authoritative org row, never the
+	// legacy mirror (see putRoutedAlias for why).
+	var dbResidency *string
+	if err := tx.QueryRow(ctx, `SELECT residency FROM principal_routing_policies WHERE principal_type = 'org'`).Scan(&dbResidency); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "check routing policy failed"})
+		return
+	}
+	if residency := orgResidencyString(dbResidency); !residencyPermitsClass(residency, targetBackendClass) {
+		c.JSON(http.StatusConflict, gin.H{
+			"error": fmt.Sprintf("residency policy is %s; alias targets a model of class %s, %q", residency, targetBackendClass, req.TargetModelID),
+		})
+		return
+	}
+
 	if _, err := tx.Exec(ctx, `DELETE FROM model_alias_routes WHERE alias = $1`, alias); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "clear stale routes failed"})
 		return
@@ -616,6 +651,7 @@ func (h *RoutingHandler) putStaticAlias(c *gin.Context, tx pgx.Tx, alias string,
 		return
 	}
 
+	h.kickGateway(ctx)
 	evtType := activity.ModelAliasUpdated
 	if created {
 		evtType = activity.ModelAliasCreated
@@ -798,6 +834,7 @@ func (h *RoutingHandler) putRoutedAlias(c *gin.Context, tx pgx.Tx, alias string,
 		resp.Warnings = []string{semanticRouterNotConfiguredWarning}
 	}
 
+	h.kickGateway(ctx)
 	evtType := activity.ModelAliasUpdated
 	if created {
 		evtType = activity.ModelAliasCreated
@@ -829,6 +866,23 @@ func (h *RoutingHandler) DeleteAlias(c *gin.Context) {
 		return
 	}
 
+	// 409: an alias that is somebody's default_model cannot simply vanish --
+	// /v1/models would preselect a name that is not in its own list and the
+	// next org/principal save would fail on "unknown model or alias id".
+	var referencedBy int
+	if err := h.db.QueryRow(ctx,
+		`SELECT COUNT(*) FROM principal_routing_policies WHERE default_model = $1`, alias,
+	).Scan(&referencedBy); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "check alias references failed"})
+		return
+	}
+	if referencedBy > 0 {
+		c.JSON(http.StatusConflict, gin.H{
+			"error": fmt.Sprintf("alias %q is the default model of %d routing polic%s; change those first", alias, referencedBy, map[bool]string{true: "y", false: "ies"}[referencedBy == 1]),
+		})
+		return
+	}
+
 	tag, err := h.db.Exec(ctx, `DELETE FROM model_aliases WHERE alias = $1`, alias)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "delete alias failed"})
@@ -838,6 +892,7 @@ func (h *RoutingHandler) DeleteAlias(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "alias not found"})
 		return
 	}
+	h.kickGateway(ctx)
 
 	evt := activity.FromContext(c, activity.ModelAliasDeleted)
 	evt.TargetType = activity.StrPtr("model_alias")
@@ -945,13 +1000,16 @@ func (h *RoutingHandler) TestAlias(c *gin.Context) {
 // come from the gateway's POST /v1/policy/impact, the same merge that
 // enforces.
 type routingPolicyResponse struct {
-	Residency          string    `json:"residency"`
-	AllowedModels      *[]string `json:"allowed_models"`
-	DefaultModel       *string   `json:"default_model"`
-	UpdatedAt          time.Time `json:"updated_at"`
-	Warnings           []string  `json:"warnings,omitempty"`
-	AffectedPrincipals *int      `json:"affected_principals,omitempty"`
-	OrgNarrowed        *bool     `json:"org_narrowed,omitempty"`
+	Residency     string    `json:"residency"`
+	AllowedModels *[]string `json:"allowed_models"`
+	DefaultModel  *string   `json:"default_model"`
+	UpdatedAt     time.Time `json:"updated_at"`
+	Warnings      []string  `json:"warnings,omitempty"`
+	// AlreadyLockedOut names principals with nothing reachable both before
+	// and after this save -- not caused by it (so not a 409), but shown.
+	AlreadyLockedOut   []string `json:"already_locked_out,omitempty"`
+	AffectedPrincipals *int     `json:"affected_principals,omitempty"`
+	OrgNarrowed        *bool    `json:"org_narrowed,omitempty"`
 	// UnresolvedModels lists enabled, allowed models the gateway has not yet
 	// seen a backend for, when the new residency is self_hosted_only: their
 	// class is unknown, so they are neither counted as lost nor as kept. Any
@@ -1095,6 +1153,8 @@ func (h *RoutingHandler) PutRoutingPolicy(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	if req.AllowedModels != nil {
+		deduped := dedupeStrings(*req.AllowedModels)
+		req.AllowedModels = &deduped
 		if err := validateAllowedModelIDs(ctx, h.db, *req.AllowedModels); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 			return
@@ -1170,7 +1230,7 @@ func (h *RoutingHandler) PutRoutingPolicy(c *gin.Context) {
 				return
 			}
 			c.JSON(http.StatusConflict, gin.H{
-				"error":      fmt.Sprintf("this policy would leave %d user(s) or key(s) with no allowed model; widen it, or change their own policies first", len(names)),
+				"error":      fmt.Sprintf("this policy would leave %d user(s) or key(s) with no reachable model; widen it, or change their own policies first", len(names)),
 				"locked_out": names,
 			})
 			return
@@ -1209,6 +1269,11 @@ func (h *RoutingHandler) PutRoutingPolicy(c *gin.Context) {
 	}
 
 	if impact != nil {
+		if len(impact.AlreadyLockedOut) > 0 {
+			if names, err := orgLockOutNames(ctx, h.db, impact.AlreadyLockedOut); err == nil {
+				resp.AlreadyLockedOut = names
+			}
+		}
 		count := len(impact.Narrowed)
 		resp.AffectedPrincipals = &count
 		narrowed := impact.OrgNarrowed
@@ -1216,6 +1281,7 @@ func (h *RoutingHandler) PutRoutingPolicy(c *gin.Context) {
 		resp.UnresolvedModels = impact.UnresolvedModels
 	}
 
+	h.kickGateway(ctx)
 	evt := activity.FromContext(c, activity.RoutingPolicyOrgChanged)
 	evt.TargetType = activity.StrPtr("routing_policy")
 	evt.Detail = map[string]any{

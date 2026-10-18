@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/jackc/pgx/v5"
 	"log"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -33,6 +35,9 @@ import (
 // passes a positive value, enforced to be >= 30s at config-load time).
 type PgStore struct {
 	pool *pgxpool.Pool
+
+	// refreshMu serialises Refresh (see its comment). Zero value is ready.
+	refreshMu sync.Mutex
 
 	// loadFn performs the actual load. Defaults to loadFromDB; overridable in
 	// tests (same package) so refresh/last-good behaviour can be exercised
@@ -110,6 +115,12 @@ func (s *PgStore) Current() (Snapshot, bool) {
 // logs loudly and leaves the previous snapshot in place — or the unloaded
 // fail-closed state, if this is the first attempt.
 func (s *PgStore) Refresh(ctx context.Context) error {
+	// Serialised: the ticker, the api's post-write kick and the preview
+	// handlers all call this. Without the lock a load that STARTED before
+	// a write could finish after a load that saw the write, and store the
+	// older snapshot on top of the newer one.
+	s.refreshMu.Lock()
+	defer s.refreshMu.Unlock()
 	snap, err := s.loadFn(ctx)
 	if err != nil {
 		// Check the raw snapshot pointer, not Current() — a snapshot that has
@@ -182,9 +193,46 @@ func (s *PgStore) Run(ctx context.Context, interval time.Duration) {
 }
 
 // loadFromDB runs the 3 SELECTs and assembles a Snapshot.
+// policyQuerier is what the loaders read through: a read-only REPEATABLE
+// READ transaction, so the five SELECTs see one consistent database state
+// (never an alias delete with its default_model update half-applied).
+type policyQuerier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	// Begin opens a nested transaction (a savepoint inside the read
+	// transaction) for probes that may fail on a not-yet-migrated schema.
+	Begin(ctx context.Context) (pgx.Tx, error)
+}
+
+// inSavepoint runs fn inside a nested transaction, so a statement that fails
+// because a migration has not created its table yet does not abort the
+// enclosing read transaction (Postgres refuses every later statement in an
+// aborted transaction). The probe's own error is returned unchanged for the
+// caller to classify.
+func inSavepoint(ctx context.Context, q policyQuerier, fn func(pq policyQuerier) error) error {
+	sp, err := q.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	if err := fn(sp); err != nil {
+		_ = sp.Rollback(ctx)
+		return err
+	}
+	return sp.Commit(ctx)
+}
+
 func (s *PgStore) loadFromDB(ctx context.Context) (Snapshot, error) {
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return Snapshot{}, fmt.Errorf("policy: begin read transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	return s.loadWith(ctx, tx)
+}
+
+func (s *PgStore) loadWith(ctx context.Context, q policyQuerier) (Snapshot, error) {
 	enabled := make(map[string]bool)
-	rows, err := s.pool.Query(ctx, `SELECT model_id, enabled FROM models`)
+	rows, err := q.Query(ctx, `SELECT model_id, enabled FROM models`)
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("policy: query models: %w", err)
 	}
@@ -209,7 +257,7 @@ func (s *PgStore) loadFromDB(ctx context.Context) (Snapshot, error) {
 	// real branching to get right) is unit-testable with fakes instead of a
 	// live model_alias_routes migration.
 	var routeRows []rawRouteRow
-	rrows, err := s.pool.Query(ctx, `
+	rrows, err := q.Query(ctx, `
 		SELECT alias, route_name, description, target_model_id, keywords
 		  FROM model_alias_routes
 		 ORDER BY alias, position`)
@@ -231,7 +279,7 @@ func (s *PgStore) loadFromDB(ctx context.Context) (Snapshot, error) {
 	rrows.Close()
 
 	var aliasRows []rawAliasRow
-	arows, err := s.pool.Query(ctx, `
+	arows, err := q.Query(ctx, `
 		SELECT alias, kind, target_model_id, default_route, classifier_kind
 		  FROM model_aliases`)
 	if err != nil {
@@ -252,14 +300,20 @@ func (s *PgStore) loadFromDB(ctx context.Context) (Snapshot, error) {
 	arows.Close()
 
 	var residency string
-	if err := s.pool.QueryRow(ctx, `SELECT residency FROM routing_policy WHERE id = true`).Scan(&residency); err != nil {
+	if err := inSavepoint(ctx, q, func(pq policyQuerier) error {
+		return pq.QueryRow(ctx, `SELECT residency FROM routing_policy WHERE id = true`).Scan(&residency)
+	}); err != nil {
 		return Snapshot{}, fmt.Errorf("policy: query routing_policy: %w", err)
 	}
 
 	// principal_routing_policies (migration 015) may not exist yet on a
 	// customer database mid-rollout, exactly like model_aliases/routing_policy
 	// before migration 010 landed — see loadPrincipalPolicyRows.
-	principalRows, err := s.loadPrincipalPolicyRows(ctx)
+	var principalRows []rawPrincipalPolicyRow
+	err = inSavepoint(ctx, q, func(pq policyQuerier) (err error) {
+		principalRows, err = s.loadPrincipalPolicyRows(ctx, pq)
+		return err
+	})
 	if err != nil {
 		if !isUndefinedTableError(err) {
 			return Snapshot{}, fmt.Errorf("policy: query principal_routing_policies: %w", err)
@@ -275,7 +329,7 @@ func (s *PgStore) loadFromDB(ctx context.Context) (Snapshot, error) {
 	// enumerate "every key owned by this user" for its "keys" list. A
 	// separate query from loadPrincipalPolicyRows' LEFT JOIN above, which only
 	// resolves ownership for keys that already have a policy row.
-	keyOwner, userKeys, err := s.loadAPIKeyOwners(ctx)
+	keyOwner, userKeys, err := s.loadAPIKeyOwners(ctx, q)
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("policy: query api_keys: %w", err)
 	}
@@ -286,7 +340,11 @@ func (s *PgStore) loadFromDB(ctx context.Context) (Snapshot, error) {
 	// empty map, never a load failure: a vendor filter is a "nice to have"
 	// UI feature, not core routing-enforcement state, and its absence must
 	// never fail the whole policy snapshot closed.
-	vendorFilters, err := s.loadVendorFilters(ctx)
+	var vendorFilters map[string]VendorFilterRow
+	err = inSavepoint(ctx, q, func(pq policyQuerier) (err error) {
+		vendorFilters, err = s.loadVendorFilters(ctx, pq)
+		return err
+	})
 	if err != nil {
 		if !isUndefinedTableError(err) {
 			return Snapshot{}, fmt.Errorf("policy: query vendor_provider_settings: %w", err)
@@ -316,14 +374,29 @@ func (s *PgStore) loadFromDB(ctx context.Context) (Snapshot, error) {
 // 017, owned by the api) into a vendor -> VendorFilterRow map. Returns the
 // raw error (including an undefined-table 42P01) for loadFromDB to classify
 // — this function performs I/O only, mirroring loadPrincipalPolicyRows.
-func (s *PgStore) loadVendorFilters(ctx context.Context) (map[string]VendorFilterRow, error) {
-	rows, err := s.pool.Query(ctx, `SELECT vendor, model_filter, filter_set_at, workspace_id FROM vendor_provider_settings`)
+func (s *PgStore) loadVendorFilters(ctx context.Context, q policyQuerier) (map[string]VendorFilterRow, error) {
+	// The first probe runs in its own savepoint: if migration 019
+	// (workspace_id) is not applied yet its failure must not abort the
+	// enclosing read transaction before the pre-019 query below.
 	hasWorkspace := true
+	var rows pgx.Rows
+	probe, err := q.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	rows, err = probe.Query(ctx, `SELECT vendor, model_filter, filter_set_at, workspace_id FROM vendor_provider_settings`)
 	if isUndefinedColumnError(err) {
+		_ = probe.Rollback(ctx)
 		// Migration 019 (workspace_id) not applied yet on this database:
 		// read the pre-019 shape; workspace ids are simply absent.
 		hasWorkspace = false
-		rows, err = s.pool.Query(ctx, `SELECT vendor, model_filter, filter_set_at FROM vendor_provider_settings`)
+		rows, err = q.Query(ctx, `SELECT vendor, model_filter, filter_set_at FROM vendor_provider_settings`)
+	} else if err != nil {
+		_ = probe.Rollback(ctx)
+	} else {
+		// Released after the rows are read; a savepoint commit while rows
+		// are open is fine, the cursor belongs to the enclosing transaction.
+		defer func() { _ = probe.Commit(ctx) }()
 	}
 	if err != nil {
 		return nil, err
@@ -363,8 +436,8 @@ func (s *PgStore) loadVendorFilters(ctx context.Context) (map[string]VendorFilte
 // row), this covers every api_key that exists -- api_keys has existed since
 // migration 001, so unlike principal_routing_policies there is no rollout
 // tolerance needed here.
-func (s *PgStore) loadAPIKeyOwners(ctx context.Context) (keyOwner map[string]string, userKeys map[string][]string, err error) {
-	rows, err := s.pool.Query(ctx, `SELECT id::text, user_id::text FROM api_keys WHERE revoked_at IS NULL`)
+func (s *PgStore) loadAPIKeyOwners(ctx context.Context, q policyQuerier) (keyOwner map[string]string, userKeys map[string][]string, err error) {
+	rows, err := q.Query(ctx, `SELECT id::text, user_id::text FROM api_keys WHERE revoked_at IS NULL`)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -428,8 +501,8 @@ type rawPrincipalPolicyRow struct {
 // loadPrincipalPolicyRows runs the principal_routing_policies / api_keys join
 // and scans every row. It performs I/O only — see buildPrincipalPolicies for
 // the pure assembly logic this feeds.
-func (s *PgStore) loadPrincipalPolicyRows(ctx context.Context) ([]rawPrincipalPolicyRow, error) {
-	rows, err := s.pool.Query(ctx, `
+func (s *PgStore) loadPrincipalPolicyRows(ctx context.Context, q policyQuerier) ([]rawPrincipalPolicyRow, error) {
+	rows, err := q.Query(ctx, `
 		SELECT prp.principal_type,
 		       prp.user_id::text,
 		       prp.api_key_id::text,

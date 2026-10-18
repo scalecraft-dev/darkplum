@@ -170,7 +170,7 @@ func TestRouteInventoryMatchesGolden(t *testing.T) {
 
 	users := handler.NewUserHandler(pool, activityRecorder, authCfg.Pepper)
 	keys := handler.NewAPIKeyHandler(pool, activityRecorder)
-	chat := handler.NewChatHandler("http://unused.invalid", "unused")
+	chat := handler.NewChatHandler("http://unused.invalid", "unused", nil)
 	activityH := handler.NewActivityHandler(pool)
 	routing := handler.NewRoutingHandler(pool, activityRecorder, "http://unused.invalid", "unused")
 	policy := handler.NewPolicyHandler(pool, activityRecorder, "http://unused.invalid", "unused")
@@ -182,7 +182,7 @@ func TestRouteInventoryMatchesGolden(t *testing.T) {
 	baseDeps := routerDeps{
 		pool: pool, authCfg: authCfg, sessionMW: sessionMW, localProvider: localProvider,
 		users: users, keys: keys, chat: chat, activityH: activityH, routing: routing,
-		policy: policy, modelHandler: modelHandler, conversations: conversations, providers: providers, prices: prices,
+		policy: policy, modelHandler: modelHandler, conversations: conversations, providers: providers, prices: prices, settings: handler.NewSettingsHandler(pool, activityRecorder),
 		billing: handler.NewBillingHandler(pool, activityRecorder, billing.NewService(&billing.Store{DB: pool}, billing.KeyReader{}, nil, nil, nil), kube.NewWriter(), true),
 	}
 

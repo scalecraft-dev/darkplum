@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"math/big"
 	"net/http"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -75,6 +77,10 @@ type APIKeyCreated struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// apiKeyNameMaxLen bounds the label an admin gives a key: it is shown in
+// the key table and in usage attribution, never parsed.
+const apiKeyNameMaxLen = 100
+
 type createAPIKeyRequest struct {
 	UserID string `json:"user_id" binding:"required"`
 	Name   string `json:"name"    binding:"required"`
@@ -85,6 +91,11 @@ func (h *APIKeyHandler) CreateAPIKey(c *gin.Context) {
 	var req createAPIKeyRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	req.Name = strings.TrimSpace(req.Name)
+	if req.Name == "" || utf8.RuneCountInString(req.Name) > apiKeyNameMaxLen {
+		c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("name must be 1-%d characters", apiKeyNameMaxLen)})
 		return
 	}
 

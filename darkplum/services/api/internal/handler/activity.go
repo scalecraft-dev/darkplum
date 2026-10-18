@@ -682,6 +682,25 @@ func (h *ActivityHandler) UsageSummary(c *gin.Context) {
 // ExportActivity handles GET /api/v1/activity/export.
 // Returns all matching activity_events as a CSV file (capped at 10 000 rows).
 // Accepts the same filter params as ListActivity except limit/offset.
+// csvSafeText neutralises a free-text cell that a spreadsheet would
+// evaluate as a formula. encoding/csv quotes delimiters correctly, but
+// Excel, Sheets and LibreOffice still execute a quoted cell that begins
+// with = + - @ or a control character; a user who names themselves
+// "=HYPERLINK(...)" would otherwise plant it in every admin's export. The
+// OWASP apostrophe prefix is used, and ONLY on cells whose text a user
+// controls (names, emails, model ids, route names) -- never on timestamps,
+// ids, counts or costs, which must keep parsing as what they are.
+func csvSafeText(cell string) string {
+	if cell == "" {
+		return cell
+	}
+	switch cell[0] {
+	case '=', '+', '-', '@', '\t', '\r', '|':
+		return "'" + cell
+	}
+	return cell
+}
+
 func (h *ActivityHandler) ExportActivity(c *gin.Context) {
 	args := []any{}
 	where := "WHERE 1=1"
@@ -775,8 +794,8 @@ func (h *ActivityHandler) ExportActivity(c *gin.Context) {
 		_ = w.Write([]string{
 			createdAt.UTC().Format(time.RFC3339),
 			eventType,
-			derefStr(actorName),
-			derefStr(actorEmail),
+			csvSafeText(derefStr(actorName)),
+			csvSafeText(derefStr(actorEmail)),
 			derefStr(targetType),
 			derefStr(targetID),
 			string(detailJSON),
@@ -959,14 +978,14 @@ func (h *ActivityHandler) ExportUsage(c *gin.Context) {
 			createdAt.UTC().Format(time.RFC3339),
 			requestID,
 			derefStr(userID),
-			derefStr(userName),
-			derefStr(userEmail),
+			csvSafeText(derefStr(userName)),
+			csvSafeText(derefStr(userEmail)),
 			derefStr(apiKeyID),
-			model,
-			derefStr(requestedModel),
+			csvSafeText(model),
+			csvSafeText(derefStr(requestedModel)),
 			provider,
 			purpose,
-			derefStr(routeName),
+			csvSafeText(derefStr(routeName)),
 			derefStr(routerReason),
 			strconv.Itoa(statusCode),
 			derefStr(denialCode),

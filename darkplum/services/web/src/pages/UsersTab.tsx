@@ -52,6 +52,7 @@ function DeleteButton({ user, onDelete }: { user: User; onDelete: (id: string) =
         onClick={() => setOpen(true)}
         disabled={loading}
         title="Delete user"
+        aria-label="Delete user"
       >
         {loading ? (
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={styles.spinner}>
@@ -138,7 +139,7 @@ function ResetPasswordButton({ userId, onReset }: { userId: string; onReset: (id
 
   if (!open) {
     return (
-      <button className={styles.actionBtn} onClick={() => setOpen(true)} title="Reset password">
+      <button className={styles.actionBtn} onClick={() => setOpen(true)} title="Reset password" aria-label="Reset password">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
           <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
           <path d="M7 11V7a5 5 0 0 1 10 0v4" />
@@ -162,7 +163,7 @@ function ResetPasswordButton({ userId, onReset }: { userId: string; onReset: (id
       <button type="submit" className={styles.actionBtn} disabled={loading} title="Confirm">
         {loading ? '...' : 'Set'}
       </button>
-      <button type="button" className={styles.actionBtn} onClick={() => { setOpen(false); setPw('') }} title="Cancel">
+      <button type="button" className={styles.actionBtn} onClick={() => { setOpen(false); setPw('') }} title="Cancel" aria-label="Cancel">
         X
       </button>
     </form>

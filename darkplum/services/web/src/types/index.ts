@@ -725,6 +725,17 @@ export interface ModelPrice {
 export interface ModelPricesResult {
   rows: ModelPrice[]
   seed_generated_at: string | null
+  /** Discovered models no active row matches; their requests show as unpriced. */
+  unpriced?: { provider: string; model_id: string }[]
+}
+
+/** GET /api/v1/settings/system-prompt. */
+export interface SystemPromptSetting {
+  /** The text in force: custom, or the built-in default. */
+  system_prompt: string
+  custom: boolean
+  default: string
+  updated_at: string | null
 }
 
 /** A PUT body. Without id: a new admin row. With id: replaces that row from

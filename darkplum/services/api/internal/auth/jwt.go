@@ -8,6 +8,12 @@ import (
 )
 
 type SessionClaims struct {
+	// SID is the sessions row this access token belongs to. Logout deletes
+	// that row, which is what makes a still-unexpired JWT stop working
+	// (validateSession refuses a token whose session row is gone). A token
+	// without a sid (minted before this field existed) is never accepted
+	// as a session on its own; the refresh cookie re-mints one that has it.
+	SID    string `json:"sid,omitempty"`
 	UserID string `json:"uid"`
 	Email  string `json:"email"`
 	Name   string `json:"name"`
@@ -17,9 +23,10 @@ type SessionClaims struct {
 
 const jwtIssuer = "darkplum-api"
 
-func SignSessionJWT(userID, email, name, role string, secret []byte, ttl time.Duration) (string, error) {
+func SignSessionJWT(sid, userID, email, name, role string, secret []byte, ttl time.Duration) (string, error) {
 	now := time.Now()
 	claims := SessionClaims{
+		SID:    sid,
 		UserID: userID,
 		Email:  email,
 		Name:   name,

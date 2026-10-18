@@ -96,6 +96,9 @@ export const ROUTES = {
   // --- Routing policy: organisation ---
   getRoutingPolicy:    { method: 'GET', path: '/api/v1/routing-policy' },
   updateRoutingPolicy: { method: 'PUT', path: '/api/v1/routing-policy' },
+  /** The platform system prompt the webchat proxy prepends to every turn. */
+  getSystemPrompt:     { method: 'GET', path: '/api/v1/settings/system-prompt' },
+  updateSystemPrompt:  { method: 'PUT', path: '/api/v1/settings/system-prompt' },
   listPolicyPrincipals: { method: 'GET', path: '/api/v1/routing-policy/principals' },
 
   // --- Routing policy: per user ---

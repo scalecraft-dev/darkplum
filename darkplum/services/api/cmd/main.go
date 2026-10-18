@@ -226,7 +226,7 @@ func run() error {
 	// Handlers.
 	users := handler.NewUserHandler(pool, activityRecorder, authCfg.Pepper)
 	keys := handler.NewAPIKeyHandler(pool, activityRecorder)
-	chat := handler.NewChatHandler(gatewayURL, serviceKey)
+	chat := handler.NewChatHandler(gatewayURL, serviceKey, pool)
 	activityH := handler.NewActivityHandler(pool)
 	routing := handler.NewRoutingHandler(pool, activityRecorder, gatewayURL, serviceKey)
 	routing.SetAvailabilityWindow(modelAvailabilityWindowFromEnv())
@@ -235,6 +235,7 @@ func run() error {
 	providers := handler.NewProvidersHandler(pool, activityRecorder, gatewayURL, serviceKey, kube.NewWriter(), modelHandler, authCfg.SecureCookie)
 
 	prices := handler.NewPricingHandler(pool, activityRecorder)
+	settings := handler.NewSettingsHandler(pool, activityRecorder)
 
 	// Vendor usage/cost reconciliation (separate billing keys; see
 	// internal/billing). The poller starts after the price seed below.
@@ -278,6 +279,7 @@ func run() error {
 		conversations: conversations,
 		providers:     providers,
 		prices:        prices,
+		settings:      settings,
 		billing:       billingH,
 	})
 
@@ -336,6 +338,7 @@ type routerDeps struct {
 	providers     *handler.ProvidersHandler
 	prices        *handler.PricingHandler
 	billing       *handler.BillingHandler
+	settings      *handler.SettingsHandler
 }
 
 // buildRouter registers every route the api serves. See routerDeps' doc
@@ -343,6 +346,15 @@ type routerDeps struct {
 func buildRouter(d routerDeps) *gin.Engine {
 	gin.SetMode(gin.ReleaseMode)
 	r := gin.New()
+	// Only hops inside the cluster (the web pod's nginx, the kind/EKS node
+	// NAT) may speak for the client via X-Forwarded-For. gin's default is to
+	// trust EVERY proxy, which makes c.ClientIP() the left-most, caller-
+	// supplied XFF entry: a free bypass of the per-IP login limiter and a
+	// forged ip_address on every audit row. nginx.conf also overwrites (not
+	// appends) X-Forwarded-For with the peer it actually saw.
+	if err := r.SetTrustedProxies(trustedProxyCIDRs); err != nil {
+		panic(fmt.Sprintf("set trusted proxies: %v", err))
+	}
 	r.Use(gin.Recovery())
 	r.Use(requestID())
 	r.Use(requestLogger())
@@ -357,6 +369,17 @@ func buildRouter(d routerDeps) *gin.Engine {
 	r.Use(csrfProtection())
 
 	r.GET("/health", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	// Every refusal this api sends is JSON; the default text/plain
+	// "404 page not found" was the one exception, and it reached SDK
+	// clients that had typed GET /v1/chat/completions.
+	r.NoRoute(func(c *gin.Context) {
+		if strings.HasPrefix(c.Request.URL.Path, "/v1/") {
+			c.JSON(http.StatusNotFound, openAIErrorBody("unknown endpoint: "+c.Request.Method+" "+c.Request.URL.Path, "invalid_request_error", "unknown_endpoint"))
+			return
+		}
+		c.JSON(http.StatusNotFound, gin.H{"error": "not found"})
+	})
 
 	// Auth config — always available so the frontend can detect auth mode.
 	r.GET("/auth/config", func(c *gin.Context) {
@@ -375,7 +398,11 @@ func buildRouter(d routerDeps) *gin.Engine {
 	// Auth routes. Local password auth (POST /login) is always registered; OIDC
 	// (GET /login redirect + callback) is additive. /me and /logout are
 	// provider-agnostic via the shared session layer.
-	loginRL := auth.LoginRateLimit(0.2, 5) // 1 attempt / 5s sustained, burst 5
+	// Per client address: 1/s sustained, burst 30 -- an office NAT or a
+	// SNAT'd node must not lock a whole org out at 09:00. The real
+	// brute-force defence is the per-account bucket inside LoginRateLimit
+	// (0.2/s, burst 5, charged only on failure).
+	loginRL := auth.LoginRateLimit(1, 30)
 	authGroup := r.Group("/auth")
 	authGroup.POST("/login", loginRL, d.localProvider.Login)
 	authGroup.POST("/change-password", d.localProvider.ChangePassword)
@@ -387,8 +414,10 @@ func buildRouter(d routerDeps) *gin.Engine {
 	}
 	authGroup.GET("/me", d.localProvider.HandleMe)
 	if d.oidcProvider != nil {
-		authGroup.GET("/login", loginRL, d.oidcProvider.Login)
-		authGroup.GET("/callback", loginRL, d.oidcProvider.Callback)
+		// Not rate-limited: the IdP checks the credential, and the
+		// callback is bound to the state cookie and PKCE verifier.
+		authGroup.GET("/login", d.oidcProvider.Login)
+		authGroup.GET("/callback", d.oidcProvider.Callback)
 		authGroup.POST("/logout", d.oidcProvider.Logout)
 	} else {
 		authGroup.POST("/logout", d.localProvider.Logout)
@@ -398,9 +427,6 @@ func buildRouter(d routerDeps) *gin.Engine {
 	v1 := r.Group("/api/v1")
 	v1.Use(d.sessionMW)
 	{
-		v1.GET("/users", d.users.ListUsers)
-		v1.GET("/api-keys", d.keys.ListAPIKeys)
-
 		// Conversation history: session-authenticated but explicitly NOT
 		// admin-only -- see the privacy comment atop
 		// internal/handler/conversations.go. Every handler scopes by the
@@ -421,6 +447,11 @@ func buildRouter(d routerDeps) *gin.Engine {
 		adminOnly := v1.Group("")
 		adminOnly.Use(auth.AdminRequired())
 		{
+			// The user directory and the key inventory (owner, name, prefix
+			// of EVERY key) are admin views; a reader has no screen that
+			// needs either, and seeing who else holds keys is not theirs.
+			adminOnly.GET("/users", d.users.ListUsers)
+			adminOnly.GET("/api-keys", d.keys.ListAPIKeys)
 			adminOnly.POST("/users", d.users.CreateUser)
 			adminOnly.DELETE("/users/:id", d.users.DeleteUser)
 			adminOnly.PATCH("/users/:id/role", d.users.UpdateRole)
@@ -463,6 +494,11 @@ func buildRouter(d routerDeps) *gin.Engine {
 
 			// Versioned price book behind the spend estimates. PUT with an id
 			// closes the old row and inserts a new one; DELETE retires.
+			// Organisation settings (migration 025): the platform system
+			// prompt the webchat proxy prepends to every turn.
+			adminOnly.GET("/settings/system-prompt", d.settings.GetSystemPrompt)
+			adminOnly.PUT("/settings/system-prompt", d.settings.PutSystemPrompt)
+
 			adminOnly.GET("/model-prices", d.prices.ListPrices)
 			adminOnly.PUT("/model-prices", d.prices.PutPrice)
 			adminOnly.DELETE("/model-prices/:id", d.prices.DeletePrice)
@@ -528,6 +564,20 @@ func buildRouter(d routerDeps) *gin.Engine {
 	r.POST("/v1/chat/completions", apiOrSession(d.sessionMW), d.chat.ProxyChat)
 
 	return r
+}
+
+// trustedProxyCIDRs is every network a forwarding hop of this api can live
+// on: RFC 1918 + loopback + ULA. A public source address is never a proxy.
+var trustedProxyCIDRs = []string{"127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "::1/128", "fc00::/7"}
+
+// openAIErrorBody is the OpenAI error envelope the /v1/* surface speaks:
+// {"error":{"message","type","code"}}. SDK clients read error.message.
+func openAIErrorBody(message, typ, code string) gin.H {
+	e := gin.H{"message": message, "type": typ}
+	if code != "" {
+		e["code"] = code
+	}
+	return gin.H{"error": e}
 }
 
 func envOr(key, fallback string) string {

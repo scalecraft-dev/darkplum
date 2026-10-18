@@ -43,7 +43,11 @@ func TestBillingRoutes_NonAdminRefused(t *testing.T) {
 		`INSERT INTO users (email, name, role) VALUES ('member@example.com', 'Member', 'reader') RETURNING id::text`).Scan(&memberID); err != nil {
 		t.Fatal(err)
 	}
-	token, err := auth.SignSessionJWT(memberID, "member@example.com", "Member", "reader", deps.authCfg.Secret, time.Hour)
+	sid, _, err := auth.InsertSession(context.Background(), deps.pool, memberID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := auth.SignSessionJWT(sid, memberID, "member@example.com", "Member", "reader", deps.authCfg.Secret, time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}

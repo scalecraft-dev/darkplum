@@ -254,6 +254,7 @@ func main() {
 	// routing.NewAnthropicSource and routing.NewOpenAISource both needed it,
 	// each reporting into it from its own discovery Source on every tick.
 	chatHandler := handler.NewChatHandler(reg, routeMgr, polStore, rulesClassifier, semanticClassifier, providerStatus)
+	chatHandler.SetPolicyRefresher(polStore.Refresh)
 
 	// providersHandler serves the two machine-only routes the api calls (with
 	// the service key) to verify and activate a vendor key an admin installs
@@ -330,6 +331,12 @@ func main() {
 // machinery, which already has its own package-level tests.
 func buildRouter(chatHandler *handler.ChatHandler, providersHandler *handler.ProvidersHandler, apiKeyMW, recordingMW, healthHandler gin.HandlerFunc) *gin.Engine {
 	engine := gin.New()
+	// Same rule as the api: only in-cluster hops may speak for a client via
+	// X-Forwarded-For. The api proxy sets it to the caller's address, so the
+	// inference audit row records the person, not the api pod.
+	if err := engine.SetTrustedProxies([]string{"127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "::1/128", "fc00::/7"}); err != nil {
+		panic(fmt.Sprintf("set trusted proxies: %v", err))
+	}
 	engine.Use(gin.Logger())
 	engine.Use(gin.Recovery())
 
@@ -355,6 +362,10 @@ func buildRouter(chatHandler *handler.ChatHandler, providersHandler *handler.Pro
 	v1.GET("/policy/effective", chatHandler.HandleEffectivePolicy)
 	v1.POST("/policy/effective", chatHandler.HandleEffectivePolicyOverride)
 	v1.POST("/policy/impact", chatHandler.HandleEffectivePolicyImpact)
+	// Service-key-only "reload policy now": the api calls it after every
+	// policy-shaped write so the snapshot never lags an admin's save by a
+	// refresh interval. Not recorded (no model is dispatched).
+	v1.POST("/policy/refresh", chatHandler.HandlePolicyRefresh)
 
 	// POST /v1/providers/:vendor/verify and .../refresh are likewise
 	// service-key-only, dispatch to no model, and produce no

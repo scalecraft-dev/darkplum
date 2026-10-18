@@ -1099,7 +1099,8 @@ func TestHandleEffectivePolicyImpact_NarrowingReportsExactlyTheDisjointPrincipal
 	h := newTestHandler(fakeProviders{}, baseOverrideRoutes(), impactSnapshot(), true)
 	// Narrow the org to m2,m3: previewUserID (m1 only) and its inheriting key
 	// previewKeyID lose everything; previewKeyID2 (m2 ∩ owner m1 = ∅) was
-	// already empty and stays so; impactKey3 (m3) keeps m3; impactUser3
+	// already empty before this change and is therefore NOT this change's
+	// lock-out (it is not listed); impactKey3 (m3) keeps m3; impactUser3
 	// inherits and is never evaluated.
 	w, c := newPolicyImpactRequest(t, middleware.KeyTypeService, `{"override":{"level":"org","policy":{"allowed_models":["m2","m3"]}}}`)
 	h.HandleEffectivePolicyImpact(c)
@@ -1111,9 +1112,8 @@ func TestHandleEffectivePolicyImpact_NarrowingReportsExactlyTheDisjointPrincipal
 		t.Fatalf("org_locked_out must be false for a non-empty org allowlist; body=%s", w.Body.String())
 	}
 	want := map[string]bool{
-		previewUserID + "/":                 true,
-		previewUserID + "/" + previewKeyID:  true,
-		previewUserID + "/" + previewKeyID2: true,
+		previewUserID + "/":                true,
+		previewUserID + "/" + previewKeyID: true,
 	}
 	gotSet := map[string]bool{}
 	for _, p := range got.LockedOut {
@@ -1163,15 +1163,16 @@ func TestHandleEffectivePolicyImpact_WideningLocksNobodyOut(t *testing.T) {
 	h := newTestHandler(fakeProviders{}, baseOverrideRoutes(), impactSnapshot(), true)
 	// null = inherit-all at org level; the only remaining empty set is
 	// previewKeyID2 (m2 ∩ owner m1), which is pre-existing, not caused here —
-	// the endpoint reports state under the override, so it is still listed.
+	// the endpoint reports what THIS change locks out, so nothing is listed
+	// (a pre-existing lock-out must never block every later org save).
 	w, c := newPolicyImpactRequest(t, middleware.KeyTypeService, `{"override":{"level":"org","policy":null}}`)
 	h.HandleEffectivePolicyImpact(c)
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d; body=%s", w.Code, w.Body.String())
 	}
 	got := decodePolicyImpact(t, w.Body.Bytes())
-	if len(got.LockedOut) != 1 || got.LockedOut[0].APIKeyID != previewKeyID2 {
-		t.Errorf("expected only the pre-existing empty key %s, got %+v", previewKeyID2, got.LockedOut)
+	if len(got.LockedOut) != 0 {
+		t.Errorf("a widening locks nobody out (the pre-existing empty key %s is not this change's), got %+v", previewKeyID2, got.LockedOut)
 	}
 	if got.OrgNarrowed || len(got.Narrowed) != 0 {
 		t.Errorf("a widening must narrow nobody: org_narrowed=%v narrowed=%+v", got.OrgNarrowed, got.Narrowed)
@@ -1182,8 +1183,9 @@ func TestHandleEffectivePolicyImpact_ResidencyTighteningNarrowsViaReachability(t
 	// m3 becomes cloud-managed; tightening the org to self_hosted_only drops
 	// it from everyone's allowed set even though no allowlist changes —
 	// the org is narrowed, and so is impactKey3 (m3 only -> nothing
-	// allowed under the residency, but NOT locked out: its allowlist is
-	// still [m3]).
+	// reachable under the residency). Its allowlist is still [m3], but a
+	// key that can reach nothing is locked out: that is what the admin's
+	// 409 exists to catch.
 	routes := baseOverrideRoutes()
 	routes["m3"] = routing.Route{ProviderKey: "bedrock", Kind: "bedrock", Class: routing.ClassCloudManaged}
 	h := newTestHandler(fakeProviders{}, routes, impactSnapshot(), true)
@@ -1203,15 +1205,15 @@ func TestHandleEffectivePolicyImpact_ResidencyTighteningNarrowsViaReachability(t
 	if narrowed[previewUserID+"/"] {
 		t.Errorf("previewUserID (m1 only, self-hosted) must not be narrowed")
 	}
-	if len(got.LockedOut) != 1 || got.LockedOut[0].APIKeyID != previewKeyID2 {
-		t.Errorf("residency never locks anyone out; only the pre-existing empty key expected, got %+v", got.LockedOut)
+	if len(got.LockedOut) != 1 || got.LockedOut[0].APIKeyID != impactKey3 {
+		t.Errorf("impactKey3 reaches nothing under self_hosted_only and is newly locked out (previewKeyID2 was already empty), got %+v", got.LockedOut)
 	}
 }
 
 func TestHandleEffectivePolicyImpact_ResidencyTighteningWithoutCloudModelsNarrowsNobody(t *testing.T) {
 	// Every enabled model is self-hosted, so self_hosted_only takes nothing
-	// away from anyone: no org_narrowed, no narrowed, no lock-outs beyond the
-	// pre-existing empty key.
+	// away from anyone: no org_narrowed, no narrowed, no lock-outs (the
+	// pre-existing empty key is not this change's).
 	h := newTestHandler(fakeProviders{}, baseOverrideRoutes(), impactSnapshot(), true)
 	w, c := newPolicyImpactRequest(t, middleware.KeyTypeService, `{"override":{"level":"org","policy":{"residency":"self_hosted_only"}}}`)
 	h.HandleEffectivePolicyImpact(c)
@@ -1222,8 +1224,8 @@ func TestHandleEffectivePolicyImpact_ResidencyTighteningWithoutCloudModelsNarrow
 	if got.OrgNarrowed || len(got.Narrowed) != 0 {
 		t.Errorf("no cloud models enabled: org_narrowed=%v narrowed=%+v, want false/[]", got.OrgNarrowed, got.Narrowed)
 	}
-	if len(got.LockedOut) != 1 || got.LockedOut[0].APIKeyID != previewKeyID2 {
-		t.Errorf("only the pre-existing empty key may be locked out, got %+v", got.LockedOut)
+	if len(got.LockedOut) != 0 {
+		t.Errorf("nothing changes for anyone, so nobody is newly locked out, got %+v", got.LockedOut)
 	}
 }
 

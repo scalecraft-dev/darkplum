@@ -42,6 +42,10 @@ const (
 	// principal_type plus the before/after policy objects (policy shape
 	// only, never content).
 	RoutingPolicyPrincipalChanged EventType = "routing_policy.principal_changed"
+	// SettingsSystemPromptChanged is recorded on PUT
+	// /api/v1/settings/system-prompt. Detail carries whether a custom prompt
+	// is now set and its length -- never the prompt text itself.
+	SettingsSystemPromptChanged EventType = "settings.system_prompt_changed"
 
 	// ConversationDeleted is recorded on DELETE /api/v1/conversations/:id.
 	// Detail carries only {"message_count": n} -- never conversation content

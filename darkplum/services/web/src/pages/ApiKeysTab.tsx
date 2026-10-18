@@ -54,6 +54,7 @@ function RevokeButton({ id, onRevoke }: { id: string; onRevoke: (id: string) => 
       onClick={handleClick}
       disabled={loading}
       title="Revoke key"
+      aria-label="Revoke key"
     >
       {loading ? (
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" className={styles.spinner}>

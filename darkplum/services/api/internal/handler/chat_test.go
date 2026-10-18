@@ -43,7 +43,7 @@ func TestProxyChat_GatewayErrorPassthrough(t *testing.T) {
 				defer gw.Close()
 
 				gin.SetMode(gin.TestMode)
-				h := NewChatHandler(gw.URL, "dp_test_service_key_000000000000000000000")
+				h := NewChatHandler(gw.URL, "dp_test_service_key_000000000000000000000", nil)
 				r := gin.New()
 				r.POST("/v1/chat/completions", h.ProxyChat)
 
@@ -93,7 +93,7 @@ func TestProxyChat_RoutingHeadersForwarded(t *testing.T) {
 			defer gw.Close()
 
 			gin.SetMode(gin.TestMode)
-			h := NewChatHandler(gw.URL, "dp_test_service_key_000000000000000000000")
+			h := NewChatHandler(gw.URL, "dp_test_service_key_000000000000000000000", nil)
 			r := gin.New()
 			r.POST("/v1/chat/completions", h.ProxyChat)
 
@@ -147,7 +147,7 @@ func TestProxyChat_StreamOutlivesServerWriteTimeout(t *testing.T) {
 	defer gw.Close()
 
 	gin.SetMode(gin.TestMode)
-	h := NewChatHandler(gw.URL, "dp_test_service_key_000000000000000000000")
+	h := NewChatHandler(gw.URL, "dp_test_service_key_000000000000000000000", nil)
 	router := gin.New()
 	router.POST("/v1/chat/completions", h.ProxyChat)
 
@@ -212,7 +212,7 @@ func TestProxyChat_RequestBodyReachesGatewayIntact(t *testing.T) {
 	defer gw.Close()
 
 	gin.SetMode(gin.TestMode)
-	h := NewChatHandler(gw.URL, "dp_test_service_key_000000000000000000000")
+	h := NewChatHandler(gw.URL, "dp_test_service_key_000000000000000000000", nil)
 	r := gin.New()
 	r.POST("/v1/chat/completions", h.ProxyChat)
 
@@ -296,7 +296,7 @@ func TestProxyChat_RetryAfterForwarded(t *testing.T) {
 	defer gw.Close()
 
 	gin.SetMode(gin.TestMode)
-	h := NewChatHandler(gw.URL, "dp_test_service_key_000000000000000000000")
+	h := NewChatHandler(gw.URL, "dp_test_service_key_000000000000000000000", nil)
 	r := gin.New()
 	r.POST("/v1/chat/completions", h.ProxyChat)
 
@@ -308,5 +308,20 @@ func TestProxyChat_RetryAfterForwarded(t *testing.T) {
 	}
 	if got := rec.Header().Get("Retry-After"); got != "7" {
 		t.Errorf("Retry-After = %q, want \"7\"", got)
+	}
+}
+
+// TestWithSystemPrompt_RejectsNonObjectAndEmptyMessages pins the two body
+// shapes the chaos exercise found: a literal `null` used to panic on a nil
+// map (500, empty body), and an empty messages array used to reach the
+// gateway as a system-prompt-only conversation.
+func TestWithSystemPrompt_RejectsNonObjectAndEmptyMessages(t *testing.T) {
+	for _, body := range []string{`null`, `{"model":"m","messages":[]}`, `{"model":"m"}`, `[]`, `"x"`} {
+		if _, _, err := withSystemPrompt([]byte(body)); err == nil {
+			t.Errorf("body %s: expected an error, got none", body)
+		}
+	}
+	if _, _, err := withSystemPrompt([]byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)); err != nil {
+		t.Fatalf("valid body refused: %v", err)
 	}
 }

@@ -129,7 +129,7 @@ func TestPgStore_LoadVendorFilters_MissingTableReturnsUndefinedTableError(t *tes
 	pool := setupPolicyDB(t)
 	s := &PgStore{pool: pool}
 
-	_, err := s.loadVendorFilters(context.Background())
+	_, err := s.loadVendorFilters(context.Background(), pool)
 	if err == nil {
 		t.Fatal("expected an error querying a table that does not exist")
 	}
@@ -207,7 +207,7 @@ func TestPgStore_LoadVendorFilters_WorkspaceID(t *testing.T) {
 			VALUES ('anthropic', ARRAY['claude-*'], $1, 'wrkspc_01'), ('openai', ARRAY['gpt-*'], $1, NULL)`, setAt); err != nil {
 			t.Fatal(err)
 		}
-		got, err := (&PgStore{pool: pool}).loadVendorFilters(ctx)
+		got, err := (&PgStore{pool: pool}).loadVendorFilters(ctx, pool)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -224,7 +224,7 @@ func TestPgStore_LoadVendorFilters_WorkspaceID(t *testing.T) {
 			VALUES ('anthropic', ARRAY['claude-*'], $1)`, setAt); err != nil {
 			t.Fatal(err)
 		}
-		got, err := (&PgStore{pool: pool}).loadVendorFilters(ctx)
+		got, err := (&PgStore{pool: pool}).loadVendorFilters(ctx, pool)
 		if err != nil {
 			t.Fatalf("pre-019 schema must still load: %v", err)
 		}

@@ -3,6 +3,7 @@ package auth
 import (
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -14,10 +15,22 @@ func SessionRequired(db *pgxpool.Pool, secret []byte, secureCook bool) gin.Handl
 	sm := &SessionManager{DB: db, Secret: secret, SecureCook: secureCook}
 	return func(c *gin.Context) {
 		claims, err := sm.ValidateSession(c)
+		if errors.Is(err, errSessionCheck) {
+			c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{"error": "session could not be verified; retry"})
+			return
+		}
 		if err != nil {
 			msg := "session expired"
 			if errors.Is(err, errNoSession) {
 				msg = "not authenticated"
+			}
+			if strings.HasPrefix(c.Request.URL.Path, "/v1/") {
+				// The OpenAI-compatible surface speaks the OpenAI envelope
+				// for every refusal, including this one.
+				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": gin.H{
+					"message": msg, "type": "authentication_error", "code": "not_authenticated",
+				}})
+				return
 			}
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": msg})
 			return
@@ -26,6 +39,7 @@ func SessionRequired(db *pgxpool.Pool, secret []byte, secureCook bool) gin.Handl
 		c.Set("user_email", claims.Email)
 		c.Set("user_name", claims.Name)
 		c.Set("user_role", claims.Role)
+		c.Set("session_id", claims.SID)
 		c.Next()
 	}
 }

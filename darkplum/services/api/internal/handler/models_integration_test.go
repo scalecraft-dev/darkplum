@@ -736,24 +736,43 @@ func TestListModels_BearerCallerIsFilteredByGateway(t *testing.T) {
 		t.Errorf("default_model must relay the gateway's, got %v", listResp.DefaultModel)
 	}
 
-	// Gateway down: unfiltered, flagged.
+	// Gateway down: a Bearer caller cannot be authenticated, so the answer
+	// is 503 -- never the unfiltered catalog.
 	h = NewModelHandler("http://127.0.0.1:1", "service-key-unused", pool)
 	r = newModelsTestRouter(h)
 	resp = httptest.NewRecorder()
 	req = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
 	req.Header.Set("Authorization", "Bearer dp_user_key")
 	r.ServeHTTP(resp, req)
-	if resp.Code != http.StatusOK {
-		t.Fatalf("status = %d, body = %s", resp.Code, resp.Body.String())
+	if resp.Code != http.StatusServiceUnavailable {
+		t.Fatalf("gateway down: status = %d, body = %s, want 503", resp.Code, resp.Body.String())
 	}
-	if err := json.Unmarshal(resp.Body.Bytes(), &listResp); err != nil {
-		t.Fatalf("decode: %v", err)
+
+	// Gateway refuses the key: its 401 is the answer, with the OpenAI
+	// envelope the /v1 surface speaks.
+	gw401 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"error":{"message":"Invalid API key","type":"invalid_request_error"}}`))
+	}))
+	defer gw401.Close()
+	h = NewModelHandler(gw401.URL, "service-key-unused", pool)
+	r = newModelsTestRouter(h)
+	resp = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	req.Header.Set("Authorization", "Bearer dp_bogus")
+	r.ServeHTTP(resp, req)
+	if resp.Code != http.StatusUnauthorized {
+		t.Fatalf("gateway 401: status = %d, body = %s, want 401", resp.Code, resp.Body.String())
 	}
-	if listResp.PolicyFiltered {
-		t.Errorf("policy_filtered must be false when the gateway could not be reached")
+	var envelope struct {
+		Error struct {
+			Message string `json:"message"`
+			Code    string `json:"code"`
+		} `json:"error"`
 	}
-	if len(listResp.Data) != 3 {
-		t.Errorf("degraded list must be the unfiltered one (m1, m2, only-m2), got %d entries", len(listResp.Data))
+	if err := json.Unmarshal(resp.Body.Bytes(), &envelope); err != nil || envelope.Error.Code != "invalid_api_key" {
+		t.Errorf("gateway 401 must relay as an OpenAI error envelope, got %s", resp.Body.String())
 	}
 }
 

@@ -2,9 +2,12 @@ package handler
 
 import (
 	"bytes"
+	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"io"
 	"log/slog"
 	"net/http"
@@ -17,16 +20,36 @@ import (
 //go:embed system-prompt.md
 var systemPrompt string
 
+// chatBodyMaxBytes caps a chat completion request body. 16 MiB (~4M tokens
+// of text) holds any prompt a 1M-token model accepts; nginx.conf's
+// client_max_body_size and the gateway's cap match it.
+const chatBodyMaxBytes = 16 << 20
+
+// chatProxyError is the OpenAI error envelope for refusals this proxy itself
+// produces, so an SDK reads error.message here exactly as it does for a
+// gateway refusal.
+func chatProxyError(message, typ, code string) gin.H {
+	e := gin.H{"message": message, "type": typ}
+	if code != "" {
+		e["code"] = code
+	}
+	return gin.H{"error": e}
+}
+
 type ChatHandler struct {
 	gatewayURL string
 	serviceKey string
 	client     *http.Client
+	// db reads the admin-set system prompt (org_settings); nil means the
+	// built-in text is always used (tests).
+	db *pgxpool.Pool
 }
 
-func NewChatHandler(gatewayURL, serviceKey string) *ChatHandler {
+func NewChatHandler(gatewayURL, serviceKey string, db *pgxpool.Pool) *ChatHandler {
 	return &ChatHandler{
 		gatewayURL: gatewayURL,
 		serviceKey: serviceKey,
+		db:         db,
 		client: &http.Client{
 			Transport: &http.Transport{
 				ResponseHeaderTimeout: 120 * time.Second,
@@ -50,15 +73,32 @@ type chatEnvelope struct {
 // "messages" member is rewritten; every other member, and every member of each
 // message, is preserved byte for byte.
 func withSystemPrompt(body []byte) (modified []byte, stream bool, err error) {
+	return withSystemPromptText(body, resolvedSystemPrompt(systemPrompt))
+}
+
+// withSystemPromptText is withSystemPrompt with the prompt text supplied:
+// the admin-set one when there is one, else the built-in default.
+func withSystemPromptText(body []byte, prompt string) (modified []byte, stream bool, err error) {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(body, &fields); err != nil {
 		return nil, false, err
+	}
+	if fields == nil {
+		// A literal `null` body unmarshals into a nil map without error;
+		// assigning "messages" into it would panic.
+		return nil, false, fmt.Errorf("request body must be a JSON object")
 	}
 	var env chatEnvelope
 	if err := json.Unmarshal(body, &env); err != nil {
 		return nil, false, err
 	}
 
+	if len(env.Messages) == 0 {
+		// The platform system prompt is prepended below, so an empty
+		// client array would reach the gateway as a one-message
+		// "conversation" with no user turn. OpenAI refuses this; so do we.
+		return nil, false, fmt.Errorf("messages must be a non-empty array")
+	}
 	hasSystemMsg := false
 	if len(env.Messages) > 0 {
 		var first struct {
@@ -70,7 +110,7 @@ func withSystemPrompt(body []byte) (modified []byte, stream bool, err error) {
 		hasSystemMsg = first.Role == "system"
 	}
 	if !hasSystemMsg {
-		system, err := json.Marshal(map[string]string{"role": "system", "content": resolvedSystemPrompt()})
+		system, err := json.Marshal(map[string]string{"role": "system", "content": prompt})
 		if err != nil {
 			return nil, false, err
 		}
@@ -86,9 +126,19 @@ func withSystemPrompt(body []byte) (modified []byte, stream bool, err error) {
 	return modified, env.Stream, err
 }
 
-func resolvedSystemPrompt() string {
+// resolvedSystemPrompt fills the {{current_date}} placeholder in text.
+func resolvedSystemPrompt(text string) string {
 	now := time.Now().Format("Monday, January 2, 2006")
-	return strings.ReplaceAll(systemPrompt, "{{current_date}}", now)
+	return strings.ReplaceAll(text, "{{current_date}}", now)
+}
+
+// effectiveSystemPrompt is the text prepended to this request: the
+// organisation's custom prompt when an admin set one, else the built-in.
+func (h *ChatHandler) effectiveSystemPrompt(ctx context.Context) string {
+	if custom, ok := systemPromptCache.get(ctx, h.db); ok {
+		return resolvedSystemPrompt(custom)
+	}
+	return resolvedSystemPrompt(systemPrompt)
 }
 
 // ProxyChat handles POST /v1/chat/completions.
@@ -113,17 +163,25 @@ func (h *ChatHandler) ProxyChat(c *gin.Context) {
 		slog.DebugContext(c.Request.Context(), "chat proxy: clear write deadline unsupported by response writer", "err", err)
 	}
 
-	body, err := io.ReadAll(c.Request.Body)
+	// Bounded read: a prompt for a 1M-context model is a few megabytes, not
+	// hundreds, and without a cap any key holder could make this process
+	// buffer whatever it was sent.
+	body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, chatBodyMaxBytes))
 	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			c.JSON(http.StatusRequestEntityTooLarge, chatProxyError(fmt.Sprintf("request body exceeds %d bytes", chatBodyMaxBytes), "invalid_request_error", "request_too_large"))
+			return
+		}
 		slog.ErrorContext(c.Request.Context(), "read request body", "err", err)
-		c.JSON(http.StatusBadRequest, gin.H{"error": "failed to read request body"})
+		c.JSON(http.StatusBadRequest, chatProxyError("failed to read request body", "invalid_request_error", "invalid_body"))
 		return
 	}
 
-	modified, stream, err := withSystemPrompt(body)
+	modified, stream, err := withSystemPromptText(body, h.effectiveSystemPrompt(c.Request.Context()))
 	if err != nil {
-		slog.ErrorContext(c.Request.Context(), "parse request body", "err", err)
-		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		slog.WarnContext(c.Request.Context(), "parse request body", "err", err)
+		c.JSON(http.StatusBadRequest, chatProxyError("invalid request body: expected a JSON object with a messages array", "invalid_request_error", "invalid_body"))
 		return
 	}
 
@@ -137,7 +195,7 @@ func (h *ChatHandler) ProxyChat(c *gin.Context) {
 	)
 	if err != nil {
 		slog.ErrorContext(c.Request.Context(), "build proxy request", "err", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "proxy request build failed"})
+		c.JSON(http.StatusInternalServerError, chatProxyError("proxy request build failed", "server_error", ""))
 		return
 	}
 
@@ -148,12 +206,15 @@ func (h *ChatHandler) ProxyChat(c *gin.Context) {
 		proxyReq.Header.Set("Authorization", "Bearer "+h.serviceKey)
 	}
 	proxyReq.Header.Set("X-Request-Id", c.GetString("request_id"))
+	// The gateway records the inference audit row; give it the person's
+	// address, not this pod's (it trusts in-cluster hops only).
+	proxyReq.Header.Set("X-Forwarded-For", c.ClientIP())
 	proxyReq.Header.Set("X-Darkplum-User-Id", c.GetString("user_id"))
 
 	resp, err := h.client.Do(proxyReq)
 	if err != nil {
 		slog.ErrorContext(c.Request.Context(), "gateway request failed", "err", err)
-		c.JSON(http.StatusBadGateway, gin.H{"error": "gateway unavailable"})
+		c.JSON(http.StatusBadGateway, chatProxyError("gateway unavailable", "server_error", "gateway_unavailable"))
 		return
 	}
 	defer resp.Body.Close()

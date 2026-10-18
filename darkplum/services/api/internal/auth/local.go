@@ -4,6 +4,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
@@ -53,8 +54,8 @@ func (p *LocalProvider) Login(c *gin.Context) {
 	var userID, email, name, role, hash string
 	err := p.DB.QueryRow(c.Request.Context(), `
 		SELECT id, email, name, role, password_hash
-		FROM users WHERE email = $1 AND password_hash IS NOT NULL
-	`, req.Email).Scan(&userID, &email, &name, &role, &hash)
+		FROM users WHERE lower(email) = lower($1) AND password_hash IS NOT NULL
+	`, strings.TrimSpace(req.Email)).Scan(&userID, &email, &name, &role, &hash)
 	if err != nil {
 		// User not found — record failed login before returning identical 401.
 		failEvt := activity.Event{
@@ -68,6 +69,7 @@ func (p *LocalProvider) Login(c *gin.Context) {
 			}
 		}
 		p.Activity.Record(c.Request.Context(), failEvt)
+		DebitLoginAccount(c)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
 		return
 	}
@@ -85,6 +87,7 @@ func (p *LocalProvider) Login(c *gin.Context) {
 			}
 		}
 		p.Activity.Record(c.Request.Context(), failEvt)
+		DebitLoginAccount(c)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "invalid credentials"})
 		return
 	}
@@ -154,7 +157,10 @@ func (p *LocalProvider) ChangePassword(c *gin.Context) {
 	}
 
 	_, err = p.DB.Exec(c.Request.Context(),
-		`UPDATE users SET password_hash = $1 WHERE id = $2`, string(newHash), claims.UserID)
+		`WITH u AS (UPDATE users SET password_hash = $1 WHERE id = $2 RETURNING id)
+		 -- Every OTHER session ends: whoever else holds a cookie for this
+		 -- account is logged out by the password change; this one stays.
+		 DELETE FROM sessions WHERE user_id = $2 AND id::text <> $3`, string(newHash), claims.UserID, claims.SID)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update password"})
 		return
@@ -201,7 +207,7 @@ func (p *LocalProvider) Setup(c *gin.Context) {
 		SELECT $1, $2, 'admin', $3, 'local'
 		WHERE NOT EXISTS (SELECT 1 FROM users WHERE password_hash IS NOT NULL)
 		RETURNING id, email, name, role
-	`, req.Email, req.Name, string(hash)).Scan(&userID, &email, &name, &role)
+	`, strings.ToLower(strings.TrimSpace(req.Email)), strings.TrimSpace(req.Name), string(hash)).Scan(&userID, &email, &name, &role)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			c.JSON(http.StatusConflict, gin.H{"error": "setup already completed"})

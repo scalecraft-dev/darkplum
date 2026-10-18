@@ -65,7 +65,7 @@ Estimates (price book x recorded tokens) are compared with what the vendor says 
 - `400 {"error": "..."}` — a body that does not validate (unknown model id, an alias in `allowed_models`, a `default_model` outside the effective allowlist).
 - `409 {"error": "...", "locked_out": ["<user email or key name>", ...]}` — the write would leave the named principals (or `"(organisation)"`) with no allowed model. Nothing was written.
 - `502 {"error": "gateway unavailable: ..."}` — a write or preview that needs the gateway's merge could not reach it. Nothing was written.
-- On `POST /v1/chat/completions`, a refusal is an OpenAI-style error `{"error": {"message", "type", "code"}}`. `code` is recorded on the usage-log row as `denial_code` and is one of: `model_not_found` (404), `model_not_enabled`, `model_residency_violation` (message names the actual class and the actual residency), `model_not_allowed` (403, `type: permission_error`), `policy_unavailable` (503, the gateway has no policy snapshot and fails closed), `invalid_request` (400, unparseable body or no `model` and no default), `request_canceled` (the caller disconnected before a model answered), `model_requires_data_retention` (422, the model needs the AWS account's Bedrock data-retention mode raised (Bedrock only); the body also carries `model`, optional `route`, `account_mode`, `required_mode: "aws_review"`), `unsupported_parameter` (400, body names the offending field — `tools`/`tool_choice`/`functions`/`function_call`/a `response_format` of type `json_schema`/non-text content blocks, for every route), `provider_rate_limited` (429, vendor `Retry-After` passed through), `provider_auth_failed` (502, generic text — never echoes the vendor's own error body), `upstream_error` (502), `upstream_timeout` (504).
+- On `POST /v1/chat/completions`, a refusal is an OpenAI-style error `{"error": {"message", "type", "code"}}`. `code` is recorded on the usage-log row as `denial_code` and is one of: `model_not_found` (404), `model_not_enabled`, `model_residency_violation` (message names the actual class and the actual residency), `model_not_allowed` (403, `type: permission_error`), `policy_unavailable` (503, the gateway has no policy snapshot and fails closed), `invalid_request` (400, unparseable body or no `model` and no default), `request_canceled` (the caller disconnected before a model answered), `model_requires_data_retention` (422, the model needs the AWS account's Bedrock data-retention mode raised (Bedrock only); the body also carries `model`, optional `route`, `account_mode`, `required_mode: "aws_review"`), `unsupported_parameter` (400, body names the offending field — `tools`/`tool_choice`/`functions`/`function_call`/a `response_format` of type `json_schema`/non-text content blocks, for every route), `provider_rate_limited` (429, vendor `Retry-After` passed through), `provider_auth_failed` (502, generic text — never echoes the vendor's own error body), `upstream_error` (502), `upstream_timeout` (504). Refusals produced before the gateway sees the request use the same envelope: `not_authenticated` (401, no session and no Bearer), `invalid_api_key` (401, the gateway refused the Bearer key — also on `GET /v1/models`, which never falls back to an unfiltered list), `invalid_body` (400, not a JSON object), `invalid_messages` (400, `messages` empty or a turn without a known `role`), `request_too_large` (413, body over 16 MiB at any hop), `unknown_endpoint` (404, any other `/v1/*` path or method), `gateway_unavailable` (502/503).
 
 ## Inventory
 
@@ -80,8 +80,8 @@ Estimates (price book x recorded tokens) are compared with what the vendor says 
 - `GET /auth/login` — auth: public, surface: ui
 - `GET /auth/callback` — auth: public, surface: machine (OIDC provider redirect target reached by browser navigation, never by an API call)
 - `POST /auth/logout` — auth: session, surface: ui
-- `GET /api/v1/users` — auth: session, surface: ui
-- `GET /api/v1/api-keys` — auth: session, surface: ui
+- `GET /api/v1/users` — auth: admin, surface: ui
+- `GET /api/v1/api-keys` — auth: admin, surface: ui
 - `GET /api/v1/conversations` — auth: session, surface: ui — filters: limit
 - `POST /api/v1/conversations` — auth: session, surface: ui
 - `GET /api/v1/conversations/:id` — auth: session, surface: ui — filters: format=export
@@ -118,6 +118,8 @@ Estimates (price book x recorded tokens) are compared with what the vendor says 
 - `POST /api/v1/model-aliases/:alias/test` — auth: admin, surface: ui
 - `GET /api/v1/routing-policy` — auth: admin, surface: ui
 - `PUT /api/v1/routing-policy` — auth: admin, surface: ui
+- `GET /api/v1/settings/system-prompt` — auth: admin, surface: ui
+- `PUT /api/v1/settings/system-prompt` — auth: admin, surface: ui
 - `GET /api/v1/routing-policy/principals` — auth: admin, surface: ui — filters: limit (max 200), offset
 - `GET /api/v1/activity` — auth: admin, surface: ui — filters: actor_id, event_type, since, until, limit, offset
 - `GET /api/v1/activity/export` — auth: admin, surface: ui — filters: actor_id, event_type, since, until
@@ -148,6 +150,7 @@ Estimates (price book x recorded tokens) are compared with what the vendor says 
 - `GET /v1/policy/effective` — auth: service, surface: machine (Single effective-policy implementation, consulted by the api for every effective/preview/me view with the service key)
 - `POST /v1/policy/effective` — auth: service, surface: machine (Preview counterpart of GET /v1/policy/effective, consulted by the api's routing-policy impact-preview endpoints (POST .../users/:id/routing-policy/preview, .../api-keys/:id/routing-policy/preview) so preview and real save share the one gateway merge implementation)
 - `POST /v1/policy/impact` — auth: service, surface: machine (Org-wide lock-out check consulted by the api's PUT /api/v1/routing-policy before it writes: re-merges every principal with an explicit policy row under the proposed org policy in one call, so the org PUT refuses (409) a lock-out exactly like the user/key PUTs do, with the one gateway merge implementation)
+- `POST /v1/policy/refresh` — auth: service, surface: machine (Reload the policy snapshot now. The api calls it after every policy-shaped write (model enable/disable, alias, org and per-principal policy) so chat enforcement, effective-policy reads and lock-out previews reflect the write immediately instead of up to POLICY_REFRESH_SECONDS later)
 - `POST /v1/providers/:vendor/verify` — auth: service, surface: machine (Called only by the api, with the service key, to verify and activate a vendor key an administrator installs from Admin > Models)
 - `POST /v1/providers/:vendor/refresh` — auth: service, surface: machine (Called only by the api, with the service key, to verify and activate a vendor key an administrator installs from Admin > Models)
 

@@ -76,6 +76,7 @@ import {
 import { Skeleton } from '../components/ui/Skeleton'
 import { AccessOverviewSection } from './AccessOverviewSection'
 import { RoutingPolicyCard, type OrgPolicyDraft } from './RoutingPolicyCard'
+import { SystemPromptCard } from './SystemPromptCard'
 import { VendorEnableModal } from './VendorEnableModal'
 import { VendorInstallModal, type Outcome, type VendorInstallMode } from './VendorInstallModal'
 import { VendorStatusSection } from './VendorStatusSection'
@@ -104,13 +105,13 @@ type Filter = 'all' | 'enabled' | 'disabled'
  *  which of it anyone actually reaches. Each is a tab; `?tab=` names the open
  *  one so either can be linked to. Aliases and routed aliases have their own
  *  page, Admin > Routing; `?tab=aliases` is redirected there so old links land. */
-type TabKey = 'models' | 'policy' | 'prices'
+type TabKey = 'models' | 'policy' | 'prices' | 'prompt'
 /** Prefix for this page's tab/panel DOM ids, so another tab set on the same
  *  page could never share an id with these. */
 const TAB_SCOPE = 'models-page'
 
 function tabFromParam(value: string | null): TabKey {
-  return value === 'policy' || value === 'prices' ? value : 'models'
+  return value === 'policy' || value === 'prices' || value === 'prompt' ? value : 'models'
 }
 
 /** Extract the vendor from a Bedrock inference profile ID.
@@ -1209,6 +1210,12 @@ function ModelsPageBody() {
           </svg>
           Prices
         </Tab>
+        <Tab id="prompt" active={tab === 'prompt'} onClick={() => selectTab('prompt')}>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" />
+          </svg>
+          System prompt
+        </Tab>
       </TabList>
 
       <TabPanel id="models" scope={TAB_SCOPE} active={tab === 'models'}>
@@ -1268,6 +1275,10 @@ function ModelsPageBody() {
           onRetry={() => void loadPrincipals()}
           onLoadMore={() => void loadMorePrincipals()}
         />
+      </TabPanel>
+
+      <TabPanel id="prompt" scope={TAB_SCOPE} active={tab === 'prompt'}>
+        <SystemPromptCard />
       </TabPanel>
 
       {/* Self-contained: its own reads and its two small modals. Those portal

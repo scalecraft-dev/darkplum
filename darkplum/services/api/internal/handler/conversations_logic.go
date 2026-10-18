@@ -13,9 +13,9 @@ const (
 	conversationTitleMaxLen       = 200
 	conversationTitleTruncateLen  = 60
 	conversationDefaultTitle      = "New conversation"
-	conversationContentMaxBytes   = 262144 // 256 KiB; mirrors migration 012's CHECK on conversation_messages.content
-	conversationImportKeyMaxLen   = 200    // mirrors migration 012's CHECK on conversations.import_key
-	conversationRequestIDMaxLen   = 200    // defensive cap; request_id is an opaque hex string in practice (see cmd/main.go requestID())
+	conversationContentMaxBytes   = 16 << 20 // 16 MiB; mirrors migration 025's CHECK on conversation_messages.content, = chatBodyMaxBytes
+	conversationImportKeyMaxLen   = 200      // mirrors migration 012's CHECK on conversations.import_key
+	conversationRequestIDMaxLen   = 200      // defensive cap; request_id is an opaque hex string in practice (see cmd/main.go requestID())
 	conversationsListDefaultLimit = 200
 	conversationsListMaxLimit     = 200
 )
@@ -56,6 +56,15 @@ func validConversationTitle(title string) bool {
 // validImportKey mirrors conversations.import_key's CHECK constraint. A nil
 // or empty import key is fine (no idempotency requested); non-empty is
 // capped.
+// conversationModelMaxLen bounds conversations.model, which is a model or
+// alias id (the gateway caps alias names at 63 and no vendor id approaches
+// 200). It is echoed in every list response, so it is bounded like title.
+const conversationModelMaxLen = 200
+
+func validConversationModel(model string) bool {
+	return utf8.RuneCountInString(model) <= conversationModelMaxLen
+}
+
 func validImportKey(importKey *string) bool {
 	if importKey == nil {
 		return true

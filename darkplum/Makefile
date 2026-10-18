@@ -486,7 +486,7 @@ expose-web: ## Publish the web UI on an AWS NLB: make expose-web [SCHEME=interna
 		SECURE=false; \
 	fi; \
 	kubectl patch svc darkplum-web -n darkplum-system --type=merge \
-		-p "{\"metadata\":{\"annotations\":$$ANN},\"spec\":{\"type\":\"LoadBalancer\",\"ports\":$$PORTS}}" >/dev/null; \
+		-p "{\"metadata\":{\"annotations\":$$ANN},\"spec\":{\"type\":\"LoadBalancer\",\"externalTrafficPolicy\":\"Local\",\"ports\":$$PORTS}}" >/dev/null; \
 	echo "Waiting for the load balancer hostname (EKS provisions the NLB; usually 1-3 minutes)..."; \
 	for i in $$(seq 1 30); do \
 		HOST=$$(kubectl get svc darkplum-web -n darkplum-system -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null); \
@@ -512,7 +512,7 @@ expose-web: ## Publish the web UI on an AWS NLB: make expose-web [SCHEME=interna
 
 unexpose-web: ## Revert the web UI to cluster-internal (port-forward only)
 	@kubectl patch svc darkplum-web -n darkplum-system --type=merge \
-		-p '{"metadata":{"annotations":{"service.beta.kubernetes.io/aws-load-balancer-type":null,"service.beta.kubernetes.io/aws-load-balancer-scheme":null,"service.beta.kubernetes.io/aws-load-balancer-internal":null,"service.beta.kubernetes.io/aws-load-balancer-ssl-cert":null,"service.beta.kubernetes.io/aws-load-balancer-ssl-ports":null,"service.beta.kubernetes.io/aws-load-balancer-backend-protocol":null}},"spec":{"type":"ClusterIP","ports":[{"name":"http","port":80,"targetPort":80,"protocol":"TCP"}]}}' >/dev/null
+		-p '{"metadata":{"annotations":{"service.beta.kubernetes.io/aws-load-balancer-type":null,"service.beta.kubernetes.io/aws-load-balancer-scheme":null,"service.beta.kubernetes.io/aws-load-balancer-internal":null,"service.beta.kubernetes.io/aws-load-balancer-ssl-cert":null,"service.beta.kubernetes.io/aws-load-balancer-ssl-ports":null,"service.beta.kubernetes.io/aws-load-balancer-backend-protocol":null}},"spec":{"type":"ClusterIP","externalTrafficPolicy":null,"ports":[{"name":"http","port":80,"targetPort":80,"protocol":"TCP"}]}}' >/dev/null
 	@CURRENT=$$(kubectl get secret darkplum-auth -n darkplum-system -o jsonpath='{.data.SECURE_COOKIES}' 2>/dev/null | base64 -d 2>/dev/null); \
 	if [ "$$CURRENT" != "true" ]; then \
 		kubectl patch secret darkplum-auth -n darkplum-system --type=merge -p '{"stringData":{"SECURE_COOKIES":"true"}}' >/dev/null; \

@@ -127,6 +127,26 @@ func regionEligible(rowRegion *string, model string, eventRegion *string) bool {
 	return eventRegion != nil && *eventRegion == *rowRegion
 }
 
+// MatchAnyRegion reports whether some active, region-specific or region-less
+// row of provider's matches model at t, ignoring which region. Used by the
+// price book's "unpriced models" listing, where the request region is not
+// known; spend attribution itself always uses Match.
+func MatchAnyRegion(prices []Price, provider, model string, t time.Time) bool {
+	for i := range prices {
+		p := &prices[i]
+		if p.Provider != provider || !p.effective(t) {
+			continue
+		}
+		if p.Region != nil && *p.Region == GlobalRegion {
+			continue
+		}
+		if ok, err := path.Match(p.ModelPattern, model); err == nil && ok {
+			return true
+		}
+	}
+	return false
+}
+
 // Match returns the most specific price effective at t for the event's
 // provider/model/region, or nil when none applies (the event is "unpriced").
 func Match(prices []Price, provider, model string, region *string, t time.Time) *Price {

@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -334,12 +335,22 @@ func (h *ModelHandler) ListModels(c *gin.Context) {
 		// safe if it is ever mounted elsewhere).
 		ids, dm, gwErr := h.bearerModels(ctx, bearer)
 		if gwErr != nil {
-			slog.WarnContext(ctx, "list models: gateway model list unavailable for api-key caller, falling back to unfiltered list", "err", gwErr)
-		} else {
-			allowedModels = &ids
-			defaultModel = dm
-			policyFiltered = true
+			// The gateway is the only thing that validates a Bearer key.
+			// Its refusal IS the answer -- never fall back to the full
+			// catalog for a caller that could not be authenticated -- and a
+			// gateway that cannot be reached is a 503, not a free listing.
+			var gs *gatewayStatusError
+			if errors.As(gwErr, &gs) && (gs.status == http.StatusUnauthorized || gs.status == http.StatusForbidden) {
+				c.JSON(gs.status, gin.H{"error": gin.H{"message": "Invalid API key", "type": "authentication_error", "code": "invalid_api_key"}})
+				return
+			}
+			slog.WarnContext(ctx, "list models: gateway model list unavailable for api-key caller", "err", gwErr)
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": gin.H{"message": "model list temporarily unavailable", "type": "server_error", "code": "gateway_unavailable"}})
+			return
 		}
+		allowedModels = &ids
+		defaultModel = dm
+		policyFiltered = true
 	}
 	if defaultModel == nil && policyFiltered {
 		// A filtered caller with no effective default: nothing to preselect.
@@ -478,6 +489,14 @@ func (h *ModelHandler) ListModels(c *gin.Context) {
 // from the gateway (a bad key, say) is returned as an error and the caller
 // gets the degraded unfiltered list -- the gateway will refuse the chat
 // request itself.
+// gatewayStatusError is a non-200 from the gateway, kept typed so the caller
+// can tell an auth decision (401/403) from an outage.
+type gatewayStatusError struct{ status int }
+
+func (e *gatewayStatusError) Error() string {
+	return fmt.Sprintf("gateway /v1/models returned %d", e.status)
+}
+
 func (h *ModelHandler) bearerModels(ctx context.Context, authorization string) ([]string, *string, error) {
 	ctx, cancel := context.WithTimeout(ctx, gatewayEffectiveTimeout)
 	defer cancel()
@@ -502,7 +521,7 @@ func (h *ModelHandler) bearerModels(ctx context.Context, authorization string) (
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, nil, fmt.Errorf("gateway /v1/models returned %d", resp.StatusCode)
+		return nil, nil, &gatewayStatusError{status: resp.StatusCode}
 	}
 	var body struct {
 		Data []struct {
@@ -743,7 +762,11 @@ func (h *ModelHandler) ListAdminModels(c *gin.Context) {
 // unmarshaled to the literal bytes "null" when the key is explicitly null,
 // so parseDisplayName can distinguish the two by inspecting the bytes.
 type toggleModelRequest struct {
-	Enabled     bool            `json:"enabled"`
+	// Enabled is a pointer so that a body without it (a rename, or {}) leaves
+	// the flag alone. As a plain bool, "absent" decoded to false and a
+	// display_name-only PATCH from the Models page silently disabled the
+	// model it was renaming.
+	Enabled     *bool           `json:"enabled"`
 	DisplayName json.RawMessage `json:"display_name"`
 }
 
@@ -797,15 +820,23 @@ func (h *ModelHandler) ToggleModel(c *gin.Context) {
 		return
 	}
 
+	if req.Enabled == nil && !changeDisplayName {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "nothing to change: send enabled and/or display_name"})
+		return
+	}
+
+	// Each field is applied only when it was sent: COALESCE keeps the stored
+	// value for an absent enabled, and the display_name branch is taken only
+	// when the key was present (null clears it).
 	var tag pgconn.CommandTag
 	if changeDisplayName {
 		tag, err = h.pool.Exec(c.Request.Context(), `
-			UPDATE models SET enabled = $1, display_name = $2, updated_at = now() WHERE id = $3
+			UPDATE models SET enabled = COALESCE($1, enabled), display_name = $2, updated_at = now() WHERE id = $3
 		`, req.Enabled, displayName, id)
 	} else {
 		// UPDATE first — matching the pattern in users.go (Exec + RowsAffected).
 		tag, err = h.pool.Exec(c.Request.Context(), `
-			UPDATE models SET enabled = $1, updated_at = now() WHERE id = $2
+			UPDATE models SET enabled = COALESCE($1, enabled), updated_at = now() WHERE id = $2
 		`, req.Enabled, id)
 	}
 	if err != nil {
@@ -816,6 +847,9 @@ func (h *ModelHandler) ToggleModel(c *gin.Context) {
 	if tag.RowsAffected() == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "model not found"})
 		return
+	}
+	if req.Enabled != nil {
+		kickGatewayPolicy(c.Request.Context(), h.client, h.gatewayURL, h.serviceKey)
 	}
 
 	// Fetch and return the updated row so the frontend can refresh without a

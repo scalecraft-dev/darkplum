@@ -273,6 +273,21 @@ export function PricesTab() {
         </div>
       </div>
 
+      {!error && !loading && (data?.unpriced?.length ?? 0) > 0 && (
+        <details className={styles.unpriced}>
+          <summary>
+            {data!.unpriced!.length} discovered model{data!.unpriced!.length === 1 ? '' : 's'} with no price — their requests show as unpriced in Spend
+          </summary>
+          <ul className={styles.unpricedList}>
+            {data!.unpriced!.map((m) => (
+              <li key={`${m.provider}/${m.model_id}`}>
+                <span className={styles.mono}>{m.model_id}</span> <span className={styles.muted}>({providerLabel(m.provider)})</span>
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
+
       {error ? (
         <div className={styles.errorCard} role="alert">
           <span>Prices could not be loaded: {error}</span>

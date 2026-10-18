@@ -53,6 +53,7 @@ export const EVENT_LABELS: Record<string, { label: string; variant: EventVariant
   // Per-principal policy. The organisation event and the per-principal one are
   // named apart: one moves everybody, the other moves one user or one key.
   'routing_policy.org_changed':       { label: 'Org Policy Changed',       variant: 'warning' },
+  'settings.system_prompt_changed':   { label: 'System Prompt Changed',    variant: 'warning' },
   'routing_policy.principal_changed': { label: 'Principal Policy Changed', variant: 'warning' },
 
   // Vendor keys. The three that touch the credential are amber, like the API

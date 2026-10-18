@@ -1,0 +1,31 @@
+# Who may connect to the api.
+#
+# Only the web pod's nginx, which fronts every browser and SDK request. With
+# this in place "trusted proxies" in the api (cmd/main.go) effectively means
+# "nginx": no other pod can hand the api an X-Forwarded-For of its choosing,
+# so the per-address login limiter and every audit ip_address record the
+# address nginx actually saw.
+#
+# Kubelet health probes and `kubectl port-forward` are node-local and not
+# subject to pod NetworkPolicy, so probes and the operator CLI keep working.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-ingress
+  namespace: darkplum-system
+  labels:
+    app.kubernetes.io/part-of: darkplum
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: darkplum-api
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: darkplum-web
+      ports:
+        - protocol: TCP
+          port: 8080

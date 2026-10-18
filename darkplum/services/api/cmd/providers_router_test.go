@@ -33,7 +33,7 @@ func newProvidersRouterTestDeps(t *testing.T) routerDeps {
 
 	users := handler.NewUserHandler(pool, activityRecorder, authCfg.Pepper)
 	keys := handler.NewAPIKeyHandler(pool, activityRecorder)
-	chat := handler.NewChatHandler("http://unused.invalid", "unused")
+	chat := handler.NewChatHandler("http://unused.invalid", "unused", nil)
 	activityH := handler.NewActivityHandler(pool)
 	routing := handler.NewRoutingHandler(pool, activityRecorder, "http://unused.invalid", "unused")
 	policy := handler.NewPolicyHandler(pool, activityRecorder, "http://unused.invalid", "unused")
@@ -45,7 +45,7 @@ func newProvidersRouterTestDeps(t *testing.T) routerDeps {
 	return routerDeps{
 		pool: pool, authCfg: authCfg, sessionMW: sessionMW, localProvider: localProvider,
 		users: users, keys: keys, chat: chat, activityH: activityH, routing: routing,
-		policy: policy, modelHandler: modelHandler, conversations: conversations, providers: providers, prices: prices,
+		policy: policy, modelHandler: modelHandler, conversations: conversations, providers: providers, prices: prices, settings: handler.NewSettingsHandler(pool, activityRecorder),
 		billing: handler.NewBillingHandler(pool, activityRecorder, billing.NewService(&billing.Store{DB: pool}, billing.KeyReader{}, nil, nil, nil), kube.NewWriter(), true),
 	}
 }
@@ -137,7 +137,11 @@ func TestProviderRoutes_NonAdminSessionRefused403(t *testing.T) {
 		`INSERT INTO users (email, name, role) VALUES ('member@example.com', 'Member', 'reader') RETURNING id::text`).Scan(&memberID); err != nil {
 		t.Fatalf("insert member: %v", err)
 	}
-	token, err := auth.SignSessionJWT(memberID, "member@example.com", "Member", "reader", deps.authCfg.Secret, time.Hour)
+	sid, _, err := auth.InsertSession(context.Background(), deps.pool, memberID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, err := auth.SignSessionJWT(sid, memberID, "member@example.com", "Member", "reader", deps.authCfg.Secret, time.Hour)
 	if err != nil {
 		t.Fatalf("sign session jwt: %v", err)
 	}

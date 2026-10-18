@@ -6,10 +6,12 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"log/slog"
 	"net"
 	"net/http"
@@ -86,6 +88,31 @@ type responseFormatField struct {
 // that today's providers rebuild the outbound request from ChatRequest and
 // so never actually forward them; see unsupportedRequestParam for the
 // fields that must NOT be silently dropped this way.
+// chatBodyMaxBytes caps a chat completion body; the api's proxy and
+// nginx.conf apply the same 16 MiB so every hop refuses the same request.
+// 16 MiB is ~4M tokens of text, past any model's context, and small enough
+// that a burst of maximal requests stays inside the gateway's memory limit.
+const chatBodyMaxBytes = 16 << 20
+
+// invalidMessages returns the 400 message for a messages array no backend
+// could accept, or "" when the shape is fine. Content is left to the
+// provider (a tool-result turn may legitimately be empty for some).
+func invalidMessages(msgs []provider.Message) string {
+	if len(msgs) == 0 {
+		return "messages must be a non-empty array"
+	}
+	for i, m := range msgs {
+		switch m.Role {
+		case "system", "user", "assistant", "tool", "developer", "function":
+		case "":
+			return fmt.Sprintf("messages[%d]: role is required", i)
+		default:
+			return fmt.Sprintf("messages[%d]: unknown role %q", i, m.Role)
+		}
+	}
+	return ""
+}
+
 type chatCompletionRequest struct {
 	Model       string             `json:"model"`
 	Messages    []provider.Message `json:"messages"`
@@ -245,6 +272,68 @@ type ChatHandler struct {
 
 	// providerStatus supplies GET /v1/models' `providers` array. May be nil.
 	providerStatus providerStatusSource
+
+	// policyRefresh, when set (SetPolicyRefresher), reloads the policy
+	// snapshot from Postgres on demand. The api calls POST /v1/policy/refresh
+	// after every policy-shaped write, and the preview/impact handlers call
+	// it before evaluating, so an admin's lock-out guard never judges a
+	// write against a snapshot that predates the write before it.
+	policyRefresh func(context.Context) error
+}
+
+// SetPolicyRefresher wires the on-demand policy reload (see policyRefresh).
+func (h *ChatHandler) SetPolicyRefresher(fn func(context.Context) error) { h.policyRefresh = fn }
+
+// refreshPolicyNow reloads the snapshot if a refresher is wired. A failed
+// reload is an error for the caller: a lock-out guard evaluated on a
+// snapshot that may predate the previous write is the bug this exists to
+// close, so preview/impact answer 503 rather than guess.
+func (h *ChatHandler) refreshPolicyNow(ctx context.Context) error {
+	if h.policyRefresh == nil {
+		return nil
+	}
+	if err := h.policyRefresh(ctx); err != nil {
+		log.Printf("policy: on-demand refresh failed: %v", err)
+		return err
+	}
+	return nil
+}
+
+// respondRefreshFailed is the 503 preview/impact return when the snapshot
+// could not be brought up to date first.
+func respondRefreshFailed(c *gin.Context) {
+	c.JSON(http.StatusServiceUnavailable, openAIError{Error: openAIErrorBody{
+		Message: "policy snapshot could not be refreshed; retry",
+		Type:    "server_error",
+		Code:    "policy_refresh_failed",
+	}})
+}
+
+// HandlePolicyRefresh handles POST /v1/policy/refresh (service key only):
+// reload the policy snapshot now. 204 when reloaded, 503 when the reload
+// failed (the last good snapshot stays in force), 501 when no refresher is
+// wired.
+func (h *ChatHandler) HandlePolicyRefresh(c *gin.Context) {
+	if c.GetString(middleware.ContextKeyType) != middleware.KeyTypeService {
+		c.JSON(http.StatusForbidden, openAIError{
+			Error: openAIErrorBody{
+				Message: "POST /v1/policy/refresh is only available to the service key",
+				Type:    "permission_error",
+				Code:    "service_key_required",
+			},
+		})
+		return
+	}
+	if h.policyRefresh == nil {
+		c.JSON(http.StatusNotImplemented, openAIError{Error: openAIErrorBody{Message: "policy refresh is not available", Type: "server_error"}})
+		return
+	}
+	if err := h.policyRefresh(c.Request.Context()); err != nil {
+		log.Printf("policy: refresh on request failed: %v", err)
+		c.JSON(http.StatusServiceUnavailable, openAIError{Error: openAIErrorBody{Message: "policy refresh failed; last snapshot kept", Type: "server_error", Code: "policy_refresh_failed"}})
+		return
+	}
+	c.Status(http.StatusNoContent)
 }
 
 // NewChatHandler constructs a ChatHandler. providerStatus may be nil (no
@@ -424,7 +513,22 @@ func lastUserTurn(messages []provider.Message) provider.Message {
 // across instance renames or multiple instances of the same kind.
 func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 	var req chatCompletionRequest
-	if err := json.NewDecoder(c.Request.Body).Decode(&req); err != nil {
+	if err := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, chatBodyMaxBytes)).Decode(&req); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			c.Set("denial_code", "invalid_request")
+			c.Set("resolved_model", noModelRecorded)
+			c.Header("X-Darkplum-Model", noModelRecorded)
+			logDenial(c, "invalid_request", noModelRecorded, "", "")
+			c.JSON(http.StatusRequestEntityTooLarge, openAIError{
+				Error: openAIErrorBody{
+					Message: fmt.Sprintf("request body exceeds %d bytes", chatBodyMaxBytes),
+					Type:    "invalid_request_error",
+					Code:    "request_too_large",
+				},
+			})
+			return
+		}
 		c.Set("denial_code", "invalid_request")
 		c.Set("resolved_model", noModelRecorded)
 		c.Header("X-Darkplum-Model", noModelRecorded)
@@ -467,6 +571,24 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 				Message: "model is required",
 				Type:    "invalid_request_error",
 				Code:    "model_required",
+			},
+		})
+		return
+	}
+
+	// messages must be a non-empty array of turns that each name a role:
+	// every backend rejects an empty or role-less conversation, and the
+	// refusal belongs here, before the request is attributed to a vendor.
+	if msg := invalidMessages(req.Messages); msg != "" {
+		c.Set("denial_code", "invalid_request")
+		c.Set("resolved_model", req.Model)
+		logDenial(c, "invalid_request", req.Model, "", "")
+		c.JSON(http.StatusBadRequest, openAIError{
+			Error: openAIErrorBody{
+				Message: msg,
+				Type:    "invalid_request_error",
+				Code:    "invalid_messages",
+				Param:   "messages",
 			},
 		})
 		return
@@ -951,8 +1073,13 @@ func isUUID(s string) bool {
 // byte-for-byte unchanged by POST's existence.
 type effectivePolicyResponse struct {
 	policy.EffectivePolicy
-	ReachableModels []string                  `json:"reachable_models"`
-	Keys            []effectivePolicyKeyEntry `json:"keys,omitempty"`
+	ReachableModels []string `json:"reachable_models"`
+	// LockedOut is the gateway's own verdict (see lockedOut): the api
+	// shows and refuses on this rather than re-deriving it from its own
+	// tables, which can disagree with the route table (an enabled model
+	// with no route is "enabled" to the api and unreachable here).
+	LockedOut bool                      `json:"locked_out"`
+	Keys      []effectivePolicyKeyEntry `json:"keys,omitempty"`
 }
 
 // effectivePolicyKeyEntry is one entry of effectivePolicyResponse.Keys — a
@@ -1028,9 +1155,11 @@ func (h *ChatHandler) HandleEffectivePolicy(c *gin.Context) {
 	// REAL service-key request) skip key-level rows entirely.
 	eff := snap.EffectiveFor(userID, keyID, middleware.KeyTypeUser)
 
+	table := h.routes.Snapshot()
 	c.JSON(http.StatusOK, effectivePolicyResponse{
 		EffectivePolicy: eff,
-		ReachableModels: reachableModels(eff, snap, h.routes.Snapshot()),
+		ReachableModels: reachableModels(eff, snap, table),
+		LockedOut:       lockedOut(eff, snap, table),
 	})
 }
 
@@ -1101,6 +1230,14 @@ func (h *ChatHandler) HandleEffectivePolicyOverride(c *gin.Context) {
 				Code:    "service_key_required",
 			},
 		})
+		return
+	}
+	// A preview is the api's lock-out guard: it must see every write that
+	// already happened, not a snapshot up to one interval old. Two drawer
+	// saves within that interval used to pass the guard and leave a key
+	// with nothing reachable.
+	if err := h.refreshPolicyNow(c.Request.Context()); err != nil {
+		respondRefreshFailed(c)
 		return
 	}
 
@@ -1241,9 +1378,12 @@ type policyImpactResponse struct {
 	// every user and key there is).
 	OrgLockedOut bool `json:"org_locked_out"`
 	// LockedOut lists every principal with an explicit policy row (or a key
-	// owned by a user with one) whose effective allowlist would be empty
-	// under the override. Never null.
+	// owned by a user with one) that the override NEWLY locks out. Never null.
 	LockedOut []policyImpactPrincipal `json:"locked_out"`
+	// AlreadyLockedOut lists principals locked out both before and under
+	// the override: not this change's doing, so never a reason to refuse
+	// it, but the admin looking at blast radius must still see them.
+	AlreadyLockedOut []policyImpactPrincipal `json:"already_locked_out"`
 	// OrgNarrowed is true when the org's own allowed set (allowed ∧ enabled
 	// ∧ residency-ok — policy only, not backend health) under the override
 	// loses a model it has now: everyone who simply inherits the
@@ -1298,6 +1438,10 @@ func (h *ChatHandler) HandleEffectivePolicyImpact(c *gin.Context) {
 				Code:    "service_key_required",
 			},
 		})
+		return
+	}
+	if err := h.refreshPolicyNow(c.Request.Context()); err != nil {
+		respondRefreshFailed(c)
 		return
 	}
 
@@ -1361,7 +1505,7 @@ func (h *ChatHandler) HandleEffectivePolicyImpact(c *gin.Context) {
 // hence every inheriting principal's — shrinks (OrgNarrowed). Split from the
 // handler so tests can drive it with a hand-built Snapshot and route table.
 func policyImpact(snap policy.Snapshot, table *routing.Table, override *policy.PolicyOverride) policyImpactResponse {
-	resp := policyImpactResponse{LockedOut: []policyImpactPrincipal{}, Narrowed: []policyImpactPrincipal{}, UnresolvedModels: []string{}}
+	resp := policyImpactResponse{LockedOut: []policyImpactPrincipal{}, AlreadyLockedOut: []policyImpactPrincipal{}, Narrowed: []policyImpactPrincipal{}, UnresolvedModels: []string{}}
 
 	// The org's own chain is just its row (ChainFor's first element; the
 	// user placeholder is dropped so an inheriting principal's view is
@@ -1369,7 +1513,7 @@ func policyImpact(snap policy.Snapshot, table *routing.Table, override *policy.P
 	orgChain := snap.ChainFor("", "")[:1]
 	orgNow := policy.Effective(orgChain)
 	orgAfter := policy.Effective(override.Apply(orgChain))
-	if lockedOut(orgAfter) {
+	if lockedOut(orgAfter, snap, table) {
 		resp.OrgLockedOut = true
 		resp.OrgNarrowed = len(allowedModels(orgNow, snap, table)) > 0
 		return resp
@@ -1404,8 +1548,15 @@ func policyImpact(snap policy.Snapshot, table *routing.Table, override *policy.P
 		now := policy.Effective(chain)
 		after := policy.Effective(override.Apply(chain))
 		p := policyImpactPrincipal{UserID: userID, APIKeyID: keyID}
-		if lockedOut(after) {
-			resp.LockedOut = append(resp.LockedOut, p)
+		// Only a principal this change locks out is this change's fault.
+		// One already locked out by its own row must not block every org
+		// tightening forever -- it is reported by its own policy views.
+		if lockedOut(after, snap, table) {
+			if lockedOut(now, snap, table) {
+				resp.AlreadyLockedOut = append(resp.AlreadyLockedOut, p)
+			} else {
+				resp.LockedOut = append(resp.LockedOut, p)
+			}
 		}
 		_, ownRow := snap.UserRows[userID]
 		if keyID != "" {
@@ -1537,10 +1688,36 @@ func losesAny(before, after []string) bool {
 	return false
 }
 
-// lockedOut reports whether eff permits no model at all — a non-nil, empty
-// allowlist. nil (unrestricted) is not locked out.
-func lockedOut(eff policy.EffectivePolicy) bool {
-	return eff.AllowedModels != nil && len(*eff.AllowedModels) == 0
+// lockedOut reports whether eff leaves a principal with nothing to chat
+// with: a non-nil, empty allowlist, OR no reachable model (allowed ∧ enabled
+// ∧ routable ∧ residency-ok) while the gateway has at least one enabled,
+// routable model at all. A policy naming only disabled models, or a
+// residency that excludes every allowed model, locks a principal out
+// exactly as [] does, and the preview/409 must say so. With nothing enabled
+// anywhere, nobody can chat whatever the policy says, so that state is not
+// blamed on the policy under evaluation. nil (unrestricted) with reachable
+// models is not locked out.
+func lockedOut(eff policy.EffectivePolicy, snap policy.Snapshot, table *routing.Table) bool {
+	if eff.AllowedModels != nil && len(*eff.AllowedModels) == 0 {
+		return true
+	}
+	if !anyModelRoutable(snap, table) {
+		return false
+	}
+	return len(reachableModels(eff, snap, table)) == 0
+}
+
+// anyModelRoutable reports whether at least one enabled model has a route.
+func anyModelRoutable(snap policy.Snapshot, table *routing.Table) bool {
+	for id, enabled := range snap.Enabled {
+		if !enabled {
+			continue
+		}
+		if _, ok := table.Lookup(id); ok {
+			return true
+		}
+	}
+	return false
 }
 
 // previewEffective builds userID/keyID's raw chain (Snapshot.ChainFor),
@@ -1556,6 +1733,7 @@ func previewEffective(snap policy.Snapshot, table *routing.Table, userID, keyID 
 	return effectivePolicyResponse{
 		EffectivePolicy: eff,
 		ReachableModels: reachableModels(eff, snap, table),
+		LockedOut:       lockedOut(eff, snap, table),
 	}
 }
 
@@ -1584,6 +1762,18 @@ func reachableModels(eff policy.EffectivePolicy, snap policy.Snapshot, table *ro
 		reachable = append(reachable, id)
 	}
 	return reachable
+}
+
+// orgEffectiveResidency is the residency chat enforces for a principal with
+// no row of its own: the org row's value when it sets one, else the
+// snapshot's org-level value (the legacy mirror, which pgstore already folds
+// into the org row on load; hand-built test snapshots set only the field).
+func orgEffectiveResidency(snap policy.Snapshot) string {
+	eff := policy.Effective(snap.ChainFor("", "")[:1])
+	if eff.Sources.Residency == policy.SourceNone {
+		return snap.Residency
+	}
+	return eff.Residency
 }
 
 // routingDryrunRequest is the body of POST /v1/routing/dryrun.
@@ -1696,10 +1886,15 @@ func (h *ChatHandler) HandleRoutingDryrun(c *gin.Context) {
 			Code:    "model_not_enabled",
 			Message: fmt.Sprintf("model %q is not enabled on this gateway", target),
 		}
-	} else if !policy.ResidencyPermits(snap.Residency, rt.Class) {
+	} else if orgResidency := orgEffectiveResidency(snap); !policy.ResidencyPermits(orgResidency, rt.Class) {
+		// The org row's residency, exactly as chat enforces it -- NOT
+		// snap.Residency, which is read from the legacy routing_policy
+		// mirror that migration 016 downgrades cloud_account_only to any,
+		// so a dryrun there said "fine" for an external route the real
+		// request would refuse.
 		resp.WouldBeRefused = &routingDryrunRefusal{
 			Code:    "model_residency_violation",
-			Message: residencyViolationMessage(target, rt.Class, snap.Residency),
+			Message: residencyViolationMessage(target, rt.Class, orgResidency),
 		}
 	}
 

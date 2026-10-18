@@ -21,6 +21,8 @@ export function App() {
       <Route path="/admin/activity" element={<ProtectedRoute requireAdmin><Layout><ActivityPage /></Layout></ProtectedRoute>} />
       <Route path="/chat" element={<ProtectedRoute><Layout><ChatPage /></Layout></ProtectedRoute>} />
       <Route path="/profile" element={<ProtectedRoute><Layout><ProfilePage /></Layout></ProtectedRoute>} />
+      {/* Anything else is a typo or a stale link, not a blank page. */}
+      <Route path="*" element={<Navigate to="/chat" replace />} />
     </Routes>
   )
 }

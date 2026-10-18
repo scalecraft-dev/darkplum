@@ -262,10 +262,29 @@ type reconRow struct {
 	ReportedTokens *reconTokens `json:"reported_tokens"`
 	DeltaCents     *string      `json:"delta_cents"`
 
-	est      *spendAgg
-	rep      *big.Rat
-	vendor   string
-	sortCost *big.Rat
+	est    *spendAgg
+	rep    *big.Rat
+	vendor string
+	// mixedVendors is set once a second, different vendor contributes to
+	// the row (only possible under group_by=day); the row then reports no
+	// single vendor rather than whichever happened to be seen first.
+	mixedVendors bool
+	sortCost     *big.Rat
+}
+
+// noteVendor records a contributing vendor: the first one names the row,
+// a different later one marks it mixed.
+func (r *reconRow) noteVendor(v string) {
+	if v == "" {
+		return
+	}
+	switch r.vendor {
+	case "":
+		r.vendor = v
+	case v:
+	default:
+		r.mixedVendors = true
+	}
 }
 
 // GetReconciliation handles GET /api/v1/usage/reconciliation.
@@ -328,8 +347,10 @@ func (h *BillingHandler) GetReconciliation(c *gin.Context) {
 	for k, a := range est {
 		r := get(k, a.label)
 		r.est = a
-		if !a.mixed && a.provider != "" {
-			r.vendor = a.provider
+		if a.mixed {
+			r.mixedVendors = true
+		} else if a.provider != "" {
+			r.noteVendor(a.provider)
 		}
 	}
 
@@ -390,9 +411,7 @@ func (h *BillingHandler) GetReconciliation(c *gin.Context) {
 			r.rep = new(big.Rat)
 		}
 		r.rep.Add(r.rep, amt)
-		if gb != "day" && r.vendor == "" {
-			r.vendor = vendor
-		}
+		r.noteVendor(vendor)
 	}
 	cr.Close()
 
@@ -420,12 +439,7 @@ func (h *BillingHandler) GetReconciliation(c *gin.Context) {
 		t.Input += unc + ccreate
 		t.Cached += cread
 		t.Output += out
-		if _, ok := rows[key]; !ok {
-			r := get(key, key)
-			if gb != "day" {
-				r.vendor = vendor
-			}
-		}
+		get(key, key).noteVendor(vendor)
 	}
 	ur.Close()
 
@@ -444,7 +458,7 @@ func (h *BillingHandler) GetReconciliation(c *gin.Context) {
 			r.DeltaCents = &d
 		}
 		r.ReportedTokens = tokens[k]
-		if r.vendor != "" {
+		if r.vendor != "" && !r.mixedVendors {
 			v := r.vendor
 			r.Vendor = &v
 		}

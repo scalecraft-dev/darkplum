@@ -4,6 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -13,13 +15,15 @@ func newRLRouter(mw gin.HandlerFunc) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 	r := gin.New()
 	r.POST("/x", mw, func(c *gin.Context) { c.Status(http.StatusOK) })
+	// /fail behaves like a wrong password: the account bucket is charged.
+	r.POST("/fail", mw, func(c *gin.Context) { DebitLoginAccount(c); c.Status(http.StatusUnauthorized) })
 	return r
 }
 
 // TestLoginRateLimit_Unchanged proves LoginRateLimit's externally-visible
-// behavior survived being rebuilt on the shared rateLimiter: burst requests
-// succeed, the next is refused with the original plain error body, and no
-// Retry-After header is added (login behavior is explicitly not to change).
+// behavior: burst requests succeed, the next is refused with the plain
+// error body the login form shows, and a Retry-After tells the form how
+// long to disable the button.
 func TestLoginRateLimit_Unchanged(t *testing.T) {
 	r := newRLRouter(LoginRateLimit(0.2, 2))
 
@@ -40,8 +44,8 @@ func TestLoginRateLimit_Unchanged(t *testing.T) {
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429", rec.Code)
 	}
-	if rec.Header().Get("Retry-After") != "" {
-		t.Fatalf("expected no Retry-After header on the login limiter, got %q", rec.Header().Get("Retry-After"))
+	if rec.Header().Get("Retry-After") == "" {
+		t.Fatalf("expected a Retry-After header on the login limiter")
 	}
 	if got := rec.Body.String(); got != `{"error":"too many login attempts, try again later"}` {
 		t.Fatalf("body = %s", got)
@@ -54,6 +58,54 @@ func TestLoginRateLimit_Unchanged(t *testing.T) {
 	r.ServeHTTP(rec2, req2)
 	if rec2.Code != http.StatusOK {
 		t.Fatalf("different IP: status = %d, want 200", rec2.Code)
+	}
+}
+
+// TestLoginRateLimit_PerAccount proves the second bucket: the same email
+// attempted from many different client addresses is throttled once the
+// account's burst is spent, so a brute force cannot sidestep the per-IP
+// bucket by rotating (or forging) its source address.
+func TestLoginRateLimit_PerAccount(t *testing.T) {
+	r := newRLRouter(LoginRateLimit(100, 100)) // per-IP effectively off
+	attempt := func(path, ip, email string) int {
+		body := strings.NewReader(`{"email":"` + email + `","password":"x"}`)
+		req := httptest.NewRequest(http.MethodPost, path, body)
+		req.RemoteAddr = ip + ":1234"
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	// accountBurst failed guesses from rotating addresses are allowed...
+	for i := 0; i < accountBurst; i++ {
+		if code := attempt("/fail", "10.0.0."+strconv.Itoa(i), "Victim@Example.com"); code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: status = %d, want 401", i, code)
+		}
+	}
+	// ...the next, from yet another address and with the email in another
+	// case, is refused before the handler runs.
+	if code := attempt("/fail", "10.0.0.99", "victim@example.com"); code != http.StatusTooManyRequests {
+		t.Fatalf("same account from a new IP: status = %d, want 429", code)
+	}
+	// A different account from that same address is unaffected.
+	if code := attempt("/fail", "10.0.0.99", "other@example.com"); code != http.StatusUnauthorized {
+		t.Fatalf("other account: status = %d, want 401", code)
+	}
+	// Successful attempts never charge the account bucket: the rightful
+	// owner logging in repeatedly is not throttled.
+	for i := 0; i < accountBurst*3; i++ {
+		if code := attempt("/x", "10.0.0.50", "owner@example.com"); code != http.StatusOK {
+			t.Fatalf("successful login %d: status = %d, want 200", i, code)
+		}
+	}
+	// Padding the body past the peek limit must not un-key the account
+	// bucket: it is refused, not waved through.
+	padded := strings.NewReader(`{"email":"victim@example.com","password":"x"}` + strings.Repeat(" ", loginBodyPeekLimit))
+	req := httptest.NewRequest(http.MethodPost, "/x", padded)
+	req.RemoteAddr = "10.0.0.10:1234"
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("padded body: status = %d, want 413", rec.Code)
 	}
 }
 

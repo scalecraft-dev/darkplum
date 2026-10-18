@@ -4,9 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"math/big"
 	"net/http"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5"
@@ -72,7 +76,55 @@ func (h *PricingHandler) ListPrices(c *gin.Context) {
 	for _, p := range prices {
 		rows = append(rows, priceToJSON(p))
 	}
-	c.JSON(http.StatusOK, gin.H{"rows": rows, "seed_generated_at": pricing.SeedGeneratedAt()})
+	unpriced, err := unpricedModels(c.Request.Context(), h.db, prices)
+	if err != nil {
+		slog.WarnContext(c.Request.Context(), "list model prices: unpriced check failed", "err", err)
+		unpriced = []unpricedModel{}
+	}
+	c.JSON(http.StatusOK, gin.H{"rows": rows, "seed_generated_at": pricing.SeedGeneratedAt(), "unpriced": unpriced})
+}
+
+// unpricedModel is a discovered model no active price row matches: its
+// requests show as unpriced in Spend until an admin adds a row.
+type unpricedModel struct {
+	Provider string `json:"provider"`
+	ModelID  string `json:"model_id"`
+}
+
+// unpricedModels evaluates every discovered model against the active book.
+// A Bedrock model counts as priced if any row's pattern matches it in any
+// region (the request's actual region is unknown here); a "global." id
+// needs a "global" row, exactly as spend attribution requires.
+func unpricedModels(ctx context.Context, db *pgxpool.Pool, prices []pricing.Price) ([]unpricedModel, error) {
+	rows, err := db.Query(ctx, `SELECT provider, model_id FROM models ORDER BY provider, model_id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	now := time.Now()
+	out := make([]unpricedModel, 0)
+	for rows.Next() {
+		var provider, id string
+		if err := rows.Scan(&provider, &id); err != nil {
+			return nil, err
+		}
+		if provider == "mock" {
+			continue
+		}
+		var region *string
+		if strings.HasPrefix(id, pricing.GlobalRegion+".") {
+			g := pricing.GlobalRegion
+			region = &g
+		}
+		if pricing.Match(prices, provider, id, region, now) != nil {
+			continue
+		}
+		if provider == "bedrock" && region == nil && pricing.MatchAnyRegion(prices, provider, id, now) {
+			continue
+		}
+		out = append(out, unpricedModel{Provider: provider, ModelID: id})
+	}
+	return out, rows.Err()
 }
 
 type putPriceBody struct {
@@ -98,6 +150,21 @@ func parseOptRate(n *json.Number) (*big.Rat, error) {
 // PutPrice handles PUT /api/v1/model-prices. Without id it inserts a new
 // admin row; with id it closes that row (effective_to = now) and inserts a
 // replacement, never mutating history.
+// Input bounds for a price row. Patterns are model ids with globs; regions
+// are cloud region names; notes are a sentence or two shown in the table.
+const (
+	pricePatternMaxLen = 200
+	priceRegionMaxLen  = 64
+	priceNotesMaxLen   = 2000
+)
+
+func strPtrEq(a, b *string) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
 func (h *PricingHandler) PutPrice(c *gin.Context) {
 	var body putPriceBody
 	if err := c.ShouldBindJSON(&body); err != nil {
@@ -110,12 +177,29 @@ func (h *PricingHandler) PutPrice(c *gin.Context) {
 		bad("provider must be one of anthropic, openai, bedrock, vllm, lmstudio, mock")
 		return
 	}
+	body.ModelPattern = strings.TrimSpace(body.ModelPattern)
 	if err := pricing.ValidatePattern(body.ModelPattern); err != nil {
 		bad(err.Error())
 		return
 	}
-	if body.Region != nil && *body.Region == "" {
-		body.Region = nil
+	if utf8.RuneCountInString(body.ModelPattern) > pricePatternMaxLen {
+		bad(fmt.Sprintf("model_pattern must be at most %d characters", pricePatternMaxLen))
+		return
+	}
+	if body.Region != nil {
+		r := strings.TrimSpace(*body.Region)
+		if r == "" {
+			body.Region = nil
+		} else if utf8.RuneCountInString(r) > priceRegionMaxLen {
+			bad(fmt.Sprintf("region must be at most %d characters", priceRegionMaxLen))
+			return
+		} else {
+			body.Region = &r
+		}
+	}
+	if body.Notes != nil && utf8.RuneCountInString(*body.Notes) > priceNotesMaxLen {
+		bad(fmt.Sprintf("notes must be at most %d characters", priceNotesMaxLen))
+		return
 	}
 	if body.InputPerMtok == nil || body.OutputPerMtok == nil {
 		bad("input_per_mtok and output_per_mtok are required")
@@ -168,6 +252,15 @@ func (h *PricingHandler) PutPrice(c *gin.Context) {
 		}
 		if old.EffectiveTo != nil && !old.EffectiveTo.After(time.Now()) {
 			c.JSON(http.StatusConflict, gin.H{"error": "model price is already retired"})
+			return
+		}
+		// A replacement is a new rate for the SAME price line: provider,
+		// pattern and region are its identity. Letting them drift would
+		// retire one model's price and quietly create another's under a
+		// "replaced" audit row -- the original line is then unpriced with
+		// nothing in the audit trail saying so.
+		if old.Provider != body.Provider || old.ModelPattern != body.ModelPattern || !strPtrEq(old.Region, body.Region) {
+			bad("a replacement must keep the provider, model_pattern and region of the price it replaces; retire it and add a new price instead")
 			return
 		}
 		if _, err := tx.Exec(ctx, `UPDATE model_prices SET effective_to = now() WHERE id = $1`, *body.ID); err != nil {

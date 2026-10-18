@@ -254,12 +254,12 @@ func RotateRefreshToken(ctx context.Context, db *pgxpool.Pool, oldToken string, 
 	newHash := HashString(newToken)
 	newExpiry := time.Now().Add(refreshTTL)
 
-	var sessionUser string
+	var sessionID, sessionUser string
 	err = db.QueryRow(ctx, `
 		UPDATE sessions SET refresh_token_hash = $2, expires_at = $3
 		WHERE refresh_token_hash = $1 AND expires_at > now()
-		RETURNING user_id::text
-	`, oldHash, newHash, newExpiry).Scan(&sessionUser)
+		RETURNING id::text, user_id::text
+	`, oldHash, newHash, newExpiry).Scan(&sessionID, &sessionUser)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, "", "", errors.New("refresh token expired or already used")
@@ -279,12 +279,12 @@ func RotateRefreshToken(ctx context.Context, db *pgxpool.Pool, oldToken string, 
 	}
 	userID, email, name, role := sessionUser, u.email, u.name, u.role
 
-	jwt, err := SignSessionJWT(userID, email, name, role, secret, jwtTTL)
+	jwt, err := SignSessionJWT(sessionID, userID, email, name, role, secret, jwtTTL)
 	if err != nil {
 		return nil, "", "", err
 	}
 
-	return &SessionClaims{UserID: userID, Email: email, Name: name, Role: role}, newToken, jwt, nil
+	return &SessionClaims{SID: sessionID, UserID: userID, Email: email, Name: name, Role: role}, newToken, jwt, nil
 }
 
 func CleanupExpiredSessions(ctx context.Context, db *pgxpool.Pool) {

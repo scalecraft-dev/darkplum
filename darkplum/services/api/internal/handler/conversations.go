@@ -24,6 +24,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -330,16 +331,28 @@ func (h *ConversationHandler) CreateConversation(c *gin.Context) {
 
 	title := deriveConversationTitle(req.Messages)
 	if req.Title != nil {
-		if !validConversationTitle(*req.Title) {
+		t := strings.TrimSpace(*req.Title)
+		if !validConversationTitle(t) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "title must be 1-200 characters"})
 			return
 		}
-		title = *req.Title
+		title = t
 	}
 
 	model := ""
 	if req.Model != nil {
-		model = *req.Model
+		model = strings.TrimSpace(*req.Model)
+		if !validConversationModel(model) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("model must be at most %d characters", conversationModelMaxLen)})
+			return
+		}
+	}
+
+	// An empty import_key is "no idempotency requested", same as absent --
+	// otherwise a client that always sends "" could only ever create one
+	// conversation.
+	if req.ImportKey != nil && *req.ImportKey == "" {
+		req.ImportKey = nil
 	}
 
 	// Idempotent import: an existing (user_id, import_key) row wins outright.
@@ -504,9 +517,21 @@ func (h *ConversationHandler) PatchConversation(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if req.Title != nil && !validConversationTitle(*req.Title) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "title must be 1-200 characters"})
-		return
+	if req.Title != nil {
+		t := strings.TrimSpace(*req.Title)
+		if !validConversationTitle(t) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "title must be 1-200 characters"})
+			return
+		}
+		req.Title = &t
+	}
+	if req.Model != nil {
+		m := strings.TrimSpace(*req.Model)
+		if !validConversationModel(m) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("model must be at most %d characters", conversationModelMaxLen)})
+			return
+		}
+		req.Model = &m
 	}
 
 	var setPinnedModel bool
@@ -524,7 +549,10 @@ func (h *ConversationHandler) PatchConversation(c *gin.Context) {
 				c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("pinned_model must be at most %d characters", pinnedModelMaxLen)})
 				return
 			}
-			pinnedModelValue = &s
+			// "" means unpinned, exactly like null: there is no fourth state.
+			if s = strings.TrimSpace(s); s != "" {
+				pinnedModelValue = &s
+			}
 		}
 	}
 
@@ -743,11 +771,15 @@ func (h *ConversationHandler) TruncateMessages(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid conversation id"})
 		return
 	}
-	fromSeq, err := strconv.Atoi(c.Query("from_seq"))
-	if err != nil || fromSeq < 1 {
+	// seq is an INT column: anything past int32 is not a sequence number
+	// this conversation could have, so it is a 400 here rather than a
+	// driver encoding failure (500) in the DELETE below.
+	fromSeq64, err := strconv.ParseInt(c.Query("from_seq"), 10, 32)
+	if err != nil || fromSeq64 < 1 {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "from_seq must be a positive integer"})
 		return
 	}
+	fromSeq := int(fromSeq64)
 	userID := c.GetString("user_id")
 	ctx := c.Request.Context()
 

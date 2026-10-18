@@ -68,14 +68,14 @@
     "service": "api",
     "method": "GET",
     "path": "/api/v1/users",
-    "auth": "session",
+    "auth": "admin",
     "surface": "ui"
   },
   {
     "service": "api",
     "method": "GET",
     "path": "/api/v1/api-keys",
-    "auth": "session",
+    "auth": "admin",
     "surface": "ui"
   },
   {
@@ -335,6 +335,22 @@
   {
     "service": "api",
     "method": "GET",
+    "path": "/api/v1/settings/system-prompt",
+    "auth": "admin",
+    "surface": "ui",
+    "reason": "Read the platform system prompt the webchat proxy prepends to every turn: the admin-set text when one exists, else the built-in default, plus the default itself so the editor can reset to it"
+  },
+  {
+    "service": "api",
+    "method": "PUT",
+    "path": "/api/v1/settings/system-prompt",
+    "auth": "admin",
+    "surface": "ui",
+    "reason": "Set (string, <= 20000 chars) or reset (null/blank) the organisation's system prompt; chat turns use the new text within 5 s; recorded as settings.system_prompt_changed (length only, never the text)"
+  },
+  {
+    "service": "api",
+    "method": "GET",
     "path": "/api/v1/routing-policy/principals",
     "auth": "admin",
     "surface": "ui"
@@ -527,6 +543,14 @@
     "auth": "service",
     "surface": "machine",
     "reason": "Org-wide lock-out check consulted by the api's PUT /api/v1/routing-policy before it writes: re-merges every principal with an explicit policy row under the proposed org policy in one call, so the org PUT refuses (409) a lock-out exactly like the user/key PUTs do, with the one gateway merge implementation"
+  },
+  {
+    "service": "gateway",
+    "method": "POST",
+    "path": "/v1/policy/refresh",
+    "auth": "service",
+    "surface": "machine",
+    "reason": "Reload the policy snapshot now. The api calls it after every policy-shaped write (model enable/disable, alias, org and per-principal policy) so chat enforcement, effective-policy reads and lock-out previews reflect the write immediately instead of up to POLICY_REFRESH_SECONDS later"
   },
   {
     "service": "gateway",
