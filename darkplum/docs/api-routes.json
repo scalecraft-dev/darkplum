@@ -351,6 +351,125 @@
   {
     "service": "api",
     "method": "GET",
+    "path": "/api/v1/library",
+    "auth": "session",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "POST",
+    "path": "/api/v1/library",
+    "auth": "session",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/api/v1/library/export",
+    "auth": "session",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "POST",
+    "path": "/api/v1/library/import",
+    "auth": "session",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/api/v1/library/:id",
+    "auth": "session",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "PUT",
+    "path": "/api/v1/library/:id",
+    "auth": "session",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "DELETE",
+    "path": "/api/v1/library/:id",
+    "auth": "session",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "POST",
+    "path": "/api/v1/library/:id/share",
+    "auth": "session",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/api/v1/library/:id/export",
+    "auth": "session",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "POST",
+    "path": "/api/v1/library/:id/tools/verify",
+    "auth": "session",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "PUT",
+    "path": "/api/v1/library/:id/tools/credential",
+    "auth": "session",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "DELETE",
+    "path": "/api/v1/library/:id/tools/credential",
+    "auth": "session",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/api/v1/library/shared",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "POST",
+    "path": "/api/v1/library/shared/:id/unshare",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "DELETE",
+    "path": "/api/v1/library/shared/:id",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/api/v1/settings/tool-hosts",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "PUT",
+    "path": "/api/v1/settings/tool-hosts",
+    "auth": "admin",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
     "path": "/api/v1/routing-policy/principals",
     "auth": "admin",
     "surface": "ui"

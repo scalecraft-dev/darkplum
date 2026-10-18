@@ -46,6 +46,22 @@ const (
 	// /api/v1/settings/system-prompt. Detail carries whether a custom prompt
 	// is now set and its length -- never the prompt text itself.
 	SettingsSystemPromptChanged EventType = "settings.system_prompt_changed"
+	// The admin-managed list of MCP server hosts tools may call.
+	SettingsToolHostsChanged EventType = "settings.tool_hosts_changed"
+
+	// Library (skills, context, tools). Metadata only: id, kind, slug,
+	// visibility, sizes -- never an item's body.
+	LibraryItemCreated           EventType = "library.created"
+	LibraryItemUpdated           EventType = "library.updated"
+	LibraryItemShared            EventType = "library.shared"
+	LibraryItemUnshared          EventType = "library.unshared"
+	LibraryItemDeleted           EventType = "library.deleted"
+	LibraryImported              EventType = "library.imported"
+	LibraryExported              EventType = "library.exported"
+	LibraryOwnerReassigned       EventType = "library.owner_reassigned"
+	LibraryToolVerified          EventType = "library.tool_verified"
+	LibraryToolCredentialSet     EventType = "library.tool_credential_set"
+	LibraryToolCredentialRemoved EventType = "library.tool_credential_removed"
 
 	// ConversationDeleted is recorded on DELETE /api/v1/conversations/:id.
 	// Detail carries only {"message_count": n} -- never conversation content

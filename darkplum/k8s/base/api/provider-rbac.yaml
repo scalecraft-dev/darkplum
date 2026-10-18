@@ -31,7 +31,10 @@ rules:
     # that the api's daily reconciliation job reads back through its own file
     # mount — a deliberately separate object from the inference keys, which the
     # api can only write.
-    resourceNames: ["darkplum-provider-keys", "darkplum-billing-keys"]
+    # darkplum-tool-credentials holds the OPTIONAL bearer tokens library tool
+    # items (MCP servers) need, written here and read back through the api's
+    # own file mount, like the billing keys.
+    resourceNames: ["darkplum-provider-keys", "darkplum-billing-keys", "darkplum-tool-credentials"]
     verbs: ["patch"]
   - apiGroups: [""]
     resources: ["configmaps"]

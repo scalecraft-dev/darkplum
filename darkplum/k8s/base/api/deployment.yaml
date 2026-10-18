@@ -85,6 +85,9 @@ spec:
             # Where the optional vendor billing keys are mounted (see volumes).
             - name: BILLING_KEYS_DIR
               value: /var/run/darkplum/billing-keys
+            # Where library tool (MCP server) credentials are mounted.
+            - name: TOOL_CREDENTIALS_DIR
+              value: /var/run/darkplum/tool-credentials
           readinessProbe:
             httpGet:
               path: /health
@@ -106,6 +109,10 @@ spec:
             - name: billing-keys
               mountPath: /var/run/darkplum/billing-keys
               readOnly: true
+            # Library tool credentials, one file per tool item id. Optional.
+            - name: tool-credentials
+              mountPath: /var/run/darkplum/tool-credentials
+              readOnly: true
           resources:
             requests:
               memory: 128Mi
@@ -114,4 +121,8 @@ spec:
         - name: billing-keys
           secret:
             secretName: darkplum-billing-keys
+            optional: true
+        - name: tool-credentials
+          secret:
+            secretName: darkplum-tool-credentials
             optional: true

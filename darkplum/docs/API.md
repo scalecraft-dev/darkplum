@@ -60,6 +60,12 @@ Estimates (price book x recorded tokens) are compared with what the vendor says 
 - `POST /api/v1/usage/reconciliation/refresh` — pull every configured vendor now. `202 {"state": "pulling"}`; rate-limited to 1/min. The api also pulls at start, daily at 03:00 UTC, and after a key install (last 31 UTC days, both reports).
 - `GET /api/v1/usage/reconciliation?since&until&group_by=day|model|vendor` — `{"vendors": [{vendor, configured, state, last_pulled_at, key_last4}], "rows": [{key, label, vendor, estimated_cents, reported_cents, reported_tokens: {input, cached, output} | null, delta_cents}], "currency": "USD"}`. `state` is `not_configured|ok|auth_failed|wrong_key_type|unreachable|pulling`; cents are decimal strings (4 places), `null` when unknown; `delta_cents = reported - estimated` only when both exist. Estimates cover the billable vendors (anthropic, openai, bedrock) for all request purposes. `reported_tokens.input` is uncached + cache-creation tokens and `cached` is cache reads. For `group_by=model`, Anthropic/OpenAI model ids map 1:1; report lines without a model are keyed by their description, and Bedrock Cost Explorer usage types are mapped best-effort (`USE1-ClaudeHaiku45-input-tokens` -> family `claudehaiku45`, prefix-matched against recorded Bedrock model ids; ambiguous or unknown stays keyed by the usage type and labelled `unmapped`). Admin models list `providers[]` gains `billing: {configured, state, last_pulled_at}`.
 
+### Library (skills, context, tools)
+
+`/api/v1/library` holds the items a person keeps in the organisation's own database and can share with colleagues: `kind` is `skill` (instructions, markdown), `context` (reference text, markdown) or `tool` (an MCP server: body is the JSON `{"server_url", "allowed_tools"?}`). An item is `private` (owner only) or `org` (every signed-in user can read and attach it; only the owner edits it). A private item is invisible to everyone else, administrators included: the governance routes under `/api/v1/library/shared` are scoped to `org` items in SQL. Deleting a user removes their private items and reassigns their shared ones to the acting administrator. Every item carries `content_sha256`; a tool item carries `tool: {server_url, catalog, catalog_at, credential: {set, last4}}`. `POST .../tools/verify` connects to the server (host must be on the admin allowlist `PUT /api/v1/settings/tool-hosts {hosts: ["mcp.corp.example", "*.svc.cluster.local"]}`), lists its tools and caches them; `PUT .../tools/credential {token}` stores a bearer token in the cluster Secret `darkplum-tool-credentials` (never Postgres, never returned). Export: one item as `.md` (front matter `name`, `description`, `kind`) or `.json` (tool, no credential); `GET /api/v1/library/export` is a zip of everything the user can see. Import takes `{filename, content, kind?, visibility?}` for one file; `?dry_run=1` previews and lists front-matter keys that would be dropped (only `name`, `description`, `kind` are read; a Claude SKILL.md's scripts and resources are never imported or run).
+
+Attaching to a chat: `POST /v1/chat/completions` (session auth only) takes the header `X-Darkplum-Library-Items: <id>,<id>` (at most 8). Skills and context are injected as a system message after the organisation prompt; tool items become the request's `tools`, and the api runs the tool loop (at most 8 rounds): each call goes to the MCP server, and the stream carries extra `chat.completion.chunk` frames with an empty `choices` array and a `darkplum: {type: "tool_call"|"tool_result", call_id, server, server_name, tool, arguments|content, is_error, duration_ms}` member that OpenAI SDKs ignore and the webchat renders. The response carries `X-Darkplum-Library: <id>:<sha12>,...` and `X-Darkplum-Tools: <count>`. Refusals (OpenAI envelope): `400 library_requires_session` (a Bearer caller sent the header), `400 library_invalid` / `library_too_many` / `library_too_large` (over 100k characters of text) / `library_too_many_tools`, `404 library_item_not_found` (body carries `missing: [ids]`; an item was deleted or unshared), `422 library_tool_unverified` / `library_tool_invalid`, `503 library_unavailable` (the library could not be read: the turn is refused rather than sent without the attachment).
+
 ### Refusals
 
 - `400 {"error": "..."}` — a body that does not validate (unknown model id, an alias in `allowed_models`, a `default_model` outside the effective allowlist).
@@ -120,6 +126,23 @@ Estimates (price book x recorded tokens) are compared with what the vendor says 
 - `PUT /api/v1/routing-policy` — auth: admin, surface: ui
 - `GET /api/v1/settings/system-prompt` — auth: admin, surface: ui
 - `PUT /api/v1/settings/system-prompt` — auth: admin, surface: ui
+- `GET /api/v1/library` — auth: session, surface: ui — filters: kind (skill, context, tool), scope (mine, shared, all; default all), q (name/description search, max 100 characters)
+- `POST /api/v1/library` — auth: session, surface: ui
+- `GET /api/v1/library/export` — auth: session, surface: ui
+- `POST /api/v1/library/import` — auth: session, surface: ui — filters: dry_run=1 (parse and preview only; nothing is written)
+- `GET /api/v1/library/:id` — auth: session, surface: ui
+- `PUT /api/v1/library/:id` — auth: session, surface: ui
+- `DELETE /api/v1/library/:id` — auth: session, surface: ui
+- `POST /api/v1/library/:id/share` — auth: session, surface: ui
+- `GET /api/v1/library/:id/export` — auth: session, surface: ui
+- `POST /api/v1/library/:id/tools/verify` — auth: session, surface: ui
+- `PUT /api/v1/library/:id/tools/credential` — auth: session, surface: ui
+- `DELETE /api/v1/library/:id/tools/credential` — auth: session, surface: ui
+- `GET /api/v1/library/shared` — auth: admin, surface: ui
+- `POST /api/v1/library/shared/:id/unshare` — auth: admin, surface: ui
+- `DELETE /api/v1/library/shared/:id` — auth: admin, surface: ui
+- `GET /api/v1/settings/tool-hosts` — auth: admin, surface: ui
+- `PUT /api/v1/settings/tool-hosts` — auth: admin, surface: ui
 - `GET /api/v1/routing-policy/principals` — auth: admin, surface: ui — filters: limit (max 200), offset
 - `GET /api/v1/activity` — auth: admin, surface: ui — filters: actor_id, event_type, since, until, limit, offset
 - `GET /api/v1/activity/export` — auth: admin, surface: ui — filters: actor_id, event_type, since, until

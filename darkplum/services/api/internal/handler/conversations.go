@@ -63,6 +63,11 @@ type messageInput struct {
 	Role      string  `json:"role"`
 	Content   string  `json:"content"`
 	RequestID *string `json:"request_id,omitempty"`
+	// ToolEvents is the tool calls an assistant turn made and their
+	// results, as the chat proxy reported them to the browser (see
+	// chat_library.go toolEvent). Stored as given, bounded in size; it is
+	// the user's own conversation content. Ignored on user turns.
+	ToolEvents json.RawMessage `json:"tool_events,omitempty"`
 }
 
 // conversationSummary is the wire shape returned by list/patch and embedded
@@ -77,6 +82,9 @@ type conversationSummary struct {
 	MessageCount int       `json:"message_count"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
+	// LibraryItemIDs are the library items attached to this conversation
+	// (the chip row), restored on reopen. Always an array, never null.
+	LibraryItemIDs []string `json:"library_item_ids"`
 }
 
 // conversationMessage is the wire shape for one persisted message.
@@ -89,6 +97,8 @@ type conversationMessage struct {
 	Model     *string   `json:"model"`
 	RequestID *string   `json:"request_id"`
 	CreatedAt time.Time `json:"created_at"`
+	// ToolEvents is null on turns that made no tool calls.
+	ToolEvents json.RawMessage `json:"tool_events"`
 }
 
 // conversationFull is the wire shape for get/create: summary fields plus the
@@ -190,10 +200,10 @@ func resolveMessageProvenance(ctx context.Context, q rowQuerier, userID string, 
 func (h *ConversationHandler) loadConversationFull(ctx context.Context, userID, convID string) (*conversationFull, error) {
 	var full conversationFull
 	err := h.db.QueryRow(ctx, `
-		SELECT id, title, model, pinned_model, created_at, updated_at
+		SELECT id, title, model, pinned_model, created_at, updated_at, library_item_ids::text[]
 		FROM conversations
 		WHERE id = $1 AND user_id = $2
-	`, convID, userID).Scan(&full.ID, &full.Title, &full.Model, &full.PinnedModel, &full.CreatedAt, &full.UpdatedAt)
+	`, convID, userID).Scan(&full.ID, &full.Title, &full.Model, &full.PinnedModel, &full.CreatedAt, &full.UpdatedAt, &full.LibraryItemIDs)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, nil
@@ -205,7 +215,7 @@ func (h *ConversationHandler) loadConversationFull(ctx context.Context, userID, 
 	// safe to query by conversation_id alone here only because the row above
 	// already proved convID belongs to userID.
 	rows, err := h.db.Query(ctx, `
-		SELECT seq, role, content, model, request_id, created_at
+		SELECT seq, role, content, model, request_id, created_at, tool_events
 		FROM conversation_messages
 		WHERE conversation_id = $1
 		ORDER BY seq
@@ -218,8 +228,12 @@ func (h *ConversationHandler) loadConversationFull(ctx context.Context, userID, 
 	full.Messages = make([]conversationMessage, 0)
 	for rows.Next() {
 		var m conversationMessage
-		if err := rows.Scan(&m.Seq, &m.Role, &m.Content, &m.Model, &m.RequestID, &m.CreatedAt); err != nil {
+		var events []byte
+		if err := rows.Scan(&m.Seq, &m.Role, &m.Content, &m.Model, &m.RequestID, &m.CreatedAt, &events); err != nil {
 			return nil, err
+		}
+		if len(events) > 0 {
+			m.ToolEvents = json.RawMessage(events)
 		}
 		full.Messages = append(full.Messages, m)
 	}
@@ -228,6 +242,9 @@ func (h *ConversationHandler) loadConversationFull(ctx context.Context, userID, 
 	}
 	rows.Close()
 	full.MessageCount = len(full.Messages)
+	if full.LibraryItemIDs == nil {
+		full.LibraryItemIDs = []string{}
+	}
 	h.backfillProvenance(ctx, userID, convID, full.Messages)
 
 	return &full, nil
@@ -264,7 +281,8 @@ func (h *ConversationHandler) ListConversations(c *gin.Context) {
 
 	rows, err := h.db.Query(ctx, `
 		SELECT id, title, model, pinned_model, created_at, updated_at,
-			(SELECT COUNT(*) FROM conversation_messages cm WHERE cm.conversation_id = c.id) AS message_count
+			(SELECT COUNT(*) FROM conversation_messages cm WHERE cm.conversation_id = c.id) AS message_count,
+			library_item_ids::text[]
 		FROM conversations c
 		WHERE user_id = $1
 		ORDER BY updated_at DESC
@@ -280,10 +298,13 @@ func (h *ConversationHandler) ListConversations(c *gin.Context) {
 	summaries := make([]conversationSummary, 0)
 	for rows.Next() {
 		var s conversationSummary
-		if err := rows.Scan(&s.ID, &s.Title, &s.Model, &s.PinnedModel, &s.CreatedAt, &s.UpdatedAt, &s.MessageCount); err != nil {
+		if err := rows.Scan(&s.ID, &s.Title, &s.Model, &s.PinnedModel, &s.CreatedAt, &s.UpdatedAt, &s.MessageCount, &s.LibraryItemIDs); err != nil {
 			slog.ErrorContext(ctx, "scan conversation row failed", "err", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "list conversations failed"})
 			return
+		}
+		if s.LibraryItemIDs == nil {
+			s.LibraryItemIDs = []string{}
 		}
 		summaries = append(summaries, s)
 	}
@@ -418,10 +439,10 @@ func (h *ConversationHandler) CreateConversation(c *gin.Context) {
 
 		var createdAtMsg time.Time
 		if err := tx.QueryRow(ctx, `
-			INSERT INTO conversation_messages (conversation_id, seq, role, content, model, request_id)
-			VALUES ($1, $2, $3, $4, $5, $6)
+			INSERT INTO conversation_messages (conversation_id, seq, role, content, model, request_id, tool_events)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
 			RETURNING created_at
-		`, convID, seq, m.Role, m.Content, msgModel, msgRequestID).Scan(&createdAtMsg); err != nil {
+		`, convID, seq, m.Role, m.Content, msgModel, msgRequestID, toolEventsArg(m)).Scan(&createdAtMsg); err != nil {
 			slog.ErrorContext(ctx, "create conversation: insert message failed", "err", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "create conversation failed"})
 			return
@@ -440,7 +461,8 @@ func (h *ConversationHandler) CreateConversation(c *gin.Context) {
 
 	c.JSON(http.StatusCreated, conversationFull{
 		conversationSummary: conversationSummary{
-			ID: convID, Title: title, Model: model, MessageCount: len(messages),
+			LibraryItemIDs: []string{},
+			ID:             convID, Title: title, Model: model, MessageCount: len(messages),
 			CreatedAt: createdAt, UpdatedAt: updatedAt,
 		},
 		Messages: messages,
@@ -499,6 +521,11 @@ type patchConversationRequest struct {
 	Title       *string         `json:"title,omitempty"`
 	Model       *string         `json:"model,omitempty"`
 	PinnedModel json.RawMessage `json:"pinned_model,omitempty"`
+	// LibraryItemIDs replaces the attached items (at most 8 ids). Nothing
+	// here checks that the ids are visible to the user: that is decided on
+	// every chat turn, where it matters, and a stale id simply refuses the
+	// turn with its id named.
+	LibraryItemIDs *[]string `json:"library_item_ids,omitempty"`
 }
 
 // PatchConversation handles PATCH /api/v1/conversations/:id. Always bumps
@@ -556,18 +583,43 @@ func (h *ConversationHandler) PatchConversation(c *gin.Context) {
 		}
 	}
 
+	setLibrary := false
+	var libraryIDs []string
+	if req.LibraryItemIDs != nil {
+		setLibrary = true
+		libraryIDs = dedupeStrings(*req.LibraryItemIDs)
+		if len(libraryIDs) > libraryMaxAttached {
+			c.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("library_item_ids must hold at most %d ids", libraryMaxAttached)})
+			return
+		}
+		for _, lid := range libraryIDs {
+			if !isValidUUID(lid) {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "library_item_ids must be item ids"})
+				return
+			}
+		}
+		if libraryIDs == nil {
+			libraryIDs = []string{}
+		}
+	}
+
 	var s conversationSummary
 	err := h.db.QueryRow(ctx, `
 		UPDATE conversations
 		SET title = COALESCE($1, title),
 			model = COALESCE($2, model),
 			pinned_model = CASE WHEN $5 THEN $6 ELSE pinned_model END,
+			library_item_ids = CASE WHEN $7 THEN $8::uuid[] ELSE library_item_ids END,
 			updated_at = now()
 		WHERE id = $3 AND user_id = $4
 		RETURNING id, title, model, pinned_model, created_at, updated_at,
-			(SELECT COUNT(*) FROM conversation_messages cm WHERE cm.conversation_id = conversations.id)
-	`, req.Title, req.Model, id, userID, setPinnedModel, pinnedModelValue).Scan(
-		&s.ID, &s.Title, &s.Model, &s.PinnedModel, &s.CreatedAt, &s.UpdatedAt, &s.MessageCount)
+			(SELECT COUNT(*) FROM conversation_messages cm WHERE cm.conversation_id = conversations.id),
+			library_item_ids::text[]
+	`, req.Title, req.Model, id, userID, setPinnedModel, pinnedModelValue, setLibrary, libraryIDs).Scan(
+		&s.ID, &s.Title, &s.Model, &s.PinnedModel, &s.CreatedAt, &s.UpdatedAt, &s.MessageCount, &s.LibraryItemIDs)
+	if s.LibraryItemIDs == nil {
+		s.LibraryItemIDs = []string{}
+	}
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "conversation not found"})
@@ -660,11 +712,12 @@ func (h *ConversationHandler) AppendMessages(c *gin.Context) {
 		}
 
 		var createdAt time.Time
+		events := toolEventsForStorage(m)
 		if err := tx.QueryRow(ctx, `
-			INSERT INTO conversation_messages (conversation_id, seq, role, content, model, request_id)
-			VALUES ($1, $2, $3, $4, $5, $6)
+			INSERT INTO conversation_messages (conversation_id, seq, role, content, model, request_id, tool_events)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
 			RETURNING created_at
-		`, id, seq, m.Role, m.Content, msgModel, msgRequestID).Scan(&createdAt); err != nil {
+		`, id, seq, m.Role, m.Content, msgModel, msgRequestID, toolEventsArg(m)).Scan(&createdAt); err != nil {
 			slog.ErrorContext(ctx, "append messages: insert failed", "id", id, "err", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "append messages failed"})
 			return
@@ -672,6 +725,7 @@ func (h *ConversationHandler) AppendMessages(c *gin.Context) {
 		inserted = append(inserted, conversationMessage{
 			Seq: seq, Role: m.Role, Content: m.Content,
 			Model: msgModel, RequestID: msgRequestID, CreatedAt: createdAt,
+			ToolEvents: json.RawMessage(events),
 		})
 	}
 

@@ -1,6 +1,8 @@
 package handler
 
 import (
+	"bytes"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"unicode/utf8"
@@ -91,7 +93,43 @@ func validMessageInput(m messageInput) error {
 	if m.RequestID != nil && utf8.RuneCountInString(*m.RequestID) > conversationRequestIDMaxLen {
 		return fmt.Errorf("request_id exceeds %d characters", conversationRequestIDMaxLen)
 	}
+	if ev := bytes.TrimSpace(m.ToolEvents); len(ev) > 0 && string(ev) != "null" {
+		if len(ev) > toolEventsMaxBytes {
+			return fmt.Errorf("tool_events exceeds %d bytes", toolEventsMaxBytes)
+		}
+		var arr []json.RawMessage
+		if err := json.Unmarshal(ev, &arr); err != nil {
+			return fmt.Errorf("tool_events must be a JSON array")
+		}
+	}
 	return nil
+}
+
+// toolEventsMaxBytes sits under the 1 MiB CHECK in migration 026 with room
+// for jsonb's own rendering, which can be a little longer than the input.
+const toolEventsMaxBytes = 900 << 10
+
+// toolEventsArg is toolEventsForStorage as a query argument: an untyped nil
+// (SQL NULL) when there is nothing to store. A nil []byte would be encoded
+// as the JSON literal null, which is a value, not NULL.
+func toolEventsArg(m messageInput) any {
+	if ev := toolEventsForStorage(m); ev != nil {
+		return ev
+	}
+	return nil
+}
+
+// toolEventsForStorage returns the tool_events to store for a turn: the
+// given array on an assistant turn, NULL otherwise (and for an empty array).
+func toolEventsForStorage(m messageInput) []byte {
+	if m.Role != roleAssistant {
+		return nil
+	}
+	ev := bytes.TrimSpace(m.ToolEvents)
+	if len(ev) == 0 || string(ev) == "null" || string(ev) == "[]" {
+		return nil
+	}
+	return ev
 }
 
 // validateInitialMessages validates the optional messages array on POST

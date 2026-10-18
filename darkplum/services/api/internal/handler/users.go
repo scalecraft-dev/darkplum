@@ -22,6 +22,15 @@ type UserHandler struct {
 	db       *pgxpool.Pool
 	activity *activity.Recorder
 	pepper   []byte
+	// toolCredentialCleanup removes the cluster-Secret credentials of tool
+	// items deleted along with a user, after the transaction commits. nil
+	// when no tool service is wired (tests).
+	toolCredentialCleanup func(ctx context.Context, itemIDs []string)
+}
+
+// SetToolCredentialCleanup wires the library's credential cleanup in.
+func (h *UserHandler) SetToolCredentialCleanup(fn func(ctx context.Context, itemIDs []string)) {
+	h.toolCredentialCleanup = fn
 }
 
 func NewUserHandler(db *pgxpool.Pool, rec *activity.Recorder, pepper []byte) *UserHandler {
@@ -360,7 +369,19 @@ func (h *UserHandler) DeleteUser(c *gin.Context) {
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "you cannot delete your own account"})
 		return
 	}
+	adminID := c.GetString("user_id")
+	var reassigned, credentials []string
 	outcome, err := h.withAdminLock(c.Request.Context(), func(tx pgx.Tx) (adminGuardOutcome, error) {
+		// The person's library: private items go with them (like their
+		// conversations, which cascade); org-shared items pass to the acting
+		// administrator so a shared skill never vanishes from colleagues'
+		// chats or becomes an uneditable orphan. Done before the DELETE so
+		// the FK's ON DELETE SET NULL never has to fire.
+		ids, creds, err := reassignLibraryOnUserDelete(c.Request.Context(), tx, id, adminID)
+		if err != nil {
+			return guardFailed, err
+		}
+		reassigned, credentials = ids, creds
 		tag, err := tx.Exec(c.Request.Context(), `
 			DELETE FROM users WHERE id = $1
 			  AND (role <> 'admin' OR (SELECT COUNT(*) FROM users WHERE role = 'admin') > 1)
@@ -398,6 +419,16 @@ func (h *UserHandler) DeleteUser(c *gin.Context) {
 	evt.TargetType = activity.StrPtr("user")
 	evt.TargetID = activity.StrPtr(id)
 	h.activity.Record(c.Request.Context(), evt)
+	if len(credentials) > 0 && h.toolCredentialCleanup != nil {
+		h.toolCredentialCleanup(c.Request.Context(), credentials)
+	}
+	if len(reassigned) > 0 {
+		re := activity.FromContext(c, activity.LibraryOwnerReassigned)
+		re.TargetType = activity.StrPtr("user")
+		re.TargetID = activity.StrPtr(id)
+		re.Detail = map[string]any{"items": reassigned, "new_owner_id": adminID}
+		h.activity.Record(c.Request.Context(), re)
+	}
 
 	c.Status(http.StatusNoContent)
 }

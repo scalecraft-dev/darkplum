@@ -237,6 +237,13 @@ func run() error {
 	prices := handler.NewPricingHandler(pool, activityRecorder)
 	settings := handler.NewSettingsHandler(pool, activityRecorder)
 
+	// The library (skills, context, tools) and the MCP side that runs tool
+	// items from a chat turn.
+	toolSvc := handler.NewToolService(pool, activityRecorder, kube.NewWriter(), envOr("TOOL_CREDENTIALS_DIR", "/var/run/darkplum/tool-credentials"))
+	chat.WithTools(toolSvc)
+	library := handler.NewLibraryHandler(pool, activityRecorder, toolSvc)
+	users.SetToolCredentialCleanup(toolSvc.RemoveCredentialsQuietly)
+
 	// Vendor usage/cost reconciliation (separate billing keys; see
 	// internal/billing). The poller starts after the price seed below.
 	billingSvc := billing.NewService(&billing.Store{DB: pool},
@@ -281,6 +288,7 @@ func run() error {
 		prices:        prices,
 		settings:      settings,
 		billing:       billingH,
+		library:       library,
 	})
 
 	srv := &http.Server{
@@ -339,6 +347,7 @@ type routerDeps struct {
 	prices        *handler.PricingHandler
 	billing       *handler.BillingHandler
 	settings      *handler.SettingsHandler
+	library       *handler.LibraryHandler
 }
 
 // buildRouter registers every route the api serves. See routerDeps' doc
@@ -444,6 +453,21 @@ func buildRouter(d routerDeps) *gin.Engine {
 		// endpoints below), just what they can actually reach right now.
 		v1.GET("/me/routing-policy/effective", d.policy.GetMyPolicyEffective)
 
+		// The library: every signed-in user. Visibility is enforced in SQL
+		// (handler/library.go); nothing admin-only lives on these paths.
+		v1.GET("/library", d.library.List)
+		v1.POST("/library", d.library.Create)
+		v1.GET("/library/export", d.library.ExportAll)
+		v1.POST("/library/import", d.library.Import)
+		v1.GET("/library/:id", d.library.Get)
+		v1.PUT("/library/:id", d.library.Update)
+		v1.DELETE("/library/:id", d.library.Delete)
+		v1.POST("/library/:id/share", d.library.Share)
+		v1.GET("/library/:id/export", d.library.ExportOne)
+		v1.POST("/library/:id/tools/verify", d.library.VerifyTool)
+		v1.PUT("/library/:id/tools/credential", d.library.PutToolCredential)
+		v1.DELETE("/library/:id/tools/credential", d.library.DeleteToolCredential)
+
 		adminOnly := v1.Group("")
 		adminOnly.Use(auth.AdminRequired())
 		{
@@ -498,6 +522,14 @@ func buildRouter(d routerDeps) *gin.Engine {
 			// prompt the webchat proxy prepends to every turn.
 			adminOnly.GET("/settings/system-prompt", d.settings.GetSystemPrompt)
 			adminOnly.PUT("/settings/system-prompt", d.settings.PutSystemPrompt)
+
+			// Library governance: org-shared items only (private items have
+			// no admin read path), and the allowed tool-server hosts.
+			adminOnly.GET("/library/shared", d.library.ListShared)
+			adminOnly.POST("/library/shared/:id/unshare", d.library.AdminUnshare)
+			adminOnly.DELETE("/library/shared/:id", d.library.AdminDelete)
+			adminOnly.GET("/settings/tool-hosts", d.library.GetToolHosts)
+			adminOnly.PUT("/settings/tool-hosts", d.library.PutToolHosts)
 
 			adminOnly.GET("/model-prices", d.prices.ListPrices)
 			adminOnly.PUT("/model-prices", d.prices.PutPrice)

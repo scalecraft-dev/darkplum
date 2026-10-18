@@ -30,6 +30,19 @@ metadata:
     app.kubernetes.io/part-of: darkplum
 type: Opaque
 ---
+# Bearer tokens for library tool items (MCP servers), one data key per item
+# id: optional, written by the api when a person saves a token on a tool,
+# read back by the api's file mount at call time. Same no-`data` rule.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: darkplum-tool-credentials
+  namespace: darkplum-system
+  labels:
+    app.kubernetes.io/name: darkplum-api
+    app.kubernetes.io/part-of: darkplum
+type: Opaque
+---
 apiVersion: v1
 kind: ConfigMap
 metadata:

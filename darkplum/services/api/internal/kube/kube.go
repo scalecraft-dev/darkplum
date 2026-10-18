@@ -326,6 +326,11 @@ func (w *Writer) SetSecretKey(ctx context.Context, name string, value []byte) er
 // (admin-scope) keys, mounted read-only into the api as files.
 const BillingKeysSecret = "darkplum-billing-keys"
 
+// ToolCredentialsSecret holds the optional bearer tokens library tool items
+// (MCP servers) need, one data key per item id, mounted read-only into the
+// api as files like the billing keys.
+const ToolCredentialsSecret = "darkplum-tool-credentials"
+
 // BillingSecrets is the narrow interface the billing-key routes depend on,
 // satisfied by *Writer and fakeable without an apiserver.
 type BillingSecrets interface {

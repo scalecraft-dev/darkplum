@@ -40,9 +40,20 @@ type ChatHandler struct {
 	gatewayURL string
 	serviceKey string
 	client     *http.Client
-	// db reads the admin-set system prompt (org_settings); nil means the
-	// built-in text is always used (tests).
+	// db reads the admin-set system prompt (org_settings) and resolves
+	// library attachments; nil means the built-in text is always used and
+	// attachments are refused (tests).
 	db *pgxpool.Pool
+	// tools runs library tool items (MCP servers); nil refuses tool
+	// attachments.
+	tools *toolService
+}
+
+// WithTools wires the MCP side in; without it a turn with a tool item
+// attached is refused library_unavailable.
+func (h *ChatHandler) WithTools(t *toolService) *ChatHandler {
+	h.tools = t
+	return h
 }
 
 func NewChatHandler(gatewayURL, serviceKey string, db *pgxpool.Pool) *ChatHandler {
@@ -178,11 +189,57 @@ func (h *ChatHandler) ProxyChat(c *gin.Context) {
 		return
 	}
 
+	// Library attachments (chat_library.go). Resolved before the body is
+	// rewritten so a refusal costs nothing else.
+	isBearer := strings.HasPrefix(c.GetHeader("Authorization"), "Bearer ")
+	itemIDs, refusal := parseLibraryHeader(c.GetHeader(libraryItemsHeader))
+	if refusal != nil {
+		refusal.write(c)
+		return
+	}
+	var att *attachments
+	if len(itemIDs) > 0 {
+		if isBearer || c.GetString("user_id") == "" {
+			(&libraryRefusal{http.StatusBadRequest, "library_requires_session", "library items can only be attached from a signed-in browser session, not with an API key", nil}).write(c)
+			return
+		}
+		resolveStart := time.Now()
+		att, refusal = resolveAttachments(c.Request.Context(), h.db, c.GetString("user_id"), itemIDs)
+		if refusal != nil {
+			slog.WarnContext(c.Request.Context(), "library attachments refused", "request_id", c.GetString("request_id"), "user_id", c.GetString("user_id"), "code", refusal.code, "items", itemIDs)
+			refusal.write(c)
+			return
+		}
+		if len(att.tools) > 0 && h.tools == nil {
+			(&libraryRefusal{http.StatusServiceUnavailable, "library_unavailable", "tools are not available on this deployment", nil}).write(c)
+			return
+		}
+		slog.InfoContext(c.Request.Context(), "library attachments", "request_id", c.GetString("request_id"), "user_id", c.GetString("user_id"), "items", itemIDs, "text_items", len(att.text), "tool_servers", len(att.tools), "resolve_ms", time.Since(resolveStart).Milliseconds())
+	}
+
 	modified, stream, err := withSystemPromptText(body, h.effectiveSystemPrompt(c.Request.Context()))
 	if err != nil {
 		slog.WarnContext(c.Request.Context(), "parse request body", "err", err)
 		c.JSON(http.StatusBadRequest, chatProxyError("invalid request body: expected a JSON object with a messages array", "invalid_request_error", "invalid_body"))
 		return
+	}
+	if att != nil {
+		modified, err = withLibraryMessage(modified, composeLibraryText(att.text))
+		if err != nil {
+			c.JSON(http.StatusBadRequest, chatProxyError("invalid request body", "invalid_request_error", "invalid_body"))
+			return
+		}
+		c.Header(libraryUsedHeader, att.usedHeaderValue())
+		if len(att.tools) > 0 {
+			defs, bindings, refusal := buildWireTools(att.tools)
+			if refusal != nil {
+				refusal.write(c)
+				return
+			}
+			c.Header(libraryToolsHeader, fmt.Sprint(len(defs)))
+			h.proxyWithTools(c, modified, stream, defs, bindings)
+			return
+		}
 	}
 
 	target := fmt.Sprintf("%s/v1/chat/completions", h.gatewayURL)
@@ -199,17 +256,7 @@ func (h *ChatHandler) ProxyChat(c *gin.Context) {
 		return
 	}
 
-	proxyReq.Header.Set("Content-Type", "application/json")
-	if clientAuth := c.GetHeader("Authorization"); strings.HasPrefix(clientAuth, "Bearer ") {
-		proxyReq.Header.Set("Authorization", clientAuth)
-	} else {
-		proxyReq.Header.Set("Authorization", "Bearer "+h.serviceKey)
-	}
-	proxyReq.Header.Set("X-Request-Id", c.GetString("request_id"))
-	// The gateway records the inference audit row; give it the person's
-	// address, not this pod's (it trusts in-cluster hops only).
-	proxyReq.Header.Set("X-Forwarded-For", c.ClientIP())
-	proxyReq.Header.Set("X-Darkplum-User-Id", c.GetString("user_id"))
+	h.setProxyHeaders(c, proxyReq)
 
 	resp, err := h.client.Do(proxyReq)
 	if err != nil {
@@ -225,36 +272,7 @@ func (h *ChatHandler) ProxyChat(c *gin.Context) {
 	// recording chats there would pollute the Admin Events view with API traffic.
 
 	c.Status(resp.StatusCode)
-	for _, header := range []string{
-		"Content-Type",
-		"X-Request-Id",
-		"Cache-Control",
-		// Routing headers (routed aliases only, but harmless to check
-		// unconditionally): the resolved model, the route the classifier
-		// picked, and its one-line reason. Set by the gateway before its
-		// first response byte, for both stream and non-stream requests (see
-		// DESIGN3's Semantics section) -- passed through here unmodified so
-		// the webchat can show "answered by <model> (route <name>)" and
-		// implement pinned_model stickiness without a second round trip.
-		"X-Darkplum-Model",
-		"X-Darkplum-Route",
-		"X-Darkplum-Router-Reason",
-		// Backend class (self_hosted|cloud_managed|external_api) and provider
-		// kind (vllm|lmstudio|bedrock|anthropic|openai|mock) the request
-		// actually resolved to -- set by the gateway before its first response
-		// byte, same as the routing headers above, so the webchat can render
-		// residency provenance ("sent to Anthropic — leaves your cloud
-		// account") without a second round trip.
-		"X-Darkplum-Backend-Class",
-		"X-Darkplum-Provider",
-		// A vendor's rate limit reaches the caller as 429 with the vendor's own
-		// Retry-After, so an SDK's backoff engages instead of hammering.
-		"Retry-After",
-	} {
-		if v := resp.Header.Get(header); v != "" {
-			c.Header(header, v)
-		}
-	}
+	copyProxyHeaders(c, resp)
 
 	if flusher, ok := c.Writer.(http.Flusher); ok && stream {
 		buf := make([]byte, 4096)
@@ -277,6 +295,63 @@ func (h *ChatHandler) ProxyChat(c *gin.Context) {
 	} else {
 		if _, err := io.Copy(c.Writer, resp.Body); err != nil {
 			slog.WarnContext(c.Request.Context(), "response copy interrupted", "err", err)
+		}
+	}
+}
+
+// setProxyHeaders sets the headers every hop to the gateway carries: the
+// caller's own Bearer key when it sent one, else the service key; the
+// request id; the person's address and id for the audit row. Nothing else
+// from the inbound request is forwarded, so no inbound X-Darkplum-* header
+// can reach the gateway.
+func (h *ChatHandler) setProxyHeaders(c *gin.Context, proxyReq *http.Request) {
+	proxyReq.Header.Set("Content-Type", "application/json")
+	if clientAuth := c.GetHeader("Authorization"); strings.HasPrefix(clientAuth, "Bearer ") {
+		proxyReq.Header.Set("Authorization", clientAuth)
+	} else {
+		proxyReq.Header.Set("Authorization", "Bearer "+h.serviceKey)
+	}
+	proxyReq.Header.Set("X-Request-Id", c.GetString("request_id"))
+	// The gateway records the inference audit row; give it the person's
+	// address, not this pod's (it trusts in-cluster hops only).
+	proxyReq.Header.Set("X-Forwarded-For", c.ClientIP())
+	proxyReq.Header.Set("X-Darkplum-User-Id", c.GetString("user_id"))
+}
+
+// proxiedResponseHeaders are the gateway response headers passed through to
+// the browser.
+var proxiedResponseHeaders = []string{
+	"Content-Type",
+	"X-Request-Id",
+	"Cache-Control",
+	// Routing headers (routed aliases only, but harmless to check
+	// unconditionally): the resolved model, the route the classifier
+	// picked, and its one-line reason. Set by the gateway before its
+	// first response byte, for both stream and non-stream requests (see
+	// DESIGN3's Semantics section) -- passed through here unmodified so
+	// the webchat can show "answered by <model> (route <name>)" and
+	// implement pinned_model stickiness without a second round trip.
+	"X-Darkplum-Model",
+	"X-Darkplum-Route",
+	"X-Darkplum-Router-Reason",
+	// Backend class (self_hosted|cloud_managed|external_api) and provider
+	// kind (vllm|lmstudio|bedrock|anthropic|openai|mock) the request
+	// actually resolved to -- set by the gateway before its first response
+	// byte, same as the routing headers above, so the webchat can render
+	// residency provenance ("sent to Anthropic — leaves your cloud
+	// account") without a second round trip.
+	"X-Darkplum-Backend-Class",
+	"X-Darkplum-Provider",
+	// A vendor's rate limit reaches the caller as 429 with the vendor's own
+	// Retry-After, so an SDK's backoff engages instead of hammering.
+	"Retry-After",
+}
+
+// copyProxyHeaders copies proxiedResponseHeaders from the gateway response.
+func copyProxyHeaders(c *gin.Context, resp *http.Response) {
+	for _, header := range proxiedResponseHeaders {
+		if v := resp.Header.Get(header); v != "" {
+			c.Header(header, v)
 		}
 	}
 }
