@@ -73,6 +73,11 @@ func setupTestDB(t *testing.T) *pgxpool.Pool {
 		cfg.ConnConfig.RuntimeParams = map[string]string{}
 	}
 	cfg.ConnConfig.RuntimeParams["search_path"] = schema
+	// Four connections, the pool's floor and what a two-core CI runner gets:
+	// a handler that holds a connection while asking the pool for another
+	// deadlocks here exactly as it would there, instead of being hidden by
+	// a developer machine's larger pool.
+	cfg.MaxConns = 4
 
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {

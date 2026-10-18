@@ -413,6 +413,13 @@ func (h *ConversationHandler) CreateConversation(c *gin.Context) {
 			// never nil here -- with a nil import_key the UNIQUE constraint
 			// never fires (NULLs are distinct), so ON CONFLICT DO NOTHING
 			// can only have suppressed a row for a non-nil key.
+			//
+			// Release this transaction's connection BEFORE reading through
+			// the pool: it wrote nothing, and holding it while asking the
+			// pool for a second connection deadlocks once enough racing
+			// requests hold every connection the pool has (seen in CI on a
+			// four-connection pool with eight concurrent imports).
+			_ = tx.Rollback(ctx)
 			existing, ferr := h.loadFullByImportKey(ctx, userID, *req.ImportKey)
 			if ferr != nil || existing == nil {
 				slog.ErrorContext(ctx, "create conversation: fetch after import race failed", "err", ferr)

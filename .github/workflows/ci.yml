@@ -51,7 +51,10 @@ jobs:
       # The api and gateway integration tests (migrations, model sync, aliases,
       # service key, audit recorder) run against the Postgres service container;
       # without TEST_DATABASE_URL they would skip silently.
-      - run: go test -race -count=1 ./...
+      # Five minutes is several times what any package needs here; a hang
+      # (a pool deadlock, say) then fails with a goroutine dump instead of
+      # sitting at Go's ten-minute default.
+      - run: go test -race -count=1 -timeout 5m ./...
         env:
           TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/dptest?sslmode=disable
 
