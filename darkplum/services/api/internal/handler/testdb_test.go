@@ -10,6 +10,7 @@ import (
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -25,13 +26,33 @@ import (
 // Not safe to use from tests that run in parallel with each other (none in
 // this package do — see testdb_test.go's setupTestDB doc comment, which only
 // claims parallel-safety with respect to the database).
-func captureLogs(t *testing.T) *bytes.Buffer {
+func captureLogs(t *testing.T) *logBuffer {
 	t.Helper()
-	var buf bytes.Buffer
+	buf := &logBuffer{}
 	prev := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	slog.SetDefault(slog.New(slog.NewTextHandler(buf, nil)))
 	t.Cleanup(func() { slog.SetDefault(prev) })
-	return &buf
+	return buf
+}
+
+// logBuffer is a bytes.Buffer safe to read while handlers' background
+// goroutines (the billing pull after a key install, say) are still logging
+// into it; a plain buffer is a data race the race detector catches.
+type logBuffer struct {
+	mu sync.Mutex
+	b  bytes.Buffer
+}
+
+func (l *logBuffer) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.Write(p)
+}
+
+func (l *logBuffer) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.b.String()
 }
 
 var nonSchemaChar = regexp.MustCompile(`[^a-z0-9_]+`)
