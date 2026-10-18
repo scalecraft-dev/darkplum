@@ -1,0 +1,363 @@
+/* The library page. Padding and responsive steps come from PageLayout; the
+   heading is the one serif display moment on the page, the same face and
+   tracking as the wordmark and the empty chat. */
+
+.page {
+  composes: page from './PageLayout.module.css';
+}
+
+.header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: var(--space-4);
+  margin-bottom: var(--space-6);
+}
+
+.headerText {
+  min-width: 0;
+  flex: 1 1 20rem;
+}
+
+.display {
+  font-family: var(--font-serif);
+  font-size: var(--fs-2xl);
+  font-weight: var(--fw-medium);
+  line-height: var(--lh-tight);
+  letter-spacing: -0.01em;
+  color: var(--fg-default);
+}
+
+.lede {
+  margin-top: var(--space-1);
+  font-size: var(--fs-base);
+  line-height: var(--lh-normal);
+  color: var(--fg-muted);
+  max-width: 60ch;
+}
+
+.headerActions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* --- One tab's list --- */
+
+.list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+}
+
+/* The segmented filter: ActivityTab's log toggle. */
+.segmented {
+  display: flex;
+  background: var(--bg-surface-raised);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  padding: 3px;
+  gap: 2px;
+}
+
+.segment {
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-xs);
+  color: var(--fg-muted);
+  white-space: nowrap;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.segment:hover {
+  color: var(--fg-default);
+}
+
+.segment:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
+.segmentActive {
+  background: var(--bg-primary);
+  color: var(--fg-default);
+  box-shadow: var(--shadow-sm);
+}
+
+/* The search field: ApiKeysTab's. */
+.searchWrap {
+  position: relative;
+  flex: 1;
+  min-width: 160px;
+  max-width: 320px;
+}
+
+.searchIcon {
+  position: absolute;
+  left: var(--space-3);
+  top: 50%;
+  transform: translateY(-50%);
+  width: 14px;
+  height: 14px;
+  color: var(--fg-subtle);
+  pointer-events: none;
+}
+
+.searchInput {
+  width: 100%;
+  box-sizing: border-box;
+  padding: var(--space-2) var(--space-3) var(--space-2) calc(var(--space-3) + 14px + var(--space-2));
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  color: var(--fg-default);
+  font-size: var(--fs-sm);
+  outline: none;
+  transition: border-color var(--transition-fast);
+}
+
+.searchInput:focus {
+  border-color: var(--border-focus);
+}
+
+.searchInput::placeholder {
+  color: var(--fg-subtle);
+}
+
+/* --- Rows --- */
+
+.rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+}
+
+.rows > li + li {
+  border-top: 1px solid var(--border-muted);
+}
+
+.row {
+  width: 100%;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  text-align: left;
+  color: inherit;
+  transition: background var(--transition-fast);
+}
+
+.row:hover {
+  background: var(--bg-surface-hover);
+}
+
+.row:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: -2px;
+}
+
+.rowGlyph {
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-md);
+  background: var(--bg-surface-raised);
+  color: var(--fg-muted);
+}
+
+.rowMain {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.rowName {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.rowNameText {
+  font-size: var(--fs-base);
+  font-weight: var(--fw-medium);
+  color: var(--fg-default);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.rowDesc {
+  font-size: var(--fs-sm);
+  color: var(--fg-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 72ch;
+}
+
+.rowMeta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.scopeShared {
+  color: var(--brand-fg);
+}
+
+.rowSize {
+  min-width: 3.5rem;
+  text-align: right;
+}
+
+/* --- States --- */
+
+.skeletons {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.errorRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  background: var(--danger-bg);
+  border-left: 2px solid var(--danger-fg);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-sm);
+  color: var(--fg-default);
+}
+
+.empty {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-10) var(--space-8);
+  background: var(--bg-surface);
+  border: 1px dashed var(--border-default);
+  border-radius: var(--radius-lg);
+}
+
+.emptyGlyph {
+  width: 40px;
+  height: 40px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-md);
+  background: var(--bg-surface-raised);
+  color: var(--fg-muted);
+}
+
+.emptyTitle {
+  font-family: var(--font-serif);
+  font-size: var(--fs-xl);
+  font-weight: var(--fw-medium);
+  line-height: var(--lh-tight);
+  letter-spacing: -0.01em;
+  color: var(--fg-default);
+}
+
+.emptyText {
+  font-size: var(--fs-base);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-muted);
+  max-width: 60ch;
+}
+
+.emptyActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.emptySmall {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-6) var(--space-4);
+  font-size: var(--fs-sm);
+  color: var(--fg-muted);
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius-lg);
+}
+
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* --- Responsive --- */
+
+@media (max-width: 767px) {
+  .searchWrap {
+    max-width: none;
+    flex-basis: 100%;
+  }
+
+  /* The meta line drops under the name rather than squeezing it. */
+  .row {
+    grid-template-columns: auto minmax(0, 1fr);
+    align-items: start;
+  }
+
+  .rowMeta {
+    grid-column: 2;
+    flex-wrap: wrap;
+    gap: var(--space-1) var(--space-3);
+    white-space: normal;
+  }
+
+  .rowSize {
+    min-width: 0;
+    text-align: left;
+  }
+
+  .empty {
+    padding: var(--space-6) var(--space-4);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .segment,
+  .searchInput,
+  .row {
+    transition: none;
+  }
+}

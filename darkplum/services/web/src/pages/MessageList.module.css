@@ -491,3 +491,132 @@
     transition: none;
   }
 }
+
+/* Tool activity: what the api ran for this reply, above the words. */
+.toolActivity {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin: 0 0 var(--space-3);
+  padding: 0;
+  list-style: none;
+}
+
+.toolCall {
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  font-size: var(--fs-sm);
+}
+
+.toolCallHead {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  cursor: pointer;
+  list-style: none;
+  color: var(--fg-muted);
+}
+
+.toolCallHead::-webkit-details-marker {
+  display: none;
+}
+
+.toolCallHead:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: -2px;
+  border-radius: var(--radius-md);
+}
+
+.toolStatus {
+  width: 8px;
+  height: 8px;
+  border-radius: var(--radius-full);
+  flex-shrink: 0;
+}
+
+.toolStatusOk { background: var(--success-fg); }
+.toolStatusError { background: var(--danger-fg); }
+.toolStatusPending {
+  background: var(--fg-subtle);
+  animation: toolPulse 1.2s ease-in-out infinite;
+}
+
+@keyframes toolPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+.toolGlyph {
+  display: inline-flex;
+  color: var(--fg-muted);
+  flex-shrink: 0;
+}
+
+.toolChevron {
+  color: var(--fg-subtle);
+  flex-shrink: 0;
+  transition: transform var(--transition-fast);
+}
+
+.toolCall[open] .toolChevron {
+  transform: rotate(180deg);
+}
+
+.toolCallName {
+  color: var(--fg-default);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1;
+}
+
+.toolCallMeta {
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+  white-space: nowrap;
+}
+
+.toolDetails {
+  padding: 0 var(--space-3) var(--space-3);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.toolDetailLabel {
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+  margin-top: var(--space-1);
+}
+
+.toolPre {
+  margin: 0;
+  padding: var(--space-2);
+  max-height: 240px;
+  overflow: auto;
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  line-height: var(--lh-normal);
+  color: var(--fg-default);
+  background: var(--bg-code);
+  border-radius: var(--radius-sm);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.usedLine {
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .toolStatusPending {
+    animation: none;
+  }
+  .toolChevron {
+    transition: none;
+  }
+}

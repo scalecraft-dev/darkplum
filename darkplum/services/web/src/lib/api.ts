@@ -1,4 +1,4 @@
-import type { User, ApiKey, ChatMessage, ActivityEvent, AliasRouteTest, BackendClass, InferenceEvent, InferencePurpose, UsageBucket, UsageSummary, UserUsageSummary, KeyUsageSummary, Model, AdminModel, AdminModelsResult, ModelAlias, ModelAliasInput, ProviderStatus, Residency, RoutingPolicy, PrincipalPolicy, EffectivePolicy, PolicyPreview, PolicyPrincipalsPage, ConversationSummary, ConversationFull, ConversationMessage, ConversationMessageInput, VendorName, SpendGroupBy, SpendReport, SpendTimelineGroupBy, ProviderBilling, ReconciliationGroupBy, ReconciliationReport, ModelPricesResult, ModelPrice, ModelPriceInput , SystemPromptSetting } from '../types'
+import type { User, ApiKey, ChatMessage, ActivityEvent, AliasRouteTest, BackendClass, InferenceEvent, InferencePurpose, UsageBucket, UsageSummary, UserUsageSummary, KeyUsageSummary, Model, AdminModel, AdminModelsResult, ModelAlias, ModelAliasInput, ProviderStatus, Residency, RoutingPolicy, PrincipalPolicy, EffectivePolicy, PolicyPreview, PolicyPrincipalsPage, ConversationSummary, ConversationFull, ConversationMessage, ConversationMessageInput, VendorName, SpendGroupBy, SpendReport, SpendTimelineGroupBy, ProviderBilling, ReconciliationGroupBy, ReconciliationReport, ModelPricesResult, ModelPrice, ModelPriceInput , SystemPromptSetting, LibraryItem, LibraryItemInput, LibraryItemUpdate, LibraryImportRequest, LibraryImportPreview, LibraryKind, LibraryVisibility, ToolEvent, ToolHostsSetting } from '../types'
 import { parseRetryAfter } from './modelRouting'
 import { ROUTES, buildPath, type QueryValue, type Route } from './routes'
 
@@ -792,7 +792,7 @@ export function getConversation(id: string): Promise<ConversationFull> {
  *  classifies every message rather than holding a thread to one model. */
 export function updateConversation(
   id: string,
-  patch: { title?: string; model?: string; pinned_model?: string | null },
+  patch: { title?: string; model?: string; pinned_model?: string | null; library_item_ids?: string[] },
 ): Promise<ConversationSummary> {
   return request<ConversationSummary>(ROUTES.updateConversation, { params: { id }, body: patch })
 }
@@ -855,10 +855,13 @@ export class ChatError extends Error {
    *  for a routed alias, the route that picked it. */
   readonly refusedModel?: string
   readonly route?: string
+  /** library_item_not_found: the attached item ids the api could not use. */
+  readonly missing?: string[]
 
   constructor(
     message: string,
     opts: {
+      missing?: string[]
       code?: string
       type?: string
       status?: number
@@ -871,6 +874,7 @@ export class ChatError extends Error {
     super(message)
     this.name = 'ChatError'
     this.code = opts.code
+    this.missing = opts.missing
     this.type = opts.type
     this.status = opts.status
     this.param = opts.param
@@ -904,12 +908,35 @@ export interface ChatResponseMeta {
   /** X-Darkplum-Provider — the provider kind that served it, which is the
    *  vendor's name on an external route. */
   provider: string | null
+  /** X-Darkplum-Library — the library item ids the api attached to this turn.
+   *  Empty when none were. */
+  libraryUsed: string[]
+}
+
+/** X-Darkplum-Library is `<id>:<sha12>,...`; the ids are what the UI names. */
+function readLibraryUsed(raw: string | null): string[] {
+  if (!raw) return []
+  return raw
+    .split(',')
+    .map((part) => part.trim().split(':')[0])
+    .filter(Boolean)
 }
 
 /** Only the three wire values are accepted off a header. Anything else is null
  *  — 'no class reported' — rather than a class the UI would then label. */
 function readBackendClass(raw: string | null): BackendClass | null {
   return raw === 'self_hosted' || raw === 'cloud_managed' || raw === 'external_api' ? raw : null
+}
+
+/** What a turn may carry beyond its messages. */
+export interface StreamChatOptions {
+  /** Library items attached to the conversation. The api resolves them
+   *  against the signed-in person and refuses the turn (404
+   *  library_item_not_found, `missing` ids in the body) if one is gone. */
+  libraryItemIds?: string[]
+  /** Tool activity the api reports while it runs a tool server on the
+   *  model's behalf: the call, then its result. */
+  onToolEvent?: (event: ToolEvent) => void
 }
 
 export async function streamChat(
@@ -920,8 +947,13 @@ export async function streamChat(
   onError: (err: Error) => void,
   signal: AbortSignal,
   onMeta?: (meta: ChatResponseMeta) => void,
+  options: StreamChatOptions = {},
 ): Promise<void> {
   let res: Response
+  const libraryHeader: Record<string, string> =
+    options.libraryItemIds && options.libraryItemIds.length > 0
+      ? { 'X-Darkplum-Library-Items': options.libraryItemIds.join(',') }
+      : {}
   try {
     res = await fetch(pathOf(ROUTES.chatCompletions), {
       method: ROUTES.chatCompletions.method,
@@ -932,6 +964,7 @@ export async function streamChat(
         'Content-Type': 'application/json',
         'X-Requested-With': 'XMLHttpRequest',
         ...CLASSES_HEADER,
+        ...libraryHeader,
       },
       credentials: 'same-origin',
       body: JSON.stringify({ model, messages, stream: true }),
@@ -955,6 +988,7 @@ export async function streamChat(
     routerReason: res.headers.get('X-Darkplum-Router-Reason'),
     backendClass: readBackendClass(res.headers.get('X-Darkplum-Backend-Class')),
     provider: res.headers.get('X-Darkplum-Provider'),
+    libraryUsed: readLibraryUsed(res.headers.get('X-Darkplum-Library')),
   })
 
   if (!res.ok) {
@@ -972,6 +1006,7 @@ export async function streamChat(
     let param: string | undefined
     let refusedModel: string | undefined
     let route: string | undefined
+    let missing: string[] | undefined
     const trimmed = raw.trim()
     if (trimmed.startsWith('{')) {
       try {
@@ -984,6 +1019,7 @@ export async function streamChat(
                 param?: string
                 model?: unknown
                 route?: unknown
+                missing?: unknown
               }
             | string
         }
@@ -994,6 +1030,9 @@ export async function streamChat(
           param = typeof body.error.param === 'string' ? body.error.param : undefined
           refusedModel = stringOrUndefined(body.error.model)
           route = stringOrUndefined(body.error.route)
+          missing = Array.isArray(body.error.missing)
+            ? body.error.missing.filter((x): x is string => typeof x === 'string')
+            : undefined
         } else if (typeof body.error === 'string' && body.error) {
           message = body.error
         }
@@ -1009,6 +1048,7 @@ export async function streamChat(
         param,
         refusedModel,
         route,
+        missing,
         // Read only on the one status that can carry it. The vendor's own
         // interval reaches us through the gateway and the api unmodified; a
         // 429 that arrives without one still gets a wait, decided by the UI.
@@ -1048,6 +1088,9 @@ export async function streamChat(
         try {
           const parsed = JSON.parse(data) as {
             choices?: Array<{ delta: { content?: string } }>
+            /** The api's own frames while it runs a tool: no choices, one
+             *  event. An OpenAI SDK would ignore them; the chat shows them. */
+            darkplum?: ToolEvent
             error?: {
               message: string
               code?: string
@@ -1072,6 +1115,10 @@ export async function streamChat(
             )
             return
           }
+          if (parsed.darkplum && (parsed.darkplum.type === 'tool_call' || parsed.darkplum.type === 'tool_result')) {
+            options.onToolEvent?.(parsed.darkplum)
+            continue
+          }
           const token = parsed.choices?.[0]?.delta?.content
           if (token) onToken(token)
         } catch {
@@ -1088,4 +1135,96 @@ export async function streamChat(
   }
 
   onDone()
+}
+
+// ---------------------------------------------------------------------------
+// The library
+//
+// Session-scoped like conversations: a private item that is not the signed-in
+// person's comes back as a 404, never a 403. Shared items are readable by
+// everyone in the organisation and editable by their owner only.
+// ---------------------------------------------------------------------------
+
+export function listLibrary(params: { kind?: LibraryKind; scope?: 'mine' | 'shared' | 'all'; q?: string } = {}): Promise<LibraryItem[]> {
+  return request<LibraryItem[]>(ROUTES.listLibrary, { query: params })
+}
+
+export function createLibraryItem(body: LibraryItemInput): Promise<LibraryItem> {
+  return request<LibraryItem>(ROUTES.createLibraryItem, { body })
+}
+
+export function getLibraryItem(id: string): Promise<LibraryItem> {
+  return request<LibraryItem>(ROUTES.getLibraryItem, { params: { id } })
+}
+
+export function updateLibraryItem(id: string, body: LibraryItemUpdate): Promise<LibraryItem> {
+  return request<LibraryItem>(ROUTES.updateLibraryItem, { params: { id }, body })
+}
+
+export function deleteLibraryItem(id: string): Promise<void> {
+  return request<void>(ROUTES.deleteLibraryItem, { params: { id } })
+}
+
+/** `org` shares with everyone in the organisation; `private` takes it back. */
+export function shareLibraryItem(id: string, visibility: LibraryVisibility): Promise<LibraryItem> {
+  return request<LibraryItem>(ROUTES.shareLibraryItem, { params: { id }, body: { visibility } })
+}
+
+/** One item as a portable file: markdown with front matter, or JSON for a
+ *  tool (never with its credential). */
+export function exportLibraryItem(id: string): Promise<{ blob: Blob; filename: string }> {
+  return requestBlob(ROUTES.exportLibraryItem, { params: { id }, fallbackName: `library-item-${id}.md` })
+}
+
+/** Everything the person can see, as a zip of those files. */
+export function exportLibrary(): Promise<{ blob: Blob; filename: string }> {
+  return requestBlob(ROUTES.exportLibrary, { fallbackName: 'darkplum-library.zip' })
+}
+
+/** One file. With dryRun the server only says what it would create. */
+export function importLibraryItem(body: LibraryImportRequest, dryRun = false): Promise<LibraryImportPreview> {
+  return request<LibraryImportPreview>(ROUTES.importLibraryItem, {
+    body,
+    query: dryRun ? { dry_run: 1 } : undefined,
+  })
+}
+
+/** Connects to a tool item's server and records the tools it offers. The
+ *  server's host must be on the administrator's allowed list
+ *  (422 tool_host_not_allowed otherwise). */
+export function verifyLibraryTool(id: string): Promise<LibraryItem> {
+  return request<LibraryItem>(ROUTES.verifyLibraryTool, { params: { id } })
+}
+
+/** Stores the bearer token a tool server needs, in the cluster — never in
+ *  the database, never shown again. The reply says it is set and its last
+ *  four characters, nothing more. */
+export function setLibraryToolCredential(id: string, token: string): Promise<LibraryItem> {
+  return request<LibraryItem>(ROUTES.putLibraryToolCredential, { params: { id }, body: { token } })
+}
+
+export function removeLibraryToolCredential(id: string): Promise<void> {
+  return request<void>(ROUTES.deleteLibraryToolCredential, { params: { id } })
+}
+
+// Governance (admin): shared items only. Private items are never listed here.
+
+export function listSharedLibrary(): Promise<LibraryItem[]> {
+  return request<LibraryItem[]>(ROUTES.listSharedLibrary)
+}
+
+export function adminUnshareLibraryItem(id: string): Promise<void> {
+  return request<void>(ROUTES.adminUnshareLibraryItem, { params: { id } })
+}
+
+export function adminDeleteLibraryItem(id: string): Promise<void> {
+  return request<void>(ROUTES.adminDeleteLibraryItem, { params: { id } })
+}
+
+export function getToolHosts(): Promise<ToolHostsSetting> {
+  return request<ToolHostsSetting>(ROUTES.getToolHosts)
+}
+
+export function updateToolHosts(hosts: string[]): Promise<ToolHostsSetting> {
+  return request<ToolHostsSetting>(ROUTES.updateToolHosts, { body: { hosts } })
 }

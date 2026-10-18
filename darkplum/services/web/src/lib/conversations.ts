@@ -4,6 +4,7 @@ import type {
   ConversationMessage,
   ConversationMessageInput,
   ConversationSummary,
+  ToolEvent,
 } from '../types'
 import {
   appendConversationMessages,
@@ -47,6 +48,8 @@ export interface Conversation {
   /** A conversation that exists only in this tab. Nothing is created on the
    *  server until the first message is sent. */
   draft?: boolean
+  /** Library items attached to this conversation, sent with every turn. */
+  libraryItemIds: string[]
 }
 
 /** The one conversation that has not been created yet. */
@@ -96,6 +99,7 @@ function fromSummary(s: ConversationSummary): Conversation {
     syncedCount: stillFresh ? existing.syncedCount : s.message_count,
     serverSeq: s.message_count,
     unsavedFrom: stillFresh ? existing.unsavedFrom : null,
+    libraryItemIds: s.library_item_ids ?? [],
   }
 }
 
@@ -104,6 +108,7 @@ function fromFull(full: ConversationFull): Conversation {
     role: m.role,
     content: m.content,
     model: m.model,
+    toolEvents: m.tool_events ?? null,
   }))
   const lastSeq = full.messages.length > 0 ? full.messages[full.messages.length - 1].seq : 0
   return {
@@ -118,6 +123,7 @@ function fromFull(full: ConversationFull): Conversation {
     syncedCount: messages.length,
     serverSeq: lastSeq,
     unsavedFrom: null,
+    libraryItemIds: full.library_item_ids ?? [],
   }
 }
 
@@ -162,7 +168,7 @@ export async function openConversation(
 }
 
 /** A conversation that exists only here, until the first message is sent. */
-export function createDraft(model: string): Conversation {
+export function createDraft(model: string, libraryItemIds: string[] = []): Conversation {
   const now = new Date().toISOString()
   return {
     id: DRAFT_ID,
@@ -177,6 +183,7 @@ export function createDraft(model: string): Conversation {
     serverSeq: 0,
     unsavedFrom: null,
     draft: true,
+    libraryItemIds,
   }
 }
 
@@ -185,13 +192,21 @@ export async function startConversation(input: {
   title: string
   model: string
   messages: ChatMessage[]
+  libraryItemIds?: string[]
 }): Promise<Conversation> {
   const full = await createConversation({
     title: input.title,
     model: input.model,
     messages: input.messages.map(toInput),
   })
-  return put(fromFull(full))
+  const conv = fromFull(full)
+  // The draft's attachments carry over on this copy. The create body does
+  // not take them, so the caller writes them with setConversationLibraryItems
+  // and tells the person if that fails.
+  if (input.libraryItemIds && input.libraryItemIds.length > 0) {
+    conv.libraryItemIds = input.libraryItemIds
+  }
+  return put(conv)
 }
 
 export interface AppendResult {
@@ -286,11 +301,19 @@ export function assistantTurn(
   content: string,
   model: string,
   requestId: string | null,
+  toolEvents?: ToolEvent[] | null,
 ): ConversationMessageInput {
   const input: ConversationMessageInput = { role: 'assistant', content: fit(content) }
   if (model) input.model = model
   if (requestId) input.request_id = requestId
+  if (toolEvents && toolEvents.length > 0) input.tool_events = toolEvents
   return input
+}
+
+/** Replaces the library items attached to a conversation. A preference, like
+ *  the model: the server does not check the ids here, only on each turn. */
+export async function setConversationLibraryItems(id: string, ids: string[]): Promise<void> {
+  await updateConversation(id, { library_item_ids: ids })
 }
 
 /** Keeps one turn inside the column's limit. Long replies are cut rather than

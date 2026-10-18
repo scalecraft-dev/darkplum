@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { ChatError, exportConversation, streamChat } from '../lib/api'
+import { ChatError, exportConversation, listLibrary, streamChat } from '../lib/api'
 import {
   CONVERSATION_PAGE,
   DRAFT_ID,
@@ -17,6 +17,7 @@ import {
   loadConversations,
   openConversation,
   renameConversation,
+  setConversationLibraryItems,
   setConversationModel,
   startConversation,
   toWireMessages,
@@ -26,7 +27,7 @@ import {
 } from '../lib/conversations'
 import { saveBlob } from '../lib/download'
 import { chatTagline, pickDefaultModel } from '../lib/modelChoice'
-import type { BackendClass, ChatMessage } from '../types'
+import type { BackendClass, ChatMessage, LibraryItem, ToolEvent } from '../types'
 import { useAuth } from '../context/AuthContext'
 import { useToast } from '../components/Toast'
 import { useModels } from '../hooks/useModels'
@@ -34,7 +35,7 @@ import { Button } from '../components/ui'
 import { Skeleton } from '../components/ui/Skeleton'
 import { ConversationList, type ListState } from './ConversationList'
 import { MessageList, type ChatFailure } from './MessageList'
-import { ChatComposer, type ComposerNotice } from './ChatComposer'
+import { ChatComposer, type AttachedChip, type ComposerLibrary, type ComposerNotice } from './ChatComposer'
 import { ModelSelector } from './ModelSelector'
 import { ModelAccessNotice } from './ModelAccessNotice'
 import styles from './ChatPage.module.css'
@@ -80,7 +81,14 @@ interface Attempt {
    *  this side can work it out from the model that was picked. */
   backendClass: BackendClass | null
   provider: string | null
+  /** The tool calls the api ran for this reply, in order, and the library
+   *  items it attached (from the response header). */
+  toolEvents: ToolEvent[]
+  libraryUsed: string[]
 }
+
+/** How many library items a turn may carry; matches the api. */
+const LIBRARY_MAX_ATTACHED = 8
 
 export function ChatPage() {
   const navigate = useNavigate()
@@ -118,6 +126,17 @@ export function ChatPage() {
   const [pendingModel, setPendingModel] = useState<string | null>(null)
   const [failure, setFailure] = useState<ChatFailure | null>(null)
   const abortRef = useRef<AbortController | null>(null)
+  /** The library, for the composer's picker and for naming chips and the
+   *  "used …" line. Read on first visit and whenever the picker opens. */
+  const [libraryItems, setLibraryItems] = useState<LibraryItem[]>([])
+  const [libraryLoading, setLibraryLoading] = useState(false)
+  const [libraryError, setLibraryError] = useState<string | null>(null)
+  /** Attachments chosen before a conversation exists; they move onto the
+   *  conversation when it is created. */
+  const [draftLibraryIds, setDraftLibraryIds] = useState<string[]>([])
+  /** Ids the api refused on the last turn: removed or no longer shared.
+   *  The chips stay, muted, until the person removes them. */
+  const [missingLibraryIds, setMissingLibraryIds] = useState<string[]>([])
   const modelIds = useMemo(() => models.map((m) => m.id), [models])
   /** Who owns each entry on offer. On an external model that is the vendor,
    *  which is who a failure card names when the gateway's own provider header
@@ -163,7 +182,101 @@ export function ChatPage() {
     setPendingModel(null)
   }, [pendingModel, modelsReady, modelIds])
 
+  const patchConv = useCallback((id: string, patch: (conv: Conversation) => Conversation) => {
+    setConversations((prev) => prev.map((c) => (c.id === id ? patch(c) : c)))
+  }, [])
+
   const active = conversations.find((c) => c.id === activeId) ?? null
+  const attachedIds = active ? active.libraryItemIds : draftLibraryIds
+  /** Undefined while the library has not loaded: a reply then says how many
+   *  items it used rather than naming ones it cannot know. */
+  const libraryNames = useMemo(
+    () => (libraryError || (libraryLoading && libraryItems.length === 0) ? undefined : new Map(libraryItems.map((it) => [it.id, it.name]))),
+    [libraryItems, libraryError, libraryLoading],
+  )
+
+  const refreshLibrary = useCallback(async () => {
+    setLibraryLoading(true)
+    try {
+      setLibraryItems(await listLibrary())
+      setLibraryError(null)
+    } catch (err) {
+      setLibraryError(errorText(err, 'Your library could not be loaded'))
+    } finally {
+      setLibraryLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    void refreshLibrary()
+  }, [refreshLibrary])
+
+  /** Writes a new attachment list to the open conversation (or the draft). */
+  const setAttached = useCallback(
+    (ids: string[]) => {
+      setMissingLibraryIds((prev) => prev.filter((id) => ids.includes(id)))
+      if (!active) {
+        setDraftLibraryIds(ids)
+        return
+      }
+      const before = active.libraryItemIds
+      patchConv(active.id, (c) => ({ ...c, libraryItemIds: ids }))
+      if (active.draft) {
+        setDraftLibraryIds(ids)
+        return
+      }
+      void setConversationLibraryItems(active.id, ids).catch((err) => {
+        // Nothing was saved: the chips go back to what the server holds.
+        patchConv(active.id, (c) => ({ ...c, libraryItemIds: before }))
+        toast(errorText(err, 'The attachment could not be saved to this conversation'), 'error')
+      })
+    },
+    [active, patchConv, toast],
+  )
+
+  const handleToggleAttachment = useCallback(
+    (item: LibraryItem) => {
+      if (attachedIds.includes(item.id)) {
+        setAttached(attachedIds.filter((id) => id !== item.id))
+      } else if (attachedIds.length < LIBRARY_MAX_ATTACHED) {
+        setAttached([...attachedIds, item.id])
+      }
+    },
+    [attachedIds, setAttached],
+  )
+
+  const handleRemoveAttachment = useCallback(
+    (id: string) => setAttached(attachedIds.filter((x) => x !== id)),
+    [attachedIds, setAttached],
+  )
+
+  const chips: AttachedChip[] = useMemo(
+    () =>
+      attachedIds.map((id) => {
+        const item = libraryItems.find((it) => it.id === id)
+        return {
+          id,
+          name: item?.name ?? 'Unavailable item',
+          kind: item?.kind ?? 'skill',
+          missing: missingLibraryIds.includes(id) || (!item && !libraryLoading && !libraryError),
+        }
+      }),
+    [attachedIds, libraryItems, missingLibraryIds, libraryLoading, libraryError],
+  )
+
+  const composerLibrary: ComposerLibrary = useMemo(
+    () => ({
+      attached: chips,
+      onRemove: handleRemoveAttachment,
+      onToggle: handleToggleAttachment,
+      items: libraryItems,
+      loading: libraryLoading,
+      error: libraryError,
+      onRefresh: () => void refreshLibrary(),
+      remaining: Math.max(0, LIBRARY_MAX_ATTACHED - attachedIds.length),
+    }),
+    [chips, handleRemoveAttachment, handleToggleAttachment, libraryItems, libraryLoading, libraryError, refreshLibrary, attachedIds.length],
+  )
   /** The entry the picker is on, for anything that has to describe it — the
    *  empty state's tagline above all, which sits one line under the picker's
    *  own "leaves your cloud account" and must not contradict it. */
@@ -178,10 +291,6 @@ export function ChatPage() {
     if (streaming) return
     for (const conv of conversations) cacheConversation(conv)
   }, [conversations, streaming])
-
-  const patchConv = useCallback((id: string, patch: (conv: Conversation) => Conversation) => {
-    setConversations((prev) => prev.map((c) => (c.id === id ? patch(c) : c)))
-  }, [])
 
   const readList = useCallback(async (limit = listLimit) => {
     setListState('loading')
@@ -298,9 +407,10 @@ export function ChatPage() {
   const handleNewChat = useCallback(() => {
     setFailure(null)
     setThreadError(null)
-    setConversations((prev) => (prev.some((c) => c.draft) ? prev : [createDraft(model), ...prev]))
+    setMissingLibraryIds([])
+    setConversations((prev) => (prev.some((c) => c.draft) ? prev : [createDraft(model, draftLibraryIds), ...prev]))
     setActiveId(DRAFT_ID)
-  }, [model])
+  }, [model, draftLibraryIds])
 
   const handleSelectConversation = useCallback((id: string) => {
     const conv = conversations.find((c) => c.id === id)
@@ -308,6 +418,7 @@ export function ChatPage() {
     setActiveId(id)
     setFailure(null)
     setThreadError(null)
+    setMissingLibraryIds([])
     // An untouched new chat is not worth keeping once the person moves on.
     setConversations((prev) =>
       prev.filter((c) => !(c.draft && c.id !== id && c.messages.length === 0)),
@@ -436,8 +547,16 @@ export function ChatPage() {
       }> => {
         try {
           if (isDraft) {
-            const created = await startConversation({ title, model: picked, messages: unsent })
+            const created = await startConversation({ title, model: picked, messages: unsent, libraryItemIds: conv.libraryItemIds })
             liveId = created.id
+            // The attachments now belong to the conversation, not to the
+            // next draft.
+            setDraftLibraryIds([])
+            if (conv.libraryItemIds.length > 0) {
+              void setConversationLibraryItems(created.id, conv.libraryItemIds).catch((err) => {
+                toast(errorText(err, 'The attachments could not be saved to this conversation'), 'error')
+              })
+            }
             setConversations((prev) =>
               prev.map((c) =>
                 c.id === DRAFT_ID
@@ -480,6 +599,7 @@ export function ChatPage() {
         const ctrl = new AbortController()
         abortRef.current = ctrl
         let accum = ''
+        const events: ToolEvent[] = []
         const attempt: Attempt = {
           outcome: 'aborted',
           error: null,
@@ -490,19 +610,29 @@ export function ChatPage() {
           reason: null,
           backendClass: null,
           provider: null,
+          toolEvents: events,
+          libraryUsed: [],
         }
+        const showPartial = () =>
+          setConversations((prev) =>
+            prev.map((c) =>
+              c.id === liveId
+                ? {
+                    ...c,
+                    messages: [
+                      ...messagesToSend,
+                      { role: 'assistant' as const, content: accum, toolEvents: [...events] },
+                    ],
+                  }
+                : c,
+            ),
+          )
         await streamChat(
           toWireMessages(messagesToSend),
           modelId,
           (token) => {
             accum += token
-            setConversations((prev) =>
-              prev.map((c) =>
-                c.id === liveId
-                  ? { ...c, messages: [...messagesToSend, { role: 'assistant' as const, content: accum }] }
-                  : c,
-              ),
-            )
+            showPartial()
           },
           () => {
             attempt.outcome = 'done'
@@ -519,6 +649,14 @@ export function ChatPage() {
             attempt.reason = meta.routerReason
             attempt.backendClass = meta.backendClass
             attempt.provider = meta.provider
+            attempt.libraryUsed = meta.libraryUsed
+          },
+          {
+            libraryItemIds: conv.libraryItemIds,
+            onToolEvent: (event) => {
+              events.push(event)
+              showPartial()
+            },
           },
         )
         abortRef.current = null
@@ -541,6 +679,9 @@ export function ChatPage() {
         const err = result.error
         const chatErr = err instanceof ChatError ? err : null
         const code = chatErr?.code
+        if (code === 'library_item_not_found' && chatErr?.missing) {
+          setMissingLibraryIds(chatErr.missing)
+        }
         setFailure({
           message: err ? err.message : 'The message was not sent',
           code,
@@ -562,7 +703,16 @@ export function ChatPage() {
         return
       }
 
-      const reply = result.text
+      // A reply that ended after its tool calls with no words (stopped, or
+      // the model said nothing) is kept for what it did, with a line that
+      // says so: the history needs text on every assistant turn, and so do
+      // the backends on the next send.
+      const reply =
+        result.text.trim() || result.toolEvents.length === 0
+          ? result.text
+          : result.outcome === 'aborted'
+            ? '(Stopped before replying.)'
+            : '(No reply after the tool calls.)'
       if (!reply.trim()) {
         // Stopped before a word arrived: there is no turn worth keeping.
         setConversations((prev) =>
@@ -575,6 +725,8 @@ export function ChatPage() {
       // the only thing that knows what a routed alias resolved to — the picker
       // held an alias, and the alias is not a model.
       const resolved = result.servedModel ?? sendModel
+      // The turn went through with these attachments, so none is missing.
+      setMissingLibraryIds([])
 
       let stored = false
       let servedBy: string | null = resolved
@@ -583,7 +735,7 @@ export function ChatPage() {
       if (target.stored) {
         try {
           const appended = await appendTurns(target.id, [
-            assistantTurn(reply, resolved, result.requestId),
+            assistantTurn(reply, resolved, result.requestId, result.toolEvents),
           ])
           const saved = appended.messages[appended.messages.length - 1]
           // The server names the model that actually served the request; it
@@ -615,6 +767,8 @@ export function ChatPage() {
           // than claiming something it cannot know.
           backendClass: result.backendClass,
           provider: result.provider,
+          toolEvents: result.toolEvents.length > 0 ? result.toolEvents : null,
+          libraryUsed: result.libraryUsed.length > 0 ? result.libraryUsed : null,
         },
       ]
       setConversations((prev) =>
@@ -648,14 +802,14 @@ export function ChatPage() {
         }
       }
     },
-    [streaming, model, modelOwners, reconcileModels],
+    [streaming, model, modelOwners, reconcileModels, toast],
   )
 
   const handleSend = useCallback(
     async (text: string) => {
       let conv = active
       if (!conv) {
-        conv = createDraft(model)
+        conv = createDraft(model, draftLibraryIds)
         const draft = conv
         setConversations((prev) => [draft, ...prev.filter((c) => !c.draft)])
         setActiveId(DRAFT_ID)
@@ -663,7 +817,7 @@ export function ChatPage() {
       const messagesToSend: ChatMessage[] = [...conv.messages, { role: 'user', content: text }]
       await sendMessages(conv, messagesToSend)
     },
-    [active, model, sendMessages],
+    [active, model, sendMessages, draftLibraryIds],
   )
 
   /** A second answer to the same question replaces the first, on the server as
@@ -917,6 +1071,7 @@ export function ChatPage() {
             failure={failure}
             isAdmin={isAdmin}
             unsavedFrom={active?.unsavedFrom ?? null}
+            libraryNames={libraryNames}
             /* Retrying with nothing selected would repeat the same refused
                request, so the card offers it only once a model is chosen. */
             onRetry={modelsState === 'ready' ? handleRetry : undefined}
@@ -928,6 +1083,7 @@ export function ChatPage() {
           onStop={handleStop}
           streaming={streaming}
           disabled={composerDisabled}
+          library={composerLibrary}
           /* The empty-state card has its own Try again; offer one here only
              when that card is not on screen. */
           notice={

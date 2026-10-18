@@ -4,6 +4,7 @@ import { ProtectedRoute } from './components/ProtectedRoute'
 import { ActivityPage } from './pages/ActivityPage'
 import { AdminPage } from './pages/AdminPage'
 import { ChatPage } from './pages/ChatPage'
+import { LibraryPage } from './pages/LibraryPage'
 import { LoginPage } from './pages/LoginPage'
 import { ModelsPage } from './pages/ModelsPage'
 import { ProfilePage } from './pages/ProfilePage'
@@ -20,6 +21,7 @@ export function App() {
       <Route path="/admin/routing" element={<ProtectedRoute requireAdmin><Layout><RoutingPage /></Layout></ProtectedRoute>} />
       <Route path="/admin/activity" element={<ProtectedRoute requireAdmin><Layout><ActivityPage /></Layout></ProtectedRoute>} />
       <Route path="/chat" element={<ProtectedRoute><Layout><ChatPage /></Layout></ProtectedRoute>} />
+      <Route path="/library" element={<ProtectedRoute><Layout><LibraryPage /></Layout></ProtectedRoute>} />
       <Route path="/profile" element={<ProtectedRoute><Layout><ProfilePage /></Layout></ProtectedRoute>} />
       {/* Anything else is a typo or a stale link, not a blank page. */}
       <Route path="*" element={<Navigate to="/chat" replace />} />

@@ -93,7 +93,7 @@
 
   /* --- Typography --- */
   --font-sans: 'Inter Variable', 'Inter', system-ui, -apple-system, sans-serif;
-  --font-serif: 'Newsreader', 'Georgia', 'Times New Roman', serif;
+  --font-serif: 'Newsreader Variable', 'Newsreader', 'Georgia', 'Times New Roman', serif;
   --font-mono: 'JetBrains Mono Variable', 'JetBrains Mono', ui-monospace, monospace;
 
   --fs-xs: 0.6875rem;

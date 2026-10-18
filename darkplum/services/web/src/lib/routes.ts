@@ -119,6 +119,27 @@ export const ROUTES = {
   // --- Routing policy: the signed-in person's own ---
   myPolicyEffective: { method: 'GET', path: '/api/v1/me/routing-policy/effective' },
 
+  // --- Library: skills, context and tools (every signed-in person) ---
+  listLibrary:                { method: 'GET',    path: '/api/v1/library' },
+  createLibraryItem:          { method: 'POST',   path: '/api/v1/library' },
+  exportLibrary:              { method: 'GET',    path: '/api/v1/library/export' },
+  importLibraryItem:          { method: 'POST',   path: '/api/v1/library/import' },
+  getLibraryItem:             { method: 'GET',    path: '/api/v1/library/:id' },
+  updateLibraryItem:          { method: 'PUT',    path: '/api/v1/library/:id' },
+  deleteLibraryItem:          { method: 'DELETE', path: '/api/v1/library/:id' },
+  shareLibraryItem:           { method: 'POST',   path: '/api/v1/library/:id/share' },
+  exportLibraryItem:          { method: 'GET',    path: '/api/v1/library/:id/export' },
+  verifyLibraryTool:          { method: 'POST',   path: '/api/v1/library/:id/tools/verify' },
+  /** The bearer token travels on the body and nowhere else, like vendor keys. */
+  putLibraryToolCredential:   { method: 'PUT',    path: '/api/v1/library/:id/tools/credential' },
+  deleteLibraryToolCredential: { method: 'DELETE', path: '/api/v1/library/:id/tools/credential' },
+  // --- Library governance (admin): org-shared items and allowed tool hosts ---
+  listSharedLibrary:          { method: 'GET',    path: '/api/v1/library/shared' },
+  adminUnshareLibraryItem:    { method: 'POST',   path: '/api/v1/library/shared/:id/unshare' },
+  adminDeleteLibraryItem:     { method: 'DELETE', path: '/api/v1/library/shared/:id' },
+  getToolHosts:               { method: 'GET',    path: '/api/v1/settings/tool-hosts' },
+  updateToolHosts:            { method: 'PUT',    path: '/api/v1/settings/tool-hosts' },
+
   // --- Conversations ---
   listConversations:     { method: 'GET',    path: '/api/v1/conversations' },
   createConversation:    { method: 'POST',   path: '/api/v1/conversations' },

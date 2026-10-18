@@ -9,13 +9,127 @@
   max-width: 900px;
   margin: 0 auto;
   display: flex;
-  align-items: flex-end;
+  flex-direction: column;
   gap: var(--space-2);
   background: var(--bg-surface);
   border: 1px solid var(--border-default);
   border-radius: var(--radius-lg);
   padding: var(--space-3) var(--space-3);
   transition: border-color var(--transition-fast);
+}
+
+.inputRow {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-2);
+}
+
+/* What is attached, inside the composer's own edge so the layout does not
+   jump when the first chip appears. */
+.chipRow {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-2);
+}
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  max-width: 100%;
+  padding: 2px var(--space-1) 2px var(--space-1);
+  font-size: var(--fs-xs);
+  color: var(--fg-default);
+  background: var(--brand-subtle);
+  border: 1px solid var(--brand-muted);
+  border-radius: var(--radius-full);
+}
+
+.chipMissing {
+  color: var(--fg-subtle);
+  background: var(--bg-base);
+  border-style: dashed;
+  border-color: var(--border-default);
+}
+
+.chipGlyph {
+  display: inline-flex;
+  width: 16px;
+  height: 16px;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-full);
+  color: var(--fg-muted);
+}
+
+.chipName {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 220px;
+}
+
+.chipNote {
+  color: var(--fg-subtle);
+}
+
+.chipRemove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  margin: -4px -2px -4px 0;
+  border-radius: var(--radius-full);
+  color: var(--fg-subtle);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+
+.chipRemove:hover:not(:disabled) {
+  color: var(--fg-default);
+  background: var(--bg-surface-hover);
+}
+
+.chipRemove:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 1px;
+}
+
+.pickerWrap {
+  position: relative;
+  flex-shrink: 0;
+}
+
+.attachBtn {
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--fg-muted);
+  background: transparent;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: background var(--transition-fast), color var(--transition-fast);
+}
+
+.attachBtn:hover:not(:disabled),
+.attachBtnOpen {
+  color: var(--fg-default);
+  background: var(--bg-surface-hover);
+}
+
+.attachBtn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.attachBtn:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
 }
 
 .composer:focus-within {
@@ -165,6 +279,7 @@
   .composer,
   .sendBtn,
   .stopBtn,
+  .attachBtn,
   .reasonAction {
     transition-duration: 0.01ms !important;
   }

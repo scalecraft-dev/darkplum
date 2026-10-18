@@ -1,0 +1,483 @@
+/* The library item drawer. Overlay, slide and close button follow
+   ActivityDrawer; the body is a column of header, scroll area and a fixed
+   action footer, because a 64 KB skill is longer than any screen and Save
+   must not scroll away with it. */
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.4);
+  z-index: var(--z-drawer);
+  animation: fadeIn 0.15s ease;
+}
+
+.overlay[data-state='closed'] {
+  animation: fadeOut 0.15s ease;
+}
+
+.drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  width: 560px;
+  max-width: 100vw;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-surface);
+  border-left: 1px solid var(--border-default);
+  box-shadow: var(--shadow-lg);
+  z-index: var(--z-overlay);
+  animation: slideIn 0.15s ease;
+}
+
+.drawer[data-state='closed'] {
+  animation: slideOut 0.15s ease;
+}
+
+@keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+@keyframes fadeOut { from { opacity: 1; } to { opacity: 0; } }
+@keyframes slideIn { from { transform: translateX(100%); } to { transform: translateX(0); } }
+@keyframes slideOut { from { transform: translateX(0); } to { transform: translateX(100%); } }
+
+/* --- Header --- */
+
+.header {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-3);
+  padding: var(--space-5) var(--space-6) var(--space-4);
+  border-bottom: 1px solid var(--border-muted);
+}
+
+.headerGlyph {
+  width: 36px;
+  height: 36px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-md);
+  background: var(--bg-surface-raised);
+  color: var(--fg-muted);
+}
+
+.headerText {
+  flex: 1;
+  min-width: 0;
+}
+
+.title {
+  font-size: var(--fs-lg);
+  font-weight: var(--fw-semibold);
+  color: var(--fg-default);
+  letter-spacing: -0.01em;
+  line-height: var(--lh-tight);
+  overflow-wrap: anywhere;
+}
+
+.subtitle {
+  margin-top: var(--space-1);
+  font-size: var(--fs-xs);
+  color: var(--fg-muted);
+}
+
+.closeBtn {
+  width: 28px;
+  height: 28px;
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  color: var(--fg-muted);
+  transition: color var(--transition-fast), background var(--transition-fast);
+}
+
+.closeBtn:hover {
+  color: var(--fg-default);
+  background: var(--bg-surface-raised);
+}
+
+/* --- Unsaved-changes question --- */
+
+.discard {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-6);
+  background: var(--warning-bg);
+  border-bottom: 1px solid var(--warning-border);
+  font-size: var(--fs-sm);
+  color: var(--fg-default);
+}
+
+/* --- Body --- */
+
+.scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--space-5) var(--space-6);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+}
+
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+/* Matches the Input primitive's label so the textarea reads as one of the
+   same set of fields. */
+.label {
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--fg-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.editor {
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 240px;
+  padding: var(--space-3);
+  font-family: var(--font-mono);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-default);
+  background: var(--bg-base);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  outline: none;
+  resize: vertical;
+  tab-size: 2;
+  transition: border-color var(--transition-fast);
+}
+
+.editor:focus {
+  border-color: var(--border-focus);
+}
+
+.editor[aria-invalid='true'] {
+  border-color: var(--danger-fg);
+}
+
+.editor::placeholder {
+  color: var(--fg-subtle);
+}
+
+.monoInput {
+  font-family: var(--font-mono);
+}
+
+.count {
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+  font-variant-numeric: tabular-nums;
+}
+
+.countNear {
+  color: var(--warning-fg);
+}
+
+.countOver {
+  color: var(--danger-fg);
+}
+
+.hint {
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+}
+
+.mono {
+  font-family: var(--font-mono);
+  font-size: 0.95em;
+  overflow-wrap: anywhere;
+}
+
+.alert {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3);
+  background: var(--danger-bg);
+  border-left: 2px solid var(--danger-fg);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-normal);
+  color: var(--fg-default);
+}
+
+.alert > span {
+  flex: 1 1 16rem;
+}
+
+/* --- Sections (server, credential, sharing, administration) --- */
+
+.section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding-top: var(--space-5);
+  border-top: 1px solid var(--border-muted);
+}
+
+.sectionHead {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.sectionTitle {
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+  color: var(--fg-default);
+}
+
+.sectionText {
+  font-size: var(--fs-sm);
+  line-height: var(--lh-normal);
+  color: var(--fg-muted);
+}
+
+.inlineActions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.catalog {
+  list-style: none;
+  margin: var(--space-1) 0 0;
+  padding: 0;
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius-md);
+}
+
+.catalogRow {
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--border-muted);
+}
+
+.catalogRow:last-child {
+  border-bottom: none;
+}
+
+.catalogName {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--fs-sm);
+  color: var(--fg-default);
+}
+
+.catalogOff .catalogName > .mono {
+  color: var(--fg-subtle);
+}
+
+.catalogDesc {
+  margin-top: 2px;
+  font-size: var(--fs-xs);
+  line-height: var(--lh-normal);
+  color: var(--fg-muted);
+}
+
+/* --- Someone else's item --- */
+
+.readOnly {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.description {
+  font-size: var(--fs-base);
+  line-height: var(--lh-normal);
+  color: var(--fg-muted);
+}
+
+.facts {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: var(--space-2) var(--space-4);
+  font-size: var(--fs-sm);
+}
+
+.facts dt {
+  color: var(--fg-subtle);
+}
+
+.facts dd {
+  margin: 0;
+  color: var(--fg-default);
+  min-width: 0;
+}
+
+.factWithCopy {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* Rendered markdown: the assistant bubble's rhythm (MessageList), in a well. */
+.markdown {
+  padding: var(--space-4);
+  background: var(--bg-base);
+  border: 1px solid var(--border-muted);
+  border-radius: var(--radius-md);
+  font-size: var(--fs-base);
+  line-height: var(--lh-relaxed);
+  color: var(--fg-default);
+  overflow-wrap: anywhere;
+}
+
+.markdown p { margin-bottom: var(--space-3); }
+.markdown > :last-child { margin-bottom: 0; }
+
+.markdown h1,
+.markdown h2,
+.markdown h3,
+.markdown h4 {
+  margin: var(--space-4) 0 var(--space-2);
+  font-weight: var(--fw-semibold);
+  line-height: var(--lh-tight);
+}
+
+.markdown > h1:first-child,
+.markdown > h2:first-child,
+.markdown > h3:first-child { margin-top: 0; }
+
+.markdown h1 { font-size: var(--fs-lg); }
+.markdown h2 { font-size: var(--fs-md); }
+.markdown h3,
+.markdown h4 { font-size: var(--fs-base); }
+
+.markdown ul,
+.markdown ol {
+  margin: var(--space-2) 0 var(--space-3);
+  padding-left: var(--space-6);
+}
+
+.markdown li { margin: var(--space-1) 0; }
+
+.markdown blockquote {
+  margin: var(--space-2) 0;
+  padding-left: var(--space-4);
+  border-left: 3px solid var(--border-default);
+  color: var(--fg-muted);
+}
+
+.markdown hr {
+  border: none;
+  border-top: 1px solid var(--border-default);
+  margin: var(--space-4) 0;
+}
+
+.markdown strong { font-weight: var(--fw-semibold); }
+
+.markdown :not(pre) > code {
+  font-family: var(--font-mono);
+  font-size: 0.9em;
+  background: var(--bg-surface-raised);
+  padding: 1px 5px;
+  border-radius: var(--radius-sm);
+}
+
+.markdown a {
+  color: var(--brand-fg);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.markdown table {
+  display: block;
+  overflow-x: auto;
+  border-collapse: collapse;
+  font-size: var(--fs-sm);
+  margin: var(--space-2) 0 var(--space-3);
+}
+
+.markdown th,
+.markdown td {
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--border-default);
+  text-align: left;
+}
+
+.markdown th {
+  background: var(--bg-surface-raised);
+  font-weight: var(--fw-medium);
+}
+
+/* --- Footer --- */
+
+.footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-6);
+  border-top: 1px solid var(--border-default);
+  background: var(--bg-surface);
+}
+
+.footerEnd {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  margin-left: auto;
+}
+
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+@media (max-width: 767px) {
+  .header,
+  .scroll,
+  .footer,
+  .discard {
+    padding-left: var(--space-4);
+    padding-right: var(--space-4);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .overlay,
+  .drawer,
+  .overlay[data-state='closed'],
+  .drawer[data-state='closed'] {
+    animation: none;
+  }
+  .editor,
+  .closeBtn {
+    transition: none;
+  }
+}

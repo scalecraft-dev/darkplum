@@ -40,6 +40,32 @@ export interface ChatMessage {
   /** The vendor that served it, from the gateway's response header — the
    *  provider kind (anthropic, openai, bedrock, vllm…). Display only. */
   provider?: string | null
+  /** Assistant turns: the tool calls the api made on the model's behalf and
+   *  what came back, in order. Stored with the turn, so it survives a reload.
+   *  Stripped before the turn goes back to the gateway. */
+  toolEvents?: ToolEvent[] | null
+  /** The library items the api says this reply used (from the
+   *  X-Darkplum-Library header): item ids. Known for the turn that just
+   *  arrived only. Display only. */
+  libraryUsed?: string[] | null
+}
+
+/** One step of a tool call the api ran for a reply, as the stream reports
+ *  it: the call, then its result, paired by call_id. */
+export interface ToolEvent {
+  type: 'tool_call' | 'tool_result'
+  call_id: string
+  /** The library item (tool server) the call went to: its slug, id and name. */
+  server?: string
+  server_id?: string
+  server_name?: string
+  /** The tool's own name on that server. */
+  tool: string
+  arguments?: unknown
+  content?: string
+  is_error?: boolean
+  duration_ms?: number
+  truncated?: boolean
 }
 
 /** A conversation as the list endpoint returns it: no message bodies. */
@@ -55,6 +81,8 @@ export interface ConversationSummary {
   message_count: number
   created_at: string
   updated_at: string
+  /** The library items attached to this conversation (the chip row). */
+  library_item_ids: string[]
 }
 
 export interface ConversationMessage {
@@ -67,6 +95,8 @@ export interface ConversationMessage {
   /** Assistant turns: the gateway request this reply came from. */
   request_id: string | null
   created_at: string
+  /** Assistant turns: the tool calls made for this reply, or null. */
+  tool_events: ToolEvent[] | null
 }
 
 export interface ConversationFull extends ConversationSummary {
@@ -80,6 +110,7 @@ export interface ConversationMessageInput {
   content: string
   model?: string
   request_id?: string
+  tool_events?: ToolEvent[]
 }
 
 /**
@@ -750,4 +781,103 @@ export interface ModelPriceInput {
   cache_read_per_mtok: string | null
   cache_write_per_mtok: string | null
   notes: string | null
+}
+
+// ---------------------------------------------------------------------------
+// The library: skills, context and tools a person keeps in the organisation's
+// own database, shares with colleagues, attaches to chats and exports again.
+// ---------------------------------------------------------------------------
+
+export type LibraryKind = 'skill' | 'context' | 'tool'
+export type LibraryVisibility = 'private' | 'org'
+
+export interface LibraryOwner {
+  id: string
+  name: string
+  email: string
+}
+
+/** One tool a tool server advertised when it was last verified. */
+export interface LibraryToolCatalogEntry {
+  name: string
+  description?: string
+  inputSchema?: unknown
+}
+
+/** The tool-kind extras: where the server is, what it offers, whether a
+ *  credential is stored for it (never the credential itself). */
+export interface LibraryToolInfo {
+  server_url: string
+  allowed_tools?: string[]
+  catalog: LibraryToolCatalogEntry[]
+  catalog_at: string | null
+  server_name?: string
+  credential: { set: boolean; last4?: string }
+}
+
+export interface LibraryItem {
+  id: string
+  kind: LibraryKind
+  name: string
+  slug: string
+  description: string
+  /** Markdown for a skill or context item; the JSON configuration for a tool. */
+  body: string
+  visibility: LibraryVisibility
+  /** Null only for an item whose owner was removed before ownership passed to
+   *  an administrator. */
+  owner: LibraryOwner | null
+  /** True when the signed-in person owns it, so may edit, share and delete it. */
+  mine: boolean
+  content_sha256: string
+  size_bytes: number
+  shared_at: string | null
+  created_at: string
+  updated_at: string
+  tool?: LibraryToolInfo
+}
+
+/** The create body. For a tool, `body` is the JSON configuration
+ *  `{"server_url": "...", "allowed_tools": [...]}`. */
+export interface LibraryItemInput {
+  kind: LibraryKind
+  name: string
+  slug?: string
+  description?: string
+  body: string
+  visibility?: LibraryVisibility
+}
+
+/** The update body: kind is fixed once created. */
+export interface LibraryItemUpdate {
+  name: string
+  slug?: string
+  description?: string
+  body: string
+}
+
+export interface LibraryImportRequest {
+  filename: string
+  content: string
+  /** The tab the file was imported from; a `kind:` in the file wins. */
+  kind?: LibraryKind
+  visibility?: LibraryVisibility
+}
+
+/** What an import would create (dry run) or did create. `dropped` lists the
+ *  front-matter keys the file carried that are not kept. */
+export interface LibraryImportPreview {
+  kind: LibraryKind
+  name: string
+  slug: string
+  description: string
+  size_bytes: number
+  dropped: string[]
+  item?: LibraryItem
+}
+
+/** The admin allowlist of MCP server hosts tools may call. */
+export interface ToolHostsSetting {
+  hosts: string[]
+  updated_at: string | null
 }

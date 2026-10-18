@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
-import type { BackendClass, ChatMessage } from '../types'
+import type { BackendClass, ChatMessage, ToolEvent } from '../types'
 import { formatModelName } from '../lib/formatModelName'
 import {
   RETRY_AFTER_DEFAULT_SECONDS,
@@ -20,6 +20,7 @@ import { DATA_RETENTION_CODE, dataRetentionFailureCopy } from '../lib/dataRetent
 import { CodeBlock } from '../components/ui/CodeBlock'
 import { CopyButton } from '../components/ui/CopyButton'
 import { EgressGlyph } from '../components/ui'
+import { KindGlyph } from '../components/ui/KindGlyph'
 import styles from './MessageList.module.css'
 
 /** A failed send, kept outside the message history so it is never replayed
@@ -52,6 +53,8 @@ export interface ChatFailure {
 }
 
 interface Props {
+  /** Item id -> name, for the "used …" line under a reply. */
+  libraryNames?: Map<string, string>
   messages: ChatMessage[]
   streaming: boolean
   onRegenerate?: () => void
@@ -488,6 +491,117 @@ const Provenance = ({
   )
 }
 
+/** One tool call and its result, paired by call_id. A call without a
+ *  result yet is in flight. */
+interface ToolExchange {
+  call: ToolEvent
+  result?: ToolEvent
+}
+
+function pairToolEvents(events: ToolEvent[]): ToolExchange[] {
+  const out: ToolExchange[] = []
+  const byId = new Map<string, ToolExchange>()
+  for (const ev of events) {
+    if (ev.type === 'tool_call') {
+      const ex: ToolExchange = { call: ev }
+      out.push(ex)
+      byId.set(ev.call_id, ex)
+    } else {
+      const ex = byId.get(ev.call_id)
+      if (ex) ex.result = ev
+      else out.push({ call: { ...ev, type: 'tool_call' }, result: ev })
+    }
+  }
+  return out
+}
+
+function formatArguments(args: unknown): string {
+  if (args === undefined || args === null) return ''
+  if (typeof args === 'string') return args
+  try {
+    const text = JSON.stringify(args, null, 2)
+    return text === '{}' ? '' : text
+  } catch {
+    return ''
+  }
+}
+
+/** "A", "A and B", "A, B and C". */
+function joinNames(names: string[]): string {
+  if (names.length <= 1) return names.join('')
+  return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`
+}
+
+function formatDuration(ms?: number): string {
+  if (!ms) return ''
+  return ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`
+}
+
+/** What the api did on the model's behalf before (or while) it answered:
+ *  each call, where it went, and what came back. Shown above the reply so
+ *  the words below are read knowing what they rest on. */
+const ToolActivity = ({ events, streaming }: { events: ToolEvent[]; streaming: boolean }) => {
+  const exchanges = pairToolEvents(events)
+  if (exchanges.length === 0) return null
+  return (
+    <ul className={styles.toolActivity} aria-label="Tool calls made for this reply">
+      {exchanges.map((ex) => {
+        const pending = !ex.result
+        const failed = Boolean(ex.result?.is_error)
+        const args = formatArguments(ex.call.arguments)
+        const where = ex.call.server_name ? `${ex.call.server_name} · ${ex.call.tool}` : ex.call.tool
+        const duration = formatDuration(ex.result?.duration_ms)
+        const status = pending
+          ? streaming
+            ? 'Running…'
+            : 'No result'
+          : failed
+            ? 'Failed'
+            : duration
+              ? `Done in ${duration}`
+              : 'Done'
+        return (
+          <li key={ex.call.call_id}>
+            <details className={styles.toolCall}>
+              <summary className={styles.toolCallHead}>
+                <span
+                  className={`${styles.toolStatus} ${pending ? styles.toolStatusPending : failed ? styles.toolStatusError : styles.toolStatusOk}`}
+                  aria-hidden="true"
+                />
+                <span className={styles.toolGlyph}>
+                  <KindGlyph kind="tool" size={13} />
+                </span>
+                <span className={styles.toolCallName}>{where}</span>
+                <span className={styles.toolCallMeta}>{status}</span>
+                <svg className={styles.toolChevron} width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <polyline points="6 9 12 15 18 9" />
+                </svg>
+              </summary>
+            <div className={styles.toolDetails}>
+              {args && (
+                <>
+                  <div className={styles.toolDetailLabel}>Arguments</div>
+                  <pre className={styles.toolPre}>{args}</pre>
+                </>
+              )}
+              {ex.result && (
+                <>
+                  <div className={styles.toolDetailLabel}>
+                    {failed ? 'Error' : 'Result'}
+                    {ex.result.truncated ? ' (truncated)' : ''}
+                  </div>
+                  <pre className={styles.toolPre}>{ex.result.content || '(empty)'}</pre>
+                </>
+              )}
+              </div>
+            </details>
+          </li>
+        )
+      })}
+    </ul>
+  )
+}
+
 const AssistantBubble = memo(({
   content,
   model,
@@ -495,6 +609,9 @@ const AssistantBubble = memo(({
   routerReason,
   backendClass,
   provider,
+  toolEvents,
+  libraryUsed,
+  libraryNames,
   isStreaming,
   isLast,
   onRegenerate,
@@ -510,11 +627,24 @@ const AssistantBubble = memo(({
   /** Where it ran, and who served it. Same lifetime as `route`. */
   backendClass?: BackendClass | null
   provider?: string | null
+  /** Tool calls made for this reply (stored with it), and the library items
+   *  the api attached to the turn (header only; gone after a reload). */
+  toolEvents?: ToolEvent[] | null
+  libraryUsed?: string[] | null
+  libraryNames?: Map<string, string>
   isStreaming: boolean
   isLast: boolean
   onRegenerate?: () => void
 }) => {
   const reasonId = useId()
+  const used = libraryUsed ?? []
+  const usedNames = libraryNames ? used.map((id) => libraryNames.get(id) ?? 'an item that is no longer available') : []
+  const usedText = libraryNames
+    ? joinNames(usedNames)
+    : used.length === 1
+      ? '1 library item'
+      : `${used.length} library items`
+  const hasTools = Boolean(toolEvents && toolEvents.length > 0)
   // Closed by default: the line under a reply is a footnote, and the reason is
   // one tap away rather than a hover only a mouse can find.
   const [reasonOpen, setReasonOpen] = useState(false)
@@ -523,6 +653,7 @@ const AssistantBubble = memo(({
   return (
     <div className={`${styles.message} ${styles.assistant}`}>
       <div className={styles.bubble}>
+        {hasTools && <ToolActivity events={toolEvents ?? []} streaming={isStreaming} />}
         {isStreaming && !content ? (
           <ThinkingIndicator />
         ) : (
@@ -535,10 +666,15 @@ const AssistantBubble = memo(({
               {content}
             </ReactMarkdown>
             {isStreaming && <span className={styles.cursor} aria-hidden="true" />}
-            {!isStreaming && content && (
+            {!isStreaming && (content || hasTools) && (
               <div className={styles.footer}>
                 <div className={styles.actions}>
                   <CopyButton value={content} label="Copy" />
+                  {used.length > 0 && (
+                    <span className={styles.usedLine} title="Library items attached to this turn">
+                      Used {usedText}
+                    </span>
+                  )}
                   {model && (
                     <Provenance
                       model={model}
@@ -583,6 +719,7 @@ export function MessageList({
   isAdmin,
   onRetry,
   unsavedFrom,
+  libraryNames,
 }: Props) {
   const bottomRef = useRef<HTMLDivElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
@@ -629,6 +766,9 @@ export function MessageList({
                 routerReason={msg.routerReason}
                 backendClass={msg.backendClass}
                 provider={msg.provider}
+                toolEvents={msg.toolEvents}
+                libraryUsed={msg.libraryUsed}
+                libraryNames={libraryNames}
                 isStreaming={isLast && streaming}
                 isLast={isLast}
                 onRegenerate={onRegenerate}
