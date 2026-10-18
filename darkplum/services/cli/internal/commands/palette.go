@@ -3,7 +3,8 @@ package commands
 import "fmt"
 
 // Brand palette — the single source of truth for CLI colors. Mapped directly
-// from the hex values in DARKPLUM_BRAND_GUIDE.md to truecolor ANSI foreground
+// from the brand palette hex values (the same ones services/web uses in
+// src/tokens/tokens.css) to truecolor ANSI foreground
 // escapes. Referenced by style.go (semantic helpers) and banner.go; nothing
 // else should hardcode an ANSI color.
 var (
