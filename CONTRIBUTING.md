@@ -50,9 +50,12 @@ Each test creates its own schema and drops it afterwards.
 - Web: `pnpm install --frozen-lockfile`, `tsc --noEmit`, `pnpm run build`,
   the API-to-UI parity check and the policy truth-table check
   (`pnpm run check:policy`).
-- Docs: `go run ./cmd/apidoc` must leave `docs/API.md` unchanged, so the
-  reference never drifts from the route inventory.
-- Terraform: `terraform fmt -check` and `terraform validate`.
+- Kubernetes manifests and docs: every kustomize overlay builds, the vLLM
+  model template renders, the Makefile parses, and `go run ./cmd/apidoc`
+  must leave `docs/API.md` unchanged so the reference never drifts from the
+  route inventory.
+- Terraform: `terraform fmt -check`, `terraform validate`, and the offline
+  `terraform test` of the Bedrock IAM allowlist module.
 
 The parity check is worth understanding before you touch a route.
 `darkplum/docs/api-routes.json` is the one list of every HTTP route the
