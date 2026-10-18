@@ -142,7 +142,7 @@ func TestParseImport_BOMOnJSON(t *testing.T) {
 }
 
 func TestToolHostTooBroad(t *testing.T) {
-	for host, bad := range map[string]bool{"*.com": true, "*.corp.example": false, "mcp.corp.example": false, "169.254.169.254": true, "127.0.0.1": true, "10.0.0.5": false} {
+	for host, bad := range map[string]bool{"*.com": true, "*.corp.example": false, "mcp.corp.example": false, "169.254.169.254": true, "127.0.0.1": false, "0.0.0.0": true, "10.0.0.5": false} {
 		if got := toolHostTooBroad(host) != ""; got != bad {
 			t.Errorf("toolHostTooBroad(%q) refused=%v, want %v", host, got, bad)
 		}

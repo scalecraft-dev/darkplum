@@ -250,7 +250,7 @@ func toolErrorJSON(c *gin.Context, err error, host string) {
 	case errors.Is(err, mcp.ErrNotAllowed):
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": gin.H{
 			"code":    "tool_host_not_allowed",
-			"message": fmt.Sprintf("%s is not on the list of allowed tool servers. An administrator can add it under Admin > Library.", host),
+			"message": fmt.Sprintf("%s is not on the list of allowed tool servers. An administrator can add it under Allowed tool servers on the Library page's Tools tab.", host),
 			"host":    host,
 		}})
 	case errors.As(err, &rpc):
@@ -533,10 +533,12 @@ func (h *LibraryHandler) PutToolHosts(c *gin.Context) {
 
 // toolHostTooBroad refuses allowlist entries that would admit far more than
 // one organisation's servers: a wildcard over a whole top-level domain
-// ("*.com"), and address literals in the ranges the dialer exists to keep
-// out (loopback, link-local including the cloud metadata service,
-// unspecified, multicast). A specific private address is allowed: in-cluster
-// servers are the common case.
+// ("*.com"), and address literals for link-local (the cloud metadata
+// service lives there), unspecified and multicast ranges. A loopback
+// literal or a specific private address is allowed: listing one is the
+// administrator's deliberate act (the dialer's own loopback refusal is for
+// names that merely resolve there), and in-cluster or local servers are the
+// common case.
 func toolHostTooBroad(host string) string {
 	if strings.HasPrefix(host, "*.") {
 		if strings.Count(strings.TrimPrefix(host, "*."), ".") < 1 {
@@ -545,7 +547,7 @@ func toolHostTooBroad(host string) string {
 		return ""
 	}
 	if ip := net.ParseIP(host); ip != nil {
-		if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
+		if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast() {
 			return fmt.Sprintf("%q is a reserved address and cannot be allowed", host)
 		}
 	}

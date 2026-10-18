@@ -826,7 +826,7 @@ func toolErrorText(err error, serverURL string) string {
 	var rpc *mcp.Error
 	switch {
 	case errors.Is(err, mcp.ErrNotAllowed):
-		return fmt.Sprintf("the tool server %s is not on the organisation's allowed list; an administrator can add it under Admin > Library", host)
+		return fmt.Sprintf("the tool server %s is not on the organisation's allowed list; an administrator can add it under Allowed tool servers on the Library page's Tools tab", host)
 	case errors.As(err, &rpc):
 		return fmt.Sprintf("the tool server answered with an error (code %d)", rpc.Code)
 	case errors.Is(err, context.DeadlineExceeded):
