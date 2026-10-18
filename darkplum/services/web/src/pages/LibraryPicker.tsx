@@ -169,7 +169,7 @@ export function LibraryPicker({ items, loading, error, attachedIds, onToggle, on
         ) : items.length === 0 ? (
           <p className={styles.state}>
             Nothing in your library yet.{' '}
-            <Link to="/library?tab=skills">Import skills from Claude or ChatGPT</Link>, or write a skill,
+            <Link to="/library?tab=skills">Import instructions from a Markdown file</Link>, or write a skill,
             add a tool server or save some context on the Library page.
           </p>
         ) : visible.flat.length === 0 ? (

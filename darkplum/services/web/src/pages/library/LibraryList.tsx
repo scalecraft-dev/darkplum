@@ -26,15 +26,15 @@ interface Props {
 
 const EMPTY_COPY: Record<LibraryKind, { title: string; text: string; primary: 'import' | 'new'; primaryLabel: string; secondaryLabel: string }> = {
   skill: {
-    title: 'Bring your skills from Claude or ChatGPT',
-    text: 'Save a skill or custom instructions as a Markdown file, then import it here. It becomes a skill you can attach to any chat, on any model your organisation runs.',
+    title: 'Import instructions from a Markdown file',
+    text: 'A skill is instructions the model follows for a chat. Import a Markdown file, such as the SKILL.md from a Claude skill or custom instructions you saved as text; only the instructions are kept, never scripts or other files. It then works on any model your organisation runs.',
     primary: 'import',
-    primaryLabel: 'Import skills',
+    primaryLabel: 'Import a file',
     secondaryLabel: 'Write a new skill',
   },
   tool: {
     title: 'Connect a tool server',
-    text: 'A tool is an MCP server the model can call during a chat, such as an issue tracker or an internal search. Add its address, verify it, then attach it to a conversation.',
+    text: 'A tool is an MCP server the model can call during a chat, such as an issue tracker or an internal search. Add its address, verify it, then attach it to a conversation. An administrator must allow the server\'s host first; nothing is called until then.',
     primary: 'new',
     primaryLabel: 'New tool',
     secondaryLabel: 'Import',

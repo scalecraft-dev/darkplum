@@ -425,9 +425,14 @@ Limits to know, because this backend is different in kind from the other two:
 - **Bring-your-own key per request is declined by design.** Callers present
   Darkplum API keys only; a caller-supplied vendor key would let the caller,
   not the policy, decide where a prompt goes.
-- **Text only.** `tools`, `tool_choice`, `functions`, `response_format:
-  json_schema` and image content are refused with `400 unsupported_parameter`
-  naming the field, on every backend — previously they were silently dropped.
+- **Tool calling, client-executed.** `tools` and `tool_choice` are accepted
+  in the OpenAI shape on every backend (vLLM/LM Studio, Bedrock Converse,
+  Anthropic, OpenAI): the model's `tool_calls` come back to the caller, who
+  runs the tool and sends the `role: tool` turn. A malformed tool request is
+  refused `400 invalid_tools` naming the field; a backend that cannot take
+  tools refuses `400 unsupported_parameter` after route resolution. The
+  gateway itself never runs a tool. `functions`, `function_call`,
+  `response_format: json_schema` and image content are still refused by name.
   `top_p` and `stop` are forwarded.
 
 **Usage and cost.** Admin > Activity > Spend attributes estimated cost — at the
@@ -557,6 +562,40 @@ read -s HF_TOKEN && export HF_TOKEN
 make set-hf-token
 make deploy-model NAME=llama MODEL=meta-llama/Llama-3.1-8B-Instruct REVISION=<commit-sha>
 ```
+
+## Library: skills, tools and context
+
+Every signed-in person has a Library (one entry in the nav; three tabs:
+Skills, Tools, Context) stored in the organisation's own Postgres, not in any
+AI vendor's account. A skill is instructions in Markdown, context is
+reference text, a tool is an MCP server (streamable HTTP) the model may call
+during a chat. Items are private by default; sharing to the organisation lets
+everyone read and attach them, the owner alone edits them, and administrators
+can unshare or remove shared items. Administrators never see private items.
+Deleting a user removes their private items and passes their shared ones to
+the acting administrator. Everything exports as plain files: `.md` with a
+`name`/`description`/`kind` front matter, `.json` for a tool (never with its
+credential), or one zip of all of it. Import reads the instruction text of a
+Markdown file (a Claude `SKILL.md`'s scripts and resources are never
+imported or run) and lists what it dropped before anything is written.
+
+**Tools do nothing until an administrator allows their hosts.** The
+allowlist (Library > Tools > Allowed tool servers, or `PUT
+/api/v1/settings/tool-hosts`) is empty on every install. A tool server's host
+must be listed (`mcp.corp.example`, `*.svc.cluster.local`) before it can be
+verified or called; link-local and other reserved addresses can never be
+listed, and redirects are never followed. A server's bearer token, if it
+needs one, is written to the cluster Secret `darkplum-tool-credentials` by
+the api (never to Postgres) and read back from its file mount, like the
+billing keys. On a chat turn with a tool attached the api runs the loop
+itself: the model's call goes to the server, the result comes back as a tool
+turn, and the browser is shown each call and its result; at most 8 rounds
+and 16 calls per round. A tool call sends conversation content to that
+server, so list only servers you would send a prompt to.
+
+Verified so far against the mock model, a fake MCP server and the file-mount
+credential path. Live Anthropic, OpenAI and Bedrock tool turns, a real MCP
+server and the cluster Secret write path have not yet been exercised.
 
 ## Troubleshooting
 
