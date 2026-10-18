@@ -82,7 +82,7 @@ export function Layout({ children }: { children: React.ReactNode }) {
 
         <nav className={styles.nav} aria-label="Main navigation">
           <div className={styles.navSection}>
-            <span className={styles.navHeading}>Conversations</span>
+            <span className={styles.navHeading}>Workspace</span>
             <NavLink
               to="/chat"
               className={({ isActive }) =>
