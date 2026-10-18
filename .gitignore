@@ -25,3 +25,8 @@ dist/
 coverage/
 *.out
 *.log
+
+# Internal: the team workflow and agent personas stay on disk for local use
+# but are never published. Copies live in ../darkplum-internal.
+CLAUDE.md
+.claude/
