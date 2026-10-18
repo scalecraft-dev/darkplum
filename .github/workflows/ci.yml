@@ -133,3 +133,20 @@ jobs:
         run: |
           go run ./cmd/apidoc
           git diff --exit-code -- ../../docs/API.md || { echo "docs/API.md is stale: run 'go run ./cmd/apidoc' in services/api and commit the result"; exit 1; }
+
+  terraform:
+    name: Terraform (aws)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: darkplum/terraform/aws
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.9.8"
+      - run: terraform fmt -check -recursive -diff
+      # No backend and no cloud credentials: this proves the configuration is
+      # well formed and every variable validation holds, nothing more.
+      - run: terraform init -backend=false -input=false
+      - run: terraform validate

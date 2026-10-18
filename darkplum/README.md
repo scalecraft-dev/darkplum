@@ -1,10 +1,15 @@
-# Darkplum — Private AI Cloud
+# darkplum operations guide
 
-Deploy a private LLM platform in your own AWS account. Your prompts never reach
-Darkplum: self-hosted open-source models never leave your cluster, and Bedrock
+Deploy a private AI platform in your own AWS account. Your prompts never reach
+darkplum: self-hosted open-source models never leave your cluster, and Bedrock
 models run under your own account, your own keys and your own audit trail.
 
-## What This Deploys
+This is the install, configuration and operations reference. For what the
+project is, the repository layout, contributing and the license, start at the
+[repository README](../README.md). darkplum is open source under the Apache
+License 2.0.
+
+## What this deploys
 
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
@@ -47,7 +52,7 @@ raise it later to add self-hosted open-source models.
 
 You must have AWS credentials configured (`aws configure` or environment variables).
 
-## Quick Start
+## Quick start
 
 ```bash
 # Validate your environment first (tools, cloud creds, GPU quota).
@@ -133,7 +138,7 @@ cp terraform.tfvars.example terraform.tfvars   # edit, then `terraform apply` or
 
 See `terraform/aws/variables.tf` for the full list.
 
-## Timing Breakdown
+## Timing breakdown
 
 | Phase | Duration |
 |-------|----------|
@@ -143,7 +148,7 @@ See `terraform/aws/variables.tf` for the full list.
 | Model load into GPU memory | 2-5 min |
 | **Total** | **35-50 min** |
 
-## Makefile Targets
+## Makefile targets
 
 | Target | Description |
 |--------|-------------|
@@ -168,7 +173,9 @@ See `terraform/aws/variables.tf` for the full list.
 | `make destroy` | Tear down all resources |
 | `make check-prereqs` | Validate required tools are installed |
 | `make dev-up [DEV_PORT=8080] [DEV_AWS=1]` | Local kind stack with mocked inference (no cloud account needed) |
+| `make dev-build-api` / `dev-build-gateway` / `dev-build-web` | Rebuild one service's image and roll it into the local cluster |
 | `make dev-test` | Smoke-test the local stack |
+| `make dev-logs` / `make dev-status` | Tail the local services / show their pods |
 | `make dev-down` | Delete the local kind cluster |
 
 ## API reference
@@ -238,7 +245,7 @@ Not yet built: an organisation retention policy and supervised eDiscovery
 access (dual control, audited). Both are planned as explicit features rather
 than by weakening the owner-only rule.
 
-## Models and Routing
+## Models and routing
 
 Every model sits behind one OpenAI-compatible endpoint. The gateway resolves each
 request to a backend and refuses anything it cannot place — an unknown, disabled
@@ -304,7 +311,7 @@ The role is granted the geo inference profiles (`us.anthropic.claude-*`) and the
 underlying models in that geography's regions only — no all-region wildcard and no
 `global.` profiles. One more thing the role may do is *read* the account's
 Bedrock data-retention mode: some models (Claude Fable 5 and later) are refused
-by Bedrock unless that mode is raised to `aws_review`, and Darkplum uses the
+by Bedrock unless that mode is raised to `aws_review`, and darkplum uses the
 read to mark such models **Needs AWS opt-in** in Admin > Models before anyone
 sends a prompt. Raising the mode is an account-owner decision made with your
 own credentials — the role cannot write it — and what it means is in
@@ -316,12 +323,12 @@ or from a terminal; both end up in the same place and either can be used at any
 time.
 
 *In the product:* **Admin > Models > Model vendors > Install key.** Paste the key,
-choose **Check key** — Darkplum asks the vendor, through the gateway, which
+choose **Check key** — darkplum asks the vendor, through the gateway, which
 models the key can reach and lists them — tick the models to offer, and choose
 **Install key**. The card shows *Installing* until your cluster has picked the
 key up (usually about two minutes; you can leave the page), then offers **Review
 and enable**. *Replace key*, *Change models* and *Remove key* are on the same
-card. Nothing is restarted. Installing from the product needs Darkplum to be
+card. Nothing is restarted. Installing from the product needs darkplum to be
 served over HTTPS, or reached on `localhost` — see below; without either, the card
 shows the terminal path instead.
 
@@ -339,7 +346,7 @@ make set-openai-key MODELS='gpt-*'
 
 **Create the Anthropic key inside a workspace.** Anthropic requires every request
 made with a key created at *organisation* level to name a workspace
-(`anthropic-workspace-id`); Darkplum sends that header when you give it a
+(`anthropic-workspace-id`); darkplum sends that header when you give it a
 workspace ID — the optional field on the install form, or `WORKSPACE=wrkspc_…`
 on the make target — and the key check tells you when a key needs one. A key
 created inside a workspace (Anthropic console > Workspaces > API keys) needs
@@ -377,7 +384,7 @@ sends it from your browser through the web tier and the api, in memory, on its w
 into that Secret — so that path must be HTTPS: the api refuses a key over plain
 HTTP (local `localhost` development excepted), and inside the cluster the hops
 between web, api and gateway are plain HTTP, as they are for everything else
-Darkplum carries. The make target avoids all of that: the key goes from your
+darkplum carries. The make target avoids all of that: the key goes from your
 terminal to the Kubernetes API over TLS and nowhere else. The api's only
 Kubernetes permission is `patch` on that one Secret and on the filter's
 ConfigMap — it cannot reach any other Secret — but be clear about what that does
@@ -403,12 +410,12 @@ Limits to know, because this backend is different in kind from the other two:
   gateway's role refuses models outside the allowlist even if the gateway is
   wrong. For a vendor key the only control below the gateway is the scope *you*
   set on the key at the vendor — an Anthropic workspace key with a spend limit,
-  an OpenAI project key with a model allowlist and a budget. Darkplum cannot see
+  an OpenAI project key with a model allowlist and a budget. darkplum cannot see
   or verify that scope. Set it.
 - **The key is organisation-wide.** Every permitted user and API key spends
   against the same vendor key; there is no per-principal vendor credential.
   Anyone who can read Secrets in `darkplum-system` can read it — which is whoever
-  administers the cluster. Any Darkplum administrator can replace or remove it
+  administers the cluster. Any darkplum administrator can replace or remove it
   from Admin > Models; each install, replacement, removal and model-list change is
   in Admin > Activity with who did it and the last four characters of the key
   they submitted.
@@ -423,7 +430,7 @@ Limits to know, because this backend is different in kind from the other two:
   because a GPU node was unhealthy would be a data-egress decision taken when
   nobody is watching.
 - **Bring-your-own key per request is declined by design.** Callers present
-  Darkplum API keys only; a caller-supplied vendor key would let the caller,
+  darkplum API keys only; a caller-supplied vendor key would let the caller,
   not the policy, decide where a prompt goes.
 - **Tool calling, client-executed.** `tools` and `tool_choice` are accepted
   in the OpenAI shape on every backend (vLLM/LM Studio, Bedrock Converse,
@@ -437,7 +444,7 @@ Limits to know, because this backend is different in kind from the other two:
 
 **Usage and cost.** Admin > Activity > Spend attributes estimated cost — at the
 vendors' published list prices, kept in Admin > Models > Prices — to people,
-API keys, models, aliases, routes and backends, from Darkplum's own records.
+API keys, models, aliases, routes and backends, from darkplum's own records.
 Optionally, a separate **billing key** per vendor (an Anthropic *Admin API key*
 or OpenAI *admin key*, not the inference key, held by the api only and used by
 one daily job) reconciles those estimates against the vendor's own usage and

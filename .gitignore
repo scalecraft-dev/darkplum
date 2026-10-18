@@ -8,3 +8,20 @@
 # Dependencies and build output
 node_modules/
 dist/
+
+# Environment files and local secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# Test and build output
+coverage/
+*.out
+*.log
