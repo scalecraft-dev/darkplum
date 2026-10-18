@@ -55,15 +55,20 @@ const ROW_LIMIT = 200
  * second, non-colour mark, as it does everywhere else (the egress glyph).
  */
 const CLASS_COLORS = {
+  // Dark values track the warm dark tokens: card surface #2B2A27. Moss
+  // #5C7048 fell to 2.64:1 on that surface, so the dark fill is a same-hue
+  // lift (#677D50, 3.16:1); other is a warm gray (3.72:1); lilac 4.31:1,
+  // amber 6.67:1. Grid = --border-default, axis = --fg-subtle (6.45:1),
+  // separator = --bg-surface.
   dark: {
-    self_hosted: '#5C7048',
+    self_hosted: '#677D50',
     cloud_managed: '#A877D9',
     external_api: '#D4AB55',
     external_hatch: '#7d5a0e',
-    other: '#6e6460',
-    grid: '#1A1E2A',
-    axis: '#929bab',
-    separator: '#131721',
+    other: '#83827B',
+    grid: '#42413E',
+    axis: '#B0AEA5',
+    separator: '#2B2A27',
   },
   light: {
     self_hosted: '#5C7048',

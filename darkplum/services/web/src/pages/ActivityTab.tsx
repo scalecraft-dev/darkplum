@@ -125,14 +125,16 @@ const BACKEND_CLASS_FILTERS: { label: string; value: string }[] = [
 ]
 
 // Hex values directly since CSS vars are unreliable in SVG attributes.
-// Defined per-theme because the dark grid color (#1A1E2A) is invisible on
-// light mode bone backgrounds.
+// Defined per-theme because the dark grid color is invisible on light mode
+// bone backgrounds. Dark tracks the warm dark tokens: grid = --border-default,
+// axis = --fg-subtle (6.45:1 on the #2B2A27 surface; the old #6e6460 was
+// 2.50:1), stroke is a same-hue moss lift (#5C7048 is 2.64:1, under 3:1).
 const CHART_COLORS = {
   dark: {
-    stroke: '#5C7048',
+    stroke: '#677D50',
     fill:   'rgba(92, 112, 72, 0.18)',
-    grid:   '#1A1E2A',
-    axis:   '#6e6460',
+    grid:   '#42413E',
+    axis:   '#B0AEA5',
   },
   light: {
     stroke: '#5C7048',

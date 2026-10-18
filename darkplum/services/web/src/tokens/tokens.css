@@ -7,22 +7,35 @@
   --color-sage:     #A8B89A;
   --color-bone:     #F0EBE0;
 
-  /* --- Backgrounds (dark mode: neutral slate) --- */
-  --bg-base: #0B0E14;
-  --bg-primary: #0D1017;
-  --bg-surface: #131721;
-  --bg-surface-raised: #1A1E2A;
-  --bg-surface-hover: #232834;
-  --bg-user-message: #1A1E2A;
-  --bg-code: #0A0D12;
+  /* --- Backgrounds (dark mode: warm near-neutral, claude.ai-aligned) --- */
+  /* Hue ~60, ~2-3% saturation. Lightness order is preserved from the slate
+     palette: base = code < primary < surface < raised = user-message < hover.
+     --bg-base drives the sidebar / conversation rail and inset wells, so it
+     takes the recessed #1F1E1B (claude.ai's sidebar), not #141413: the rail
+     sits darker than the canvas exactly as on claude.ai. --bg-surface is the
+     card / input / composer / table-header layer ON the canvas, so it must sit
+     above #262624; #2B2A27 is a step between canvas and raised (cards also
+     carry a border). Code shares the recessed tier: #141413 next to a
+     #30302E code-block header was too hard a jump. */
+  --bg-base: #1F1E1B;
+  --bg-primary: #262624;
+  --bg-surface: #2B2A27;
+  --bg-surface-raised: #30302E;
+  --bg-surface-hover: #3E3D3A;
+  --bg-user-message: #30302E;
+  --bg-code: #1F1E1B;
 
   /* --- Foreground / text --- */
-  /* Secondary text uses cool neutral grays tuned to the slate backgrounds:
-     warm taupe on cool slate read muddy and failed WCAG AA. Verified AA on
-     every real background up to --bg-surface-hover (#232834) row-hover. */
-  --fg-default: #ece7df;
-  --fg-muted: #aab1bd;
-  --fg-subtle: #929bab;
+  /* Warm grays matched to the warm backgrounds (claude.ai text-100/200/300).
+     text-400 #87867F was rejected for subtle: 2.97:1 on row-hover, 3.93:1 on
+     surface. Measured (base / primary / surface / raised / hover):
+       default #FAF9F5  15.82 / 14.39 / 13.62 / 12.55 / 10.31
+       muted   #C2C0B6   9.14 /  8.31 /  7.87 /  7.25 /  5.95
+       subtle  #B0AEA5   7.50 /  6.82 /  6.45 /  5.95 /  4.88
+     All AA for body text on every background up to --bg-surface-hover. */
+  --fg-default: #FAF9F5;
+  --fg-muted: #C2C0B6;
+  --fg-subtle: #B0AEA5;
   --fg-on-emphasis: var(--color-bone);
 
   /* --- Brand / accent (moss for interactive, grape for identity) --- */
@@ -31,7 +44,8 @@
   --brand-muted: rgba(92, 112, 72, 0.18);
   --brand-subtle: rgba(92, 112, 72, 0.08);
   /* Brand color for TEXT on muted/dark surfaces. Moss is too dark on dark
-     (~3.3:1), so dark mode uses sage; light keeps moss (reads on bone). */
+     (~2.6:1 on surface), so dark mode uses sage; light keeps moss (reads on
+     bone). Sage: 7.21 canvas, 5.17 row-hover, 4.58 on brand-muted over hover. */
   --brand-fg: var(--color-sage);
 
   /* --- Grape identity (for brand-specific surfaces) --- */
@@ -46,25 +60,35 @@
   --success-border: rgba(92, 112, 72, 0.30);
 
   /* --- Semantic: danger --- */
-  /* Lifted from #c45454 (sub-AA, ~3.3:1 on hovered rows) for legibility. */
-  --danger-fg: #d97070;
+  /* #d97070 fell to 3.36:1 on the warm row-hover (#3E3D3A); lifted along the
+     same hue/saturation. 6.32 canvas, 5.99 surface, 4.53 hover; badge on
+     danger-bg over surface 5.45 / over raised 5.01. */
+  --danger-fg: #e29292;
   --danger-bg: rgba(196, 84, 84, 0.10);
   --danger-border: rgba(196, 84, 84, 0.25);
 
   /* --- Semantic: warning --- */
-  --warning-fg: #c49a3c;
+  /* #c49a3c fell to 4.16:1 on row-hover; same-hue lift. 6.32 canvas,
+     5.98 surface, 4.53 hover; badge on warning-bg over surface 5.09. */
+  --warning-fg: #c9a24c;
   --warning-bg: rgba(196, 154, 60, 0.10);
   --warning-border: rgba(196, 154, 60, 0.25);
 
   /* --- Semantic: info --- */
-  /* Lilac #A877D9 was borderline (~4.4:1 on hovered rows); nudged lighter. */
-  --info-fg: #b58ce0;
+  /* Lilac #A877D9 is sub-AA on dark rows; #b58ce0 then fell to 4.03:1 on the
+     warm row-hover. 6.33 canvas, 5.99 surface, 4.53 hover; badge on info-bg
+     over surface 5.10. */
+  --info-fg: #bd98e3;
   --info-bg: rgba(168, 119, 217, 0.12);
   --info-border: rgba(168, 119, 217, 0.25);
 
   /* --- Borders --- */
-  --border-default: #232834;
-  --border-muted: #1A1E2A;
+  /* Solid equivalents of claude.ai's rgba(222,220,209,a) hairlines composited
+     on the canvas: a=0.15 -> #42413E, a=0.08 -> #353532. Default reads on
+     base, canvas, surface and raised; on a hovered row (#3E3D3A) it is
+     1.06:1 and effectively vanishes, as the slate palette's did. */
+  --border-default: #42413E;
+  --border-muted: #353532;
   --border-focus: var(--color-moss);
 
   /* --- Typography --- */

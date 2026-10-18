@@ -27,8 +27,11 @@ import { useToast } from '../components/Toast'
 import { Avatar, Badge, EgressGlyph, Skeleton } from '../components/ui'
 import styles from './ActivityDrawer.module.css'
 
+// Dark: stroke is a same-hue moss lift (moss #5C7048 is 2.64:1 on the
+// #2B2A27 surface, under the 3:1 graphics minimum); grid = --border-default;
+// axis = --fg-subtle (6.45:1 on surface; the old #6e6460 was 2.50:1).
 const CHART_COLORS = {
-  dark:  { stroke: '#5C7048', grid: '#1A1E2A', axis: '#6e6460' },
+  dark:  { stroke: '#677D50', grid: '#42413E', axis: '#B0AEA5' },
   light: { stroke: '#5C7048', grid: '#d4cec4', axis: '#6e6460' },
 } as const
 
