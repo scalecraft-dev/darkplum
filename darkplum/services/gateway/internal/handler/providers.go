@@ -16,10 +16,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/scalecraft/darkplum/gateway/internal/middleware"
-	"github.com/scalecraft/darkplum/gateway/internal/provider"
-	"github.com/scalecraft/darkplum/gateway/internal/provider/credsource"
-	"github.com/scalecraft/darkplum/gateway/internal/routing"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/middleware"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider/credsource"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/routing"
 )
 
 // refreshHintWindow is how long a POST /v1/providers/:vendor/refresh call

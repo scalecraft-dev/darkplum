@@ -9,7 +9,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/scalecraft/darkplum/gateway/internal/recorder"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/recorder"
 )
 
 // statusWriter wraps gin.ResponseWriter to capture the HTTP status code after

@@ -12,10 +12,10 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/scalecraft/darkplum/gateway/internal/policy"
-	"github.com/scalecraft/darkplum/gateway/internal/provider/anthropic"
-	"github.com/scalecraft/darkplum/gateway/internal/provider/credsource"
-	"github.com/scalecraft/darkplum/gateway/internal/routing"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/policy"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider/anthropic"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider/credsource"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/routing"
 )
 
 func TestHandleChatCompletions_VendorOutageDoesNotAffectLocalModel(t *testing.T) {

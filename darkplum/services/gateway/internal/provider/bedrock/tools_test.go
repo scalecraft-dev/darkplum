@@ -14,7 +14,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/document"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
 
-	"github.com/scalecraft/darkplum/gateway/internal/provider"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider"
 )
 
 func docJSON(t *testing.T, d document.Interface) string {

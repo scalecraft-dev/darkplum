@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/scalecraft/darkplum/gateway/internal/policy"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/policy"
 )
 
 func aliasWithRoutes(routes ...policy.RouteDef) policy.AliasDef {

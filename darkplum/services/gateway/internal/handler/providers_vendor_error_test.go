@@ -14,9 +14,9 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/scalecraft/darkplum/gateway/internal/middleware"
-	"github.com/scalecraft/darkplum/gateway/internal/provider/anthropic"
-	"github.com/scalecraft/darkplum/gateway/internal/provider/openai"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/middleware"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider/anthropic"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider/openai"
 )
 
 const vendorErrSentinel = "SENTINEL-acct-org-4242-leak"

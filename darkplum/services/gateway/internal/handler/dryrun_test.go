@@ -10,9 +10,9 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/scalecraft/darkplum/gateway/internal/policy"
-	"github.com/scalecraft/darkplum/gateway/internal/router"
-	"github.com/scalecraft/darkplum/gateway/internal/routing"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/policy"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/router"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/routing"
 )
 
 func doDryrun(t *testing.T, h *ChatHandler, alias, text string) (*httptest.ResponseRecorder, routingDryrunResponse) {

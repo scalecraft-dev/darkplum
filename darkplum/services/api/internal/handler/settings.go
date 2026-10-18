@@ -13,7 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/scalecraft/darkplum/api/internal/activity"
+	"github.com/scalecraft-dev/darkplum/api/internal/activity"
 )
 
 // Organisation settings: a key/value table (migration 025) an admin edits

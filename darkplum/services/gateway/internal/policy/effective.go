@@ -1,6 +1,6 @@
 package policy
 
-import "github.com/scalecraft/darkplum/gateway/internal/routing"
+import "github.com/scalecraft-dev/darkplum/gateway/internal/routing"
 
 // Principal levels for PolicyRow.Level and principal_routing_policies.
 // principal_type (migration 015). These are also the exact values the

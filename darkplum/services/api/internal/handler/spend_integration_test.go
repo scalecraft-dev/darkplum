@@ -13,8 +13,8 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/scalecraft/darkplum/api/internal/activity"
-	"github.com/scalecraft/darkplum/api/internal/pricing"
+	"github.com/scalecraft-dev/darkplum/api/internal/activity"
+	"github.com/scalecraft-dev/darkplum/api/internal/pricing"
 )
 
 type spendFixture struct {

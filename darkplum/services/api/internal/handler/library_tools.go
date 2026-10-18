@@ -37,9 +37,9 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/scalecraft/darkplum/api/internal/activity"
-	"github.com/scalecraft/darkplum/api/internal/kube"
-	"github.com/scalecraft/darkplum/api/internal/mcp"
+	"github.com/scalecraft-dev/darkplum/api/internal/activity"
+	"github.com/scalecraft-dev/darkplum/api/internal/kube"
+	"github.com/scalecraft-dev/darkplum/api/internal/mcp"
 )
 
 const (

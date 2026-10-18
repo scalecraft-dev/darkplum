@@ -10,10 +10,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/scalecraft/darkplum/gateway/internal/policy"
-	"github.com/scalecraft/darkplum/gateway/internal/provider"
-	"github.com/scalecraft/darkplum/gateway/internal/provider/mock"
-	"github.com/scalecraft/darkplum/gateway/internal/routing"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/policy"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider/mock"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/routing"
 )
 
 func mockToolHandler(t *testing.T) *ChatHandler {

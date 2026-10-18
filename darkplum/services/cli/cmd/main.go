@@ -3,7 +3,7 @@ package main
 import (
 	"github.com/alecthomas/kong"
 
-	"github.com/scalecraft/darkplum/cli/internal/commands"
+	"github.com/scalecraft-dev/darkplum/cli/internal/commands"
 )
 
 func main() {

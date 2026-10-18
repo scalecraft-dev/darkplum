@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/scalecraft/darkplum/gateway/internal/provider"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider"
 )
 
 // normalizedRequest is the result of normalizeMessages: a hoisted system

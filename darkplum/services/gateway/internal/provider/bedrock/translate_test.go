@@ -11,7 +11,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime"
 	"github.com/aws/aws-sdk-go-v2/service/bedrockruntime/types"
 
-	"github.com/scalecraft/darkplum/gateway/internal/provider"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider"
 )
 
 // ---------------------------------------------------------------------------

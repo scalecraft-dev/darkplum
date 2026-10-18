@@ -16,10 +16,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/scalecraft/darkplum/gateway/internal/middleware"
-	"github.com/scalecraft/darkplum/gateway/internal/provider"
-	"github.com/scalecraft/darkplum/gateway/internal/provider/anthropic"
-	"github.com/scalecraft/darkplum/gateway/internal/provider/credsource"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/middleware"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider/anthropic"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider/credsource"
 )
 
 func init() {

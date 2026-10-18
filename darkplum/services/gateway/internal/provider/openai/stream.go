@@ -10,7 +10,7 @@ import (
 	"net/http"
 	"strings"
 
-	"github.com/scalecraft/darkplum/gateway/internal/provider"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider"
 )
 
 // Stream implements provider.Provider. Rendered ONLY through

@@ -17,10 +17,10 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/scalecraft/darkplum/gateway/internal/middleware"
-	"github.com/scalecraft/darkplum/gateway/internal/policy"
-	"github.com/scalecraft/darkplum/gateway/internal/router"
-	"github.com/scalecraft/darkplum/gateway/internal/routing"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/middleware"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/policy"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/router"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/routing"
 )
 
 // doChatAs builds a chat completion request exactly like doChat, but also

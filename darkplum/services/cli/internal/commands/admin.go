@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/scalecraft/darkplum/cli/internal/kube"
+	"github.com/scalecraft-dev/darkplum/cli/internal/kube"
 )
 
 // AdminCmd groups admin-account operations.

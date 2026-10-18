@@ -3,7 +3,7 @@ package provider_test
 import (
 	"testing"
 
-	"github.com/scalecraft/darkplum/gateway/internal/provider"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider"
 )
 
 func TestValidateVendorBaseURL(t *testing.T) {

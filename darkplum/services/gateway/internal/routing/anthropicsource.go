@@ -3,9 +3,9 @@ package routing
 import (
 	"context"
 
-	"github.com/scalecraft/darkplum/gateway/internal/provider"
-	"github.com/scalecraft/darkplum/gateway/internal/provider/anthropic"
-	"github.com/scalecraft/darkplum/gateway/internal/provider/credsource"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider/anthropic"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider/credsource"
 )
 
 // anthropicCredentialChecker is the subset of *credsource.Source this source

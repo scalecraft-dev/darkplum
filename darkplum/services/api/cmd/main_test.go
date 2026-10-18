@@ -12,8 +12,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/scalecraft/darkplum/api/internal/db"
-	"github.com/scalecraft/darkplum/api/internal/handler"
+	"github.com/scalecraft-dev/darkplum/api/internal/db"
+	"github.com/scalecraft-dev/darkplum/api/internal/handler"
 )
 
 func TestParseModelSyncInterval(t *testing.T) {

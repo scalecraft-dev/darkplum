@@ -6,7 +6,7 @@ import (
 	"io"
 	"testing"
 
-	"github.com/scalecraft/darkplum/gateway/internal/provider"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider"
 )
 
 // fakeBedrockProvider implements bedrockDiscoverer without touching AWS.

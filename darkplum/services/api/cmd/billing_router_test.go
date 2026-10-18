@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/scalecraft/darkplum/api/internal/auth"
+	"github.com/scalecraft-dev/darkplum/api/internal/auth"
 )
 
 var billingRoutes = []struct{ method, path string }{

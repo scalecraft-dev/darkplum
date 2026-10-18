@@ -18,7 +18,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/scalecraft/darkplum/api/internal/activity"
+	"github.com/scalecraft-dev/darkplum/api/internal/activity"
 )
 
 // newPolicyTestUser inserts a real users row with a unique-per-call email

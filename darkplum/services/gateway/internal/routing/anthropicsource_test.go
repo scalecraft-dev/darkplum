@@ -7,8 +7,8 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/scalecraft/darkplum/gateway/internal/provider"
-	"github.com/scalecraft/darkplum/gateway/internal/provider/credsource"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider/credsource"
 )
 
 // fakeAnthropicCreds is an anthropicCredentialChecker fake.

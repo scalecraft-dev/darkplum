@@ -1,4 +1,4 @@
-module github.com/scalecraft/darkplum/cli
+module github.com/scalecraft-dev/darkplum/cli
 
 go 1.25.0
 

@@ -11,7 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/bcrypt"
 
-	"github.com/scalecraft/darkplum/api/internal/activity"
+	"github.com/scalecraft-dev/darkplum/api/internal/activity"
 )
 
 const bcryptCost = 12

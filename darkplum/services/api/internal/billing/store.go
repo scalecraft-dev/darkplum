@@ -7,7 +7,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/scalecraft/darkplum/api/internal/pricing"
+	"github.com/scalecraft-dev/darkplum/api/internal/pricing"
 )
 
 // Store persists vendor reports and the per-vendor status row.

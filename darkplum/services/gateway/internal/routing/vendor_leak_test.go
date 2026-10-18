@@ -11,9 +11,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/scalecraft/darkplum/gateway/internal/provider"
-	"github.com/scalecraft/darkplum/gateway/internal/provider/anthropic"
-	"github.com/scalecraft/darkplum/gateway/internal/provider/openai"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider/anthropic"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider/openai"
 )
 
 // sentinelKeyFragment / sentinelWorkspaceID are planted in a fake vendor's

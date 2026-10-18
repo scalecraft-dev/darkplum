@@ -11,7 +11,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/scalecraft/darkplum/gateway/internal/provider"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider"
 )
 
 func call(id, name, args string) provider.ToolCall {

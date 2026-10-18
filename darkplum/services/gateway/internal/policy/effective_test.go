@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/scalecraft/darkplum/gateway/internal/routing"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/routing"
 )
 
 func strP(s string) *string { return &s }

@@ -8,7 +8,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/scalecraft/darkplum/gateway/internal/routing"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/routing"
 )
 
 // residencyTruthTablePath is the canonical, cross-service artifact naming

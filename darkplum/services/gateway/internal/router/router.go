@@ -18,7 +18,7 @@ import (
 	"errors"
 	"strings"
 
-	"github.com/scalecraft/darkplum/gateway/internal/policy"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/policy"
 )
 
 // Input bundles everything a Classifier needs to decide a route for one

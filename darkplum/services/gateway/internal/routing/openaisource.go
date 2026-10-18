@@ -3,9 +3,9 @@ package routing
 import (
 	"context"
 
-	"github.com/scalecraft/darkplum/gateway/internal/provider"
-	"github.com/scalecraft/darkplum/gateway/internal/provider/credsource"
-	"github.com/scalecraft/darkplum/gateway/internal/provider/openai"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider/credsource"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider/openai"
 )
 
 // openaiCredentialChecker is the subset of *credsource.Source this source

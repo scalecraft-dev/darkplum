@@ -15,7 +15,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/scalecraft/darkplum/api/internal/db"
+	"github.com/scalecraft-dev/darkplum/api/internal/db"
 )
 
 // captureLogs swaps the global slog default logger for one that writes to a

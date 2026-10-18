@@ -4,7 +4,7 @@ import (
 	"context"
 	"strings"
 
-	"github.com/scalecraft/darkplum/gateway/internal/policy"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/policy"
 )
 
 // RulesClassifier matches a routed alias's ordered routes against Input by

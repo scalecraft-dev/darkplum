@@ -10,7 +10,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/scalecraft/darkplum/api/internal/kube"
+	"github.com/scalecraft-dev/darkplum/api/internal/kube"
 )
 
 func TestValidVendor(t *testing.T) {

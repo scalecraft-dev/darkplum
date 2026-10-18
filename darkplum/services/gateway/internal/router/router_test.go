@@ -3,7 +3,7 @@ package router
 import (
 	"testing"
 
-	"github.com/scalecraft/darkplum/gateway/internal/policy"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/policy"
 )
 
 func TestNormalizeRouteToken(t *testing.T) {

@@ -11,7 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/scalecraft/darkplum/api/internal/activity"
+	"github.com/scalecraft-dev/darkplum/api/internal/activity"
 )
 
 const testAnthropicKey = "sk-ant-abcdefghijklmnopqrstuvwx"

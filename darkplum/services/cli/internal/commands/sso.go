@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/scalecraft/darkplum/cli/internal/kube"
+	"github.com/scalecraft-dev/darkplum/cli/internal/kube"
 )
 
 // SSOCmd groups SSO/OIDC operations.

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/scalecraft/darkplum/gateway/internal/provider"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider"
 )
 
 const (

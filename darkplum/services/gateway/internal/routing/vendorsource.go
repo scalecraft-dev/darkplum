@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/scalecraft/darkplum/gateway/internal/provider"
-	"github.com/scalecraft/darkplum/gateway/internal/provider/credsource"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider/credsource"
 )
 
 // vendorCredentialChecker is the subset of *credsource.Source every direct

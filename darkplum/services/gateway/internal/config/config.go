@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/scalecraft/darkplum/gateway/internal/provider"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider"
 )
 
 // Config holds all runtime configuration for the gateway, loaded from environment variables.

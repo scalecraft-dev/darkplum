@@ -9,7 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/bcrypt"
 
-	"github.com/scalecraft/darkplum/api/internal/activity"
+	"github.com/scalecraft-dev/darkplum/api/internal/activity"
 )
 
 // CreateLocalAdmin provisions a local password admin directly. Unlike Setup it

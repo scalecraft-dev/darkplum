@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/scalecraft/darkplum/gateway/internal/provider"
-	"github.com/scalecraft/darkplum/gateway/internal/provider/bedrock"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider/bedrock"
 )
 
 // bedrockDiscoverer is the subset of *bedrock.BedrockProvider this source

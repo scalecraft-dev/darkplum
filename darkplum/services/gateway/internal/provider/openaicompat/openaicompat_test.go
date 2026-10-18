@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/scalecraft/darkplum/gateway/internal/provider"
-	"github.com/scalecraft/darkplum/gateway/internal/provider/openaicompat"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider/openaicompat"
 )
 
 // ---------------------------------------------------------------------------

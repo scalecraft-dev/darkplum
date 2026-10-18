@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/scalecraft/darkplum/gateway/internal/health"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/health"
 )
 
 // ---------------------------------------------------------------------------

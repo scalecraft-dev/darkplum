@@ -14,10 +14,10 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/scalecraft/darkplum/gateway/internal/policy"
-	"github.com/scalecraft/darkplum/gateway/internal/provider/credsource"
-	"github.com/scalecraft/darkplum/gateway/internal/provider/openai"
-	"github.com/scalecraft/darkplum/gateway/internal/routing"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/policy"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider/credsource"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider/openai"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/routing"
 )
 
 func TestHandleChatCompletions_OpenAIOutageLeavesLocalAndAnthropicAnswering(t *testing.T) {

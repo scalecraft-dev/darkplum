@@ -12,7 +12,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/scalecraft/darkplum/gateway/internal/policy"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/policy"
 )
 
 // healthProbeCacheTTL bounds how often SemanticRouterClassifier.HealthStatus

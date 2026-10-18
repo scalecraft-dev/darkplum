@@ -1,4 +1,4 @@
-module github.com/scalecraft/darkplum/gateway
+module github.com/scalecraft-dev/darkplum/gateway
 
 go 1.25.0
 

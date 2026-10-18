@@ -13,7 +13,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
-	"github.com/scalecraft/darkplum/api/internal/mcp"
+	"github.com/scalecraft-dev/darkplum/api/internal/mcp"
 )
 
 func TestParseLibraryHeader(t *testing.T) {
