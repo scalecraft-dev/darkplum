@@ -139,6 +139,7 @@ func (p *BedrockProvider) Complete(ctx context.Context, req provider.ChatRequest
 		System:          system,
 		InferenceConfig: inferenceConfig,
 		ToolConfig:      toolConfig,
+		RequestMetadata: requestMetadata(req),
 	})
 	if err != nil {
 		return nil, p.wrapError(req.Model, err, toolConfig != nil)
@@ -178,6 +179,7 @@ func (p *BedrockProvider) Stream(ctx context.Context, req provider.ChatRequest, 
 		System:          system,
 		InferenceConfig: inferenceConfig,
 		ToolConfig:      toolConfig,
+		RequestMetadata: requestMetadata(req),
 	})
 	if err != nil {
 		return nil, p.wrapError(req.Model, err, toolConfig != nil)
@@ -256,6 +258,22 @@ loop:
 	return stats, nil
 }
 
+// requestMetadataUserKey is the Converse requestMetadata key the caller's
+// pseudonymised `user` is sent under. Bedrock limits keys and values to 256
+// characters from [a-zA-Z0-9\s:_@$#=/+,-.], at most 16 pairs; "user_id" and a
+// "k1:<64 hex>" value (67 chars) are inside all of that. The metadata is
+// written to Bedrock invocation logs, which is why it is never the raw value.
+const requestMetadataUserKey = "user_id"
+
+// requestMetadata is the Converse requestMetadata for req: the pseudonymised
+// user when the handler supplied one, nil otherwise.
+func requestMetadata(req provider.ChatRequest) map[string]string {
+	if req.User == "" {
+		return nil
+	}
+	return map[string]string{requestMetadataUserKey: req.User}
+}
+
 // wrapError classifies the data-retention refusal (a typed, scrubbed error and
 // a per-model flag for GET /v1/models availability) and otherwise defers to
 // wrapBedrockError.
@@ -294,10 +312,13 @@ func isToolsUnsupportedValidation(code, message string) bool {
 func (p *BedrockProvider) SupportsTools() bool { return true }
 
 // ParamCaps implements provider.ParamCapable. Converse has no JSON mode,
-// logprobs, logit_bias or parallel-tool-call switch; toolChoice any/tool is
+// logprobs, logit_bias or parallel-tool-call switch (toolChoice is only
+// auto/any/tool, none of which limits a turn to one call), so
+// parallel_tool_calls:false with tools stays refused. toolChoice any/tool is
 // enforced natively and stop sequences map to inferenceConfig.stopSequences.
+// `user` becomes requestMetadata as an HMAC pseudonym.
 func (p *BedrockProvider) ParamCaps() provider.ParamCaps {
-	return provider.ParamCaps{Stop: true, ForcedToolChoice: true}
+	return provider.ParamCaps{Stop: true, ForcedToolChoice: true, UserID: provider.UserIDHMAC}
 }
 
 // wrapBedrockError converts a Bedrock SDK error into a BedrockAPIError that

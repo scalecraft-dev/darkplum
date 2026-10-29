@@ -105,6 +105,15 @@ spec:
             - name: provider-keys
               mountPath: /var/run/darkplum/provider-keys
               readOnly: true
+            # Per-organisation HMAC secret (files user-hmac-key, user-hmac-key-id)
+            # used to pseudonymise the OpenAI `user` field before it is sent to
+            # Anthropic / Bedrock, which must never receive the raw identifier.
+            # Generated at install by `make deploy-platform` and read from files
+            # (USER_HMAC_DIR, default /var/run/darkplum/user-hmac), never from the
+            # environment or the database. Rotation: docs/RUNBOOK-vendor-apis.md.
+            - name: user-hmac
+              mountPath: /var/run/darkplum/user-hmac
+              readOnly: true
           readinessProbe:
             httpGet:
               path: /health
@@ -132,4 +141,11 @@ spec:
         - name: provider-keys
           secret:
             secretName: darkplum-provider-keys
+            optional: true
+        # Optional: without it the gateway starts and serves normally, and the
+        # `user` field is simply left off Anthropic and Bedrock requests (one
+        # WARNING in the gateway log) rather than sent raw.
+        - name: user-hmac
+          secret:
+            secretName: darkplum-user-hmac
             optional: true

@@ -157,6 +157,22 @@ type compatRequest struct {
 	// would otherwise add a usage chunk to a stream nobody asked it of does not.
 	ResponseFormat *compatResponseFormat `json:"response_format,omitempty"`
 	StreamOptions  *compatStreamOptions  `json:"stream_options,omitempty"`
+
+	// OpenAI parameters, present only for a non-default value.
+	Seed             *int64             `json:"seed,omitempty"`
+	FrequencyPenalty *float64           `json:"frequency_penalty,omitempty"`
+	PresencePenalty  *float64           `json:"presence_penalty,omitempty"`
+	Logprobs         *bool              `json:"logprobs,omitempty"`
+	TopLogprobs      *int               `json:"top_logprobs,omitempty"`
+	LogitBias        map[string]float64 `json:"logit_bias,omitempty"`
+	User             string             `json:"user,omitempty"`
+
+	// vLLM extensions (outside the OpenAI schema), present only when set.
+	TopK               *int            `json:"top_k,omitempty"`
+	MinP               *float64        `json:"min_p,omitempty"`
+	RepetitionPenalty  *float64        `json:"repetition_penalty,omitempty"`
+	GuidedJSON         json.RawMessage `json:"guided_json,omitempty"`
+	ChatTemplateKwargs json.RawMessage `json:"chat_template_kwargs,omitempty"`
 }
 
 type compatResponseFormat struct {
@@ -177,10 +193,11 @@ type compatResponse struct {
 }
 
 type compatChoice struct {
-	Index        int            `json:"index"`
-	Message      *compatMessage `json:"message"`
-	Delta        *compatDelta   `json:"delta"`
-	FinishReason *string        `json:"finish_reason"`
+	Index        int             `json:"index"`
+	Message      *compatMessage  `json:"message"`
+	Delta        *compatDelta    `json:"delta"`
+	Logprobs     json.RawMessage `json:"logprobs"`
+	FinishReason *string         `json:"finish_reason"`
 }
 
 type compatMessage struct {
@@ -282,6 +299,7 @@ func (p *OpenAICompatProvider) Complete(ctx context.Context, req provider.ChatRe
 		Content:      content,
 		ToolCalls:    toolCalls,
 		FinishReason: finishReason,
+		Logprobs:     provider.NormalizeLogprobs(choice.Logprobs),
 	}
 	if cr.Usage != nil {
 		chatResp.PromptTokens = cr.Usage.PromptTokens
@@ -548,7 +566,7 @@ func (p *OpenAICompatProvider) adaptNonStreamingResponse(resp *http.Response, w 
 	var frames [][]byte
 	toolCalls := normalizeToolCalls(choice.Message.ToolCalls)
 	if content != "" || len(toolCalls) == 0 {
-		deltaChunk, err := provider.BuildStreamingChunkSSE(cr.ID, cr.Model, content)
+		deltaChunk, err := provider.BuildStreamingChunkLogprobsSSE(cr.ID, cr.Model, content, choice.Logprobs)
 		if err != nil {
 			return nil, fmt.Errorf("openaicompat(%s): building synthesized delta chunk: %w", p.name, err)
 		}
@@ -638,6 +656,27 @@ func (p *OpenAICompatProvider) buildRequestBody(req provider.ChatRequest, stream
 	if stream && req.IncludeUsage {
 		cr.StreamOptions = &compatStreamOptions{IncludeUsage: true}
 	}
+	cr.Seed = req.Seed
+	cr.FrequencyPenalty = req.FrequencyPenalty
+	cr.PresencePenalty = req.PresencePenalty
+	if req.Logprobs {
+		t := true
+		cr.Logprobs = &t
+		cr.TopLogprobs = req.TopLogprobs
+	}
+	if len(req.LogitBias) > 0 {
+		cr.LogitBias = req.LogitBias
+	}
+	// The upstream is inside the customer's boundary: the caller's `user` is
+	// forwarded as sent. parallel_tool_calls is deliberately NOT forwarded:
+	// vLLM accepts and ignores it, so false could not be enforced (see
+	// ParamCaps), and true is the default.
+	cr.User = req.User
+	cr.TopK = req.VLLM.TopK
+	cr.MinP = req.VLLM.MinP
+	cr.RepetitionPenalty = req.VLLM.RepetitionPenalty
+	cr.GuidedJSON = req.VLLM.GuidedJSON
+	cr.ChatTemplateKwargs = req.VLLM.ChatTemplateKwargs
 	b, err := json.Marshal(cr)
 	if err != nil {
 		return nil, fmt.Errorf("openaicompat(%s): marshalling request: %w", p.name, err)
@@ -673,11 +712,16 @@ func (p *OpenAICompatProvider) upstreamError(statusCode int, body []byte) error 
 // SupportsTools makes this a tool-capable backend (provider.ToolCapable).
 func (p *OpenAICompatProvider) SupportsTools() bool { return true }
 
-// ParamCaps implements provider.ParamCapable. vLLM takes json_object, stop and
-// tool_choice required/named; it ignores parallel_tool_calls:false, and
-// logprobs/logit_bias are not put on the wire yet, so those are refused.
+// ParamCaps implements provider.ParamCapable. vLLM takes json_object, stop,
+// tool_choice required/named, logprobs (returned in OpenAI's shape and relayed
+// on both paths) and logit_bias. It accepts but ignores
+// parallel_tool_calls:false, so that stays refused rather than forwarded.
 func (p *OpenAICompatProvider) ParamCaps() provider.ParamCaps {
-	return provider.ParamCaps{JSONMode: true, Stop: true, ForcedToolChoice: true}
+	return provider.ParamCaps{
+		JSONMode: true, Stop: true, ForcedToolChoice: true,
+		Logprobs: true, LogitBias: true,
+		UserID: provider.UserIDRaw,
+	}
 }
 
 // normalizeToolCalls defaults a missing type to "function" and drops nothing

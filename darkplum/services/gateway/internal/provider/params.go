@@ -26,7 +26,31 @@ type ParamCaps struct {
 	ForcedToolChoice bool
 	// SerialToolCalls: parallel_tool_calls:false is enforced by the backend.
 	SerialToolCalls bool
+	// UserID says what the backend is given for the caller's `user` field.
+	// The handler fills ChatRequest.User according to it, so a provider only
+	// ever forwards ChatRequest.User and can never see the raw value of a
+	// field it must pseudonymise.
+	UserID UserIDMode
 }
+
+// UserIDMode is how a backend receives the OpenAI `user` field.
+type UserIDMode int
+
+const (
+	// UserIDNone: the backend has nowhere to put it; the field is not sent
+	// (today's behaviour, unchanged).
+	UserIDNone UserIDMode = iota
+	// UserIDRaw: forwarded verbatim. Only for a backend inside the customer's
+	// boundary (in-cluster vLLM / LM Studio).
+	UserIDRaw
+	// UserIDHMAC: sent as <id>:<hex> HMAC-SHA256 under the org's secret
+	// (OpenAI user, Anthropic metadata.user_id, Bedrock requestMetadata); all
+	// three receive the same value for the same person. Those fields
+	// are free-form but Anthropic documents that they must not carry an
+	// email address or name, and Bedrock writes request metadata to
+	// invocation logs; the raw value never leaves the gateway.
+	UserIDHMAC
+)
 
 // ParamCapable is implemented by a provider that reports its ParamCaps. A
 // provider that does not implement it is treated as supporting none of them.

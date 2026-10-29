@@ -83,14 +83,24 @@ func TestChatParams_PerBackendContract(t *testing.T) {
 	all := func(param string) map[string]string {
 		return map[string]string{"openai": param, "vllm": param, "anthropic": param, "bedrock": param}
 	}
+	only := func(param string, backends ...string) map[string]string {
+		m := map[string]string{}
+		for _, b := range backends {
+			m[b] = param
+		}
+		return m
+	}
 	cases := []tc{
 		{"n=2", func(b map[string]any) { b["n"] = 2 }, all("n")},
 		{"n=1", func(b map[string]any) { b["n"] = 1 }, nil},
 		{"n=null", func(b map[string]any) { b["n"] = nil }, nil},
-		{"logprobs=true", func(b map[string]any) { b["logprobs"] = true }, all("logprobs")},
+		{"logprobs=true", func(b map[string]any) { b["logprobs"] = true }, only("logprobs", "anthropic", "bedrock")},
 		{"logprobs=false", func(b map[string]any) { b["logprobs"] = false }, nil},
 		{"logprobs=null", func(b map[string]any) { b["logprobs"] = nil }, nil},
-		{"logit_bias set", func(b map[string]any) { b["logit_bias"] = map[string]int{"50256": -100} }, all("logit_bias")},
+		{"logit_bias set", func(b map[string]any) { b["logit_bias"] = map[string]int{"50256": -100} }, only("logit_bias", "anthropic", "bedrock")},
+		{"store=true", func(b map[string]any) { b["store"] = true }, all("store")},
+		{"store=false", func(b map[string]any) { b["store"] = false }, nil},
+		{"store=null", func(b map[string]any) { b["store"] = nil }, nil},
 		{"logit_bias empty", func(b map[string]any) { b["logit_bias"] = map[string]int{} }, nil},
 		{"logit_bias=null", func(b map[string]any) { b["logit_bias"] = nil }, nil},
 		{"stop list", func(b map[string]any) { b["stop"] = []string{"END"} }, nil},
@@ -101,7 +111,7 @@ func TestChatParams_PerBackendContract(t *testing.T) {
 		{"tool_choice required", func(b map[string]any) { b["tools"] = tools; b["tool_choice"] = "required" }, nil},
 		{"tool_choice named", func(b map[string]any) { b["tools"] = tools; b["tool_choice"] = named }, nil},
 		{"tool_choice auto", func(b map[string]any) { b["tools"] = tools; b["tool_choice"] = "auto" }, nil},
-		{"parallel_tool_calls=false with tools", func(b map[string]any) { b["tools"] = tools; b["parallel_tool_calls"] = false }, all("parallel_tool_calls")},
+		{"parallel_tool_calls=false with tools", func(b map[string]any) { b["tools"] = tools; b["parallel_tool_calls"] = false }, only("parallel_tool_calls", "vllm", "bedrock")},
 		{"parallel_tool_calls=true with tools", func(b map[string]any) { b["tools"] = tools; b["parallel_tool_calls"] = true }, nil},
 		{"parallel_tool_calls=false without tools", func(b map[string]any) { b["parallel_tool_calls"] = false }, nil},
 	}

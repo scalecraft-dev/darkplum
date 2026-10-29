@@ -45,6 +45,18 @@ type chatRequest struct {
 	Tools               []provider.Tool `json:"tools,omitempty"`
 	ToolChoice          json.RawMessage `json:"tool_choice,omitempty"`
 	ResponseFormat      *responseFormat `json:"response_format,omitempty"`
+
+	// Sent only when the caller set a non-default value (see
+	// provider.ChatRequest): the field is absent from the body otherwise.
+	Seed              *int64             `json:"seed,omitempty"`
+	FrequencyPenalty  *float64           `json:"frequency_penalty,omitempty"`
+	PresencePenalty   *float64           `json:"presence_penalty,omitempty"`
+	Logprobs          *bool              `json:"logprobs,omitempty"`
+	TopLogprobs       *int               `json:"top_logprobs,omitempty"`
+	LogitBias         map[string]float64 `json:"logit_bias,omitempty"`
+	ParallelToolCalls *bool              `json:"parallel_tool_calls,omitempty"`
+	Store             *bool              `json:"store,omitempty"`
+	User              string             `json:"user,omitempty"`
 }
 
 // responseFormat is response_format on the wire; the gateway only ever sends
@@ -70,6 +82,7 @@ type chatCompletionResponse struct {
 
 type completionChoi struct {
 	Message      *completionMessage `json:"message"`
+	Logprobs     json.RawMessage    `json:"logprobs"`
 	FinishReason *string            `json:"finish_reason"`
 }
 
@@ -119,8 +132,9 @@ type streamChunk struct {
 }
 
 type streamChoice struct {
-	Delta        *streamDelta `json:"delta"`
-	FinishReason *string      `json:"finish_reason"`
+	Delta        *streamDelta    `json:"delta"`
+	Logprobs     json.RawMessage `json:"logprobs"`
+	FinishReason *string         `json:"finish_reason"`
 }
 
 type streamDelta struct {

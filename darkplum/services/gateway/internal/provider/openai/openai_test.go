@@ -1220,7 +1220,10 @@ func waitForGoroutineSettle(baseline int) int {
 // ---------------------------------------------------------------------------
 
 func TestParamCaps_OpenAI(t *testing.T) {
-	want := provider.ParamCaps{JSONMode: true, Stop: true, ForcedToolChoice: true}
+	want := provider.ParamCaps{
+		JSONMode: true, Stop: true, ForcedToolChoice: true,
+		Logprobs: true, LogitBias: true, SerialToolCalls: true, UserID: provider.UserIDHMAC,
+	}
 	if got := New(&fakeCreds{key: "k"}, Config{}).ParamCaps(); got != want {
 		t.Errorf("ParamCaps = %+v, want %+v", got, want)
 	}

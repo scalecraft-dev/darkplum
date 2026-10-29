@@ -6,6 +6,7 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"regexp"
@@ -138,15 +140,35 @@ type chatCompletionRequest struct {
 	// stream_options; it is a 400 without stream:true, like OpenAI.
 	StreamOptions *streamOptionsField `json:"stream_options,omitempty"`
 
-	// N, Logprobs, LogitBias and ParallelToolCalls are inspected ONLY to
-	// refuse, after route resolution, a value the resolved backend cannot
-	// honour (see backendParamRefusal) — never forwarded. Their defaults
-	// (n:1, logprobs:false, empty logit_bias, parallel_tool_calls:true) and
-	// null are accepted silently on every backend.
-	N                 *float64       `json:"n,omitempty"`
-	Logprobs          *bool          `json:"logprobs,omitempty"`
-	LogitBias         map[string]any `json:"logit_bias,omitempty"`
-	ParallelToolCalls *bool          `json:"parallel_tool_calls,omitempty"`
+	// N and Store are inspected ONLY to refuse (n>1; store:true) — never
+	// forwarded as such. Their defaults (n:1, store:false) and null are
+	// accepted silently on every backend.
+	N     *float64 `json:"n,omitempty"`
+	Store *bool    `json:"store,omitempty"`
+
+	// The fields below are forwarded to a backend that can honour them (see
+	// provider.ParamCaps) and refused after route resolution on one that
+	// cannot (see backendParamRefusal), for a non-default value. Their
+	// defaults (logprobs:false, empty logit_bias, parallel_tool_calls:true,
+	// zero penalties) and null are accepted silently on every backend.
+	// Seed, penalties and user are not refused anywhere: a backend with no
+	// equivalent leaves them off the wire as it always has.
+	Logprobs          *bool              `json:"logprobs,omitempty"`
+	TopLogprobs       *int               `json:"top_logprobs,omitempty"`
+	LogitBias         map[string]float64 `json:"logit_bias,omitempty"`
+	ParallelToolCalls *bool              `json:"parallel_tool_calls,omitempty"`
+	Seed              *int64             `json:"seed,omitempty"`
+	FrequencyPenalty  *float64           `json:"frequency_penalty,omitempty"`
+	PresencePenalty   *float64           `json:"presence_penalty,omitempty"`
+	User              string             `json:"user,omitempty"`
+
+	// vLLM sampling extensions, forwarded by the openaicompat provider only
+	// (ignored by every other backend, as before).
+	TopK               *int            `json:"top_k,omitempty"`
+	MinP               *float64        `json:"min_p,omitempty"`
+	RepetitionPenalty  *float64        `json:"repetition_penalty,omitempty"`
+	GuidedJSON         json.RawMessage `json:"guided_json,omitempty"`
+	ChatTemplateKwargs json.RawMessage `json:"chat_template_kwargs,omitempty"`
 
 	// Functions and FunctionCall are inspected ONLY to produce an honest 400
 	// unsupported_parameter (see unsupportedRequestParam) — never forwarded
@@ -213,6 +235,116 @@ func effectiveMaxTokens(req chatCompletionRequest) (tokens int, conflict bool) {
 	return req.MaxTokens, false
 }
 
+// invalidParam returns the first malformed value among the parameters the
+// gateway forwards, with a message, or "" when all are well formed. These are
+// the ranges OpenAI documents; checking them here gives the same 400 on every
+// backend instead of whatever the backend does with an out-of-range value
+// (the Anthropic path would otherwise accept and ignore them).
+func invalidParam(req chatCompletionRequest) (param, msg string) {
+	if req.TopLogprobs != nil {
+		if *req.TopLogprobs < 0 || *req.TopLogprobs > 20 {
+			return "top_logprobs", "top_logprobs must be between 0 and 20"
+		}
+		if *req.TopLogprobs > 0 && (req.Logprobs == nil || !*req.Logprobs) {
+			return "top_logprobs", "top_logprobs requires logprobs to be true"
+		}
+	}
+	if len(req.LogitBias) > maxLogitBiasEntries {
+		return "logit_bias", fmt.Sprintf("logit_bias accepts at most %d entries", maxLogitBiasEntries)
+	}
+	for tok, bias := range req.LogitBias {
+		if !tokenIDPattern.MatchString(tok) {
+			return "logit_bias", fmt.Sprintf("logit_bias key %q must be an integer token id", tok)
+		}
+		if bias < -100 || bias > 100 || math.IsNaN(bias) {
+			return "logit_bias", fmt.Sprintf("logit_bias for token %q must be between -100 and 100", tok)
+		}
+	}
+	if v := req.FrequencyPenalty; v != nil && (*v < -2 || *v > 2) {
+		return "frequency_penalty", "frequency_penalty must be between -2 and 2"
+	}
+	if v := req.PresencePenalty; v != nil && (*v < -2 || *v > 2) {
+		return "presence_penalty", "presence_penalty must be between -2 and 2"
+	}
+	if v := req.MinP; v != nil && (*v < 0 || *v > 1) {
+		return "min_p", "min_p must be between 0 and 1"
+	}
+	if v := req.RepetitionPenalty; v != nil && *v <= 0 {
+		return "repetition_penalty", "repetition_penalty must be greater than 0"
+	}
+	if v := req.TopK; v != nil && *v < -1 {
+		return "top_k", "top_k must be -1 (disabled) or a non-negative integer"
+	}
+	if kw := rawJSONOrNil(req.ChatTemplateKwargs); kw != nil {
+		if len(kw) > maxChatTemplateKwargsBytes {
+			return "chat_template_kwargs", fmt.Sprintf("chat_template_kwargs must be at most %d bytes", maxChatTemplateKwargsBytes)
+		}
+		var obj map[string]json.RawMessage
+		if err := json.Unmarshal(kw, &obj); err != nil || obj == nil {
+			return "chat_template_kwargs", "chat_template_kwargs must be a JSON object"
+		}
+		for k, v := range obj {
+			if !allowedTemplateKwargs[k] {
+				return "chat_template_kwargs", fmt.Sprintf("chat_template_kwargs key %q is not allowed; allowed keys: enable_thinking, thinking, reasoning_effort", k)
+			}
+			if !scalarTemplateValue(v) {
+				return "chat_template_kwargs", fmt.Sprintf("chat_template_kwargs value for %q must be a boolean, number or short string", k)
+			}
+		}
+	}
+	if gj := rawJSONOrNil(req.GuidedJSON); gj != nil {
+		if len(gj) > maxGuidedJSONBytes {
+			return "guided_json", fmt.Sprintf("guided_json must be at most %d bytes", maxGuidedJSONBytes)
+		}
+		if !json.Valid(gj) {
+			return "guided_json", "guided_json must be valid JSON"
+		}
+	}
+	return "", ""
+}
+
+const (
+	maxLogitBiasEntries        = 300 // OpenAI's limit
+	maxChatTemplateKwargsBytes = 4 << 10
+	maxGuidedJSONBytes         = 64 << 10
+)
+
+// tokenIDPattern: logit_bias keys are integer token ids (OpenAI's rule).
+var tokenIDPattern = regexp.MustCompile(`^[0-9]{1,10}$`)
+
+// allowedTemplateKwargs is an allowlist, not a denylist of reserved names:
+// chat_template_kwargs are variables handed to the model's Jinja chat
+// template, and any template variable (messages, tools, system text, or a
+// custom one a template interpolates) lets the caller change the rendered
+// prompt after the gateway's policy and content checks ran on the messages.
+// A denylist would have to know every template; these three switch reasoning
+// behaviour and carry no prompt text. Extend deliberately.
+var allowedTemplateKwargs = map[string]bool{"enable_thinking": true, "thinking": true, "reasoning_effort": true}
+
+// scalarTemplateValue: a bool, a number, or a string of at most 32 bytes.
+func scalarTemplateValue(raw json.RawMessage) bool {
+	var v any
+	if json.Unmarshal(raw, &v) != nil {
+		return false
+	}
+	switch x := v.(type) {
+	case bool, float64:
+		return true
+	case string:
+		return len(x) <= 32
+	}
+	return false
+}
+
+// rawJSONOrNil is raw trimmed, or nil when it is absent or JSON null.
+func rawJSONOrNil(raw json.RawMessage) json.RawMessage {
+	t := bytes.TrimSpace(raw)
+	if len(t) == 0 || bytes.Equal(t, []byte("null")) {
+		return nil
+	}
+	return t
+}
+
 // backendParamRefusal returns the request field the resolved backend cannot
 // honour, with the reason, or "" when every parameter the caller sent is
 // either supported or at its default. It is a contract refusal: the same
@@ -227,6 +359,9 @@ func effectiveMaxTokens(req chatCompletionRequest) (tokens int, conflict bool) {
 func backendParamRefusal(req chatCompletionRequest, caps provider.ParamCaps) (param, reason string) {
 	if req.N != nil && *req.N > 1 {
 		return "n", "only one choice per request is supported"
+	}
+	if req.Store != nil && *req.Store {
+		return "store", "completions are never stored by a vendor on this gateway's behalf; send store:false or omit it"
 	}
 	if req.ResponseFormat != nil && req.ResponseFormat.Type == "json_object" && !caps.JSONMode {
 		return "response_format", "this backend has no JSON mode"
@@ -250,6 +385,56 @@ func backendParamRefusal(req chatCompletionRequest, caps provider.ParamCaps) (pa
 		}
 	}
 	return "", ""
+}
+
+// applyForwardedParams copies the parameters the backend can honour onto
+// chatReq, each only when the caller sent a non-default value, so the field is
+// absent from the outbound body otherwise. A parameter the backend has no
+// equivalent for is simply not copied (seed and penalties on Anthropic and
+// Bedrock keep today's behaviour); the ones that would be a wrong answer
+// were already refused by backendParamRefusal.
+func (h *ChatHandler) applyForwardedParams(chatReq *provider.ChatRequest, req chatCompletionRequest, caps provider.ParamCaps) {
+	chatReq.Seed = req.Seed
+	if v := req.FrequencyPenalty; v != nil && *v != 0 {
+		chatReq.FrequencyPenalty = v
+	}
+	if v := req.PresencePenalty; v != nil && *v != 0 {
+		chatReq.PresencePenalty = v
+	}
+	if caps.Logprobs && req.Logprobs != nil && *req.Logprobs {
+		chatReq.Logprobs = true
+		chatReq.TopLogprobs = req.TopLogprobs
+	}
+	if caps.LogitBias && len(req.LogitBias) > 0 {
+		chatReq.LogitBias = req.LogitBias
+	}
+	if req.ParallelToolCalls != nil && !*req.ParallelToolCalls {
+		chatReq.ParallelToolCalls = req.ParallelToolCalls
+	}
+	chatReq.NoStore = req.Store != nil && !*req.Store
+
+	// `user`: raw only where the backend takes it raw; an HMAC pseudonym where
+	// the backend must not see the person's identifier; otherwise nothing.
+	// The raw value is never copied for a UserIDHMAC backend, so no provider
+	// can send it.
+	switch caps.UserID {
+	case provider.UserIDRaw:
+		chatReq.User = req.User
+	case provider.UserIDHMAC:
+		if req.User != "" && h.userPseudonym != nil {
+			if v, ok := h.userPseudonym.Pseudonym(req.User); ok {
+				chatReq.User = v
+			}
+		}
+	}
+
+	chatReq.VLLM = provider.VLLMExtensions{
+		TopK:               req.TopK,
+		MinP:               req.MinP,
+		RepetitionPenalty:  req.RepetitionPenalty,
+		GuidedJSON:         rawJSONOrNil(req.GuidedJSON),
+		ChatTemplateKwargs: rawJSONOrNil(req.ChatTemplateKwargs),
+	}
 }
 
 // wantsTools reports whether the request involves tool calling at all: a
@@ -380,7 +565,22 @@ type ChatHandler struct {
 	// it before evaluating, so an admin's lock-out guard never judges a
 	// write against a snapshot that predates the write before it.
 	policyRefresh func(context.Context) error
+
+	// userPseudonym, when set (SetUserPseudonymizer), pseudonymises `user`
+	// for Anthropic and Bedrock.
+	userPseudonym UserPseudonymizer
 }
+
+// UserPseudonymizer turns the caller's OpenAI `user` into the value a backend
+// that must not receive it raw is sent (see internal/userid); ok=false means
+// the field is omitted. Implemented by *userid.Pseudonymizer.
+type UserPseudonymizer interface {
+	Pseudonym(user string) (string, bool)
+}
+
+// SetUserPseudonymizer wires the HMAC pseudonymiser used for backends whose
+// ParamCaps().UserID is UserIDHMAC. Unset (nil), `user` is omitted there.
+func (h *ChatHandler) SetUserPseudonymizer(p UserPseudonymizer) { h.userPseudonym = p }
 
 // SetPolicyRefresher wires the on-demand policy reload (see policyRefresh).
 func (h *ChatHandler) SetPolicyRefresher(fn func(context.Context) error) { h.policyRefresh = fn }
@@ -924,6 +1124,19 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 		})
 		return
 	}
+	if param, msg := invalidParam(req); param != "" {
+		c.Set("denial_code", "invalid_request")
+		logDenial(c, "invalid_request", req.Model, "", "")
+		c.JSON(http.StatusBadRequest, openAIError{
+			Error: openAIErrorBody{
+				Message: msg,
+				Type:    "invalid_request_error",
+				Code:    "invalid_request",
+				Param:   param,
+			},
+		})
+		return
+	}
 	maxTokens, maxTokensConflict := effectiveMaxTokens(req)
 	if maxTokensConflict {
 		c.Set("denial_code", "unsupported_parameter")
@@ -1230,6 +1443,7 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 		JSONMode:     req.ResponseFormat != nil && req.ResponseFormat.Type == "json_object",
 		IncludeUsage: req.Stream && req.StreamOptions != nil && req.StreamOptions.IncludeUsage,
 	}
+	h.applyForwardedParams(&chatReq, req, provider.CapsOf(prov))
 	if wantsTools(req) {
 		chatReq.Tools = req.Tools
 		chatReq.ToolChoice = req.ToolChoice

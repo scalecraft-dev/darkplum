@@ -813,7 +813,10 @@ func TestStreamDoneSSE(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestParamCaps_OpenAICompat(t *testing.T) {
-	want := provider.ParamCaps{JSONMode: true, Stop: true, ForcedToolChoice: true}
+	want := provider.ParamCaps{
+		JSONMode: true, Stop: true, ForcedToolChoice: true,
+		Logprobs: true, LogitBias: true, UserID: provider.UserIDRaw,
+	}
 	if got := newTestProvider(t, "http://127.0.0.1:1").ParamCaps(); got != want {
 		t.Errorf("ParamCaps = %+v, want %+v", got, want)
 	}

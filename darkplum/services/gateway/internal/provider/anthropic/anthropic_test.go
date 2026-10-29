@@ -1056,7 +1056,7 @@ func waitForGoroutineSettle(baseline int) int {
 // ---------------------------------------------------------------------------
 
 func TestParamCaps_Anthropic(t *testing.T) {
-	want := provider.ParamCaps{Stop: true, ForcedToolChoice: true}
+	want := provider.ParamCaps{Stop: true, ForcedToolChoice: true, SerialToolCalls: true, UserID: provider.UserIDHMAC}
 	if got := New(&fakeCreds{key: "k"}, Config{}).ParamCaps(); got != want {
 		t.Errorf("ParamCaps = %+v, want %+v", got, want)
 	}

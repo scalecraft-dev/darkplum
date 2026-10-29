@@ -157,27 +157,37 @@ func (p *Provider) Stream(ctx context.Context, req provider.ChatRequest, w io.Wr
 			}
 		}
 
-		if content == "" && len(toolDeltas) == 0 {
+		var logprobs json.RawMessage
+		if req.Logprobs {
+			logprobs = provider.NormalizeLogprobs(choice.Logprobs)
+		}
+
+		if content == "" && len(toolDeltas) == 0 && logprobs == nil {
 			// Skip empty deltas and role-only chunks — there is nothing to
 			// render.
 			continue
 		}
 
 		var out [][]byte
-		if content != "" {
-			sseChunk, buildErr := provider.BuildStreamingChunkSSE(completionID, stats.Model, content)
+		// The choice's logprobs ride on the first chunk emitted for this
+		// delta (text if there is any, else the first tool-call fragment), so
+		// they are never dropped and never duplicated.
+		if content != "" || (logprobs != nil && len(toolDeltas) == 0) {
+			sseChunk, buildErr := provider.BuildStreamingChunkLogprobsSSE(completionID, stats.Model, content, logprobs)
 			if buildErr != nil {
 				return nil, fmt.Errorf("openai: building streaming chunk: %w", buildErr)
 			}
 			out = append(out, sseChunk)
+			logprobs = nil
 		}
 		// Tool-call fragments keep the vendor's index and arrival order, so
 		// parallel calls reassemble correctly on the client.
 		for _, d := range toolDeltas {
-			sseChunk, buildErr := provider.BuildToolCallDeltaSSE(completionID, stats.Model, d)
+			sseChunk, buildErr := provider.BuildToolCallDeltaLogprobsSSE(completionID, stats.Model, d, logprobs)
 			if buildErr != nil {
 				return nil, fmt.Errorf("openai: building tool-call chunk: %w", buildErr)
 			}
+			logprobs = nil
 			out = append(out, sseChunk)
 		}
 		for _, sseChunk := range out {

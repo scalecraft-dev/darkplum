@@ -224,6 +224,36 @@ deploy-platform: build-images push-images ## Build, push, and deploy gateway + w
 			--from-literal=SESSION_SIGNING_KEY="$$SESSION_SIGNING_KEY" \
 			--from-literal=SERVICE_KEY_SECRET="$$SERVICE_KEY_SECRET" \
 			--dry-run=client -o yaml | kubectl apply -f -
+	@# Per-org HMAC secret the gateway uses to pseudonymise the OpenAI `user` field
+	@# for Anthropic and Bedrock. Same keep-an-existing-value rule as
+	@# SESSION_SIGNING_KEY: regenerating it would change every pseudonym a vendor
+	@# has already seen, so an installed value (and its key id) is never replaced.
+	@# It lives only in this Secret (never Postgres, never an env var).
+	@echo "Creating user-pseudonym secret (kept if it already exists)..."
+	@# A new key is generated ONLY when the Secret is genuinely NotFound. Any other
+	@# kubectl failure (auth, wrong context, network) aborts: guessing "missing"
+	@# there would replace a live key and change every pseudonym vendors have seen.
+	@# The key itself is never printed.
+	@ERR=$$(kubectl get secret darkplum-user-hmac -n darkplum-system -o name 2>&1 >/dev/null); RC=$$?; \
+		if [ $$RC -eq 0 ]; then \
+			EXISTING_USER_HMAC_KEY=$$(kubectl get secret darkplum-user-hmac -n darkplum-system \
+				-o jsonpath='{.data.user-hmac-key}' | base64 -d); \
+			EXISTING_USER_HMAC_KEY_ID=$$(kubectl get secret darkplum-user-hmac -n darkplum-system \
+				-o jsonpath='{.data.user-hmac-key-id}' | base64 -d); \
+		elif echo "$$ERR" | grep -q "NotFound"; then \
+			EXISTING_USER_HMAC_KEY=""; EXISTING_USER_HMAC_KEY_ID=""; \
+		else \
+			echo "ERROR: could not check for the darkplum-user-hmac secret (not a NotFound): $$ERR" >&2; \
+			echo "Refusing to generate a new user-pseudonym key. Fix kubectl access and re-run." >&2; \
+			exit 1; \
+		fi; \
+		USER_HMAC_KEY=$${USER_HMAC_KEY:-$${EXISTING_USER_HMAC_KEY:-$$(openssl rand -base64 48)}}; \
+		USER_HMAC_KEY_ID=$${USER_HMAC_KEY_ID:-$${EXISTING_USER_HMAC_KEY_ID:-k1}}; \
+		kubectl create secret generic darkplum-user-hmac \
+			--namespace=darkplum-system \
+			--from-literal=user-hmac-key="$$USER_HMAC_KEY" \
+			--from-literal=user-hmac-key-id="$$USER_HMAC_KEY_ID" \
+			--dry-run=client -o yaml | kubectl apply -f -
 	@# The api owns the schema: it must migrate before the gateway rolls, because
 	@# the gateway fails closed (503 policy_unavailable) until it can load routing
 	@# policy from tables the api creates.

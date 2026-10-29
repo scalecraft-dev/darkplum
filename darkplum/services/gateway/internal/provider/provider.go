@@ -66,6 +66,49 @@ type ChatRequest struct {
 	// ends the stream with OpenAI's separate usage chunk (choices: []). When
 	// false a stream keeps usage on the finish_reason chunk, as before.
 	IncludeUsage bool
+
+	// The fields below are set by the handler only for a request the resolved
+	// backend can honour them on (see ParamCaps), and only when the caller
+	// sent a non-default value; a provider forwards what it is given.
+
+	// Seed is the OpenAI `seed`.
+	Seed *int64
+	// FrequencyPenalty and PresencePenalty are non-zero values only.
+	FrequencyPenalty *float64
+	PresencePenalty  *float64
+	// Logprobs is logprobs:true; TopLogprobs is the caller's top_logprobs
+	// (only meaningful with Logprobs). The provider returns the logprobs in
+	// ChatResponse.Logprobs / on the stream chunks, in OpenAI's shape.
+	Logprobs    bool
+	TopLogprobs *int
+	// LogitBias is a non-empty logit_bias (token id -> bias).
+	LogitBias map[string]float64
+	// ParallelToolCalls is non-nil only for parallel_tool_calls:false on a
+	// request that carries tools.
+	ParallelToolCalls *bool
+	// NoStore is store:false (store:true is refused by the handler).
+	NoStore bool
+	// User is the `user` value in the form this backend is to receive it:
+	// raw, or already pseudonymised, per ParamCaps().UserID. Empty means
+	// send nothing.
+	User string
+	// VLLM carries the vLLM sampling extensions; only the openaicompat
+	// provider reads it.
+	VLLM VLLMExtensions
+}
+
+// VLLMExtensions are request fields outside the OpenAI schema that vLLM's
+// OpenAI-compatible server accepts. Forwarded by the openaicompat provider
+// only; every other backend ignores them, as it always has.
+type VLLMExtensions struct {
+	TopK              *int
+	MinP              *float64
+	RepetitionPenalty *float64
+	// GuidedJSON is the JSON schema (or schema string) for guided decoding,
+	// relayed as sent.
+	GuidedJSON json.RawMessage
+	// ChatTemplateKwargs is a JSON object handed to the chat template.
+	ChatTemplateKwargs json.RawMessage
 }
 
 // Message is a single turn in a conversation. Content can be a plain string
@@ -161,6 +204,10 @@ type ChatResponse struct {
 	// ToolCalls is what the model asked the caller to run; FinishReason is
 	// "tool_calls" when non-empty.
 	ToolCalls []ToolCall
+	// Logprobs is the choice's logprobs object ({"content":[...],
+	// "refusal":...}) relayed as the backend sent it; nil when the caller
+	// did not ask for logprobs or the backend sent none.
+	Logprobs json.RawMessage
 }
 
 // StreamStats holds the token-count and finish metadata extracted from the
@@ -194,10 +241,11 @@ type openAICompletion struct {
 }
 
 type completionChoice struct {
-	Index        int            `json:"index"`
-	Message      *choiceMessage `json:"message,omitempty"`
-	Delta        *choiceDelta   `json:"delta,omitempty"`
-	FinishReason *string        `json:"finish_reason"`
+	Index        int             `json:"index"`
+	Message      *choiceMessage  `json:"message,omitempty"`
+	Delta        *choiceDelta    `json:"delta,omitempty"`
+	Logprobs     json.RawMessage `json:"logprobs,omitempty"`
+	FinishReason *string         `json:"finish_reason"`
 }
 
 type choiceMessage struct {
@@ -238,6 +286,7 @@ func BuildCompletionJSON(resp *ChatResponse) ([]byte, error) {
 					Content:   completionContent(resp),
 					ToolCalls: resp.ToolCalls,
 				},
+				Logprobs:     NormalizeLogprobs(resp.Logprobs),
 				FinishReason: &finishReason,
 			},
 		},
@@ -266,6 +315,12 @@ func completionContent(resp *ChatResponse) *string {
 // concatenates string fields across deltas, and OpenAI itself sends the role
 // only on a stream's first chunk.
 func BuildToolCallDeltaSSE(id, model string, delta ToolCallDelta) ([]byte, error) {
+	return BuildToolCallDeltaLogprobsSSE(id, model, delta, nil)
+}
+
+// BuildToolCallDeltaLogprobsSSE is BuildToolCallDeltaSSE for a chunk that also
+// carries the choice's logprobs.
+func BuildToolCallDeltaLogprobsSSE(id, model string, delta ToolCallDelta, logprobs json.RawMessage) ([]byte, error) {
 	noReason := (*string)(nil)
 	chunk := openAICompletion{
 		ID:      id,
@@ -276,6 +331,44 @@ func BuildToolCallDeltaSSE(id, model string, delta ToolCallDelta) ([]byte, error
 			{
 				Index:        0,
 				Delta:        &choiceDelta{ToolCalls: []ToolCallDelta{delta}},
+				Logprobs:     NormalizeLogprobs(logprobs),
+				FinishReason: noReason,
+			},
+		},
+	}
+	data, err := json.Marshal(chunk)
+	if err != nil {
+		return nil, err
+	}
+	return fmt.Appendf(nil, "data: %s\n\n", data), nil
+}
+
+// NormalizeLogprobs returns raw, or nil when it is absent or the JSON null a
+// backend sends for "no logprobs on this choice", so the field is omitted
+// rather than relayed as an empty object.
+func NormalizeLogprobs(raw json.RawMessage) json.RawMessage {
+	t := strings.TrimSpace(string(raw))
+	if t == "" || t == "null" {
+		return nil
+	}
+	return raw
+}
+
+// BuildStreamingChunkLogprobsSSE is BuildStreamingChunkSSE for a delta that
+// also carries the choice's logprobs (OpenAI places them beside delta, on the
+// choice). With empty logprobs it is identical to BuildStreamingChunkSSE.
+func BuildStreamingChunkLogprobsSSE(id, model, contentDelta string, logprobs json.RawMessage) ([]byte, error) {
+	noReason := (*string)(nil)
+	chunk := openAICompletion{
+		ID:      id,
+		Object:  "chat.completion.chunk",
+		Created: time.Now().Unix(),
+		Model:   model,
+		Choices: []completionChoice{
+			{
+				Index:        0,
+				Delta:        &choiceDelta{Role: "assistant", Content: contentDelta},
+				Logprobs:     NormalizeLogprobs(logprobs),
 				FinishReason: noReason,
 			},
 		},

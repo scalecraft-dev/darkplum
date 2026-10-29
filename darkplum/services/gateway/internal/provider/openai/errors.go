@@ -89,6 +89,15 @@ func translateVendorErrorBody(statusCode int, header http.Header, status authFai
 var rejectableParams = map[string]bool{
 	"response_format":       true,
 	"max_completion_tokens": true,
+	"seed":                  true,
+	"frequency_penalty":     true,
+	"presence_penalty":      true,
+	"logprobs":              true,
+	"top_logprobs":          true,
+	"logit_bias":            true,
+	"parallel_tool_calls":   true,
+	"store":                 true,
+	"user":                  true,
 }
 
 // translateVendor400 is translateVendorErrorBody for a 400, additionally

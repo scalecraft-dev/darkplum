@@ -397,7 +397,7 @@ func max(a, b int) int {
 // ---------------------------------------------------------------------------
 
 func TestParamCaps_Bedrock(t *testing.T) {
-	want := provider.ParamCaps{Stop: true, ForcedToolChoice: true}
+	want := provider.ParamCaps{Stop: true, ForcedToolChoice: true, UserID: provider.UserIDHMAC}
 	if got := (&BedrockProvider{}).ParamCaps(); got != want {
 		t.Errorf("ParamCaps = %+v, want %+v", got, want)
 	}

@@ -420,6 +420,12 @@ func buildParams(req provider.ChatRequest, norm normalizedRequest, maxTokens int
 		params.System = []sdk.TextBlockParam{{Text: norm.System}}
 	}
 	params.Tools, params.ToolChoice = toSDKTools(req)
+	// req.User is already the org-keyed HMAC pseudonym (ParamCaps().UserID is
+	// UserIDHMAC), never the caller's raw value; empty when no secret is
+	// installed, in which case nothing is sent.
+	if req.User != "" {
+		params.Metadata = sdk.MetadataParam{UserID: sdk.String(req.User)}
+	}
 	if len(req.Stop) > 0 {
 		params.StopSequences = req.Stop
 	}
@@ -473,11 +479,14 @@ const emptyToolResultText = "(empty result)"
 func (p *Provider) SupportsTools() bool { return true }
 
 // ParamCaps implements provider.ParamCapable. The Messages API has no JSON
-// mode, logprobs or logit_bias. tool_choice any/tool is enforced natively;
-// disable_parallel_tool_use exists but is not wired yet, so parallel_tool_calls
-// :false is refused rather than dropped.
+// mode, logprobs or logit_bias. tool_choice any/tool is enforced natively, and
+// parallel_tool_calls:false is translated to disable_parallel_tool_use on the
+// tool_choice. `user` becomes metadata.user_id as an HMAC pseudonym.
 func (p *Provider) ParamCaps() provider.ParamCaps {
-	return provider.ParamCaps{Stop: true, ForcedToolChoice: true}
+	return provider.ParamCaps{
+		Stop: true, ForcedToolChoice: true, SerialToolCalls: true,
+		UserID: provider.UserIDHMAC,
+	}
 }
 
 // toSDKTools translates the request's tools and tool_choice. tool_choice
@@ -499,6 +508,22 @@ func toSDKTools(req provider.ChatRequest) ([]sdk.ToolUnionParam, sdk.ToolChoiceU
 		choice = sdk.ToolChoiceUnionParam{OfAny: &sdk.ToolChoiceAnyParam{}}
 	case "function":
 		choice = sdk.ToolChoiceUnionParam{OfTool: &sdk.ToolChoiceToolParam{Name: name}}
+	}
+
+	// parallel_tool_calls:false -> disable_parallel_tool_use:true on whatever
+	// tool_choice applies. Absent tool_choice is auto, which is where the
+	// flag has to live. "none" calls no tool at all, so there is nothing to
+	// serialise and the flag is a no-op there.
+	if req.ParallelToolCalls != nil && !*req.ParallelToolCalls {
+		disable := sdk.Bool(true)
+		switch kind {
+		case "", "auto":
+			choice = sdk.ToolChoiceUnionParam{OfAuto: &sdk.ToolChoiceAutoParam{DisableParallelToolUse: disable}}
+		case "required":
+			choice = sdk.ToolChoiceUnionParam{OfAny: &sdk.ToolChoiceAnyParam{DisableParallelToolUse: disable}}
+		case "function":
+			choice = sdk.ToolChoiceUnionParam{OfTool: &sdk.ToolChoiceToolParam{Name: name, DisableParallelToolUse: disable}}
+		}
 	}
 
 	tools := make([]sdk.ToolUnionParam, 0, len(req.Tools))
