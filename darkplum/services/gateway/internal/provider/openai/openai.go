@@ -172,6 +172,9 @@ func buildRequestBody(req provider.ChatRequest, stream bool, drop droppedParams)
 	if len(req.Stop) > 0 && !drop.stop {
 		body.Stop = req.Stop
 	}
+	if req.JSONMode {
+		body.ResponseFormat = &responseFormat{Type: "json_object"}
+	}
 	if stream {
 		body.Stream = true
 		body.StreamOptions = &streamOptions{IncludeUsage: true}
@@ -243,6 +246,9 @@ func (p *Provider) Complete(ctx context.Context, req provider.ChatRequest) (*pro
 		// retried again.
 	}
 
+	if statusCode == http.StatusBadRequest {
+		return nil, translateVendor400(header, p.cfg.Status, respBody)
+	}
 	if statusCode != http.StatusOK {
 		return nil, translateVendorError(statusCode, header, p.cfg.Status)
 	}
@@ -302,5 +308,12 @@ func toChatResponse(cr *chatCompletionResponse) (*provider.ChatResponse, error) 
 
 // SupportsTools makes this a tool-capable backend (provider.ToolCapable).
 func (p *Provider) SupportsTools() bool { return true }
+
+// ParamCaps implements provider.ParamCapable. json_object, stop and forced
+// tool_choice are forwarded; logprobs, logit_bias and parallel_tool_calls are
+// not put on the wire yet, so a non-default value is refused by the handler.
+func (p *Provider) ParamCaps() provider.ParamCaps {
+	return provider.ParamCaps{JSONMode: true, Stop: true, ForcedToolChoice: true}
+}
 
 var _ provider.Provider = (*Provider)(nil)

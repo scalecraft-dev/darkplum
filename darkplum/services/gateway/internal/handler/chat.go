@@ -71,11 +71,12 @@ func (s *stopField) UnmarshalJSON(data []byte) error {
 }
 
 // responseFormatField is the subset of the OpenAI `response_format` object
-// the gateway inspects: only Type matters, to detect the structured-output
-// shape ("json_schema") request-shape honesty refuses on every route (see
-// unsupportedRequestParam). "json_object" (plain JSON mode, no schema) is
-// left alone — a backend that ignores it silently degrades to prose, which
-// is the same pre-existing behaviour every other inert field gets.
+// the gateway inspects: only Type matters. "json_schema" (structured output)
+// is refused on every route (see unsupportedRequestParam); "json_object" is
+// forwarded to a backend that has a JSON mode and refused after route
+// resolution for one that does not (see backendParamRefusal), because a
+// backend that ignored it would answer in prose to a caller that parses JSON;
+// "text" is the default and accepted everywhere.
 type responseFormatField struct {
 	Type string `json:"type"`
 }
@@ -115,13 +116,16 @@ func invalidMessages(msgs []provider.Message) string {
 }
 
 type chatCompletionRequest struct {
-	Model       string             `json:"model"`
-	Messages    []provider.Message `json:"messages"`
-	Stream      bool               `json:"stream"`
-	MaxTokens   int                `json:"max_tokens,omitempty"`
-	Temperature *float64           `json:"temperature,omitempty"`
-	TopP        *float64           `json:"top_p,omitempty"`
-	Stop        stopField          `json:"stop,omitempty"`
+	Model     string             `json:"model"`
+	Messages  []provider.Message `json:"messages"`
+	Stream    bool               `json:"stream"`
+	MaxTokens int                `json:"max_tokens,omitempty"`
+	// MaxCompletionTokens is the newer name for MaxTokens (the only one
+	// OpenAI's reasoning models accept); see effectiveMaxTokens.
+	MaxCompletionTokens int       `json:"max_completion_tokens,omitempty"`
+	Temperature         *float64  `json:"temperature,omitempty"`
+	TopP                *float64  `json:"top_p,omitempty"`
+	Stop                stopField `json:"stop,omitempty"`
 
 	// Tools and ToolChoice are client-executed tool calling (see
 	// provider/tools.go): validated by provider.ValidateTools, forwarded only
@@ -130,9 +134,24 @@ type chatCompletionRequest struct {
 	Tools      []provider.Tool `json:"tools,omitempty"`
 	ToolChoice json.RawMessage `json:"tool_choice,omitempty"`
 
-	// The fields below are inspected ONLY to produce an honest 400
+	// StreamOptions is present (non-null) only when the caller sent
+	// stream_options; it is a 400 without stream:true, like OpenAI.
+	StreamOptions *streamOptionsField `json:"stream_options,omitempty"`
+
+	// N, Logprobs, LogitBias and ParallelToolCalls are inspected ONLY to
+	// refuse, after route resolution, a value the resolved backend cannot
+	// honour (see backendParamRefusal) — never forwarded. Their defaults
+	// (n:1, logprobs:false, empty logit_bias, parallel_tool_calls:true) and
+	// null are accepted silently on every backend.
+	N                 *float64       `json:"n,omitempty"`
+	Logprobs          *bool          `json:"logprobs,omitempty"`
+	LogitBias         map[string]any `json:"logit_bias,omitempty"`
+	ParallelToolCalls *bool          `json:"parallel_tool_calls,omitempty"`
+
+	// Functions and FunctionCall are inspected ONLY to produce an honest 400
 	// unsupported_parameter (see unsupportedRequestParam) — never forwarded
-	// to any provider.
+	// to any provider. ResponseFormat likewise for json_schema; its
+	// json_object is forwarded as provider.ChatRequest.JSONMode.
 	Functions      []json.RawMessage    `json:"functions,omitempty"`
 	FunctionCall   json.RawMessage      `json:"function_call,omitempty"`
 	ResponseFormat *responseFormatField `json:"response_format,omitempty"`
@@ -153,8 +172,9 @@ type chatCompletionRequest struct {
 // HandleChatCompletions. functions is refused only when non-empty;
 // function_call only when set to something other than "none" — an SDK
 // that always includes an empty/off default must not be penalised for it.
-// Inert fields (user, n, seed, logit_bias, metadata, top_p, stop, ...) are
-// deliberately not inspected here.
+// Inert fields (user, seed, metadata, ...) are deliberately not inspected
+// here; n, logprobs, logit_bias and parallel_tool_calls are per backend and
+// refused after route resolution (backendParamRefusal).
 func unsupportedRequestParam(req chatCompletionRequest) string {
 	if len(req.Functions) > 0 {
 		return "functions"
@@ -171,6 +191,65 @@ func unsupportedRequestParam(req chatCompletionRequest) string {
 		}
 	}
 	return ""
+}
+
+// streamOptionsField is the subset of OpenAI's stream_options the gateway
+// honours. Unknown keys (include_obfuscation, ...) are ignored.
+type streamOptionsField struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
+// effectiveMaxTokens folds max_tokens and max_completion_tokens (the same
+// limit under two names) into the one value providers take. Both set and
+// different is ambiguous and refused (param names max_completion_tokens);
+// 0 means unset, as it always has for max_tokens.
+func effectiveMaxTokens(req chatCompletionRequest) (tokens int, conflict bool) {
+	if req.MaxTokens > 0 && req.MaxCompletionTokens > 0 && req.MaxTokens != req.MaxCompletionTokens {
+		return 0, true
+	}
+	if req.MaxCompletionTokens > 0 {
+		return req.MaxCompletionTokens, false
+	}
+	return req.MaxTokens, false
+}
+
+// backendParamRefusal returns the request field the resolved backend cannot
+// honour, with the reason, or "" when every parameter the caller sent is
+// either supported or at its default. It is a contract refusal: the same
+// 400 unsupported_parameter in every mode, because dropping the field would
+// hand the caller a wrong answer (prose for JSON mode, three choices
+// collapsed to one, a forced tool call that was not forced).
+//
+// Defaults pass silently on every backend (n:1, logprobs:false, empty
+// logit_bias, parallel_tool_calls:true, response_format text, and null for
+// any of them). Order is fixed so a request with several problems always
+// reports the same one.
+func backendParamRefusal(req chatCompletionRequest, caps provider.ParamCaps) (param, reason string) {
+	if req.N != nil && *req.N > 1 {
+		return "n", "only one choice per request is supported"
+	}
+	if req.ResponseFormat != nil && req.ResponseFormat.Type == "json_object" && !caps.JSONMode {
+		return "response_format", "this backend has no JSON mode"
+	}
+	if len(req.Stop) > 0 && !caps.Stop {
+		return "stop", "this backend cannot enforce stop sequences"
+	}
+	if req.Logprobs != nil && *req.Logprobs && !caps.Logprobs {
+		return "logprobs", "this backend does not return logprobs"
+	}
+	if len(req.LogitBias) > 0 && !caps.LogitBias {
+		return "logit_bias", "this backend does not apply logit_bias"
+	}
+	if len(req.Tools) > 0 {
+		kind, _, _ := provider.ToolChoiceKind(req.ToolChoice)
+		if (kind == "required" || kind == "function") && !caps.ForcedToolChoice {
+			return "tool_choice", "this backend cannot enforce a required or named tool call"
+		}
+		if req.ParallelToolCalls != nil && !*req.ParallelToolCalls && !caps.SerialToolCalls {
+			return "parallel_tool_calls", "this backend cannot restrict a turn to a single tool call"
+		}
+	}
+	return "", ""
 }
 
 // wantsTools reports whether the request involves tool calling at all: a
@@ -249,8 +328,10 @@ type providerStatusSource interface {
 //     content block are refused before route resolution, on EVERY route,
 //     since no backend implements any of them (see unsupportedRequestParam);
 //     a malformed tools/tool_choice/tool turn is refused 400 invalid_tools
-//     (provider.ValidateTools). Whether the backend supports tools at all is
-//     checked in step 9.
+//     (provider.ValidateTools). stream_options without stream:true and
+//     max_tokens/max_completion_tokens set to different values are refused
+//     here too. Whether the backend supports tools at all is checked in
+//     step 9.
 //  3. policy snapshot must be loaded, else fail closed (503 policy_unavailable)
 //  4. alias resolve (admin intent wins over a same-named discovered model; no
 //     chains). A routed alias additionally classifies the request here (step
@@ -267,7 +348,11 @@ type providerStatusSource interface {
 //     principal's effective allowlist
 //  9. tool capability (400 unsupported_parameter, param tools) when the
 //     request carries tools and the resolved backend is not
-//     provider.ToolCapable; then dispatch
+//     provider.ToolCapable; then the per-backend parameter contract
+//     (400 unsupported_parameter naming n>1, response_format json_object,
+//     stop, logprobs, logit_bias, forced tool_choice or parallel_tool_calls
+//     :false the backend cannot honour — see backendParamRefusal); then
+//     dispatch
 //
 // Steps 5-8 run unchanged regardless of how the target was resolved: a route
 // a routed alias's classifier picked goes through exactly the same
@@ -822,6 +907,38 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 		return
 	}
 
+	// stream_options is only valid on a stream; OpenAI refuses it otherwise
+	// and so do we, rather than accept a request whose usage chunk could
+	// never be delivered. max_tokens and max_completion_tokens are one limit
+	// under two names: both set and different cannot be honoured.
+	if req.StreamOptions != nil && !req.Stream {
+		c.Set("denial_code", "invalid_request")
+		logDenial(c, "invalid_request", req.Model, "", "")
+		c.JSON(http.StatusBadRequest, openAIError{
+			Error: openAIErrorBody{
+				Message: "stream_options is only allowed when stream is true",
+				Type:    "invalid_request_error",
+				Code:    "invalid_stream_options",
+				Param:   "stream_options",
+			},
+		})
+		return
+	}
+	maxTokens, maxTokensConflict := effectiveMaxTokens(req)
+	if maxTokensConflict {
+		c.Set("denial_code", "unsupported_parameter")
+		logDenial(c, "unsupported_parameter", req.Model, "", "")
+		c.JSON(http.StatusBadRequest, openAIError{
+			Error: openAIErrorBody{
+				Message: `parameters "max_tokens" and "max_completion_tokens" are the same limit and were sent with different values; send one`,
+				Type:    "invalid_request_error",
+				Code:    "unsupported_parameter",
+				Param:   "max_completion_tokens",
+			},
+		})
+		return
+	}
+
 	// Tool shape: a malformed tools array, tool_choice, or an unpaired
 	// tool turn is refused here with the field named, before any backend
 	// gets to reject it in its own words. Whether the resolved backend
@@ -1062,6 +1179,24 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 		return
 	}
 
+	// The rest of the parameters a backend may not be able to honour
+	// (n>1, JSON mode, logprobs, logit_bias, stop, forced tool_choice,
+	// serial tool calls) are refused the same way, here, before any
+	// provider call and in every mode.
+	if param, reason := backendParamRefusal(req, provider.CapsOf(prov)); param != "" {
+		c.Set("denial_code", "unsupported_parameter")
+		logDenial(c, "unsupported_parameter", req.Model, resolvedModel, route.Class)
+		c.JSON(http.StatusBadRequest, openAIError{
+			Error: openAIErrorBody{
+				Message: fmt.Sprintf("parameter %q is not supported by the backend serving model %q (%s): %s", param, resolvedModel, route.Kind, reason),
+				Type:    "invalid_request_error",
+				Code:    "unsupported_parameter",
+				Param:   param,
+			},
+		})
+		return
+	}
+
 	// Write provider KIND to Gin context for the Recording middleware.
 	// Using Kind() when available ensures audit records store "vllm"/"lmstudio"
 	// rather than instance names like "vllm-default", which would fragment
@@ -1085,13 +1220,15 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 	c.Set("provider_region", providerRegion)
 
 	chatReq := provider.ChatRequest{
-		Model:       resolvedModel,
-		Messages:    req.Messages,
-		Stream:      req.Stream,
-		MaxTokens:   req.MaxTokens,
-		Temperature: req.Temperature,
-		TopP:        req.TopP,
-		Stop:        []string(req.Stop),
+		Model:        resolvedModel,
+		Messages:     req.Messages,
+		Stream:       req.Stream,
+		MaxTokens:    maxTokens,
+		Temperature:  req.Temperature,
+		TopP:         req.TopP,
+		Stop:         []string(req.Stop),
+		JSONMode:     req.ResponseFormat != nil && req.ResponseFormat.Type == "json_object",
+		IncludeUsage: req.Stream && req.StreamOptions != nil && req.StreamOptions.IncludeUsage,
 	}
 	if wantsTools(req) {
 		chatReq.Tools = req.Tools

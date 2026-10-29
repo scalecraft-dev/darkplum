@@ -391,3 +391,87 @@ func max(a, b int) int {
 	}
 	return b
 }
+
+// ---------------------------------------------------------------------------
+// Phase A1 parameter honesty: max_tokens wire field, include_usage shape.
+// ---------------------------------------------------------------------------
+
+func TestParamCaps_Bedrock(t *testing.T) {
+	want := provider.ParamCaps{Stop: true, ForcedToolChoice: true}
+	if got := (&BedrockProvider{}).ParamCaps(); got != want {
+		t.Errorf("ParamCaps = %+v, want %+v", got, want)
+	}
+}
+
+// max_completion_tokens reaches Converse as inferenceConfig.maxTokens.
+func TestComplete_MaxTokensReachesInferenceConfig(t *testing.T) {
+	fake := &fakeConverseAPI{converseOut: &bedrockruntime.ConverseOutput{
+		Output:     &types.ConverseOutputMemberMessage{Value: types.Message{Role: types.ConversationRoleAssistant, Content: []types.ContentBlock{&types.ContentBlockMemberText{Value: "ok"}}}},
+		StopReason: types.StopReasonEndTurn,
+	}}
+	p := newProviderWithFake(fake)
+	if _, err := p.Complete(context.Background(), provider.ChatRequest{
+		Model: "model", MaxTokens: 222, Messages: []provider.Message{{Role: "user", Content: "hi"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got := fake.lastConverseInput.InferenceConfig.MaxTokens; got == nil || *got != 222 {
+		t.Errorf("inferenceConfig.maxTokens = %v, want 222", got)
+	}
+}
+
+func bedrockUsageEvents() []types.ConverseStreamOutput {
+	input, output := int32(7), int32(4)
+	return []types.ConverseStreamOutput{
+		&types.ConverseStreamOutputMemberContentBlockDelta{Value: types.ContentBlockDeltaEvent{Delta: &types.ContentBlockDeltaMemberText{Value: "Hi"}}},
+		&types.ConverseStreamOutputMemberMessageStop{Value: types.MessageStopEvent{StopReason: types.StopReasonEndTurn}},
+		// Converse reports usage only here, AFTER MessageStop.
+		&types.ConverseStreamOutputMemberMetadata{Value: types.ConverseStreamMetadataEvent{Usage: &types.TokenUsage{InputTokens: &input, OutputTokens: &output}}},
+	}
+}
+
+func TestStream_IncludeUsageWritesUsageChunkAfterMetadata(t *testing.T) {
+	fake := &fakeConverseAPI{stream: newFakeStream(bedrockUsageEvents(), nil)}
+	p := newProviderWithFake(fake)
+	var buf bytes.Buffer
+	_, err := p.Stream(context.Background(), provider.ChatRequest{
+		Model: "model", IncludeUsage: true, Messages: []provider.Message{{Role: "user", Content: "hi"}},
+	}, &buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frames := extractDataPayloads(t, buf.String())
+	if len(frames) != 3 {
+		t.Fatalf("frames = %d, want 3 (content, finish, usage): %v", len(frames), frames)
+	}
+	if !strings.Contains(frames[1], `"finish_reason":"stop"`) || !strings.Contains(frames[1], `"usage":null`) {
+		t.Errorf("finish frame = %s, want finish_reason stop and usage null", frames[1])
+	}
+	if !strings.Contains(frames[2], `"choices":[]`) || !strings.Contains(frames[2], `"prompt_tokens":7`) ||
+		!strings.Contains(frames[2], `"completion_tokens":4`) || !strings.Contains(frames[2], `"total_tokens":11`) {
+		t.Errorf("usage frame = %s, want choices [] and 7/4/11", frames[2])
+	}
+	if !strings.HasSuffix(buf.String(), provider.StreamDoneSSE) {
+		t.Error("stream must end with [DONE]")
+	}
+}
+
+// Without include_usage the stream keeps its historical shape: two frames,
+// no usage-only chunk.
+func TestStream_NoIncludeUsageHasNoUsageChunk(t *testing.T) {
+	fake := &fakeConverseAPI{stream: newFakeStream(bedrockUsageEvents(), nil)}
+	p := newProviderWithFake(fake)
+	var buf bytes.Buffer
+	if _, err := p.Stream(context.Background(), provider.ChatRequest{
+		Model: "model", Messages: []provider.Message{{Role: "user", Content: "hi"}},
+	}, &buf); err != nil {
+		t.Fatal(err)
+	}
+	frames := extractDataPayloads(t, buf.String())
+	if len(frames) != 2 {
+		t.Fatalf("frames = %d, want 2: %v", len(frames), frames)
+	}
+	if strings.Contains(buf.String(), `"choices":[]`) {
+		t.Error("no usage-only chunk expected when include_usage was not asked for")
+	}
+}

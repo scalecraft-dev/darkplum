@@ -41,6 +41,14 @@ type fakeKindProvider struct {
 	streamCalls   int
 }
 
+// vllmCaps is the ParamCaps the shared fakes report unless a test overrides
+// them: what openaicompat reports for a vLLM upstream. The per-backend
+// truth lives in each provider's own ParamCaps (pinned in its package) and
+// is exercised end to end in chat_params_test.go.
+var vllmCaps = provider.ParamCaps{JSONMode: true, Stop: true, ForcedToolChoice: true}
+
+func (p *fakeKindProvider) ParamCaps() provider.ParamCaps { return vllmCaps }
+
 func (p *fakeKindProvider) Name() string { return p.name }
 func (p *fakeKindProvider) Kind() string { return p.kind }
 

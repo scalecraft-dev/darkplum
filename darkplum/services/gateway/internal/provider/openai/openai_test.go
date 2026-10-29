@@ -1213,3 +1213,191 @@ func waitForGoroutineSettle(baseline int) int {
 	}
 	return last
 }
+
+// ---------------------------------------------------------------------------
+// Phase A1 parameter honesty: json_object, max_completion_tokens,
+// stream_options.include_usage, and the retry never touching new fields.
+// ---------------------------------------------------------------------------
+
+func TestParamCaps_OpenAI(t *testing.T) {
+	want := provider.ParamCaps{JSONMode: true, Stop: true, ForcedToolChoice: true}
+	if got := New(&fakeCreds{key: "k"}, Config{}).ParamCaps(); got != want {
+		t.Errorf("ParamCaps = %+v, want %+v", got, want)
+	}
+}
+
+func TestBuildRequestBody_JSONModeAndMaxCompletionTokens(t *testing.T) {
+	req := basicRequest("gpt-5")
+	req.JSONMode = true
+	req.MaxTokens = 321
+	b, err := buildRequestBody(req, false, droppedParams{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	_ = json.Unmarshal(b, &body)
+	if rf, _ := body["response_format"].(map[string]any); rf["type"] != "json_object" {
+		t.Errorf("response_format = %v, want {type:json_object}", body["response_format"])
+	}
+	if body["max_completion_tokens"] != float64(321) {
+		t.Errorf("max_completion_tokens = %v, want 321", body["max_completion_tokens"])
+	}
+	if _, has := body["max_tokens"]; has {
+		t.Error("max_tokens must never be sent")
+	}
+
+	// Absent when not asked for.
+	b, _ = buildRequestBody(basicRequest("gpt-5"), false, droppedParams{})
+	body = nil
+	_ = json.Unmarshal(b, &body)
+	if _, has := body["response_format"]; has {
+		t.Error("response_format must be omitted unless json_object was requested")
+	}
+}
+
+// Even with every droppable sampling parameter dropped, the new fields stay.
+func TestBuildRequestBody_DropNeverRemovesJSONModeOrMaxTokens(t *testing.T) {
+	req := basicRequest("gpt-5")
+	req.JSONMode = true
+	req.MaxTokens = 50
+	b, _ := buildRequestBody(req, true, droppedParams{temperature: true, topP: true, stop: true})
+	var body map[string]any
+	_ = json.Unmarshal(b, &body)
+	if body["response_format"] == nil || body["max_completion_tokens"] == nil {
+		t.Errorf("drop removed a non-sampling field: %v", body)
+	}
+}
+
+// A vendor 400 that names response_format (or max_completion_tokens) is not
+// retried by dropping a sampling parameter, even when the message text
+// contains a word the retry heuristic matches, and the caller gets a clean
+// 400 naming the field, never the vendor's text.
+func TestComplete_400OnResponseFormatIsNotRetriedAndNamesTheField(t *testing.T) {
+	for _, param := range []string{"response_format", "max_completion_tokens"} {
+		t.Run(param, func(t *testing.T) {
+			srv := newFakeOpenAIServer(t)
+			srv.completionResponses = []func(w http.ResponseWriter, r *http.Request, body map[string]any){
+				func(w http.ResponseWriter, _ *http.Request, _ map[string]any) {
+					writeVendorError(w, http.StatusBadRequest, "invalid_request_error",
+						"'"+param+"' is not supported with this model; stop and use something else. acct org-123", param)
+				},
+			}
+			p := newTestProvider(t, srv, nil, Config{})
+			req := basicRequest("gpt-4")
+			req.JSONMode = true
+			req.Stop = []string{"END"}
+			_, err := p.Complete(context.Background(), req)
+			var apiErr *APIError
+			if !errors.As(err, &apiErr) || apiErr.HTTPStatus() != http.StatusBadRequest {
+				t.Fatalf("err = %v, want a 400 APIError", err)
+			}
+			if srv.callCount() != 1 {
+				t.Errorf("calls = %d, want 1 (no retry)", srv.callCount())
+			}
+			body := string(apiErr.ResponseBody())
+			if !strings.Contains(body, `"param":"`+param+`"`) || !strings.Contains(body, `"code":"invalid_request"`) {
+				t.Errorf("body = %s, want invalid_request naming %s", body, param)
+			}
+			if strings.Contains(body, "org-123") {
+				t.Errorf("vendor text leaked: %s", body)
+			}
+		})
+	}
+}
+
+func TestStream_400OnResponseFormatNamesTheField(t *testing.T) {
+	srv := newFakeOpenAIServer(t)
+	srv.completionResponses = []func(w http.ResponseWriter, r *http.Request, body map[string]any){
+		func(w http.ResponseWriter, _ *http.Request, _ map[string]any) {
+			writeVendorError(w, http.StatusBadRequest, "invalid_request_error", "nope", "response_format")
+		},
+	}
+	p := newTestProvider(t, srv, nil, Config{})
+	req := basicRequest("gpt-4")
+	req.JSONMode = true
+	var buf bytes.Buffer
+	_, err := p.Stream(context.Background(), req, &buf)
+	var apiErr *APIError
+	if !errors.As(err, &apiErr) || !strings.Contains(string(apiErr.ResponseBody()), `"param":"response_format"`) {
+		t.Fatalf("err = %v, want a 400 naming response_format", err)
+	}
+	if buf.Len() != 0 || srv.callCount() != 1 {
+		t.Errorf("wrote %d bytes, %d calls; want 0 and 1", buf.Len(), srv.callCount())
+	}
+}
+
+func TestDetectUnsupportedParam_IgnoresOtherFieldsEvenWithMatchingWords(t *testing.T) {
+	body := vendorErrorJSON("invalid_request_error", "stop is not supported here", "response_format")
+	if _, ok := detectUnsupportedParam(body, droppedParams{}); ok {
+		t.Error("a 400 attributed to response_format must not trigger a sampling-parameter retry")
+	}
+}
+
+// streamFrames returns the decoded data frames of an SSE body (without DONE).
+func streamFrames(t *testing.T, out string) []map[string]any {
+	t.Helper()
+	var frames []map[string]any
+	for _, line := range strings.Split(out, "\n") {
+		payload, ok := strings.CutPrefix(line, "data: ")
+		if !ok || payload == "[DONE]" {
+			continue
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(payload), &m); err != nil {
+			t.Fatalf("decode %q: %v", payload, err)
+		}
+		frames = append(frames, m)
+	}
+	return frames
+}
+
+func TestStream_IncludeUsageShape(t *testing.T) {
+	run := func(t *testing.T, includeUsage bool) []map[string]any {
+		srv := newFakeOpenAIServer(t)
+		srv.completionResponses = []func(w http.ResponseWriter, r *http.Request, body map[string]any){
+			func(w http.ResponseWriter, _ *http.Request, body map[string]any) {
+				// The upstream is always asked for usage (metering).
+				if so, _ := body["stream_options"].(map[string]any); so["include_usage"] != true {
+					t.Errorf("upstream stream_options = %v, want include_usage true", body["stream_options"])
+				}
+				sseCompletion(w, "chatcmpl_u", "gpt-5-mini", []string{"Hi"}, "stop", 8, 3)
+			},
+		}
+		p := newTestProvider(t, srv, nil, Config{})
+		req := basicRequest("gpt-5-mini")
+		req.IncludeUsage = includeUsage
+		var buf bytes.Buffer
+		if _, err := p.Stream(context.Background(), req, &buf); err != nil {
+			t.Fatal(err)
+		}
+		return streamFrames(t, buf.String())
+	}
+
+	t.Run("asked", func(t *testing.T) {
+		frames := run(t, true)
+		// content, finish (usage null), usage-only (choices []).
+		if len(frames) != 3 {
+			t.Fatalf("frames = %d, want 3: %v", len(frames), frames)
+		}
+		if frames[1]["usage"] != nil || frames[1]["choices"].([]any)[0].(map[string]any)["finish_reason"] != "stop" {
+			t.Errorf("finish frame = %v", frames[1])
+		}
+		last := frames[2]
+		if ch, ok := last["choices"].([]any); !ok || len(ch) != 0 {
+			t.Errorf("usage frame choices = %v, want []", last["choices"])
+		}
+		if u := last["usage"].(map[string]any); u["prompt_tokens"] != float64(8) || u["completion_tokens"] != float64(3) || u["total_tokens"] != float64(11) {
+			t.Errorf("usage = %v", u)
+		}
+	})
+
+	t.Run("not asked keeps usage on the finish chunk", func(t *testing.T) {
+		frames := run(t, false)
+		if len(frames) != 2 {
+			t.Fatalf("frames = %d, want 2 (content, finish+usage): %v", len(frames), frames)
+		}
+		if frames[1]["usage"].(map[string]any)["total_tokens"] != float64(11) {
+			t.Errorf("finish frame usage = %v", frames[1]["usage"])
+		}
+	})
+}

@@ -58,6 +58,14 @@ type ChatRequest struct {
 	// which is the closest it offers -- see each provider).
 	Tools      []Tool
 	ToolChoice json.RawMessage
+	// JSONMode is response_format {"type":"json_object"}. Only ever true for
+	// a provider whose ParamCaps().JSONMode is set; the handler refuses it
+	// for every other backend.
+	JSONMode bool
+	// IncludeUsage is stream_options.include_usage on a stream: the provider
+	// ends the stream with OpenAI's separate usage chunk (choices: []). When
+	// false a stream keeps usage on the finish_reason chunk, as before.
+	IncludeUsage bool
 }
 
 // Message is a single turn in a conversation. Content can be a plain string
@@ -336,6 +344,79 @@ func BuildFinalChunkSSE(id, model, finishReason string, stats *StreamStats) ([]b
 		},
 	}
 	data, err := json.Marshal(chunk)
+	if err != nil {
+		return nil, err
+	}
+	return fmt.Appendf(nil, "data: %s\n\n", data), nil
+}
+
+// BuildFinishChunkSSE builds the finish_reason chunk of a stream whose caller
+// asked for stream_options.include_usage: OpenAI's shape, with usage null on
+// it (the usage follows in its own chunk, see BuildUsageChunkSSE).
+func BuildFinishChunkSSE(id, model, finishReason string) ([]byte, error) {
+	fr := finishReason
+	return marshalChunk(usageChunk{
+		ID:      id,
+		Object:  "chat.completion.chunk",
+		Created: time.Now().Unix(),
+		Model:   model,
+		Choices: []completionChoice{{Index: 0, Delta: &choiceDelta{}, FinishReason: &fr}},
+	})
+}
+
+// BuildUsageChunkSSE builds the usage-only chunk stream_options.include_usage
+// adds after the finish_reason chunk: choices is an empty array and usage is
+// set, exactly what OpenAI's own SDK stream accumulators expect.
+func BuildUsageChunkSSE(id, model string, stats *StreamStats) ([]byte, error) {
+	return marshalChunk(usageChunk{
+		ID:      id,
+		Object:  "chat.completion.chunk",
+		Created: time.Now().Unix(),
+		Model:   model,
+		Choices: []completionChoice{},
+		Usage: &usageInfo{
+			PromptTokens:     stats.PromptTokens,
+			CompletionTokens: stats.CompletionTokens,
+			TotalTokens:      stats.PromptTokens + stats.CompletionTokens,
+		},
+	})
+}
+
+// BuildFinalChunksSSE is the stream's terminal chunk(s) for a provider that
+// knows its usage by the time it finishes. Without include_usage it is
+// BuildFinalChunkSSE unchanged (usage on the finish_reason chunk, which
+// callers that never asked for stream_options already receive and may rely
+// on); with it, the finish_reason chunk carries usage null and the usage
+// follows in its own choices: [] chunk.
+func BuildFinalChunksSSE(id, model, finishReason string, stats *StreamStats, includeUsage bool) ([]byte, error) {
+	if !includeUsage {
+		return BuildFinalChunkSSE(id, model, finishReason, stats)
+	}
+	finish, err := BuildFinishChunkSSE(id, model, finishReason)
+	if err != nil {
+		return nil, err
+	}
+	usage, err := BuildUsageChunkSSE(id, model, stats)
+	if err != nil {
+		return nil, err
+	}
+	return append(finish, usage...), nil
+}
+
+// usageChunk is a chat.completion.chunk whose usage is a pointer, so it
+// renders null (finish chunk) or an object (usage chunk) rather than the
+// always-present zero object openAICompletion carries.
+type usageChunk struct {
+	ID      string             `json:"id"`
+	Object  string             `json:"object"`
+	Created int64              `json:"created"`
+	Model   string             `json:"model"`
+	Choices []completionChoice `json:"choices"`
+	Usage   *usageInfo         `json:"usage"`
+}
+
+func marshalChunk(c usageChunk) ([]byte, error) {
+	data, err := json.Marshal(c)
 	if err != nil {
 		return nil, err
 	}

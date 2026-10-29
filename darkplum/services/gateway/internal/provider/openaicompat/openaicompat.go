@@ -152,6 +152,19 @@ type compatRequest struct {
 	Stop        []string            `json:"stop,omitempty"`
 	Tools       []provider.Tool     `json:"tools,omitempty"`
 	ToolChoice  json.RawMessage     `json:"tool_choice,omitempty"`
+	// ResponseFormat is sent only for json_object; StreamOptions only when
+	// the caller asked for stream_options.include_usage, so an upstream that
+	// would otherwise add a usage chunk to a stream nobody asked it of does not.
+	ResponseFormat *compatResponseFormat `json:"response_format,omitempty"`
+	StreamOptions  *compatStreamOptions  `json:"stream_options,omitempty"`
+}
+
+type compatResponseFormat struct {
+	Type string `json:"type"`
+}
+
+type compatStreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 type compatResponse struct {
@@ -348,7 +361,7 @@ func (p *OpenAICompatProvider) Stream(ctx context.Context, req provider.ChatRequ
 	// non-streaming.
 	contentType := strings.TrimSpace(resp.Header.Get("Content-Type"))
 	if !strings.HasPrefix(contentType, "text/event-stream") {
-		return p.adaptNonStreamingResponse(resp, w)
+		return p.adaptNonStreamingResponse(resp, w, req.IncludeUsage)
 	}
 
 	// Wrap the response body with an idle-timeout reader. If no bytes arrive
@@ -369,6 +382,9 @@ func (p *OpenAICompatProvider) Stream(ctx context.Context, req provider.ChatRequ
 		Model: req.Model,
 	}
 
+	completionID := ""
+	sawUsageChunk := false
+
 	scanner := bufio.NewScanner(trackedBody)
 	// Increase scanner buffer for large chunks (some models emit large deltas).
 	scanner.Buffer(make([]byte, 64*1024), 64*1024)
@@ -381,6 +397,24 @@ func (p *OpenAICompatProvider) Stream(ctx context.Context, req provider.ChatRequ
 		}
 
 		line := scanner.Text()
+
+		// An upstream that ignored stream_options.include_usage would leave
+		// the caller without the usage-only chunk it asked for; synthesize
+		// it just before the terminator, from whatever usage the upstream
+		// did report (zero counts when it reported none, as Bedrock does),
+		// so include_usage is never silently unanswered.
+		if req.IncludeUsage && !sawUsageChunk && line == "data: [DONE]" {
+			if completionID == "" {
+				completionID = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
+			}
+			usageChunk, err := provider.BuildUsageChunkSSE(completionID, stats.Model, stats)
+			if err != nil {
+				return nil, fmt.Errorf("openaicompat(%s): building usage chunk: %w", p.name, err)
+			}
+			if _, err := w.Write(usageChunk); err != nil {
+				return nil, fmt.Errorf("openaicompat(%s): writing usage chunk: %w", p.name, err)
+			}
+		}
 
 		// Write the line plus the newline that the scanner stripped.
 		if _, err := fmt.Fprintf(w, "%s\n", line); err != nil {
@@ -417,6 +451,12 @@ func (p *OpenAICompatProvider) Stream(ctx context.Context, req provider.ChatRequ
 
 		if chunk.Model != "" {
 			stats.Model = chunk.Model
+		}
+		if chunk.ID != "" {
+			completionID = chunk.ID
+		}
+		if len(chunk.Choices) == 0 && chunk.Usage != nil {
+			sawUsageChunk = true
 		}
 
 		if len(chunk.Choices) > 0 {
@@ -460,7 +500,7 @@ func (p *OpenAICompatProvider) Stream(ctx context.Context, req provider.ChatRequ
 // to w. Because decoding happens before anything is written to w, a decode
 // failure surfaces as a normal error and the caller can still serve a clean
 // JSON error response instead of a corrupted stream.
-func (p *OpenAICompatProvider) adaptNonStreamingResponse(resp *http.Response, w io.Writer) (*provider.StreamStats, error) {
+func (p *OpenAICompatProvider) adaptNonStreamingResponse(resp *http.Response, w io.Writer, includeUsage bool) (*provider.StreamStats, error) {
 	p.nonStreamWarnOnce.Do(func() {
 		slog.Warn("openaicompat: upstream does not support streaming, adapting JSON response to SSE",
 			"provider", p.name, "kind", p.kind, "content_type", resp.Header.Get("Content-Type"))
@@ -526,7 +566,7 @@ func (p *OpenAICompatProvider) adaptNonStreamingResponse(resp *http.Response, w 
 			frames = append(frames, frame)
 		}
 	}
-	finalChunk, err := provider.BuildFinalChunkSSE(cr.ID, cr.Model, finishReason, stats)
+	finalChunk, err := provider.BuildFinalChunksSSE(cr.ID, cr.Model, finishReason, stats, includeUsage)
 	if err != nil {
 		return nil, fmt.Errorf("openaicompat(%s): building synthesized final chunk: %w", p.name, err)
 	}
@@ -592,6 +632,12 @@ func (p *OpenAICompatProvider) buildRequestBody(req provider.ChatRequest, stream
 	if kind, _, _ := provider.ToolChoiceKind(req.ToolChoice); kind != "" {
 		cr.ToolChoice = req.ToolChoice
 	}
+	if req.JSONMode {
+		cr.ResponseFormat = &compatResponseFormat{Type: "json_object"}
+	}
+	if stream && req.IncludeUsage {
+		cr.StreamOptions = &compatStreamOptions{IncludeUsage: true}
+	}
 	b, err := json.Marshal(cr)
 	if err != nil {
 		return nil, fmt.Errorf("openaicompat(%s): marshalling request: %w", p.name, err)
@@ -626,6 +672,13 @@ func (p *OpenAICompatProvider) upstreamError(statusCode int, body []byte) error 
 
 // SupportsTools makes this a tool-capable backend (provider.ToolCapable).
 func (p *OpenAICompatProvider) SupportsTools() bool { return true }
+
+// ParamCaps implements provider.ParamCapable. vLLM takes json_object, stop and
+// tool_choice required/named; it ignores parallel_tool_calls:false, and
+// logprobs/logit_bias are not put on the wire yet, so those are refused.
+func (p *OpenAICompatProvider) ParamCaps() provider.ParamCaps {
+	return provider.ParamCaps{JSONMode: true, Stop: true, ForcedToolChoice: true}
+}
 
 // normalizeToolCalls defaults a missing type to "function" and drops nothing
 // else: ids, names and argument strings are relayed exactly as the upstream

@@ -196,7 +196,7 @@ func (p *BedrockProvider) Stream(ctx context.Context, req provider.ChatRequest, 
 	// process, not cryptographically random (which is fine for a correlation ID).
 	completionID := fmt.Sprintf("bedrock-%p", stats)
 
-	var toolState toolStreamState
+	toolState := toolStreamState{includeUsage: req.IncludeUsage}
 	var streamErr error
 loop:
 	for {
@@ -234,6 +234,16 @@ loop:
 	}
 	if streamErr != nil {
 		return stats, fmt.Errorf("bedrock: translate error: %w", streamErr)
+	}
+
+	if req.IncludeUsage {
+		usageChunk, err := provider.BuildUsageChunkSSE(completionID, req.Model, stats)
+		if err != nil {
+			return stats, fmt.Errorf("bedrock: build usage SSE chunk: %w", err)
+		}
+		if _, err := w.Write(usageChunk); err != nil {
+			return stats, fmt.Errorf("bedrock: write usage SSE chunk: %w", err)
+		}
 	}
 
 	if _, err := fmt.Fprint(w, provider.StreamDoneSSE); err != nil {
@@ -282,6 +292,13 @@ func isToolsUnsupportedValidation(code, message string) bool {
 
 // SupportsTools implements provider.ToolCapable.
 func (p *BedrockProvider) SupportsTools() bool { return true }
+
+// ParamCaps implements provider.ParamCapable. Converse has no JSON mode,
+// logprobs, logit_bias or parallel-tool-call switch; toolChoice any/tool is
+// enforced natively and stop sequences map to inferenceConfig.stopSequences.
+func (p *BedrockProvider) ParamCaps() provider.ParamCaps {
+	return provider.ParamCaps{Stop: true, ForcedToolChoice: true}
+}
 
 // wrapBedrockError converts a Bedrock SDK error into a BedrockAPIError that
 // carries the HTTP status code and OpenAI-compatible body, so the gateway HTTP

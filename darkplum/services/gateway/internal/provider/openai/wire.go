@@ -44,6 +44,13 @@ type chatRequest struct {
 	StreamOptions       *streamOptions  `json:"stream_options,omitempty"`
 	Tools               []provider.Tool `json:"tools,omitempty"`
 	ToolChoice          json.RawMessage `json:"tool_choice,omitempty"`
+	ResponseFormat      *responseFormat `json:"response_format,omitempty"`
+}
+
+// responseFormat is response_format on the wire; the gateway only ever sends
+// {"type":"json_object"} (text is the default and json_schema is refused).
+type responseFormat struct {
+	Type string `json:"type"`
 }
 
 type streamOptions struct {

@@ -387,7 +387,7 @@ func (p *Provider) Stream(ctx context.Context, req provider.ChatRequest, w io.Wr
 		FinishReason:        finishReason,
 	}
 
-	finalChunk, err := provider.BuildFinalChunkSSE(completionID, model, finishReason, stats)
+	finalChunk, err := provider.BuildFinalChunksSSE(completionID, model, finishReason, stats, req.IncludeUsage)
 	if err != nil {
 		return nil, fmt.Errorf("anthropic: building final chunk: %w", err)
 	}
@@ -471,6 +471,14 @@ const emptyToolResultText = "(empty result)"
 
 // SupportsTools implements provider.ToolCapable.
 func (p *Provider) SupportsTools() bool { return true }
+
+// ParamCaps implements provider.ParamCapable. The Messages API has no JSON
+// mode, logprobs or logit_bias. tool_choice any/tool is enforced natively;
+// disable_parallel_tool_use exists but is not wired yet, so parallel_tool_calls
+// :false is refused rather than dropped.
+func (p *Provider) ParamCaps() provider.ParamCaps {
+	return provider.ParamCaps{Stop: true, ForcedToolChoice: true}
+}
 
 // toSDKTools translates the request's tools and tool_choice. tool_choice
 // "none" still sends the tool definitions (a history carrying tool_use /

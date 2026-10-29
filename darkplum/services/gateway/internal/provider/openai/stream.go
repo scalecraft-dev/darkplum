@@ -57,7 +57,7 @@ func (p *Provider) Stream(ctx context.Context, req provider.ChatRequest, w io.Wr
 
 		retry, ok := detectUnsupportedParam(errBody, drop)
 		if !ok {
-			return nil, translateVendorError(http.StatusBadRequest, nil, p.cfg.Status)
+			return nil, translateVendor400(nil, p.cfg.Status, errBody)
 		}
 
 		slog.Info("openai: retrying stream without unsupported sampling parameter", "model", req.Model)
@@ -72,6 +72,11 @@ func (p *Provider) Stream(ctx context.Context, req provider.ChatRequest, w io.Wr
 		// A second failure (including a second 400) is returned as-is —
 		// never retried again.
 		header := resp.Header
+		if resp.StatusCode == http.StatusBadRequest {
+			errBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return nil, translateVendor400(header, p.cfg.Status, errBody)
+		}
 		resp.Body.Close()
 		return nil, translateVendorError(resp.StatusCode, header, p.cfg.Status)
 	}
@@ -197,7 +202,7 @@ func (p *Provider) Stream(ctx context.Context, req provider.ChatRequest, w io.Wr
 		stats.FinishReason = "stop"
 	}
 
-	finalChunk, err := provider.BuildFinalChunkSSE(completionID, stats.Model, stats.FinishReason, stats)
+	finalChunk, err := provider.BuildFinalChunksSSE(completionID, stats.Model, stats.FinishReason, stats, req.IncludeUsage)
 	if err != nil {
 		return nil, fmt.Errorf("openai: building final chunk: %w", err)
 	}

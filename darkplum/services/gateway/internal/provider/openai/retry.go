@@ -56,6 +56,14 @@ func detectUnsupportedParam(body []byte, already droppedParams) (next droppedPar
 	param := strings.ToLower(strings.TrimSpace(envelope.Error.Param))
 	msg := strings.ToLower(envelope.Error.Message)
 
+	// A 400 the vendor attributes to some other field (response_format,
+	// max_completion_tokens, ...) is never a sampling-parameter problem, so
+	// it must not be retried by dropping one just because the message text
+	// happens to contain a matching word.
+	if param != "" && param != "temperature" && param != "top_p" && param != "stop" {
+		return already, false
+	}
+
 	mark := func(name string, dropped *bool) {
 		if *dropped {
 			return
