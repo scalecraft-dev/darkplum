@@ -165,6 +165,23 @@ func assertNoSyncWithin(t *testing.T, ch <-chan struct{}, d time.Duration) {
 	}
 }
 
+// drainAtMostOneSync tolerates one sync within d (one already in flight) and
+// fails on a second.
+func drainAtMostOneSync(t *testing.T, ch <-chan struct{}, d time.Duration) {
+	t.Helper()
+	deadline := time.After(d)
+	select {
+	case <-ch:
+	case <-deadline:
+		return
+	}
+	select {
+	case <-ch:
+		t.Fatal("more than one model sync after the cadence should have reverted")
+	case <-deadline:
+	}
+}
+
 // waitUntil polls cond every 20ms until it's true or timeout elapses, doing
 // one final check before failing -- used for state a sync updates via its
 // own DB round trip strictly after the gateway HTTP call syncedCh observes
@@ -260,6 +277,12 @@ func TestRunModelSyncTicker_KickTriggersImmediateSyncAndFastCadence(t *testing.T
 	// No further sync should arrive on the fast cadence from this point:
 	// proves the ticker actually reverted to the slow (1h) interval instead
 	// of continuing to tick every 5s.
+	//
+	// Under a loaded -race run, a fast tick that was already due can still be
+	// in flight when AnyInstalling() first reads false, so allow at most one
+	// sync in a first window, then require a whole fast interval with none: a
+	// loop still on the fast cadence would always tick inside the second.
+	drainAtMostOneSync(t, syncedCh, providerInstallSyncInterval+2*time.Second)
 	assertNoSyncWithin(t, syncedCh, providerInstallSyncInterval+2*time.Second)
 
 	cancel()
