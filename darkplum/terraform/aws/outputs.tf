@@ -21,6 +21,11 @@ output "provider_region" {
   value       = var.aws_region
 }
 
+output "vpc_cidr" {
+  description = "CIDR of the cluster's VPC. The gateway-egress NetworkPolicy scopes its database rule (Postgres :5432) to it."
+  value       = var.vpc_cidr
+}
+
 output "kube_config_command" {
   description = "Command to point kubectl at the cluster."
   value       = "aws eks update-kubeconfig --region ${var.aws_region} --name ${module.eks.cluster_name}"

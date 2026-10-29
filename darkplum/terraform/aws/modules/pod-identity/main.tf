@@ -12,14 +12,23 @@ resource "aws_iam_role" "this" {
         "sts:AssumeRole",
         "sts:TagSession"
       ]
-      # Pod Identity injects kubernetes-namespace and kubernetes-service-account
-      # as session tags. These conditions enforce that only the intended SA in the
-      # intended namespace can use this role — equivalent to IRSA's OIDC subject
-      # claim scoping, but at the IAM policy layer instead of the OIDC trust layer.
+      # What actually scopes this role is the pod identity association below
+      # (cluster + namespace + service account -> this role) and who holds
+      # iam:PassRole on it and eks:CreatePodIdentityAssociation: anyone with both
+      # can create another association to this role from any cluster in the
+      # account that trusts pods.eks.amazonaws.com. Keep those permissions tight.
+      #
+      # The conditions here narrow the trust to this cluster, namespace and
+      # service account. Pod Identity passes them as session tags, which a trust
+      # policy sees as aws:RequestTag/* (there are no principal tags on the
+      # pods.eks.amazonaws.com caller: aws:PrincipalTag/* denied every
+      # AssumeRoleForPodIdentity). aws:SourceAccount pins the calling account.
       Condition = {
         StringEquals = {
-          "aws:PrincipalTag/kubernetes-namespace"       = var.namespace
-          "aws:PrincipalTag/kubernetes-service-account" = var.service_account_name
+          "aws:SourceAccount"                         = var.account_id
+          "aws:RequestTag/eks-cluster-arn"            = var.cluster_arn
+          "aws:RequestTag/kubernetes-namespace"       = var.namespace
+          "aws:RequestTag/kubernetes-service-account" = var.service_account_name
         }
       }
     }]

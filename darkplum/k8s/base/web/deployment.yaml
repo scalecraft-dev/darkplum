@@ -23,7 +23,7 @@ spec:
       containers:
         - name: web
           image: darkplum-web:latest
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: Always  # :latest is mutable; IfNotPresent keeps a node on the old image after make deploy-platform
           ports:
             - name: http
               containerPort: 80

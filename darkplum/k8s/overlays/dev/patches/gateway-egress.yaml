@@ -5,7 +5,7 @@
 # LMSTUDIO_ENABLED=true, LMSTUDIO_UPSTREAM=http://host.docker.internal:1234).
 #
 # The base gateway-egress NetworkPolicy only permits :443 (AWS/Bedrock), :8000
-# (in-cluster vllm-inference), :5432 (Postgres), and :53 (DNS). kindnet enforces
+# (in-cluster vllm-inference), and :53 (DNS). kindnet enforces
 # NetworkPolicy, so without this rule the gateway's traffic to :1234 is dropped
 # at egress — LM Studio never sees the request and the gateway hangs to its 120s
 # header timeout (chat shows "no response"). This rule is NOT in base: production
@@ -21,3 +21,17 @@
     ports:
       - protocol: TCP
         port: 1234
+
+# Dev database: the in-cluster postgres pod (resources/postgres.yaml), and only
+# that pod. Base has no :5432 rule; on AWS gateway-egress-database scopes it to
+# the VPC CIDR where RDS lives.
+- op: add
+  path: /spec/egress/-
+  value:
+    to:
+      - podSelector:
+          matchLabels:
+            app.kubernetes.io/name: postgres
+    ports:
+      - protocol: TCP
+        port: 5432

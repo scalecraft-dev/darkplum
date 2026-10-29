@@ -89,6 +89,8 @@ module "pod_identity_gateway" {
 
   role_name            = "${var.cluster_name}-gateway"
   cluster_name         = module.eks.cluster_name
+  cluster_arn          = module.eks.cluster_arn
+  account_id           = data.aws_caller_identity.current.account_id
   namespace            = "darkplum-system"
   service_account_name = "darkplum-gateway"
   inline_policies = {
@@ -141,6 +143,8 @@ module "pod_identity_api" {
 
   role_name            = "${var.cluster_name}-api"
   cluster_name         = module.eks.cluster_name
+  cluster_arn          = module.eks.cluster_arn
+  account_id           = data.aws_caller_identity.current.account_id
   namespace            = "darkplum-system"
   service_account_name = "darkplum-api"
   inline_policies = {

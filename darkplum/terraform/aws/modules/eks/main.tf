@@ -23,11 +23,13 @@ module "eks" {
       # Enable Kubernetes NetworkPolicy enforcement. Without this the VPC CNI
       # admits NetworkPolicy objects but does NOT enforce them — the
       # gateway-egress policy (IMDS/SSRF egress block) would be decorative.
-      # The flag is an env var on the aws-node DaemonSet, nested under `env`.
+      # The flag is the add-on's top-level `enableNetworkPolicy` (a "true"/
+      # "false" string). Current add-on versions reject it as an `env` entry
+      # (`$.env.ENABLE_NETWORK_POLICY: is not defined in the schema`), which
+      # fails CreateAddon on a fresh install. Check the schema with
+      # `aws eks describe-addon-configuration --addon-name vpc-cni`.
       configuration_values = jsonencode({
-        env = {
-          ENABLE_NETWORK_POLICY = "true"
-        }
+        enableNetworkPolicy = "true"
       })
     }
     coredns = {

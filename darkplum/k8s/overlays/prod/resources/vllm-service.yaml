@@ -7,7 +7,11 @@ metadata:
     app.kubernetes.io/name: vllm-inference
     app.kubernetes.io/part-of: darkplum
 spec:
-  type: ClusterIP
+  # Headless: the gateway resolves the pod IP and dials it directly. A ClusterIP
+  # would be matched by the VPC CNI's egress NetworkPolicy before kube-proxy
+  # rewrites it to the pod IP, so the gateway-egress pod selector would not allow
+  # it. clusterIP is immutable; the Makefile recreates a Service that still has one.
+  clusterIP: None
   selector:
     app.kubernetes.io/name: vllm-inference
   ports:

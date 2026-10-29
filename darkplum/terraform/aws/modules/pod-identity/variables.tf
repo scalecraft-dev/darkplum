@@ -8,6 +8,16 @@ variable "cluster_name" {
   description = "Name of the EKS cluster"
 }
 
+variable "cluster_arn" {
+  type        = string
+  description = "ARN of the EKS cluster; the trust policy only accepts Pod Identity sessions from it"
+}
+
+variable "account_id" {
+  type        = string
+  description = "AWS account ID the cluster runs in (aws:SourceAccount trust condition)"
+}
+
 variable "namespace" {
   type        = string
   description = "Kubernetes namespace for the service account"
