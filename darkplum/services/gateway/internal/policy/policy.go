@@ -44,6 +44,15 @@ const (
 	ClassifierKindSemanticRouter = "semantic_router"
 )
 
+// Values of model_aliases.on_route_unavailable (migration 027): what a routed
+// alias does when the classifier's picked non-default route targets a
+// disabled or unreachable model. See handler.resolveRoutedPick.
+const (
+	OnRouteUnavailableRefuse         = "refuse"
+	OnRouteUnavailableSameOrStricter = "fallback_same_or_stricter"
+	OnRouteUnavailableAnyPermitted   = "fallback_any_permitted"
+)
+
 // RouteDef is one candidate route of a routed alias, loaded from
 // model_alias_routes and ordered by position (see AliasDef.Routes).
 type RouteDef struct {
@@ -70,7 +79,11 @@ type AliasDef struct {
 	Target         string
 	DefaultRoute   string
 	ClassifierKind string
-	Routes         []RouteDef
+	// OnRouteUnavailable is one of the OnRouteUnavailable* values; "" (a
+	// hand-built AliasDef, or a database without migration 027) is read as
+	// OnRouteUnavailableSameOrStricter, the column default.
+	OnRouteUnavailable string
+	Routes             []RouteDef
 }
 
 // Route returns the named route from a.Routes, or false if no route with
@@ -101,6 +114,19 @@ type Snapshot struct {
 	// Enabled maps model_id -> models.enabled. A model absent from this map
 	// (not yet synced by the api) is treated as not enabled.
 	Enabled map[string]bool
+	// ModelClass maps model_id -> models.backend_class, so the class of a
+	// model whose backend is down (absent from the route table) is still
+	// known for the routed-alias fallback comparison. A model absent here has
+	// an unrecorded class.
+	ModelClass map[string]string
+	// RegisteredClass maps model_id -> the strictest backend class that has
+	// ever served the id (model_registered_classes, migration 028). Unlike
+	// ModelClass it is never loosened by the api's sync, so it still says
+	// "self_hosted" after a vendor API that lists the same id has taken the
+	// id over. The request path refuses to serve an id from a class looser
+	// than this. A model absent here (or a database without migration 028)
+	// has no registration and no check is made.
+	RegisteredClass map[string]string
 	// Aliases maps alias -> AliasDef. Never chained: a static alias's Target
 	// and a routed alias's route targets are looked up as-is, never
 	// re-resolved through Aliases again (model_aliases guarantees a target is

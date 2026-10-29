@@ -260,7 +260,8 @@
     "method": "PATCH",
     "path": "/api/v1/models/:id",
     "auth": "admin",
-    "surface": "ui"
+    "surface": "ui",
+    "reason": "Body takes enabled, display_name and/or accept_class. accept_class: true re-registers the model at the backend class it is discovered under now, so a model deliberately moved to a looser class (e.g. from self-hosted to a vendor) is served again instead of refused with model_class_downgraded; API only, no UI control yet; recorded as model.class_accepted"
   },
   {
     "service": "api",

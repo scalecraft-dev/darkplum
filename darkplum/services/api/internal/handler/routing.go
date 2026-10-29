@@ -206,6 +206,7 @@ type aliasResponse struct {
 	TargetBackendClass *string                  `json:"target_backend_class"`
 	TargetAvailable    bool                     `json:"target_available"`
 	DefaultRoute       string                   `json:"default_route,omitempty"`
+	OnRouteUnavailable string                   `json:"on_route_unavailable,omitempty"`
 	Classifier         *aliasClassifierResponse `json:"classifier,omitempty"`
 	Routes             []aliasRouteResponse     `json:"routes,omitempty"`
 	CreatedAt          time.Time                `json:"created_at"`
@@ -284,6 +285,7 @@ func (h *RoutingHandler) ListAliases(c *gin.Context) {
 			a.target_model_id,
 			a.default_route,
 			a.classifier_kind,
+			a.on_route_unavailable,
 			(m.model_id IS NOT NULL) AS target_exists,
 			COALESCE(m.enabled, false) AS target_enabled,
 			m.backend_class,
@@ -309,9 +311,10 @@ func (h *RoutingHandler) ListAliases(c *gin.Context) {
 		var targetModelID *string
 		var defaultRoute *string
 		var classifierKind *string
+		var onRouteUnavailable string
 		var targetDiscoveredAt *time.Time
 		if err := rows.Scan(
-			&a.Alias, &a.Kind, &targetModelID, &defaultRoute, &classifierKind,
+			&a.Alias, &a.Kind, &targetModelID, &defaultRoute, &classifierKind, &onRouteUnavailable,
 			&a.TargetExists, &a.TargetEnabled, &a.TargetBackendClass, &targetDiscoveredAt, &a.CreatedAt, &a.UpdatedAt,
 		); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "scan alias failed"})
@@ -325,6 +328,7 @@ func (h *RoutingHandler) ListAliases(c *gin.Context) {
 			if defaultRoute != nil {
 				a.DefaultRoute = *defaultRoute
 			}
+			a.OnRouteUnavailable = onRouteUnavailable
 			if classifierKind != nil {
 				a.Classifier = &aliasClassifierResponse{Kind: *classifierKind}
 				if *classifierKind == classifierKindSemanticRouter {
@@ -380,11 +384,32 @@ type putAliasClassifierInput struct {
 // routed body is {"kind":"routed","default_route":...,"classifier":{...},
 // "routes":[...]}.
 type putAliasRequest struct {
-	Kind          string                   `json:"kind,omitempty"`
-	TargetModelID string                   `json:"target_model_id,omitempty"`
-	DefaultRoute  string                   `json:"default_route,omitempty"`
-	Classifier    *putAliasClassifierInput `json:"classifier,omitempty"`
-	Routes        []putAliasRouteInput     `json:"routes,omitempty"`
+	Kind          string `json:"kind,omitempty"`
+	TargetModelID string `json:"target_model_id,omitempty"`
+	DefaultRoute  string `json:"default_route,omitempty"`
+	// OnRouteUnavailable is optional: omitted keeps the alias's current
+	// value on replace and takes the column default on create, so older
+	// clients that never send it neither fail nor silently change it.
+	OnRouteUnavailable *string                  `json:"on_route_unavailable,omitempty"`
+	Classifier         *putAliasClassifierInput `json:"classifier,omitempty"`
+	Routes             []putAliasRouteInput     `json:"routes,omitempty"`
+}
+
+// onRouteUnavailable values; they mirror model_aliases'
+// on_route_unavailable CHECK (migration 027) and the gateway's
+// policy.OnRouteUnavailable* constants.
+const (
+	onRouteUnavailableRefuse         = "refuse"
+	onRouteUnavailableSameOrStricter = "fallback_same_or_stricter"
+	onRouteUnavailableAnyPermitted   = "fallback_any_permitted"
+)
+
+func validOnRouteUnavailable(v string) bool {
+	switch v {
+	case onRouteUnavailableRefuse, onRouteUnavailableSameOrStricter, onRouteUnavailableAnyPermitted:
+		return true
+	}
+	return false
 }
 
 // validateRoutedAliasShape checks every format-level 400 rule for a routed
@@ -455,6 +480,10 @@ func validateRoutedAliasShape(req putAliasRequest) ([]putAliasRouteInput, error)
 		return nil, fmt.Errorf("default_route %q must reference one of the routes", req.DefaultRoute)
 	}
 
+	if req.OnRouteUnavailable != nil && !validOnRouteUnavailable(*req.OnRouteUnavailable) {
+		return nil, fmt.Errorf("on_route_unavailable must be one of %s, %s, %s", onRouteUnavailableRefuse, onRouteUnavailableSameOrStricter, onRouteUnavailableAnyPermitted)
+	}
+
 	if req.Classifier == nil {
 		return nil, errors.New("classifier is required")
 	}
@@ -519,6 +548,10 @@ func (h *RoutingHandler) PutAlias(c *gin.Context) {
 	if kind == aliasKindStatic {
 		if req.TargetModelID == "" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "target_model_id is required"})
+			return
+		}
+		if req.OnRouteUnavailable != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "on_route_unavailable applies only to routed aliases (kind \"routed\"); a static alias has no routes to fall back between"})
 			return
 		}
 	} else {
@@ -776,17 +809,28 @@ func (h *RoutingHandler) putRoutedAlias(c *gin.Context, tx pgx.Tx, alias string,
 		return
 	}
 
+	// The value being replaced, for the audit event: "" when the alias is new.
+	// Read inside the transaction, under the routing advisory lock, so it is
+	// the value this upsert actually overwrites.
+	var previousOnRouteUnavailable string
+	if err := tx.QueryRow(ctx, `SELECT on_route_unavailable FROM model_aliases WHERE alias = $1`, alias).Scan(&previousOnRouteUnavailable); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "read current alias setting failed"})
+		return
+	}
+
 	var createdAt, updatedAt time.Time
 	var created bool
+	var onRouteUnavailable string
 	err = tx.QueryRow(ctx, `
-		INSERT INTO model_aliases (alias, kind, target_model_id, default_route, classifier_kind, created_at, updated_at)
-		VALUES ($1, 'routed', NULL, $2, $3, now(), now())
+		INSERT INTO model_aliases (alias, kind, target_model_id, default_route, classifier_kind, on_route_unavailable, created_at, updated_at)
+		VALUES ($1, 'routed', NULL, $2, $3, COALESCE($4::text, 'fallback_same_or_stricter'), now(), now())
 		ON CONFLICT (alias) DO UPDATE
 			SET kind = 'routed', target_model_id = NULL, default_route = EXCLUDED.default_route,
 				classifier_kind = EXCLUDED.classifier_kind,
+				on_route_unavailable = COALESCE($4::text, model_aliases.on_route_unavailable),
 				updated_at = now()
-		RETURNING created_at, updated_at, (xmax = 0)
-	`, alias, req.DefaultRoute, req.Classifier.Kind).Scan(&createdAt, &updatedAt, &created)
+		RETURNING created_at, updated_at, (xmax = 0), on_route_unavailable
+	`, alias, req.DefaultRoute, req.Classifier.Kind, req.OnRouteUnavailable).Scan(&createdAt, &updatedAt, &created, &onRouteUnavailable)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "upsert alias failed"})
 		return
@@ -829,6 +873,8 @@ func (h *RoutingHandler) putRoutedAlias(c *gin.Context, tx pgx.Tx, alias string,
 		Routes:       routesByAlias[alias],
 		CreatedAt:    createdAt,
 		UpdatedAt:    updatedAt,
+
+		OnRouteUnavailable: onRouteUnavailable,
 	}
 	if req.Classifier.Kind == classifierKindSemanticRouter && h.semanticRouterNeedsWarning(ctx) {
 		resp.Warnings = []string{semanticRouterNotConfiguredWarning}
@@ -841,7 +887,8 @@ func (h *RoutingHandler) putRoutedAlias(c *gin.Context, tx pgx.Tx, alias string,
 	}
 	evt := activity.FromContext(c, evtType)
 	evt.TargetType = activity.StrPtr("model_alias")
-	evt.Detail = map[string]any{"alias": alias, "kind": aliasKindRouted, "route_count": len(routes)}
+	evt.Detail = map[string]any{"alias": alias, "kind": aliasKindRouted, "route_count": len(routes),
+		"on_route_unavailable": onRouteUnavailable, "previous_on_route_unavailable": previousOnRouteUnavailable}
 	h.activity.Record(ctx, evt)
 
 	c.JSON(http.StatusOK, resp)

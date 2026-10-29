@@ -87,7 +87,7 @@ func TestHandleRoutingDryrun_ReportsWouldBeRefused_NotEnabled(t *testing.T) {
 	)
 
 	_, resp := doDryrun(t, h, "smart-chat", "please fix this bug")
-	if resp.WouldBeRefused == nil || resp.WouldBeRefused.Code != "model_not_enabled" {
+	if resp.WouldBeRefused == nil || resp.WouldBeRefused.Code != "route_target_unavailable" {
 		t.Errorf("got %+v", resp.WouldBeRefused)
 	}
 }
@@ -164,22 +164,23 @@ func TestHandleRoutingDryrun_MissingFields(t *testing.T) {
 	}
 }
 
-// TestHandleRoutingDryrun_ReportsFallbackDecision: the dryrun reports the
-// same decision a real completion would take for a disabled/unreachable pick.
-func TestHandleRoutingDryrun_ReportsFallbackDecision(t *testing.T) {
+// TestHandleRoutingDryrun_DownPickIsRefusedNotFallenBack: a disabled or
+// unreachable pick is reported as route_target_unavailable on the PICKED
+// route, never rerouted to the default route.
+func TestHandleRoutingDryrun_DownPickIsRefusedNotFallenBack(t *testing.T) {
 	cases := []struct {
 		name    string
 		table   map[string]routing.Route
 		enabled map[string]bool
-		reason  string
+		state   string
 	}{
 		{"disabled", map[string]routing.Route{
 			"qwen-coder": {ProviderKey: "vllm-default", Kind: "vllm", Class: routing.ClassSelfHosted},
-			"llama-3-8b": {ProviderKey: "vllm-default", Kind: "vllm", Class: routing.ClassSelfHosted},
-		}, map[string]bool{"qwen-coder": false, "llama-3-8b": true}, "fallback:route_target_disabled:code"},
+			"llama-3-8b": {ProviderKey: "anthropic", Kind: "anthropic", Class: routing.ClassExternalAPI},
+		}, map[string]bool{"qwen-coder": false, "llama-3-8b": true}, "disabled"},
 		{"unreachable", map[string]routing.Route{
-			"llama-3-8b": {ProviderKey: "vllm-default", Kind: "vllm", Class: routing.ClassSelfHosted},
-		}, map[string]bool{"llama-3-8b": true}, "fallback:route_target_unreachable:code"},
+			"llama-3-8b": {ProviderKey: "anthropic", Kind: "anthropic", Class: routing.ClassExternalAPI},
+		}, map[string]bool{"llama-3-8b": true}, "not available on this gateway"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -192,27 +193,14 @@ func TestHandleRoutingDryrun_ReportsFallbackDecision(t *testing.T) {
 			if w.Code != http.StatusOK {
 				t.Fatalf("got %d: %s", w.Code, w.Body.String())
 			}
-			if resp.RouteName != "general" || resp.TargetModelID != "llama-3-8b" || resp.Reason != tc.reason || resp.WouldBeRefused != nil {
-				t.Errorf("got %+v", resp)
+			if resp.RouteName != "code" || resp.TargetModelID != "qwen-coder" || resp.Reason != "rules:code:x" {
+				t.Errorf("must report the picked route, got %+v", resp)
+			}
+			if resp.WouldBeRefused == nil || resp.WouldBeRefused.Code != "route_target_unavailable" ||
+				!strings.Contains(resp.WouldBeRefused.Message, tc.state) ||
+				!strings.Contains(resp.WouldBeRefused.Message, "not sent anywhere else") {
+				t.Errorf("got %+v", resp.WouldBeRefused)
 			}
 		})
-	}
-}
-
-func TestHandleRoutingDryrun_BothDisabled_ReportsTwoModelRefusal(t *testing.T) {
-	h := newRoutedTestHandler(fakeProviders{}, map[string]routing.Route{
-		"qwen-coder": {ProviderKey: "vllm-default", Kind: "vllm", Class: routing.ClassSelfHosted},
-		"llama-3-8b": {ProviderKey: "vllm-default", Kind: "vllm", Class: routing.ClassSelfHosted},
-	}, policy.Snapshot{
-		Enabled:   map[string]bool{},
-		Aliases:   map[string]policy.AliasDef{"smart-chat": routedAlias},
-		Residency: policy.ResidencyAny,
-	}, &fakeClassifier{decisions: []router.Decision{{RouteName: "code", Reason: "rules:code:x"}}})
-	_, resp := doDryrun(t, h, "smart-chat", "fix this")
-	if resp.RouteName != "code" || resp.Reason != "rules:code:x" || resp.WouldBeRefused == nil || resp.WouldBeRefused.Code != "model_not_enabled" {
-		t.Fatalf("got %+v", resp)
-	}
-	if !strings.Contains(resp.WouldBeRefused.Message, `default route "general" selects "llama-3-8b", which is also disabled`) {
-		t.Errorf("message = %q", resp.WouldBeRefused.Message)
 	}
 }

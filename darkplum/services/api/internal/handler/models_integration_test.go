@@ -1001,3 +1001,230 @@ func TestListModels_AndAdminList_CarryAvailability(t *testing.T) {
 		}
 	}
 }
+
+func syncOnce(t *testing.T, ctx context.Context, h func(url string) *ModelHandler, class string) {
+	t.Helper()
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(gatewayModelsResponse{Object: "list", Data: []openAIModelEntry{
+			{ID: "hf/llama", Object: "model", Created: 1, OwnedBy: "vllm", BackendClass: class},
+		}})
+	}))
+	defer gw.Close()
+	h(gw.URL).SyncModels(ctx)
+}
+
+// A vendor taking over a self-hosted model id rewrites models.backend_class on
+// the next sync -- and must NOT loosen the registered class the gateway
+// compares against. Only the audited accept_class action may.
+func TestSyncModels_RegisteredClassOnlyTightens_AcceptClassLoosens(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	userID := newTestUser(t, ctx, pool)
+	mk := func(url string) *ModelHandler { return NewModelHandler(url, "unused", pool) }
+	registered := func() string {
+		var c string
+		if err := pool.QueryRow(ctx, `SELECT registered_class FROM model_registered_classes WHERE model_id = 'hf/llama'`).Scan(&c); err != nil {
+			t.Fatalf("registered class: %v", err)
+		}
+		return c
+	}
+
+	syncOnce(t, ctx, mk, backendClassSelfHosted)
+	if got := registered(); got != backendClassSelfHosted {
+		t.Fatalf("first sync registers the class: got %q", got)
+	}
+	// The self-hosted source expires; a vendor lists the same id.
+	syncOnce(t, ctx, mk, backendClassExternalAPI)
+	var current string
+	_ = pool.QueryRow(ctx, `SELECT backend_class FROM models WHERE model_id = 'hf/llama'`).Scan(&current)
+	if current != backendClassExternalAPI {
+		t.Fatalf("models.backend_class follows the serving backend: %q", current)
+	}
+	if got := registered(); got != backendClassSelfHosted {
+		t.Fatalf("a looser claim must not loosen the registration: got %q", got)
+	}
+
+	// The admin deliberately moves the model to the vendor.
+	var rowID string
+	_ = pool.QueryRow(ctx, `SELECT id FROM models WHERE model_id = 'hf/llama'`).Scan(&rowID)
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(func(c *gin.Context) { c.Set("user_id", userID); c.Next() })
+	h := mk("http://unused.invalid")
+	r.PATCH("/api/v1/models/:id", h.ToggleModel)
+	resp := doJSON(t, r, http.MethodPatch, "/api/v1/models/"+rowID, map[string]any{"accept_class": true})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("accept_class: %d %s", resp.Code, resp.Body.String())
+	}
+	if got := registered(); got != backendClassExternalAPI {
+		t.Fatalf("accept_class registers the current class: got %q", got)
+	}
+	var raw []byte
+	if err := pool.QueryRow(ctx, `SELECT detail FROM activity_events WHERE event_type = 'model.class_accepted'`).Scan(&raw); err != nil {
+		t.Fatalf("audit event: %v", err)
+	}
+	var d map[string]any
+	_ = json.Unmarshal(raw, &d)
+	if d["previous_registered_class"] != backendClassSelfHosted || d["registered_class"] != backendClassExternalAPI {
+		t.Errorf("audit detail = %v", d)
+	}
+
+	// A model only ever claimed by a vendor is registered as the vendor.
+	if _, err := pool.Exec(ctx, `DELETE FROM model_registered_classes`); err != nil {
+		t.Fatal(err)
+	}
+	syncOnce(t, ctx, mk, backendClassExternalAPI)
+	if got := registered(); got != backendClassExternalAPI {
+		t.Fatalf("vendor-only model registers as external_api: got %q", got)
+	}
+}
+
+// Only a missing table (migration 028 not applied) may be tolerated by the
+// sync; any other registration failure must abort it with nothing committed,
+// so backend_class never moves while the registered class did not.
+func TestSyncModels_RegistrationFailureAbortsSync_MissingTableTolerated(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	mk := func(url string) *ModelHandler { return NewModelHandler(url, "unused", pool) }
+	syncOnce(t, ctx, mk, backendClassSelfHosted)
+
+	if _, err := pool.Exec(ctx, `
+		CREATE FUNCTION boom() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'registration blocked'; END $$;
+		CREATE TRIGGER boom BEFORE INSERT OR UPDATE ON model_registered_classes FOR EACH ROW EXECUTE FUNCTION boom();
+		UPDATE models SET provider = 'unchanged' WHERE model_id = 'hf/llama'`); err != nil {
+		t.Fatal(err)
+	}
+	// A different class would update the registration (tighten): force the
+	// failing path with a stricter claim than the registered external_api.
+	if _, err := pool.Exec(ctx, `ALTER TABLE model_registered_classes DISABLE TRIGGER boom;
+		UPDATE model_registered_classes SET registered_class = 'external_api'; ALTER TABLE model_registered_classes ENABLE TRIGGER boom`); err != nil {
+		t.Fatal(err)
+	}
+	syncOnce(t, ctx, mk, backendClassSelfHosted) // would tighten external_api -> self_hosted, trigger raises
+	var provider, class string
+	_ = pool.QueryRow(ctx, `SELECT provider, backend_class FROM models WHERE model_id = 'hf/llama'`).Scan(&provider, &class)
+	if provider != "unchanged" {
+		t.Fatalf("the sync committed (provider = %q) although registration failed", provider)
+	}
+
+	// Missing table: tolerated, the models upsert commits.
+	if _, err := pool.Exec(ctx, `DROP TABLE model_registered_classes`); err != nil {
+		t.Fatal(err)
+	}
+	syncOnce(t, ctx, mk, backendClassSelfHosted)
+	_ = pool.QueryRow(ctx, `SELECT provider FROM models WHERE model_id = 'hf/llama'`).Scan(&provider)
+	if provider != "vllm" {
+		t.Fatalf("with the table missing the sync must still commit; provider = %q", provider)
+	}
+}
+
+func acceptRouter(h *ModelHandler, userID string) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	r.Use(func(c *gin.Context) { c.Set("user_id", userID); c.Next() })
+	r.PATCH("/api/v1/models/:id", h.ToggleModel)
+	return r
+}
+
+// A failed accept_class leaves enabled/display_name unchanged; a failed audit
+// write fails the request and registers nothing.
+func TestToggleModel_AcceptClassIsAtomic(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	userID := newTestUser(t, ctx, pool)
+	mk := func(url string) *ModelHandler { return NewModelHandler(url, "unused", pool) }
+	syncOnce(t, ctx, mk, backendClassExternalAPI)
+	var rowID string
+	_ = pool.QueryRow(ctx, `SELECT id FROM models WHERE model_id = 'hf/llama'`).Scan(&rowID)
+	if _, err := pool.Exec(ctx, `UPDATE model_registered_classes SET registered_class = 'self_hosted'`); err != nil {
+		t.Fatal(err)
+	}
+	r := acceptRouter(mk("http://unused.invalid"), userID)
+
+	// Audit failure.
+	if _, err := pool.Exec(ctx, `
+		CREATE FUNCTION noaudit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'audit blocked'; END $$;
+		CREATE TRIGGER noaudit BEFORE INSERT ON activity_events FOR EACH ROW EXECUTE FUNCTION noaudit()`); err != nil {
+		t.Fatal(err)
+	}
+	resp := doJSON(t, r, http.MethodPatch, "/api/v1/models/"+rowID, map[string]any{"enabled": true, "accept_class": true})
+	if resp.Code != http.StatusInternalServerError {
+		t.Fatalf("audit failure: status = %d, want 500: %s", resp.Code, resp.Body.String())
+	}
+	var enabled bool
+	var reg string
+	_ = pool.QueryRow(ctx, `SELECT enabled FROM models WHERE id = $1`, rowID).Scan(&enabled)
+	_ = pool.QueryRow(ctx, `SELECT registered_class FROM model_registered_classes WHERE model_id='hf/llama'`).Scan(&reg)
+	if enabled || reg != "self_hosted" {
+		t.Fatalf("a failed accept left changes behind: enabled=%v registered=%q", enabled, reg)
+	}
+	if _, err := pool.Exec(ctx, `DROP TRIGGER noaudit ON activity_events`); err != nil {
+		t.Fatal(err)
+	}
+
+	// Together, on success.
+	resp = doJSON(t, r, http.MethodPatch, "/api/v1/models/"+rowID, map[string]any{"enabled": true, "accept_class": true})
+	if resp.Code != http.StatusOK {
+		t.Fatalf("accept: %d %s", resp.Code, resp.Body.String())
+	}
+	_ = pool.QueryRow(ctx, `SELECT enabled FROM models WHERE id = $1`, rowID).Scan(&enabled)
+	_ = pool.QueryRow(ctx, `SELECT registered_class FROM model_registered_classes WHERE model_id='hf/llama'`).Scan(&reg)
+	if !enabled || reg != backendClassExternalAPI {
+		t.Fatalf("enabled=%v registered=%q", enabled, reg)
+	}
+
+	// Unknown model row -> 404, nothing else.
+	resp = doJSON(t, r, http.MethodPatch, "/api/v1/models/00000000-0000-0000-0000-000000000000", map[string]any{"accept_class": true})
+	if resp.Code != http.StatusNotFound {
+		t.Fatalf("missing model: %d", resp.Code)
+	}
+}
+
+// Ordering under the lock: an accept and a sync run concurrently; whichever
+// goes second sees the other's committed state, so the end state is one of the
+// two serial orders, never a mix. (accept first: external_api, then the
+// self-hosted claim tightens it back; sync first: the accept pins the class
+// the sync just recorded.)
+func TestAcceptClassAndSync_SerialisedByTheRoutingLock(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	userID := newTestUser(t, ctx, pool)
+	mk := func(url string) *ModelHandler { return NewModelHandler(url, "unused", pool) }
+	syncOnce(t, ctx, mk, backendClassExternalAPI)
+	var rowID string
+	_ = pool.QueryRow(ctx, `SELECT id FROM models WHERE model_id = 'hf/llama'`).Scan(&rowID)
+	_, _ = pool.Exec(ctx, `UPDATE model_registered_classes SET registered_class = 'self_hosted'`)
+	r := acceptRouter(mk("http://unused.invalid"), userID)
+
+	// Hold the lock: the accept must wait for it.
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, modelRoutingAdvisoryLockKey); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan int, 1)
+	go func() {
+		done <- doJSON(t, r, http.MethodPatch, "/api/v1/models/"+rowID, map[string]any{"accept_class": true}).Code
+	}()
+	select {
+	case code := <-done:
+		t.Fatalf("accept_class ran (%d) while the routing lock was held", code)
+	case <-time.After(300 * time.Millisecond):
+	}
+	// The sync that holds the lock records its (looser) claim; releasing lets
+	// the accept proceed and pin what the sync left behind.
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if code := <-done; code != http.StatusOK {
+		t.Fatalf("accept after release: %d", code)
+	}
+	var reg string
+	_ = pool.QueryRow(ctx, `SELECT registered_class FROM model_registered_classes WHERE model_id='hf/llama'`).Scan(&reg)
+	if reg != backendClassExternalAPI {
+		t.Fatalf("registered = %q", reg)
+	}
+}

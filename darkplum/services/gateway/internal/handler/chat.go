@@ -393,12 +393,19 @@ type routeContext struct {
 }
 
 // routedPickRefusal is the refusal for a routed alias whose picked route
-// (and, where applicable, its default route) cannot serve: disabled or not in
-// the route table.
+// cannot serve: its target is disabled or not in the route table. Status and
+// Type default to the 403/404 mapping of the model_not_* codes when zero.
 type routedPickRefusal struct {
 	Code    string
 	Message string
+	Status  int    // 0: derive from Code (404 model_not_found, else 403)
+	Type    string // error type matching Status; "" when Status is 0
 }
+
+// codeRouteTargetUnavailable is the refusal for a classifier-picked,
+// non-default route whose target is disabled or unreachable. It is an outage
+// (503), not a policy decision about the caller.
+const codeRouteTargetUnavailable = "route_target_unavailable"
 
 // routedPick is the effective routing decision after the classifier's pick
 // has been checked for disabled/unreachable targets.
@@ -413,30 +420,199 @@ type routedPick struct {
 // "model_not_found" if absent from the route table, "model_not_enabled" if
 // disabled. Policy (residency/allowlist) is deliberately NOT considered.
 func targetState(snap policy.Snapshot, tbl *routing.Table, target string) string {
-	if _, ok := tbl.Lookup(target); !ok {
+	rt, ok := tbl.Lookup(target)
+	if !ok {
 		return "model_not_found"
 	}
 	if !snap.Enabled[target] {
 		return "model_not_enabled"
 	}
+	if _, down := classDowngrade(snap, rt, target); down {
+		return stateClassDowngraded
+	}
 	return ""
+}
+
+// stateClassDowngraded is targetState's answer for a model id that the route
+// table serves, but only from a backend class looser than the one the id is
+// registered with.
+const stateClassDowngraded = "model_class_downgraded"
+
+// classDowngrade reports whether rt, the route currently serving target, is of
+// a looser class than the strictest class that has ever served target
+// (policy.Snapshot.RegisteredClass), and returns that registered class.
+//
+// This is the guard under the routing manager's collision rule. The manager
+// lets the lowest-ranked class win a contested id, but when the self-hosted
+// source expires its claim is dropped and a vendor API listing the same id
+// (an OpenAI-compatible vendor serving the same Hugging Face id) silently
+// becomes the winner: the id is "present", so no alias setting and no
+// not-found refusal ever fires, and a local outage becomes vendor egress. The
+// manager is not changed (a collision winner must not itself refuse); the
+// request path calls this wherever it looks a route up.
+//
+// An id with no registration, or an unrecognised class on either side of the
+// comparison, is not a downgrade here: the residency check already refuses an
+// unrecognised serving class, and a registered class outside the ladder is
+// ignored rather than allowed to refuse every request for the id.
+func classDowngrade(snap policy.Snapshot, rt routing.Route, target string) (registered string, down bool) {
+	registered = snap.RegisteredClass[target]
+	rr, rok := routing.ClassRank(registered)
+	sr, sok := routing.ClassRank(rt.Class)
+	if !rok || !sok {
+		return registered, false
+	}
+	return registered, sr > rr
+}
+
+// codeModelClassDowngraded is the refusal for a model id (direct or through a
+// static alias) that the route table serves only from a looser backend class
+// than the id is registered with. A routed alias's pick that hits this is the
+// route being down instead: the alias setting decides, and a refusal there is
+// route_target_unavailable.
+const codeModelClassDowngraded = "model_class_downgraded"
+
+// classWhere says a backend class as where the prompt would go.
+func classWhere(class string) string {
+	switch class {
+	case routing.ClassSelfHosted:
+		return "in your own cluster"
+	case routing.ClassCloudManaged:
+		return "in your cloud account"
+	case routing.ClassExternalAPI:
+		return "outside your cloud account"
+	}
+	return "somewhere that is not recognised"
+}
+
+// classDowngradeRefusal is the 503 for a model id served only by a looser
+// class than it is registered with, or nil when the route is fine.
+func classDowngradeRefusal(snap policy.Snapshot, rt routing.Route, target string) *routedPickRefusal {
+	registered, down := classDowngrade(snap, rt, target)
+	if !down {
+		return nil
+	}
+	return &routedPickRefusal{
+		Code:   codeModelClassDowngraded,
+		Status: http.StatusServiceUnavailable,
+		Type:   "service_unavailable",
+		Message: fmt.Sprintf("model %q normally runs %s; that backend is not reachable, and the model is now only offered %s, so the request was not sent anywhere. Restore the backend, or an administrator who moved the model on purpose can accept the new class on the Models page.",
+			target, classWhere(registered), classWhere(rt.Class)),
+	}
+}
+
+// homeClass is the class a picked route's model normally runs in, for the
+// "same or stricter" comparison: the strictest of the class serving it now,
+// the class the api last recorded, and the registered class. A vendor that has
+// taken over the id must not make the route look looser than it is. "" when
+// none is a recognised class (the raw value of the first non-empty one, so a message can name it).
+func homeClass(snap policy.Snapshot, tbl *routing.Table, target string) string {
+	best, bestRank, raw := "", -1, ""
+	consider := func(c string) {
+		if raw == "" {
+			raw = c
+		}
+		if r, ok := routing.ClassRank(c); ok && (bestRank < 0 || r < bestRank) {
+			best, bestRank = c, r
+		}
+	}
+	if rt, ok := tbl.Lookup(target); ok {
+		consider(rt.Class)
+	}
+	consider(snap.ModelClass[target])
+	consider(snap.RegisteredClass[target])
+	if best == "" {
+		return raw // unrecognised: the comparison fails closed, the message names it
+	}
+	return best
 }
 
 func targetStateText(code string) string {
 	if code == "model_not_found" {
 		return "not available on this gateway"
 	}
+	if code == stateClassDowngraded {
+		return "served only by a looser backend class than it normally runs on"
+	}
 	return "disabled"
 }
 
-// resolveRoutedPick applies the owner rule to a classifier decision: if the
-// picked route's target is disabled or unreachable and the pick is not the
-// default route, serve the alias's own default route instead (when its
-// target is usable). Policy refusals (residency, allowlist) are never
-// fallback cases — they are evaluated afterwards on the returned target.
-// Shared by HandleChatCompletions and HandleRoutingDryrun so both report the
-// same decision. A pick naming an unknown route is returned untouched (the
-// caller fails closed).
+// targetClass is the backend class of target for the fallback comparison:
+// the live route table's class when the model is served, else the class the
+// api recorded on the models row (a model whose backend is down is absent
+// from the table but its class is still known). "" means unrecorded, which
+// the caller treats as fail-closed.
+func targetClass(snap policy.Snapshot, tbl *routing.Table, target string) string {
+	if rt, ok := tbl.Lookup(target); ok {
+		return rt.Class
+	}
+	return snap.ModelClass[target]
+}
+
+// classText is class for a refusal message: "unrecorded" for "".
+func classText(class string) string {
+	if class == "" {
+		return "unrecorded"
+	}
+	return class
+}
+
+// modeOf is the alias's on_route_unavailable setting with the column default
+// applied: "" (a hand-built AliasDef, or no migration 027) reads as
+// fallback_same_or_stricter.
+func modeOf(alias policy.AliasDef) string {
+	if alias.OnRouteUnavailable == "" {
+		return policy.OnRouteUnavailableSameOrStricter
+	}
+	return alias.OnRouteUnavailable
+}
+
+// fallbackPermitted decides whether a request whose picked route is down may
+// be served by the alias's default route under the alias's
+// on_route_unavailable setting. It returns "" when permitted, else the
+// sentence explaining the refusal. Class order is the one residency ladder
+// (routing.ClassRank: self_hosted < cloud_managed < external_api; lower is
+// stricter). An unknown setting, or an unrecorded/unknown class on either
+// side of the "same or stricter" comparison, refuses.
+func fallbackPermitted(snap policy.Snapshot, tbl *routing.Table, alias policy.AliasDef, pickRoute policy.RouteDef, def policy.RouteDef) string {
+	mode := modeOf(alias)
+	switch mode {
+	case policy.OnRouteUnavailableRefuse:
+		return fmt.Sprintf(" The alias's on_route_unavailable setting is %q, which never uses the default route %q.", mode, alias.DefaultRoute)
+	case policy.OnRouteUnavailableAnyPermitted:
+		return ""
+	case policy.OnRouteUnavailableSameOrStricter:
+		pc, dc := homeClass(snap, tbl, pickRoute.Target), targetClass(snap, tbl, def.Target)
+		pr, pok := routing.ClassRank(pc)
+		dr, dok := routing.ClassRank(dc)
+		if pok && dok && dr <= pr {
+			return ""
+		}
+		return fmt.Sprintf(" The alias's on_route_unavailable setting is %q, which only falls back to a default route in the same or a stricter class, and the default route %q (model %q) is class %s while route %q is class %s.",
+			mode, alias.DefaultRoute, def.Target, classText(dc), pickRoute.Name, classText(pc))
+	default:
+		return fmt.Sprintf(" The alias's on_route_unavailable setting %q is not recognised.", mode)
+	}
+}
+
+// resolveRoutedPick checks the classifier's pick against the route table and
+// the enabled set. If the picked non-default route's target is disabled or
+// missing from the route table, the alias's on_route_unavailable setting
+// decides: refuse (never another route); fallback_same_or_stricter (the
+// default, serve the alias's default route only when its target is usable and
+// its class is the same as or stricter than the picked route's — a local
+// outage must never become vendor egress); fallback_any_permitted (serve the
+// default route whenever it is usable). Anything else is refused with
+// route_target_unavailable (503) naming both routes, both classes and the
+// setting. A pick of the default route itself keeps its model_not_found /
+// model_not_enabled refusal. A classifier failure never reaches the setting:
+// router/semantic.go returns alias.DefaultRoute with a fallback:classifier_*
+// reason, which is the admin's configured answer to "classification
+// unavailable". Policy refusals (residency, allowlist) are evaluated
+// afterwards on the returned target, fallback or not. Shared by
+// HandleChatCompletions and HandleRoutingDryrun so both report the same
+// decision. A pick naming an unknown route is returned untouched (the caller
+// fails closed).
 func resolveRoutedPick(snap policy.Snapshot, tbl *routing.Table, aliasName string, alias policy.AliasDef, d router.Decision) routedPick {
 	pick := routedPick{RouteName: d.RouteName, Reason: d.Reason}
 	rd, ok := alias.Route(d.RouteName)
@@ -449,6 +625,14 @@ func resolveRoutedPick(snap policy.Snapshot, tbl *routing.Table, aliasName strin
 		return pick
 	}
 	if d.RouteName == alias.DefaultRoute {
+		if state == stateClassDowngraded {
+			rt, _ := tbl.Lookup(rd.Target)
+			// The default route has nothing to fall back to: the route is
+			// down, so this is route_target_unavailable like any other.
+			pick.Refusal = classDowngradeRefusal(snap, rt, rd.Target)
+			pick.Refusal.Code = codeRouteTargetUnavailable
+			return pick
+		}
 		pick.Refusal = &routedPickRefusal{
 			Code: state,
 			Message: fmt.Sprintf("route %q of alias %q is the alias's default route and selects model %q, which is %s. Enable it on the Models page or retarget the route.",
@@ -460,18 +644,25 @@ func resolveRoutedPick(snap policy.Snapshot, tbl *routing.Table, aliasName strin
 	if !dok {
 		return pick // unreachable per buildAliases; refuse via the normal path
 	}
-	dstate := targetState(snap, tbl, def.Target)
-	if dstate != "" {
+	refuse := func(why string) routedPick {
 		pick.Refusal = &routedPickRefusal{
-			Code: state,
-			Message: fmt.Sprintf("route %q of alias %q selects model %q, which is %s, and the alias's default route %q selects %q, which is also %s. Enable one of them on the Models page or retarget the route.",
-				d.RouteName, aliasName, rd.Target, targetStateText(state), alias.DefaultRoute, def.Target, targetStateText(dstate)),
+			Code:   codeRouteTargetUnavailable,
+			Status: http.StatusServiceUnavailable,
+			Type:   "service_unavailable",
+			Message: fmt.Sprintf("route %q of alias %q selects model %q, which is %s.%s The request was not sent anywhere else. Enable the model on the Models page, retarget the route, or change the alias's setting.",
+				d.RouteName, aliasName, rd.Target, targetStateText(state), why),
 		}
 		return pick
 	}
-	kind := "route_target_disabled"
-	if state == "model_not_found" {
-		kind = "route_target_unreachable"
+	if dstate := targetState(snap, tbl, def.Target); dstate != "" {
+		return refuse(fmt.Sprintf(" The alias's on_route_unavailable setting is %q, and the default route %q selects model %q, which is also %s, so there is nothing to fall back to.", modeOf(alias), alias.DefaultRoute, def.Target, targetStateText(dstate)))
+	}
+	if why := fallbackPermitted(snap, tbl, alias, rd, def); why != "" {
+		return refuse(why)
+	}
+	kind := "route_target_unreachable"
+	if state == "model_not_enabled" {
+		kind = "route_target_disabled"
 	}
 	return routedPick{
 		RouteName: alias.DefaultRoute,
@@ -746,8 +937,8 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 	}
 
 	if routedRefusal != nil {
-		// Both the classifier's pick and the alias's default route are
-		// unusable (disabled/unreachable): nothing to fall back to.
+		// The picked route's target is disabled/unreachable. Refused; never
+		// redirected to the default route or any other model.
 		if rt, found := h.routes.Snapshot().Lookup(resolvedModel); found {
 			c.Set("backend_class", rt.Class)
 			c.Header("X-Darkplum-Backend-Class", rt.Class)
@@ -756,7 +947,9 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 		c.Set("denial_code", routedRefusal.Code)
 		logDenial(c, routedRefusal.Code, req.Model, resolvedModel, c.GetString("backend_class"))
 		status, typ := http.StatusForbidden, "permission_error"
-		if routedRefusal.Code == "model_not_found" {
+		if routedRefusal.Status != 0 {
+			status, typ = routedRefusal.Status, routedRefusal.Type
+		} else if routedRefusal.Code == "model_not_found" {
 			status, typ = http.StatusNotFound, "invalid_request_error"
 		}
 		c.JSON(status, openAIError{Error: openAIErrorBody{
@@ -784,6 +977,19 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 	c.Set("backend_class", route.Class)
 	c.Header("X-Darkplum-Backend-Class", route.Class)
 	c.Header("X-Darkplum-Provider", route.Kind)
+
+	// A model id is never served by a looser class than it is registered
+	// with: see classDowngrade. Applies to a direct model id, a static alias
+	// and a routed alias's (already fallback-resolved) target alike, before
+	// anything is dispatched, and before the stream opens.
+	if refusal := classDowngradeRefusal(snap, route, resolvedModel); refusal != nil {
+		c.Set("denial_code", refusal.Code)
+		logDenial(c, refusal.Code, req.Model, resolvedModel, route.Class)
+		c.JSON(refusal.Status, openAIError{Error: openAIErrorBody{
+			Message: refusal.Message, Type: refusal.Type, Code: refusal.Code,
+		}})
+		return
+	}
 
 	if !snap.Enabled[resolvedModel] {
 		c.Set("denial_code", "model_not_enabled")
@@ -1062,9 +1268,11 @@ func (h *ChatHandler) HandleListModels(c *gin.Context) {
 	allowExternalAPI := classesHeaderAllowsExternalAPI(c)
 
 	var eff policy.EffectivePolicy
+	var listSnap policy.Snapshot
 	filterByPolicy := false
 	if c.GetString(middleware.ContextKeyType) == middleware.KeyTypeUser {
 		if snap, loaded := h.policy.Current(); loaded {
+			listSnap = snap
 			eff = snap.EffectiveFor(attributedUserID(c), c.GetString(middleware.ContextKeyID), middleware.KeyTypeUser)
 			filterByPolicy = true
 		}
@@ -1089,6 +1297,15 @@ func (h *ChatHandler) HandleListModels(c *gin.Context) {
 		// SDK that lists models never offers one it would then be refused on.
 		if filterByPolicy && (!eff.Allows(id) || !policy.ResidencyPermits(eff.Residency, route.Class)) {
 			continue
+		}
+		// ...and the class-downgrade refusal too (see classDowngrade). Only a
+		// user key's list is filtered: the service-key list is the api's
+		// discovery feed, which must keep reporting what each backend serves
+		// so an administrator can see, and accept, a deliberate class change.
+		if filterByPolicy {
+			if _, down := classDowngrade(listSnap, route, id); down {
+				continue
+			}
 		}
 		entry := modelEntry{
 			ID:           id,
@@ -1694,6 +1911,9 @@ func allowedModels(eff policy.EffectivePolicy, snap policy.Snapshot, table *rout
 		if !policy.ResidencyPermits(eff.Residency, route.Class) {
 			continue
 		}
+		if _, down := classDowngrade(snap, route, id); down {
+			continue // chat would refuse it: model_class_downgraded
+		}
 		out = append(out, id)
 	}
 	return out
@@ -1774,8 +1994,10 @@ func anyModelRoutable(snap policy.Snapshot, table *routing.Table) bool {
 		if !enabled {
 			continue
 		}
-		if _, ok := table.Lookup(id); ok {
-			return true
+		if rt, ok := table.Lookup(id); ok {
+			if _, down := classDowngrade(snap, rt, id); !down {
+				return true
+			}
 		}
 	}
 	return false
@@ -1819,6 +2041,9 @@ func reachableModels(eff policy.EffectivePolicy, snap policy.Snapshot, table *ro
 		}
 		if !policy.ResidencyPermits(eff.Residency, route.Class) {
 			continue
+		}
+		if _, down := classDowngrade(snap, route, id); down {
+			continue // chat would refuse it: model_class_downgraded
 		}
 		reachable = append(reachable, id)
 	}
@@ -1942,6 +2167,8 @@ func (h *ChatHandler) HandleRoutingDryrun(c *gin.Context) {
 			Code:    "model_not_found",
 			Message: fmt.Sprintf("model %q is not available on this gateway", target),
 		}
+	} else if refusal := classDowngradeRefusal(snap, rt, target); refusal != nil {
+		resp.WouldBeRefused = &routingDryrunRefusal{Code: refusal.Code, Message: refusal.Message}
 	} else if !snap.Enabled[target] {
 		resp.WouldBeRefused = &routingDryrunRefusal{
 			Code:    "model_not_enabled",
@@ -2115,7 +2342,7 @@ func respondRequestCanceled(c *gin.Context) {
 // of an alias-routed 404/403). code is one of model_not_found,
 // model_not_enabled, model_residency_violation, model_not_allowed,
 // policy_unavailable, invalid_request, unsupported_parameter,
-// request_canceled. requestedModel is always the raw value
+// request_canceled, route_target_unavailable. requestedModel is always the raw value
 // the caller sent in the request body (regardless of whether it was an
 // alias), except for invalid_request where no reliable value exists —
 // noModelRecorded ("(none)") is passed instead so the log and the audit

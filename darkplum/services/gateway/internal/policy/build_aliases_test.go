@@ -150,3 +150,13 @@ func TestBuildAliases_LegacyModelClassifierKindCoercedToRules(t *testing.T) {
 }
 
 func strPtr(s string) *string { return &s }
+
+func TestBuildAliases_CarriesOnRouteUnavailable(t *testing.T) {
+	got := buildAliases(
+		[]rawAliasRow{{Alias: "a", Kind: AliasKindRouted, DefaultRoute: strPtr("general"), ClassifierKind: strPtr("rules"), OnRouteUnavailable: OnRouteUnavailableRefuse}},
+		[]rawRouteRow{{Alias: "a", Name: "general", Target: "m"}},
+	)
+	if got["a"].OnRouteUnavailable != OnRouteUnavailableRefuse {
+		t.Errorf("OnRouteUnavailable = %q", got["a"].OnRouteUnavailable)
+	}
+}

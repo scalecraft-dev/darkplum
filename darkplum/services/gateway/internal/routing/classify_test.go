@@ -144,3 +144,17 @@ func TestClassifyError_NeverReturnsRawErrorText(t *testing.T) {
 		}
 	}
 }
+
+func TestClassRank_OrdersTheLadderAndRejectsUnknown(t *testing.T) {
+	s, _ := ClassRank(ClassSelfHosted)
+	c, _ := ClassRank(ClassCloudManaged)
+	e, _ := ClassRank(ClassExternalAPI)
+	if !(s < c && c < e) {
+		t.Errorf("ranks %d %d %d must strictly increase", s, c, e)
+	}
+	for _, bad := range []string{"", "mystery"} {
+		if _, ok := ClassRank(bad); ok {
+			t.Errorf("%q must be unknown", bad)
+		}
+	}
+}

@@ -425,10 +425,16 @@ Limits to know, because this backend is different in kind from the other two:
   hard stop is the limit you set at the vendor.
 - **No failover across backends, by design.** If a vendor is down or
   rate-limiting, that request fails with the vendor's status (`429` with
-  `Retry-After` is passed through); it is not retried on a local model, and a
-  local outage is never retried on a vendor. Sending a prompt somewhere else
-  because a GPU node was unhealthy would be a data-egress decision taken when
-  nobody is watching.
+  `Retry-After` is passed through); it is not retried on a local model. The
+  only places a request can move are routed aliases (see Routed aliases): a
+  picked route that is down moves to the alias's default route only as its
+  *If the model on a chosen route is down* setting allows (by default never to a looser
+  backend class), and a classifier failure always uses the default route. Separately, once a model id is registered
+  with a stricter backend class (see Model class registration), a request for it
+  that could only be answered from a looser class is refused with `503
+  model_class_downgraded` instead of being sent there. Sending a prompt somewhere else because a
+  GPU node was unhealthy would be a data-egress decision taken when nobody is
+  watching.
 - **Bring-your-own key per request is declined by design.** Callers present
   darkplum API keys only; a caller-supplied vendor key would let the caller,
   not the policy, decide where a prompt goes.
@@ -506,17 +512,60 @@ reserves room for them.
 - *Aliases* — stable names such as `default-chat` that point at a model, so
   swapping models is an admin change rather than a code change. The usage log
   records both the alias requested and the model that served it.
+- *Model class registration* — each model sync records, per model id, the
+  strictest backend class it has seen serve that id (`model_registered_classes`;
+  the sync only ever tightens it). The gateway compares that with the class now
+  serving the id. If the backend for an id that normally runs self-hosted
+  becomes unreachable and a vendor API that lists the same id (for example an
+  OpenAI-compatible vendor serving the same Hugging Face id) would take it over,
+  the request is refused with `503 model_class_downgraded` (a plain-language
+  message, not sent anywhere) rather than answered by the vendor. This holds
+  for direct model ids and static aliases, streaming or not, and the routing
+  dry run reports the same; a routed alias's pick is treated as the route being
+  down, so the alias's *If the model on a chosen route is down* setting applies
+  (and a refusal there is `route_target_unavailable`). The user-key model list and
+  the reachable-model counts omit such ids. The guarantee has conditions: both
+  the api's migration 028 and a gateway that reads it must be in place; the id
+  must have been registered (an id served only between two syncs, or only ever
+  by a vendor, is registered at the vendor class or not at all); and an
+  in-cluster source that once lists a vendor's id pins that id to self-hosted
+  until an administrator accepts the new class.
+
+  Rollout: apply the api's migrations (028) before the gateway that reads the
+  table; until 028 is applied there is no class check, and the gateway logs a
+  warning. The migration registers each existing model at the strictest of its
+  current class and every class the usage log recorded for it. After
+  upgrading, compare `SELECT model_id, registered_class FROM
+  model_registered_classes` with your self-hosted inventory. A wrong row is
+  fixed by accepting the class the model is discovered under now:
+  `PATCH /api/v1/models/:id` with `{"accept_class": true}` — which is also how
+  you move a model to a looser class on purpose. It is audited as
+  `model.class_accepted` in Admin > Activity and is API-only for now (no
+  button). A row that is too strict (an in-cluster source once listed a vendor's
+  id) is fixed the same way, once the model is discovered under the class you
+  want.
 - *Routed aliases* — an alias whose administrator writes a short list of routes
   (a named intent, a description, one target model each) and picks a classifier:
   the open-source vLLM Semantic Router running on CPU inside your cluster, or
   explainable rules (keywords, code detection, prompt length). The classifier
   chooses among those routes and no others;
   the chosen model still passes the enabled and residency checks, and a route the
-  policy forbids is refused, never swapped. If the chosen route's model is merely
-  disabled or unreachable, the alias uses its own default route instead — an
-  admin-authored choice inside the same alias that passes the same checks — and
-  the usage log says so (`fallback:route_target_disabled`); only when the default
-  route is unusable too is the request refused. Every request records the route, the
+  policy forbids is refused, never swapped. If the chosen route's model is
+  disabled or unreachable, the alias's *If the model on a chosen route is down* setting
+  (`on_route_unavailable`) decides, per alias: `refuse` never uses another route
+  (`503 route_target_unavailable`); `fallback_same_or_stricter` (the default, for
+  new and existing aliases) uses the alias's default route only if its model is
+  usable and its backend class is the same as or stricter than the chosen
+  route's (self-hosted, then cloud-managed, then outside your cloud account) and
+  otherwise refuses with the same 503, an unknown class refusing too;
+  `fallback_any_permitted` uses the default route whenever it is usable, so
+  prompts may be sent to a looser class when a route is down. A fallback is
+  recorded as `fallback:route_target_disabled` or `fallback:route_target_unreachable`
+  and still passes the residency and allowlist checks. A classifier failure
+  (timeout, open circuit breaker, low confidence, unknown category, Semantic
+  Router not installed) is a different case and always uses the default route,
+  whatever this setting says; Admin > Routing warns when the default route is
+  looser than another route. Every request records the route, the
   reason, and every model that saw the prompt — the classifier included — and the
   chat shows which model answered. Regulated intents can stay on in-account
   models while everything else may use the frontier gateway. Test any prompt
@@ -552,11 +601,11 @@ reserves room for them.
 
   Whatever the classifier says, the chosen model still passes the enabled and
   residency checks; a pick the policy forbids is refused with the route named,
-  never swapped, while a pick whose model is disabled or unreachable falls back
-  to the alias's default route. Disabling a model that aliases route to asks for
+  never swapped, and a pick whose model is disabled or unreachable follows the
+  alias's setting above. Disabling a model that aliases route to asks for
   confirmation and says what each alias will do. Classification runs in-cluster with a 500 ms budget and a circuit
-  breaker; on timeout or breaker-open the alias falls back to its default route
-  and the reason is recorded. Neither classifier is a model invocation, so the
+  breaker; on timeout or breaker-open the alias uses its default route
+  (regardless of the setting above) and the reason is recorded. Neither classifier is a model invocation, so the
   audit trail's "which models saw this prompt" is exactly the model that
   answered.
 

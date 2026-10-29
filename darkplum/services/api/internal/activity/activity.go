@@ -6,6 +6,7 @@ import (
 	"log/slog"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -27,6 +28,12 @@ const (
 	ModelAliasCreated EventType = "model_alias.created"
 	ModelAliasUpdated EventType = "model_alias.updated"
 	ModelAliasDeleted EventType = "model_alias.deleted"
+	// ModelClassAccepted is recorded when an admin re-registers a model at
+	// the backend class it is discovered under now (PATCH /api/v1/models/:id
+	// {"accept_class": true}). That can LOOSEN where the id's prompts go --
+	// from a self-hosted backend to a vendor API -- so it is its own event;
+	// Detail carries the previous and new registered class.
+	ModelClassAccepted EventType = "model.class_accepted"
 	// RoutingPolicyChanged is no longer emitted (superseded by
 	// RoutingPolicyOrgChanged) but the constant stays defined so the web's
 	// event-type-to-label humaniser keeps rendering historical rows recorded
@@ -153,6 +160,27 @@ func (r *Recorder) Record(_ context.Context, evt Event) {
 		slog.Error("activity: failed to record event",
 			"event_type", evt.Type, "err", err)
 	}
+}
+
+// RecordTx inserts an activity event inside tx and RETURNS the error, unlike
+// Record. For changes whose audit row must commit or roll back with the change
+// itself (a loosening of where prompts may go), so a failed audit write fails
+// the request instead of leaving an unaudited change behind.
+func RecordTx(ctx context.Context, tx pgx.Tx, evt Event) error {
+	var detailJSON []byte
+	if evt.Detail != nil {
+		var err error
+		if detailJSON, err = json.Marshal(evt.Detail); err != nil {
+			return err
+		}
+	}
+	_, err := tx.Exec(ctx, `
+		INSERT INTO activity_events
+			(event_type, actor_id, target_type, target_id, detail, ip_address, request_id)
+		VALUES ($1, $2, $3, $4, $5, $6::inet, $7)
+	`, string(evt.Type), evt.ActorID, evt.TargetType, evt.TargetID,
+		detailJSON, nullableIP(evt.IP), evt.RequestID)
+	return err
 }
 
 // FromContext builds a base Event from Gin context values, leaving TargetType,

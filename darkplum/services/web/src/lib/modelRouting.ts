@@ -1,4 +1,13 @@
-import type { AliasKind, BackendClass, DisplayClass, ModelAlias, VendorName } from '../types'
+import type {
+  AliasKind,
+  BackendClass,
+  DisplayClass,
+  ModelAlias,
+  OnRouteUnavailable,
+  Residency,
+  VendorName,
+} from '../types'
+import { CLASS_RANK, residencyPermits } from './residency.ts'
 
 /** Alias format enforced by the API and the database check constraint. */
 export const ALIAS_PATTERN = '^[a-z0-9][a-z0-9._-]{0,62}$'
@@ -370,9 +379,9 @@ export function routerReasonText(reason: string | null | undefined): string {
   }
   const fallback = routeFallbackOf(reason)
   if (fallback) {
-    return `Fell back to the default route — the model on route '${fallback.route}' ${
-      fallback.state === 'disabled' ? 'is disabled' : 'is not reachable'
-    }`
+    return `The default route answered instead — the model on route '${fallback.route}' ${
+      fallback.state === 'disabled' ? 'was disabled' : 'was not reachable'
+    } at the time`
   }
   if (reason.startsWith('semantic:')) return 'Classified by the semantic router'
   return reason
@@ -381,10 +390,10 @@ export function routerReasonText(reason: string | null | undefined): string {
 const ROUTE_FALLBACK_RE = /^fallback:route_target_(disabled|unreachable):(.+)$/
 
 /**
- * A routed alias whose picked route cannot answer — its target is disabled, or
- * the gateway has no backend for it — is answered on the alias's own default
- * route instead, and the gateway records which route was skipped. Policy
- * refusals never land here: those still refuse with the route named.
+ * Parses the reason the gateway records when a routed alias's picked route
+ * could not answer and the alias's default route did, as its
+ * on_route_unavailable setting allows. Also read from rows and chat turns
+ * recorded before that setting existed, which carry the same reason.
  */
 export function routeFallbackOf(
   reason: string | null | undefined,
@@ -393,88 +402,276 @@ export function routeFallbackOf(
   return m ? { state: m[1] as 'disabled' | 'unreachable', route: m[2] } : null
 }
 
-/** Why a non-default route is not answering itself, as Admin > Routing sees it. */
-export type RouteFallbackState = 'missing' | 'disabled' | 'unreachable'
+// ---------------------------------------------------------------------------
+// When the picked route cannot answer
+// ---------------------------------------------------------------------------
 
-/** The one sentence under a non-default route whose target cannot answer while
- *  the default route can. Said in the editor and on the alias row alike. */
-export function routeFallbackHint(state: RouteFallbackState, defaultRoute: string): string {
+export const ON_ROUTE_UNAVAILABLE_DEFAULT: OnRouteUnavailable = 'fallback_same_or_stricter'
+
+/** The values the API accepts, in the order the editor offers them: strictest first. */
+export const ON_ROUTE_UNAVAILABLE_VALUES: OnRouteUnavailable[] = [
+  'refuse',
+  'fallback_same_or_stricter',
+  'fallback_any_permitted',
+]
+
+/**
+ * An alias's setting. An older API sends none, which the gateway reads as the
+ * default too; a value this bundle does not know is read as the strictest, so
+ * the screen never promises a fallback the gateway may not make.
+ */
+export function onRouteUnavailableOf(a: {
+  on_route_unavailable?: OnRouteUnavailable | string | null
+}): OnRouteUnavailable {
+  const v = a.on_route_unavailable
+  if (v === undefined || v === null) return ON_ROUTE_UNAVAILABLE_DEFAULT
+  return (ON_ROUTE_UNAVAILABLE_VALUES as string[]).includes(v) ? (v as OnRouteUnavailable) : 'refuse'
+}
+
+/** A class said as where the prompt goes, for a sentence about a default route. */
+export function classPhrase(c: DisplayClass): string {
+  switch (c) {
+    case 'self_hosted':
+      return 'in your own cluster'
+    case 'cloud_managed':
+      return 'managed in your cloud account'
+    case 'external_api':
+      return 'outside your cloud account'
+    default:
+      return 'where it runs is not known'
+  }
+}
+
+/** Why a non-default route's target cannot answer, as Admin > Routing sees it. */
+export type RouteUnavailableState = 'missing' | 'disabled' | 'unreachable'
+
+/**
+ * What happens to a message whose picked, non-default route cannot answer.
+ * Mirrors the gateway's resolveRoutedPick: the class order is the residency
+ * ladder (CLASS_RANK), and an unknown class on either side refuses.
+ */
+export type RouteOutcome =
+  | { kind: 'fallback'; defaultRoute: string; defaultClass: DisplayClass; pickClass: DisplayClass }
+  | {
+      kind: 'refused'
+      cause: 'setting' | 'default_unusable' | 'looser' | 'unknown_class'
+      defaultRoute: string | null
+      defaultClass: DisplayClass | null
+      pickClass: DisplayClass
+    }
+
+/** The default route as the outcome needs it. `usable`: its model exists and is
+ *  on (and, where the caller knows the policy, is permitted). This is the
+ *  gateway's own test (the model is in its route table and enabled), so it
+ *  deliberately ignores `target_available`: that is the api's recent-discovery
+ *  signal, which the gateway does not consult when it picks the default route. */
+export interface DefaultRouteEnd {
+  name: string
+  class: DisplayClass
+  usable: boolean
+}
+
+export function routeOutcome(
+  setting: OnRouteUnavailable,
+  pickClass: DisplayClass,
+  def: DefaultRouteEnd | null,
+): RouteOutcome {
+  const refused = (cause: 'setting' | 'default_unusable' | 'looser' | 'unknown_class'): RouteOutcome => ({
+    kind: 'refused',
+    cause,
+    defaultRoute: def?.name ?? null,
+    defaultClass: def?.class ?? null,
+    pickClass,
+  })
+  if (setting === 'refuse') return refused('setting')
+  if (!def || !def.usable) return refused('default_unusable')
+  // The gateway checks the default route against the residency policy after
+  // choosing it, and an unrecognised class is refused under every policy, so
+  // an unknown-class default never answers, whatever the setting.
+  if (def.class === 'unknown') return refused('unknown_class')
+  if (setting === 'fallback_same_or_stricter') {
+    if (pickClass === 'unknown') return refused('unknown_class')
+    if (CLASS_RANK[def.class] > CLASS_RANK[pickClass]) return refused('looser')
+  }
+  return { kind: 'fallback', defaultRoute: def.name, defaultClass: def.class, pickClass }
+}
+
+/** True when the default's class is strictly looser than the picked one's. */
+export function isLooserClass(def: DisplayClass, pick: DisplayClass): boolean {
+  return CLASS_RANK[def] > CLASS_RANK[pick]
+}
+
+/** The words after "messages that take this route are", per what is wrong. */
+export function refusalSuffix(state: RouteUnavailableState | 'blocked' | 'unknown'): string {
+  switch (state) {
+    case 'unknown':
+      return 'refused until a backend reports where the model runs'
+    case 'unreachable':
+      return 'refused until the backend is back'
+    case 'blocked':
+      return 'refused under the current policy'
+    default:
+      return 'refused until it is fixed'
+  }
+}
+
+const DEFAULT_ROUTE_REFUSES_ON_CLASSIFICATION_FAILURE =
+  'It is also the default route, so messages are refused when classification fails.'
+
+/** Why a refused outcome was refused, as one sentence, or '' for a fallback. */
+export function refusalCause(o: RouteOutcome): string {
+  if (o.kind === 'fallback') return ''
+  switch (o.cause) {
+    case 'setting':
+      return 'This alias is set to refuse rather than use another route.'
+    case 'default_unusable':
+      return o.defaultRoute
+        ? `The default route ${o.defaultRoute} cannot answer either.`
+        : 'The alias has no default route that can answer.'
+    case 'looser':
+      return `This alias only falls back to the same or a stricter class, and the default route ${o.defaultRoute ?? ''} (${classPhrase(o.defaultClass ?? 'unknown')}) is looser than this route (${classPhrase(o.pickClass)}).`
+    default:
+      return o.defaultClass === 'unknown'
+        ? `The default route ${o.defaultRoute ?? ''} has not reported where it runs, and a model whose class is unknown is refused under every policy.`
+        : `This alias only falls back to a known same or stricter class, and the class of this route is not reported.`
+  }
+}
+
+/** Where an answer on the default route runs, said where a prompt's destination matters. */
+export function fallbackSentence(o: Extract<RouteOutcome, { kind: 'fallback' }>): string {
+  return `the default route ${o.defaultRoute} (${classPhrase(o.defaultClass)})`
+}
+
+/** Said after a fallback to a looser class, which only fallback_any_permitted
+ *  allows: the prompt goes somewhere the chosen route would not have sent it. */
+export function looserFallbackNote(o: Extract<RouteOutcome, { kind: 'fallback' }>): string {
+  return isLooserClass(o.defaultClass, o.pickClass)
+    ? ` That is looser than this route (${classPhrase(o.pickClass)}); this alias's setting allows it.`
+    : ''
+}
+
+/**
+ * The one sentence under a route whose target cannot answer. Said in the
+ * editor and on the alias row alike. `outcome` is null for the alias's default
+ * route, which has nothing to fall back to.
+ */
+export function routeUnavailableHint(
+  state: RouteUnavailableState,
+  outcome: RouteOutcome | null = null,
+): string {
   const lead =
     state === 'missing'
       ? 'No model has this ID'
       : state === 'disabled'
         ? 'This model is turned off'
         : 'This model is not reachable right now'
-  return `${lead}, so messages that take this route fall back to the default route ${defaultRoute} until it is fixed.`
+  if (outcome && outcome.kind === 'fallback') {
+    return `${lead}, so messages that take this route are answered on ${fallbackSentence(outcome)} until it is fixed.${looserFallbackNote(outcome)}`
+  }
+  const why = outcome ? refusalCause(outcome) : DEFAULT_ROUTE_REFUSES_ON_CLASSIFICATION_FAILURE
+  return `${lead}, so messages that take this route are ${refusalSuffix(state)}. They are never sent to another model. ${why}`
 }
 
 /**
- * The gateway's sentence for a routed pick that cannot answer and has nowhere
- * to fall back to: the picked route is the default, or the default cannot
- * answer either. It names both models and is relayed verbatim; this only
+ * Shown in the alias editor when a classification failure would send messages
+ * somewhere looser than a route the admin wrote on purpose. A classifier
+ * failure always uses the default route, whatever the setting says. Null when
+ * the default is no looser than any other route.
+ */
+export function classificationFailureWarning(
+  defaultRoute: string,
+  defaultClass: DisplayClass,
+  otherClasses: DisplayClass[],
+): string | null {
+  if (!defaultRoute || !otherClasses.some((c) => isLooserClass(defaultClass, c))) return null
+  return `If classification fails, messages go to ${defaultRoute} (${classPhrase(defaultClass)}), whatever the setting below says. Make a stricter route the default if that is not acceptable.`
+}
+
+/** The gateway's code for a classifier-picked, non-default route whose target
+ *  is disabled or unreachable and which the alias's setting does not let the
+ *  default route answer (503). */
+export const ROUTE_TARGET_UNAVAILABLE_CODE = 'route_target_unavailable'
+
+/**
+ * A routed pick that cannot answer: either the 503 `route_target_unavailable`
+ * (a non-default route), or the model_not_found / model_not_enabled refusal the
+ * gateway keeps for a pick of the alias's default route, whose sentence says so. The message is relayed verbatim; this only
  * recognises it so chat can offer the right next step.
  */
 export function isRouteTargetRefusal(code: string | null | undefined, message: string): boolean {
+  if (code === ROUTE_TARGET_UNAVAILABLE_CODE) return true
   return (
     (code === 'model_not_enabled' || code === 'model_not_found') &&
-    message.includes("the alias's default route")
+    message.includes("is the alias's default route")
   )
 }
 
-/** One place a model is used by an alias, and what disabling it does there. */
+/** The gateway's code for a model id (direct or through a static alias) whose
+ *  usual backend is down and which is now offered only by a looser backend
+ *  class: refused with a 503 rather than sent there. */
+export const MODEL_CLASS_DOWNGRADED_CODE = 'model_class_downgraded'
+
+/** One place a model is used by an alias, and what turning it off does there. */
 export interface AliasReference {
   alias: string
   /** null for a static alias. */
   route: string | null
   isDefault: boolean
-  /** The alias's default route and its target, for a routed alias. */
-  defaultRoute: string | null
-  defaultTarget: string | null
   /** 'fallback': messages on this route move to the default route.
    *  'refused': messages that land here are refused. */
   outcome: 'fallback' | 'refused'
+  /** The full decision, for a non-default route of a routed alias. */
+  detail: RouteOutcome | null
 }
 
 /**
  * Every alias and route that targets `modelId`, with what turning the model off
- * would do to each. A non-default route falls back to its alias's default
- * route — unless that default also targets this model, or cannot answer as
- * things stand, in which case it is refused too.
+ * would do to each, from the alias's own setting and the classes involved. A
+ * default route that also targets this model, or cannot answer as things
+ * stand (or, when `residency` is given, is not permitted by it), cannot take
+ * over.
  */
-export function aliasReferencesTo(modelId: string, aliases: ModelAlias[]): AliasReference[] {
+export function aliasReferencesTo(
+  modelId: string,
+  aliases: ModelAlias[],
+  residency?: Residency,
+): AliasReference[] {
   const refs: AliasReference[] = []
   for (const a of aliases) {
     if (!isRoutedAlias(a)) {
       if (a.target_model_id === modelId) {
-        refs.push({
-          alias: a.alias,
-          route: null,
-          isDefault: false,
-          defaultRoute: null,
-          defaultTarget: null,
-          outcome: 'refused',
-        })
+        refs.push({ alias: a.alias, route: null, isDefault: false, outcome: 'refused', detail: null })
       }
       continue
     }
     const routes = a.routes ?? []
     const def = routes.find((r) => r.route_name === a.default_route) ?? null
-    const defaultUsable =
-      def !== null &&
-      def.target_model_id !== modelId &&
-      def.target_exists !== false &&
-      def.target_enabled !== false &&
-      def.target_available !== false
+    const defClass = def ? targetClassOf(def) : 'unknown'
+    const defaultEnd: DefaultRouteEnd | null = def
+      ? {
+          name: def.route_name,
+          class: defClass,
+          usable:
+            def.target_model_id !== modelId &&
+            def.target_exists !== false &&
+            def.target_enabled !== false &&
+            (residency === undefined || residencyPermits(residency, defClass)),
+        }
+      : null
     for (const r of routes) {
       if (r.target_model_id !== modelId) continue
       const isDefault = def !== null && r.route_name === def.route_name
+      if (isDefault) {
+        refs.push({ alias: a.alias, route: r.route_name, isDefault, outcome: 'refused', detail: null })
+        continue
+      }
+      const detail = routeOutcome(onRouteUnavailableOf(a), targetClassOf(r), defaultEnd)
       refs.push({
         alias: a.alias,
         route: r.route_name,
         isDefault,
-        defaultRoute: def?.route_name ?? null,
-        defaultTarget: def?.target_model_id ?? null,
-        outcome: !isDefault && defaultUsable ? 'fallback' : 'refused',
+        outcome: detail.kind,
+        detail,
       })
     }
   }
@@ -485,14 +682,13 @@ export function aliasReferencesTo(modelId: string, aliases: ModelAlias[]): Alias
 export function aliasReferenceConsequence(r: AliasReference): string {
   if (r.route === null) return 'refused until it is retargeted or the model is re-enabled'
   if (r.isDefault) {
-    return 'messages that land here will be refused until it is retargeted or re-enabled'
+    return `messages that take this route will be refused until it is retargeted or re-enabled. ${DEFAULT_ROUTE_REFUSES_ON_CLASSIFICATION_FAILURE}`
   }
-  if (r.outcome === 'fallback') {
-    return `messages will use its default route ${r.defaultRoute} (${r.defaultTarget}) instead`
+  if (r.detail && r.detail.kind === 'fallback') {
+    return `messages that take this route will use ${fallbackSentence(r.detail)} instead.${looserFallbackNote(r.detail)}`
   }
-  return r.defaultRoute
-    ? `messages will be refused — its default route ${r.defaultRoute} cannot answer either`
-    : 'messages will be refused — the alias has no default route to fall back to'
+  const why = r.detail ? ` ${refusalCause(r.detail)}` : ''
+  return `messages that take this route will be refused, never sent to another model, until it is retargeted or re-enabled.${why}`
 }
 
 /** Every target a routed alias can reach, or the single target of a static one. */
@@ -519,6 +715,8 @@ export const DENIAL_CODES = [
   'policy_unavailable',
   'request_canceled',
   'model_requires_data_retention',
+  'route_target_unavailable',
+  'model_class_downgraded',
 ] as const
 
 const DENIAL_LABELS: Record<string, string> = {
@@ -538,6 +736,8 @@ const DENIAL_LABELS: Record<string, string> = {
   // option would send a query the api answers with a 400. A row carrying it
   // still needs a written label rather than the underscore fallback.
   unsupported_parameter: 'Unsupported request option',
+  route_target_unavailable: 'Route target unavailable',
+  model_class_downgraded: 'Usual backend unavailable',
 }
 
 // The vendor failures the gateway relays — provider_rate_limited,

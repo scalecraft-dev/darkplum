@@ -931,7 +931,7 @@ function ModelsPageBody() {
         })
       }
     }
-    const refs = aliasReferencesTo(model.model_id, current)
+    const refs = aliasReferencesTo(model.model_id, current, residency)
     if (refs.length > 0) {
       setPendingDisable({ model, refs })
       return

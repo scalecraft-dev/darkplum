@@ -12,6 +12,7 @@ import {
   formatRetryCountdown,
   isEgress,
   isRouteTargetRefusal,
+  MODEL_CLASS_DOWNGRADED_CODE,
   routeFallbackOf,
   routerReasonText,
   vendorLabel,
@@ -79,6 +80,13 @@ const UnsavedNotice = () => (
   </p>
 )
 
+/** What a non-administrator reads in place of the gateway's sentence for a
+ *  routed pick that cannot answer, or a model whose usual backend is down:
+ *  those sentences name routes, models, classes and an alias setting, none of
+ *  which the sender can act on. */
+const ROUTE_UNAVAILABLE_FOR_USERS =
+  'The model that would answer this message is not available right now. Nothing was sent anywhere else instead.'
+
 /** Headline and next step for each refusal the gateway can return — a routing
  *  decision of the organisation's own, or a failure at the vendor.
  *  When a re-read of the list has confirmed the model is gone, the next step is
@@ -91,15 +99,29 @@ function failureCopy(
   // Opens every vendor-failure title, so it is a capitalised phrase rather
   // than a bare name, and is never dropped mid-sentence into a hint.
   const vendor = failedVendorLabel(failure.vendor)
-  // A routed alias whose picked route — and the default it would fall back
-  // to — cannot answer. The gateway's sentence names both models and is
-  // printed verbatim above; this only says what the reader can do.
+  // A routed alias whose picked route cannot answer (route_target_unavailable,
+  // or the default route's own model_not_*). A temporary outage as far as the
+  // sender is concerned, not a decision about them: it is refused, never
+  // redirected, and trying again is the next step. The word "route" is an
+  // administrator's; an end user is told only that the model is away.
   if (isRouteTargetRefusal(failure.code, failure.message)) {
     return {
-      title: 'This route cannot answer right now',
+      title: isAdmin ? 'This route cannot answer right now' : 'The model for this message is unavailable',
       hint: isAdmin
-        ? 'Pick another model, or retarget the route under Routing.'
-        : 'Pick another model, or ask an administrator to retarget the route.',
+        ? 'Try again once the model is back, or retarget the route under Routing.'
+        : 'This is temporary. Try again in a moment, or pick another model from the list at the top of the page.',
+    }
+  }
+  // The model's usual backend is down and the only thing still offering the
+  // id is somewhere looser; the gateway refused rather than send the prompt
+  // there. Fixed on the Models page (restore the backend, or accept the new
+  // class), not on a route.
+  if (failure.code === MODEL_CLASS_DOWNGRADED_CODE) {
+    return {
+      title: isAdmin ? "This model's usual backend is down" : 'The model for this message is unavailable',
+      hint: isAdmin
+        ? 'Restore the backend, or accept the new class on the Models page.'
+        : 'This is temporary. Try again in a moment, or pick another model from the list at the top of the page.',
     }
   }
   switch (failure.code) {
@@ -227,9 +249,10 @@ const FailureNotice = ({
     return () => window.clearTimeout(timer)
   }, [waiting])
   // Fixed in the catalogue: the model is missing from it, or switched off in it.
-  // Fixed on the alias, under Admin > Routing: a routed pick with no usable
-  // route to fall back to.
+  // Fixed on the alias, under Admin > Routing: a routed pick whose target
+  // cannot answer and which the alias's setting does not let another route take.
   const aliasRelated = isRouteTargetRefusal(failure.code, failure.message)
+  const classDowngradedRelated = failure.code === MODEL_CLASS_DOWNGRADED_CODE
   const catalogueRelated =
     !aliasRelated && (failure.code === 'model_not_found' || failure.code === 'model_not_enabled')
   // Fixed in the organisation's routing policy, which is its own tab on the
@@ -266,7 +289,9 @@ const FailureNotice = ({
         </svg>
         <span className={styles.failureTitle}>{title}</span>
       </div>
-      <p className={styles.failureMessage}>{failure.message}</p>
+      <p className={styles.failureMessage}>
+        {(aliasRelated || classDowngradedRelated) && !isAdmin ? ROUTE_UNAVAILABLE_FOR_USERS : failure.message}
+      </p>
       {/* A confirmed disappearance overrides the per-role advice: telling an
           admin to enable a model the gateway no longer discovers is a dead end.
           Some refusals say everything in the gateway's own sentence above and
@@ -309,6 +334,11 @@ const FailureNotice = ({
         {isAdmin && aliasRelated && (
           <Link to="/admin/routing" className={styles.failureLink}>
             Open Routing
+          </Link>
+        )}
+        {isAdmin && classDowngradedRelated && (
+          <Link to="/admin/models" className={styles.failureLink}>
+            Open Models
           </Link>
         )}
         {isAdmin && catalogueRelated && (
@@ -404,9 +434,10 @@ const Provenance = ({
   route?: string | null
   /** Already in plain language. Empty when the gateway sent no reason. */
   reason: string
-  /** The picked route could not answer and the alias's default route did.
-   *  Said on the line itself rather than behind "Why this route?": the reply
-   *  came from a model the route was not written for. */
+  /** The picked route could not answer and the alias's default route did, as
+   *  the alias's setting allows. Said on the line itself rather than behind
+   *  "Why this route?": the reply came from a model the route was not written
+   *  for. */
   fellBack: boolean
   /** Where this reply ran, from the gateway's header. Absent after a reload:
    *  history stores the model, not the class. */

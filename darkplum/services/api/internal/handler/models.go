@@ -16,6 +16,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/scalecraft-dev/darkplum/api/internal/activity"
 )
 
 // ModelHandler manages the models table and exposes both the chat-facing
@@ -768,6 +770,13 @@ type toggleModelRequest struct {
 	// model it was renaming.
 	Enabled     *bool           `json:"enabled"`
 	DisplayName json.RawMessage `json:"display_name"`
+	// AcceptClass re-registers the model at the backend class it is
+	// discovered under now (models.backend_class), replacing the strictest
+	// class ever recorded in model_registered_classes. This is the admin's
+	// path for a model deliberately moved from a self-hosted backend to a
+	// vendor (or any looser class): until it is sent, the gateway refuses to
+	// serve the id from a class looser than the registered one. Audited.
+	AcceptClass bool `json:"accept_class,omitempty"`
 }
 
 // displayNameMaxLen mirrors the 1-100 character bound from DESIGN4's parity
@@ -820,9 +829,27 @@ func (h *ModelHandler) ToggleModel(c *gin.Context) {
 		return
 	}
 
-	if req.Enabled == nil && !changeDisplayName {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "nothing to change: send enabled and/or display_name"})
+	if req.Enabled == nil && !changeDisplayName && !req.AcceptClass {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "nothing to change: send enabled, display_name and/or accept_class"})
 		return
+	}
+
+	ctx := c.Request.Context()
+	// One transaction for everything this PATCH changes: a rejected or failed
+	// accept_class must not leave enabled/display_name changed behind it.
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "begin transaction failed"})
+		return
+	}
+	defer tx.Rollback(ctx) // no-op once committed
+	if req.AcceptClass {
+		// Serialise with SyncModels (and PutAlias): the registered class the
+		// admin replaces is the one the sync last wrote, not one mid-flight.
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1)`, modelRoutingAdvisoryLockKey); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "acquire routing lock failed"})
+			return
+		}
 	}
 
 	// Each field is applied only when it was sent: COALESCE keeps the stored
@@ -830,17 +857,17 @@ func (h *ModelHandler) ToggleModel(c *gin.Context) {
 	// when the key was present (null clears it).
 	var tag pgconn.CommandTag
 	if changeDisplayName {
-		tag, err = h.pool.Exec(c.Request.Context(), `
+		tag, err = tx.Exec(ctx, `
 			UPDATE models SET enabled = COALESCE($1, enabled), display_name = $2, updated_at = now() WHERE id = $3
 		`, req.Enabled, displayName, id)
 	} else {
 		// UPDATE first — matching the pattern in users.go (Exec + RowsAffected).
-		tag, err = h.pool.Exec(c.Request.Context(), `
+		tag, err = tx.Exec(ctx, `
 			UPDATE models SET enabled = COALESCE($1, enabled), updated_at = now() WHERE id = $2
 		`, req.Enabled, id)
 	}
 	if err != nil {
-		slog.ErrorContext(c.Request.Context(), "toggle model update failed", "id", id, "err", err)
+		slog.ErrorContext(ctx, "toggle model update failed", "id", id, "err", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "toggle model failed"})
 		return
 	}
@@ -848,7 +875,18 @@ func (h *ModelHandler) ToggleModel(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "model not found"})
 		return
 	}
-	if req.Enabled != nil {
+	if req.AcceptClass {
+		if status, msg := h.acceptModelClass(c, tx, id); status != 0 {
+			c.JSON(status, gin.H{"error": msg})
+			return
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		slog.ErrorContext(ctx, "toggle model commit failed", "id", id, "err", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "toggle model failed"})
+		return
+	}
+	if req.Enabled != nil || req.AcceptClass {
 		kickGatewayPolicy(c.Request.Context(), h.client, h.gatewayURL, h.serviceKey)
 	}
 
@@ -866,6 +904,69 @@ func (h *ModelHandler) ToggleModel(c *gin.Context) {
 	m.Available = modelIsAvailableWithin(m.DiscoveredAt, time.Now(), h.availabilityWindow)
 
 	c.JSON(http.StatusOK, m)
+}
+
+// acceptModelClass re-registers the model at the class it is discovered under
+// now, as ONE statement, in the caller's transaction (which holds the routing
+// advisory lock), and writes the audit row in that same transaction. It
+// returns (0, "") on success, else the HTTP status and message to send; the
+// caller's transaction is then rolled back, so a failed accept changes
+// nothing. A model whose backend_class is not a known class has nothing to
+// register (400).
+func (h *ModelHandler) acceptModelClass(c *gin.Context, tx pgx.Tx, id string) (int, string) {
+	ctx := c.Request.Context()
+	var modelID, registered string
+	var previous *string
+	err := tx.QueryRow(ctx, `
+		WITH prev AS (
+			SELECT r.registered_class FROM model_registered_classes r
+			JOIN models m ON m.model_id = r.model_id WHERE m.id = $1
+		)
+		INSERT INTO model_registered_classes (model_id, registered_class)
+		SELECT model_id, backend_class FROM models
+		WHERE id = $1 AND backend_class IN ('self_hosted', 'cloud_managed', 'external_api')
+		ON CONFLICT (model_id) DO UPDATE
+			SET registered_class = EXCLUDED.registered_class, updated_at = now()
+		RETURNING model_id, registered_class, (SELECT registered_class FROM prev)
+	`, id).Scan(&modelID, &registered, &previous)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return http.StatusBadRequest, "accept_class: this model has no recognised backend class yet (no backend has reported where it runs)"
+	}
+	if err != nil {
+		slog.ErrorContext(ctx, "accept model class failed", "id", id, "err", err)
+		return http.StatusInternalServerError, "accept model class failed"
+	}
+	prev := ""
+	if previous != nil {
+		prev = *previous
+	}
+	evt := activity.FromContext(c, activity.ModelClassAccepted)
+	evt.TargetType = activity.StrPtr("model")
+	evt.Detail = map[string]any{"model_id": modelID, "previous_registered_class": prev, "registered_class": registered}
+	if err := activity.RecordTx(ctx, tx, evt); err != nil {
+		slog.ErrorContext(ctx, "accept model class: audit write failed", "id", id, "err", err)
+		return http.StatusInternalServerError, "accept model class failed: audit event could not be recorded"
+	}
+	return 0, ""
+}
+
+// registerModelClasses records, for every id the sync just saw, the class it
+// is discovered under -- but only ever TIGHTENS an existing registration (see
+// migration 028). Runs in the sync's transaction.
+func registerModelClasses(ctx context.Context, tx pgx.Tx, ids []string) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	_, err := tx.Exec(ctx, `
+		INSERT INTO model_registered_classes (model_id, registered_class)
+		SELECT model_id, backend_class FROM models
+		WHERE model_id = ANY($1) AND backend_class IN ('self_hosted', 'cloud_managed', 'external_api')
+		ON CONFLICT (model_id) DO UPDATE
+			SET registered_class = EXCLUDED.registered_class, updated_at = now()
+			WHERE (CASE EXCLUDED.registered_class WHEN 'self_hosted' THEN 0 WHEN 'cloud_managed' THEN 1 ELSE 2 END)
+			    < (CASE model_registered_classes.registered_class WHEN 'self_hosted' THEN 0 WHEN 'cloud_managed' THEN 1 ELSE 2 END)
+	`, ids)
+	return err
 }
 
 // gatewayProviderStatus is one entry of the gateway's GET /v1/models optional
@@ -1058,6 +1159,30 @@ func (h *ModelHandler) SyncModels(ctx context.Context) {
 	} else if len(normalized) > 0 {
 		slog.InfoContext(ctx, "sync models: batch upsert succeeded",
 			"model_count", len(normalized), "inserted", inserted, "updated", updated)
+	}
+
+	// Register each discovered id's class, tighten-only (migration 028). Only
+	// a missing table (SQLSTATE 42P01: the api is running ahead of its
+	// migrations) is tolerated, and then the gateway simply has no
+	// registration to check. Any other failure aborts the sync WITHOUT
+	// committing: backend_class must never move while the registered class
+	// that guards it silently did not.
+	sp, spErr := tx.Begin(ctx)
+	if spErr != nil {
+		slog.ErrorContext(ctx, "sync models: open registered-class savepoint failed; sync aborted", "err", spErr)
+		return
+	}
+	if regErr := registerModelClasses(ctx, sp, discoveredIDs); regErr != nil {
+		_ = sp.Rollback(ctx)
+		var pgErr *pgconn.PgError
+		if !(errors.As(regErr, &pgErr) && pgErr.Code == "42P01") {
+			slog.ErrorContext(ctx, "sync models: recording registered classes failed; sync aborted, nothing committed", "err", regErr)
+			return
+		}
+		slog.WarnContext(ctx, "sync models: model_registered_classes does not exist (migration 028 not applied); no class registration this sync")
+	} else if cErr := sp.Commit(ctx); cErr != nil {
+		slog.ErrorContext(ctx, "sync models: release registered-class savepoint failed; sync aborted", "err", cErr)
+		return
 	}
 
 	if err := tx.Commit(ctx); err != nil {

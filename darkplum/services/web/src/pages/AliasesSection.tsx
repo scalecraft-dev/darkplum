@@ -10,6 +10,7 @@ import type {
   ModelAlias,
   ModelAliasInput,
   ModelAliasRoute,
+  OnRouteUnavailable,
   Residency,
 } from '../types'
 import { ApiError, testModelAlias } from '../lib/api'
@@ -20,6 +21,7 @@ import {
   MAX_KEYWORDS_PER_ROUTE,
   MAX_KEYWORD_LENGTH,
   MAX_ROUTE_DESCRIPTION,
+  ON_ROUTE_UNAVAILABLE_DEFAULT,
   ROUTE_NAME_HINT,
   PER_MESSAGE_ROUTING_HINT,
   UNKNOWN_CLASS_HINT,
@@ -28,18 +30,25 @@ import {
   backendClassLabel,
   backendClassTooltip,
   backendClassVariant,
+  classPhrase,
+  classificationFailureWarning,
   displayClassOf,
+  fallbackSentence,
   isEgress,
   isReachable,
   isRoutedAlias,
   multimodalRouteNote,
-  routeFallbackHint,
+  onRouteUnavailableOf,
+  refusalSuffix,
+  routeOutcome,
+  routeUnavailableHint,
   routerReasonText,
   targetClassOf,
   validateAlias,
   validateRouteName,
   vendorLabel,
 } from '../lib/modelRouting'
+import type { DefaultRouteEnd, RouteOutcome, RouteUnavailableState } from '../lib/modelRouting'
 import { residencyLabel, residencyPermits } from '../lib/policy'
 import {
   AWS_OPT_IN_OPTION_NOTE,
@@ -96,6 +105,17 @@ function healthOf(t: AliasTargetHealth, residency: Residency): HealthKind {
   return 'ok'
 }
 
+/**
+ * The gateway's test for whether the default route can take over: its model is
+ * known and on, and the policy permits its class. Recent discovery
+ * (target_available) is not part of it, so it is not part of this either;
+ * counting it would print a refusal the gateway does not make.
+ */
+function gatewayCanServe(t: AliasTargetHealth, residency: Residency): boolean {
+  const h = healthOf(t, residency)
+  return h === 'ok' || h === 'unreachable'
+}
+
 const HEALTH_COPY: Record<
   HealthKind,
   { label: string; variant: 'success' | 'warning' | 'danger'; dashed?: boolean; hint: string }
@@ -113,7 +133,7 @@ const HEALTH_COPY: Record<
   partial: {
     label: 'Some routes refused',
     variant: 'warning',
-    hint: 'Messages that take a working route are answered as normal. The routes listed below are refused, with the route named — nothing is sent to another model instead.',
+    hint: 'Messages that take a working route are answered as normal. Routes blocked by policy are refused with the route named; for the rest, the line beside each says whether it is answered on the default route or refused.',
   },
   unknown: {
     label: 'Target not reported',
@@ -199,11 +219,12 @@ function aliasClassChips(
  * general terms.
  */
 function statusHint(a: ModelAlias, health: HealthKind, residency: Residency): string {
-  if (health === 'fallback') {
-    return `Messages that take a route listed below are answered on the default route ${a.default_route ?? ''} instead, until its target is fixed.`
+  const fellBack = routeHealths(a, residency).find((r) => r.outcome?.kind === 'fallback')
+  if (health === 'fallback' && fellBack?.outcome?.kind === 'fallback') {
+    return `Messages that take a route listed below are answered on ${fallbackSentence(fellBack.outcome)} instead, until its target is fixed.`
   }
-  if (health === 'partial' && routeHealths(a, residency).some((r) => r.health === 'fallback')) {
-    return `Messages that take a working route are answered as normal. Of the routes listed below, those blocked by policy are refused with the route named, and those whose target is off or unreachable fall back to the default route ${a.default_route ?? ''}.`
+  if (health === 'partial' && fellBack?.outcome?.kind === 'fallback') {
+    return `Messages that take a working route are answered as normal. Routes blocked by policy are refused with the route named; for the rest, the line beside each says whether it is answered on ${fallbackSentence(fellBack.outcome)} or refused.`
   }
   if (health !== 'blocked') return HEALTH_COPY[health].hint
   const targets: AliasTargetHealth[] = isRoutedAlias(a) ? a.routes ?? [] : [a]
@@ -240,27 +261,32 @@ const HEALTH_RANK: Record<HealthKind, number> = {
  * answer and some do not, that mixture is its own state; only when nothing can
  * answer does the worst route speak for the whole alias.
  */
-/** Target states the gateway falls back from. Policy refusals are not among
+/** Target states a pick can be rescued from. Policy refusals are not among
  *  them: a route the policy blocks is refused with the route named. */
 const FALLBACK_STATES = new Set<HealthKind>(['missing', 'disabled', 'unreachable'])
 
 /**
  * Each route's health as a message on it experiences it. A non-default route
  * whose target is off, missing or unreachable is answered on the alias's
- * default route while that route can answer — 'fallback', with the target's
- * own state kept in `raw` for the words beside it.
+ * default route only when the alias's setting and the two classes allow it
+ * (routeOutcome, the same rule as the gateway) — 'fallback', with the target's
+ * own state kept in `raw` for the words beside it; otherwise it is refused.
  */
 function routeHealths(
   a: ModelAlias,
   residency: Residency,
-): { route: ModelAliasRoute; raw: HealthKind; health: HealthKind }[] {
+): { route: ModelAliasRoute; raw: HealthKind; health: HealthKind; outcome: RouteOutcome | null }[] {
   const routes = a.routes ?? []
   const def = routes.find((r) => r.route_name === a.default_route)
-  const defaultOk = def !== undefined && healthOf(def, residency) === 'ok'
+  const defaultEnd: DefaultRouteEnd | null = def
+    ? { name: def.route_name, class: targetClassOf(def), usable: gatewayCanServe(def, residency) }
+    : null
+  const setting = onRouteUnavailableOf(a)
   return routes.map((route) => {
     const raw = healthOf(route, residency)
-    const falls = defaultOk && route !== def && FALLBACK_STATES.has(raw)
-    return { route, raw, health: falls ? 'fallback' : raw }
+    if (route === def || !FALLBACK_STATES.has(raw)) return { route, raw, health: raw, outcome: null }
+    const outcome = routeOutcome(setting, targetClassOf(route), defaultEnd)
+    return { route, raw, health: outcome.kind === 'fallback' ? 'fallback' : raw, outcome }
   })
 }
 
@@ -273,6 +299,13 @@ function aliasHealth(a: ModelAlias, residency: Residency): HealthKind {
   if (healths.every((h) => h === 'ok' || h === 'fallback')) return 'fallback'
   if (healths.some((h) => h === 'ok' || h === 'fallback')) return 'partial'
   return healths.reduce((worst, next) => (HEALTH_RANK[next] > HEALTH_RANK[worst] ? next : worst), 'ok')
+}
+
+/** How a route's own problem reads after "refused", for the alias row. */
+function refusalFor(raw: HealthKind): string {
+  const state: RouteUnavailableState | 'blocked' | 'unknown' =
+    raw === 'blocked' || raw === 'unknown' ? raw : raw === 'unreachable' ? 'unreachable' : 'missing'
+  return refusalSuffix(state)
 }
 
 /** 'model' is a removed kind that only a pre-migration server still sends. It
@@ -399,34 +432,42 @@ function ModelOptions({ models }: { models: AdminModel[] }) {
  *  The residency sentence names the rung in force and the class that conflicts
  *  with it, so the fix is legible without opening the Policy tab on
  *  another page. */
+/** The gateway's test for a draft default route: the model exists, is on, and
+ *  its class is known and permitted. Reachability is not part of it. */
+function draftDefaultServable(models: AdminModel[], targetModelId: string, residency: Residency): boolean {
+  const m = models.find((x) => x.model_id === targetModelId)
+  if (!m || !m.enabled) return false
+  const cls = displayClassOf(m)
+  return cls !== 'unknown' && residencyPermits(residency, cls)
+}
+
 function targetWarning(
   models: AdminModel[],
   targetModelId: string,
   residency: Residency,
-  /** For a non-default route whose default can answer: the default's name. A
-   *  missing, disabled or unreachable target then falls back rather than refuses. */
-  fallbackTo: string | null = null,
+  /** Set for a route of a routed alias (not a static alias's own target):
+   *  `outcome` is what happens to its messages if the target cannot answer, or
+   *  null for the alias's default route, which has nothing to fall back to. */
+  route?: { outcome: RouteOutcome | null },
 ): string | null {
   if (!targetModelId) return null
   const model = models.find((m) => m.model_id === targetModelId)
   if (!model) {
-    return fallbackTo
-      ? routeFallbackHint('missing', fallbackTo)
-      : 'No model has this ID. Requests that take this route are refused.'
+    return route
+      ? routeUnavailableHint('missing', route.outcome)
+      : 'No model has this ID. Requests using this alias are refused.'
   }
   if (!model.enabled) {
-    return fallbackTo
-      ? routeFallbackHint('disabled', fallbackTo)
-      : 'This model is turned off, so this route is refused until you enable it.'
+    return route
+      ? routeUnavailableHint('disabled', route.outcome)
+      : 'This model is turned off, so this alias is refused until you enable it.'
   }
   const cls = displayClassOf(model)
   if (cls === 'unknown') return UNKNOWN_CLASS_HINT
   if (!residencyPermits(residency, cls)) return blockedHint(cls, residency)
   // Same precedence as the Models row: policy > AWS opt-in > reachability.
   if (needsAwsOptIn(model)) return awsOptInRouteWarning(model.model_id)
-  if (!isReachable(model)) {
-    return fallbackTo ? routeFallbackHint('unreachable', fallbackTo) : UNREACHABLE_HINT
-  }
+  if (!isReachable(model)) return route ? routeUnavailableHint('unreachable', route.outcome) : UNREACHABLE_HINT
   return null
 }
 
@@ -604,8 +645,8 @@ interface RouteRowProps {
   index: number
   count: number
   isDefault: boolean
-  /** The default route's name, when it is not this route and can answer. */
-  fallbackTo: string | null
+  /** What happens to this route's messages if its model cannot answer; null for the default route. */
+  outcome: RouteOutcome | null
   radioName: string
   models: AdminModel[]
   residency: Residency
@@ -624,7 +665,7 @@ function RouteRow({
   index,
   count,
   isDefault,
-  fallbackTo,
+  outcome,
   radioName,
   models,
   residency,
@@ -639,7 +680,7 @@ function RouteRow({
 }: RouteRowProps) {
   const fieldId = useId()
   const label = route.route_name || `route ${index + 1}`
-  const warning = targetWarning(models, route.target_model_id, residency, isDefault ? null : fallbackTo)
+  const warning = targetWarning(models, route.target_model_id, residency, { outcome: isDefault ? null : outcome })
   const multimodal = multimodalWarning(route.route_name, route.keywords)
 
   return (
@@ -817,6 +858,9 @@ function AliasEditor({ editing, models, residency, existing, onClose, onSave }: 
   const [classifierKind, setClassifierKind] = useState<AliasClassifierChoice>(
     classifierChoiceOf(editing),
   )
+  const [onRouteUnavailable, setOnRouteUnavailable] = useState<OnRouteUnavailable>(
+    editing ? onRouteUnavailableOf(editing) : ON_ROUTE_UNAVAILABLE_DEFAULT,
+  )
   const [aliasError, setAliasError] = useState('')
   const [targetError, setTargetError] = useState('')
   const [routeErrors, setRouteErrors] = useState<Record<string, RouteErrors>>({})
@@ -907,6 +951,7 @@ function AliasEditor({ editing, models, residency, existing, onClose, onSave }: 
     return {
       kind: 'routed',
       default_route: chosenDefault,
+      on_route_unavailable: onRouteUnavailable,
       classifier: { kind: classifierKind },
       routes: routes.map((r) => ({
         route_name: r.route_name.trim(),
@@ -953,15 +998,30 @@ function AliasEditor({ editing, models, residency, existing, onClose, onSave }: 
   }
 
   const staticWarning = targetWarning(models, target, residency)
-  // The route a broken non-default route falls back to — only while the
-  // default itself can answer; otherwise those routes are refused as before.
-  const defaultDraft = routes.find((r) => r.key === defaultKey) ?? null
-  const defaultFallback =
-    defaultDraft && defaultDraft.route_name && defaultDraft.target_model_id &&
-    targetWarning(models, defaultDraft.target_model_id, residency) === null
-      ? defaultDraft.route_name
-      : null
   const keywordsUsed = classifierKind === 'rules'
+
+  // What a down route's messages do, from the drafts as typed: the default
+  // route is the only one they can move to, and only while it can answer.
+  const classOfTarget = (id: string): DisplayClass => {
+    const m = models.find((x) => x.model_id === id)
+    return m ? displayClassOf(m) : 'unknown'
+  }
+  const defaultDraft = routes.find((r) => r.key === defaultKey) ?? null
+  const defaultEnd: DefaultRouteEnd | null = defaultDraft
+    ? {
+        name: defaultDraft.route_name.trim() || 'the default route',
+        class: classOfTarget(defaultDraft.target_model_id),
+        usable: draftDefaultServable(models, defaultDraft.target_model_id, residency),
+      }
+    : null
+  const classificationWarning =
+    defaultDraft && defaultEnd
+      ? classificationFailureWarning(
+          defaultEnd.name,
+          defaultEnd.class,
+          routes.filter((r) => r.key !== defaultKey).map((r) => classOfTarget(r.target_model_id)),
+        )
+      : null
 
   return (
     <form className={styles.editor} onSubmit={(e) => void handleSubmit(e)}>
@@ -1085,7 +1145,7 @@ function AliasEditor({ editing, models, residency, existing, onClose, onSave }: 
                 index={i}
                 count={routes.length}
                 isDefault={defaultKey === r.key}
-                fallbackTo={defaultFallback}
+                outcome={routeOutcome(onRouteUnavailable, classOfTarget(r.target_model_id), defaultEnd)}
                 radioName={`${formId}-default`}
                 models={models}
                 residency={residency}
@@ -1101,6 +1161,57 @@ function AliasEditor({ editing, models, residency, existing, onClose, onSave }: 
             ))}
           </ol>
           <p className={styles.srOnly} role="status" aria-live="polite">{announcement}</p>
+
+          {classificationWarning && (
+            <p className={styles.formWarning}>
+              {classificationWarning}
+            </p>
+          )}
+
+          <fieldset className={styles.choiceSet}>
+            <legend className={styles.fieldLabel}>If the model on a chosen route is down</legend>
+            <div className={styles.choices}>
+              {(
+                [
+                  {
+                    value: 'refuse',
+                    label: 'Refuse',
+                    text: 'Never use another route. Messages that take a route whose model is off or unreachable get a temporary error.',
+                  },
+                  {
+                    value: 'fallback_same_or_stricter',
+                    label: 'Fall back to the default route if its class is the same or stricter (recommended)',
+                    text: 'Otherwise messages are refused.',
+                  },
+                  {
+                    value: 'fallback_any_permitted',
+                    label: 'Fall back to the default route whenever it can answer',
+                    text: `Prompts may be sent to ${defaultEnd?.name ?? 'the default route'} (${classPhrase(defaultEnd?.class ?? 'unknown')}) when a route is down, even if that is looser than the route that was chosen. Residency policy and allowlists still apply.`,
+                  },
+                ] as { value: OnRouteUnavailable; label: string; text: string }[]
+              ).map((o) => (
+                <label
+                  key={o.value}
+                  className={`${styles.choice} ${onRouteUnavailable === o.value ? styles.choiceChecked : ''}`}
+                >
+                  <span className={styles.choiceTop}>
+                    <input
+                      type="radio"
+                      name={`${formId}-unavailable`}
+                      checked={onRouteUnavailable === o.value}
+                      onChange={() => { setOnRouteUnavailable(o.value); setFormError('') }}
+                    />
+                    <span className={styles.choiceLabel}>{o.label}</span>
+                  </span>
+                  <span className={styles.choiceText}>{o.text}</span>
+                </label>
+              ))}
+            </div>
+          </fieldset>
+          <p className={styles.routingHint}>
+            This applies when a route is chosen but its model cannot answer. If classification
+            itself fails, messages always go to the default route.
+          </p>
 
           <fieldset className={styles.choiceSet}>
             <legend className={styles.fieldLabel}>How the route is chosen</legend>
@@ -1448,14 +1559,18 @@ export function AliasesSection({
                             </span>
                             {flaggedRoutes.length > 0 && (
                               <ul className={styles.routeFlags}>
-                                {flaggedRoutes.map(({ route, raw, health: routeHealth }) => (
+                                {flaggedRoutes.map(({ route, raw, health: routeHealth, outcome }) => (
                                   <li key={route.route_name}>
                                     <code className={styles.targetId}>{route.route_name}</code>
                                     {' → '}
                                     <code className={styles.targetId}>{route.target_model_id}</code>
                                     {` — ${ROUTE_HEALTH_LABEL[raw as Exclude<HealthKind, 'ok' | 'partial' | 'fallback'>]}`}
-                                    {routeHealth === 'fallback' &&
-                                      `, falls back to the default route ${a.default_route ?? ''} until it is fixed`}
+                                    {routeHealth === 'fallback' && outcome?.kind === 'fallback'
+                                      ? `, answered on ${fallbackSentence(outcome)} until it is fixed`
+                                      : `, ${refusalFor(raw)}`}
+                                    {routeHealth !== 'fallback' &&
+                                      route.route_name === a.default_route &&
+                                      '; it is also the default route, so messages are refused when classification fails'}
                                   </li>
                                 ))}
                               </ul>
