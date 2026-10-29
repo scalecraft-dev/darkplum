@@ -73,6 +73,12 @@ type InferenceEvent struct {
 	// policy_unavailable, invalid_request, unsupported_parameter,
 	// request_canceled), which nullableStr turns into NULL.
 	BackendClass string
+
+	// DroppedParams is inference_events.dropped_params (migration 029): the
+	// request parameters the gateway accepted but did not pass on as sent,
+	// as names (a dropped parameter) or name=action (an adjustment such as
+	// max_tokens=raised). Never values. Empty becomes NULL.
+	DroppedParams []string
 }
 
 // Recorder buffers InferenceEvents and writes them to Postgres in batches.
@@ -171,6 +177,11 @@ type schema struct {
 // first and walks forward through the slice on an undefined-column error
 // until one succeeds (or the list is exhausted).
 var schemas = []schema{
+	// dropped_params: migration 029 (dropped_params) plus everything below.
+	// Every older rung is the shape of a database that does not have this
+	// column yet, so none of them can carry it: they are the fallback this
+	// rung steps down to on a 42703.
+	{name: "dropped_params", queue: queueDroppedParamsSchema},
 	// cache_tokens: migration 021 (cache_read_tokens, cache_creation_tokens)
 	// plus everything below.
 	{name: "cache_tokens", queue: queueCacheTokensSchema},
@@ -199,6 +210,49 @@ func purposeOrDefault(p string) string {
 		return "inference"
 	}
 	return p
+}
+
+// nullableTextArray is nil (SQL NULL) for an empty list, so a request that
+// dropped nothing leaves the column NULL.
+func nullableTextArray(v []string) []string {
+	if len(v) == 0 {
+		return nil
+	}
+	return v
+}
+
+func queueDroppedParamsSchema(b *pgx.Batch, evt InferenceEvent) {
+	b.Queue(`
+		INSERT INTO inference_events
+			(request_id, api_key_id, user_id, model, requested_model, status_code, latency_ms,
+			 prompt_tokens, completion_tokens, stream, ip_address,
+			 provider, region, denial_code, purpose, route_name, router_reason, router_latency_ms,
+			 backend_class, cache_read_tokens, cache_creation_tokens, dropped_params)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::inet, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+	`,
+		evt.RequestID,
+		nullableStr(evt.APIKeyID),
+		nullableStr(evt.UserID),
+		evt.Model,
+		nullableStr(evt.RequestedModel),
+		evt.StatusCode,
+		evt.LatencyMS,
+		evt.PromptTokens,
+		evt.CompletionTokens,
+		evt.Stream,
+		nullableStr(evt.IP),
+		evt.Provider,
+		nullableStr(evt.Region),
+		nullableStr(evt.DenialCode),
+		purposeOrDefault(evt.Purpose),
+		nullableStr(evt.RouteName),
+		nullableStr(evt.RouterReason),
+		evt.RouterLatencyMS,
+		nullableStr(evt.BackendClass),
+		evt.CacheReadTokens,
+		evt.CacheCreationTokens,
+		nullableTextArray(evt.DroppedParams),
+	)
 }
 
 func queueCacheTokensSchema(b *pgx.Batch, evt InferenceEvent) {

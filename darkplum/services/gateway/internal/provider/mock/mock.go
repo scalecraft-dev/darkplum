@@ -37,6 +37,13 @@ func (p *MockProvider) Name() string { return providerName }
 
 func (p *MockProvider) Models() []string { return []string{modelID} }
 
+// ParamCaps keeps dev and demo flows unblocked: the mock accepts json_object,
+// stop and forced tool_choice (its reply is canned, so it ignores them). It
+// is excluded from the parameter contract.
+func (p *MockProvider) ParamCaps() provider.ParamCaps {
+	return provider.ParamCaps{JSONMode: true, Stop: true, ForcedToolChoice: true}
+}
+
 // SupportsTools makes the mock a tool-capable backend (provider.ToolCapable).
 func (p *MockProvider) SupportsTools() bool { return true }
 
@@ -136,7 +143,7 @@ func (p *MockProvider) Stream(_ context.Context, req provider.ChatRequest, w io.
 		FinishReason:     finish,
 	}
 
-	final, err := provider.BuildFinalChunkSSE(id, model, finish, stats)
+	final, err := provider.BuildFinalChunksSSE(id, model, finish, stats, req.IncludeUsage)
 	if err != nil {
 		return nil, fmt.Errorf("mock: building final chunk: %w", err)
 	}

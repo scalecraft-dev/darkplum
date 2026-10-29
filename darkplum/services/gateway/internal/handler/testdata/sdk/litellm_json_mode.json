@@ -1,0 +1,61 @@
+{
+  "sdk": "LiteLLM",
+  "representative": true,
+  "provenance": "Hand-assembled from the SDK's documented request serialisation, not a verbatim packet capture; the keys, defaults and nulls are the ones that SDK (or an app using it) sends.",
+  "description": "litellm.completion(..., response_format={'type': 'json_object'}): a contract refusal on a backend with no JSON mode, in both modes",
+  "expect": {
+    "lenient": {
+      "openai": {
+        "status": 200,
+        "dropped": []
+      },
+      "openaicompat": {
+        "status": 200,
+        "dropped": []
+      },
+      "anthropic": {
+        "status": 400,
+        "param": "response_format"
+      },
+      "bedrock": {
+        "status": 400,
+        "param": "response_format"
+      }
+    },
+    "strict": {
+      "openai": {
+        "status": 200,
+        "dropped": []
+      },
+      "openaicompat": {
+        "status": 200,
+        "dropped": []
+      },
+      "anthropic": {
+        "status": 400,
+        "param": "response_format"
+      },
+      "bedrock": {
+        "status": 400,
+        "param": "response_format"
+      }
+    }
+  },
+  "body": {
+    "model": "m",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are concise."
+      },
+      {
+        "role": "user",
+        "content": "Say hi"
+      }
+    ],
+    "stream": false,
+    "response_format": {
+      "type": "json_object"
+    }
+  }
+}

@@ -380,6 +380,10 @@ var proxiedResponseHeaders = []string{
 	// account") without a second round trip.
 	"X-Darkplum-Backend-Class",
 	"X-Darkplum-Provider",
+	// Request parameters the gateway accepted but did not pass on as sent
+	// (comma-separated names; name=raised for an adjustment), decided before
+	// the first byte. Passed through so an SDK user can see them.
+	"X-Darkplum-Dropped-Params",
 	// A vendor's rate limit reaches the caller as 429 with the vendor's own
 	// Retry-After, so an SDK's backoff engages instead of hammering.
 	"Retry-After",

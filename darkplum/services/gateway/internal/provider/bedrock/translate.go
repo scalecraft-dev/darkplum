@@ -167,7 +167,9 @@ func translateRequest(req provider.ChatRequest) (system []types.SystemContentBlo
 	inferenceConfig = &types.InferenceConfiguration{
 		MaxTokens: int32Ptr(maxTokens),
 	}
-	if req.Temperature != nil {
+	// Extended thinking forbids temperature (it must stay at its default);
+	// the handler already unset it, and it is not set here either way.
+	if req.Temperature != nil && !thinkingOn(req) {
 		temp := float32(*req.Temperature)
 		inferenceConfig.Temperature = &temp
 	}
@@ -467,6 +469,12 @@ func marshalToolInput(doc document.Interface) (string, error) {
 type toolStreamState struct {
 	next   int
 	blocks map[int32]*toolStreamBlock
+	// includeUsage is stream_options.include_usage. Converse reports usage in
+	// a Metadata event AFTER MessageStop, so with it set the finish_reason
+	// chunk carries usage null and Stream writes the usage-only chunk once
+	// the events channel closes; without it the finish chunk keeps its
+	// historical (zero) usage fields.
+	includeUsage bool
 }
 
 type toolStreamBlock struct {
@@ -571,7 +579,13 @@ func translateStreamEvent(
 
 	case *types.ConverseStreamOutputMemberMessageStop:
 		stats.FinishReason = convertFinishReason(string(ev.Value.StopReason))
-		finalChunk, err := provider.BuildFinalChunkSSE(completionID, modelID, stats.FinishReason, stats)
+		var finalChunk []byte
+		var err error
+		if ts.includeUsage {
+			finalChunk, err = provider.BuildFinishChunkSSE(completionID, modelID, stats.FinishReason)
+		} else {
+			finalChunk, err = provider.BuildFinalChunkSSE(completionID, modelID, stats.FinishReason, stats)
+		}
 		if err != nil {
 			return false, fmt.Errorf("bedrock: build final SSE chunk: %w", err)
 		}

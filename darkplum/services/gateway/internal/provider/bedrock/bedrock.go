@@ -134,11 +134,13 @@ func (p *BedrockProvider) Complete(ctx context.Context, req provider.ChatRequest
 	}
 
 	out, err := p.client.Converse(ctx, &bedrockruntime.ConverseInput{
-		ModelId:         aws.String(req.Model),
-		Messages:        messages,
-		System:          system,
-		InferenceConfig: inferenceConfig,
-		ToolConfig:      toolConfig,
+		ModelId:                      aws.String(req.Model),
+		Messages:                     messages,
+		System:                       system,
+		InferenceConfig:              inferenceConfig,
+		ToolConfig:                   toolConfig,
+		RequestMetadata:              requestMetadata(req),
+		AdditionalModelRequestFields: additionalModelRequestFields(req),
 	})
 	if err != nil {
 		return nil, p.wrapError(req.Model, err, toolConfig != nil)
@@ -173,11 +175,13 @@ func (p *BedrockProvider) Stream(ctx context.Context, req provider.ChatRequest, 
 	}
 
 	out, err := p.client.ConverseStream(ctx, &bedrockruntime.ConverseStreamInput{
-		ModelId:         aws.String(req.Model),
-		Messages:        messages,
-		System:          system,
-		InferenceConfig: inferenceConfig,
-		ToolConfig:      toolConfig,
+		ModelId:                      aws.String(req.Model),
+		Messages:                     messages,
+		System:                       system,
+		InferenceConfig:              inferenceConfig,
+		ToolConfig:                   toolConfig,
+		RequestMetadata:              requestMetadata(req),
+		AdditionalModelRequestFields: additionalModelRequestFields(req),
 	})
 	if err != nil {
 		return nil, p.wrapError(req.Model, err, toolConfig != nil)
@@ -196,7 +200,7 @@ func (p *BedrockProvider) Stream(ctx context.Context, req provider.ChatRequest, 
 	// process, not cryptographically random (which is fine for a correlation ID).
 	completionID := fmt.Sprintf("bedrock-%p", stats)
 
-	var toolState toolStreamState
+	toolState := toolStreamState{includeUsage: req.IncludeUsage}
 	var streamErr error
 loop:
 	for {
@@ -236,6 +240,16 @@ loop:
 		return stats, fmt.Errorf("bedrock: translate error: %w", streamErr)
 	}
 
+	if req.IncludeUsage {
+		usageChunk, err := provider.BuildUsageChunkSSE(completionID, req.Model, stats)
+		if err != nil {
+			return stats, fmt.Errorf("bedrock: build usage SSE chunk: %w", err)
+		}
+		if _, err := w.Write(usageChunk); err != nil {
+			return stats, fmt.Errorf("bedrock: write usage SSE chunk: %w", err)
+		}
+	}
+
 	if _, err := fmt.Fprint(w, provider.StreamDoneSSE); err != nil {
 		slog.Warn("bedrock: failed to write SSE done sentinel", "err", err)
 	}
@@ -244,6 +258,22 @@ loop:
 	}
 
 	return stats, nil
+}
+
+// requestMetadataUserKey is the Converse requestMetadata key the caller's
+// pseudonymised `user` is sent under. Bedrock limits keys and values to 256
+// characters from [a-zA-Z0-9\s:_@$#=/+,-.], at most 16 pairs; "user_id" and a
+// "k1:<64 hex>" value (67 chars) are inside all of that. The metadata is
+// written to Bedrock invocation logs, which is why it is never the raw value.
+const requestMetadataUserKey = "user_id"
+
+// requestMetadata is the Converse requestMetadata for req: the pseudonymised
+// user when the handler supplied one, nil otherwise.
+func requestMetadata(req provider.ChatRequest) map[string]string {
+	if req.User == "" {
+		return nil
+	}
+	return map[string]string{requestMetadataUserKey: req.User}
 }
 
 // wrapError classifies the data-retention refusal (a typed, scrubbed error and
@@ -282,6 +312,16 @@ func isToolsUnsupportedValidation(code, message string) bool {
 
 // SupportsTools implements provider.ToolCapable.
 func (p *BedrockProvider) SupportsTools() bool { return true }
+
+// ParamCaps implements provider.ParamCapable. Converse has no JSON mode,
+// logprobs, logit_bias or parallel-tool-call switch (toolChoice is only
+// auto/any/tool, none of which limits a turn to one call), so
+// parallel_tool_calls:false with tools stays refused. toolChoice any/tool is
+// enforced natively and stop sequences map to inferenceConfig.stopSequences.
+// `user` becomes requestMetadata as an HMAC pseudonym.
+func (p *BedrockProvider) ParamCaps() provider.ParamCaps {
+	return provider.ParamCaps{Stop: true, ForcedToolChoice: true, UserID: provider.UserIDHMAC}
+}
 
 // wrapBedrockError converts a Bedrock SDK error into a BedrockAPIError that
 // carries the HTTP status code and OpenAI-compatible body, so the gateway HTTP

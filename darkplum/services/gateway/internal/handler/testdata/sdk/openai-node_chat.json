@@ -1,0 +1,43 @@
+{
+  "sdk": "openai-node",
+  "representative": true,
+  "provenance": "Hand-assembled from the SDK's documented request serialisation, not a verbatim packet capture; the keys, defaults and nulls are the ones that SDK (or an app using it) sends.",
+  "description": "openai.chat.completions.create({...}) with the defaults an app spells out: n, penalties 0, logprobs false, empty logit_bias, service_tier auto",
+  "expect": {
+    "lenient": {
+      "*": {
+        "status": 200,
+        "dropped": []
+      }
+    },
+    "strict": {
+      "*": {
+        "status": 200,
+        "dropped": []
+      }
+    }
+  },
+  "body": {
+    "model": "m",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are concise."
+      },
+      {
+        "role": "user",
+        "content": "Say hi"
+      }
+    ],
+    "stream": false,
+    "max_tokens": 512,
+    "temperature": 1,
+    "top_p": 1,
+    "n": 1,
+    "presence_penalty": 0,
+    "frequency_penalty": 0,
+    "logit_bias": {},
+    "logprobs": false,
+    "service_tier": "auto"
+  }
+}

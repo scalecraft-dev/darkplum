@@ -155,6 +155,13 @@ func Recording(rec *recorder.Recorder) gin.HandlerFunc {
 		// only a dispatched request — see recorder.InferenceEvent.BackendClass.
 		backendClass := c.GetString("backend_class")
 
+		// dropped_params is decided by the chat handler before the first
+		// response byte (see handler.publishParamActions).
+		var droppedParams []string
+		if v, ok := c.Get(ContextDroppedParams); ok {
+			droppedParams, _ = v.([]string)
+		}
+
 		main := recorder.InferenceEvent{
 			RequestID:           requestID,
 			APIKeyID:            keyID,
@@ -176,6 +183,7 @@ func Recording(rec *recorder.Recorder) gin.HandlerFunc {
 			RouterReason:        routerReason,
 			RouterLatencyMS:     routerLatencyMS,
 			BackendClass:        backendClass,
+			DroppedParams:       droppedParams,
 		}
 
 		// A routed alias's classifier decision never produces a second audit

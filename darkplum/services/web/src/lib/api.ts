@@ -706,6 +706,9 @@ export function updateRoutingPolicy(body: {
   residency: Residency
   allowed_models: string[] | null
   default_model: string | null
+  /** Optional: omitted keeps what is stored, so a write that is not about it
+   *  (enabling a vendor model) can never flip it. */
+  params_mode?: 'lenient' | 'strict'
 }): Promise<RoutingPolicy> {
   return request<RoutingPolicy>(ROUTES.updateRoutingPolicy, { body })
 }

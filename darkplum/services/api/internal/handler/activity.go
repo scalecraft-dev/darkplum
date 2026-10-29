@@ -234,6 +234,13 @@ type inferenceEvent struct {
 	// refused before any route resolved (e.g. model_not_found) or on a row
 	// written before migration 016 added the column.
 	BackendClass *string `json:"backend_class,omitempty"`
+	// DroppedParams is inference_events.dropped_params (migration 029): the
+	// X-Darkplum-Dropped-Params entries for this request -- a bare name for a
+	// parameter the backend could not honour and the gateway did not send
+	// ("seed"), name=action for an adjustment ("max_tokens=raised"). Names
+	// only, never values. Null when nothing was dropped (always present in the
+	// JSON so a client can tell "none" from "field missing").
+	DroppedParams []string `json:"dropped_params"`
 }
 
 // validUsagePurposeFilter mirrors inference_events.purpose's CHECK constraint
@@ -455,7 +462,7 @@ func (h *ActivityHandler) ListUsage(c *gin.Context) {
 			ie.model, ie.requested_model, ie.provider, ie.purpose, ie.route_name, ie.router_reason,
 			ie.status_code, ie.denial_code, ie.latency_ms, ie.prompt_tokens, ie.completion_tokens,
 			ie.stream, ie.ip_address::text, ie.created_at, ie.backend_class,
-			ie.cache_read_tokens, ie.cache_creation_tokens, ie.region
+			ie.cache_read_tokens, ie.cache_creation_tokens, ie.region, ie.dropped_params
 		FROM inference_events ie
 		LEFT JOIN users u ON u.id = ie.user_id
 		%s
@@ -484,7 +491,7 @@ func (h *ActivityHandler) ListUsage(c *gin.Context) {
 			&ie.Model, &ie.RequestedModel, &ie.Provider, &ie.Purpose, &ie.RouteName, &ie.RouterReason,
 			&ie.StatusCode, &ie.DenialCode, &ie.LatencyMS, &ie.PromptTokens, &ie.CompletionTokens,
 			&ie.Stream, &ie.IPAddress, &ie.CreatedAt, &ie.BackendClass,
-			&ie.CacheReadTokens, &ie.CacheCreationTokens, &region,
+			&ie.CacheReadTokens, &ie.CacheCreationTokens, &region, &ie.DroppedParams,
 		); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "scan usage failed"})
 			return
@@ -912,7 +919,8 @@ func (h *ActivityHandler) ExportUsage(c *gin.Context) {
 			ie.backend_class,
 			ie.cache_read_tokens,
 			ie.cache_creation_tokens,
-			ie.region
+			ie.region,
+			ie.dropped_params
 		FROM inference_events ie
 		LEFT JOIN users u ON u.id = ie.user_id
 		%s
@@ -931,7 +939,7 @@ func (h *ActivityHandler) ExportUsage(c *gin.Context) {
 	c.Header("Content-Disposition", `attachment; filename="inference_events.csv"`)
 
 	w := csv.NewWriter(c.Writer)
-	_ = w.Write([]string{"timestamp", "request_id", "user_id", "user_name", "user_email", "api_key_id", "model", "requested_model", "provider", "purpose", "route_name", "router_reason", "status_code", "denial_code", "latency_ms", "prompt_tokens", "completion_tokens", "stream", "ip_address", "backend_class", "cache_read_tokens", "cache_creation_tokens", "cost_cents"})
+	_ = w.Write([]string{"timestamp", "request_id", "user_id", "user_name", "user_email", "api_key_id", "model", "requested_model", "provider", "purpose", "route_name", "router_reason", "status_code", "denial_code", "latency_ms", "prompt_tokens", "completion_tokens", "stream", "ip_address", "backend_class", "cache_read_tokens", "cache_creation_tokens", "cost_cents", "dropped_params"})
 
 	prices, err := pricing.LoadAll(c.Request.Context(), h.db)
 	if err != nil {
@@ -962,12 +970,13 @@ func (h *ActivityHandler) ExportUsage(c *gin.Context) {
 			cacheRead        *int
 			cacheCreate      *int
 			region           *string
+			droppedParams    []string
 		)
 		if err := rows.Scan(
 			&createdAt, &requestID, &userID, &userName, &userEmail, &apiKeyID, &model, &requestedModel, &provider,
 			&purpose, &routeName, &routerReason,
 			&statusCode, &denialCode, &latencyMS, &promptTokens, &completionTokens, &stream, &ipAddress,
-			&backendClass, &cacheRead, &cacheCreate, &region,
+			&backendClass, &cacheRead, &cacheCreate, &region, &droppedParams,
 		); err != nil {
 			w.Flush()
 			return
@@ -998,6 +1007,9 @@ func (h *ActivityHandler) ExportUsage(c *gin.Context) {
 			derefInt(cacheRead),
 			derefInt(cacheCreate),
 			derefStr(costCents),
+			// An unknown key's name is caller-chosen, so it gets the same
+			// formula-injection guard as the other caller-supplied text.
+			csvSafeText(strings.Join(droppedParams, ";")),
 		})
 	}
 	w.Flush()

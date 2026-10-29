@@ -1,0 +1,43 @@
+{
+  "sdk": "openai-python",
+  "representative": true,
+  "provenance": "Hand-assembled from the SDK's documented request serialisation, not a verbatim packet capture; the keys, defaults and nulls are the ones that SDK (or an app using it) sends.",
+  "description": "client.chat.completions.create(model=..., messages=..., max_completion_tokens=256, temperature=0.7, n=1, user=..., store=False, stop=None) -- the keys an app commonly sets, nulls included",
+  "expect": {
+    "lenient": {
+      "*": {
+        "status": 200,
+        "dropped": []
+      }
+    },
+    "strict": {
+      "*": {
+        "status": 200,
+        "dropped": []
+      }
+    }
+  },
+  "body": {
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are concise."
+      },
+      {
+        "role": "user",
+        "content": "Say hi"
+      }
+    ],
+    "model": "m",
+    "max_completion_tokens": 256,
+    "n": 1,
+    "stream": false,
+    "temperature": 0.7,
+    "top_p": null,
+    "stop": null,
+    "user": "customer-42",
+    "store": false,
+    "tool_choice": null,
+    "parallel_tool_calls": null
+  }
+}

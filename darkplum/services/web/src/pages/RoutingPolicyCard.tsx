@@ -16,17 +16,28 @@ import {
   residencyPermits,
   residencyRank,
 } from '../lib/policy'
+import {
+  PARAMS_MODE_NOTE,
+  PARAMS_MODE_OPTIONS,
+  PARAMS_MODE_STRICT_CONFIRM,
+  paramsModeChip,
+  paramsModeOf,
+  type ParamsMode,
+} from '../lib/chatParams'
 import { Button, EgressGlyph, Modal } from '../components/ui'
 import { Skeleton } from '../components/ui/Skeleton'
 import { ModelAllowlistPicker } from './ModelAllowlistPicker'
 import { ResidencyLadder } from './ResidencyLadder'
 import styles from './RoutingPolicyCard.module.css'
 
-/** The three fields of the organisation's policy, as the card edits them. */
+/** The fields of the organisation's policy, as the card edits them. */
 export interface OrgPolicyDraft {
   residency: Residency
   allowed_models: string[] | null
   default_model: string | null
+  /** null when the api predates params_mode: the control is hidden and the
+   *  field is not sent, so the stored value is never touched. */
+  params_mode: ParamsMode | null
 }
 
 interface Props {
@@ -68,7 +79,7 @@ interface Props {
  * the third case — the save already happened and the API had something to say
  * about it.
  */
-type ConfirmKind = 'none' | 'tighten' | 'loosen' | 'warnings'
+type ConfirmKind = 'none' | 'tighten' | 'loosen' | 'strict' | 'warnings'
 
 /** The organisation may stand on any rung. Nothing above it can forbid one. */
 const ORG_RUNGS = RESIDENCY_LADDER.map((r) => ({ value: r.value, deadReason: null }))
@@ -93,11 +104,18 @@ function toDraft(policy: RoutingPolicy | null): OrgPolicyDraft {
     residency: policy?.residency ?? 'cloud_account_only',
     allowed_models: policy?.allowed_models ?? null,
     default_model: policy?.default_model ?? null,
+    params_mode: policy?.params_mode === undefined ? null : paramsModeOf(policy.params_mode),
   }
 }
 
 function sameDraft(a: OrgPolicyDraft, b: OrgPolicyDraft): boolean {
-  if (a.residency !== b.residency || a.default_model !== b.default_model) return false
+  if (
+    a.residency !== b.residency ||
+    a.default_model !== b.default_model ||
+    a.params_mode !== b.params_mode
+  ) {
+    return false
+  }
   if (a.allowed_models === null || b.allowed_models === null) {
     return a.allowed_models === b.allowed_models
   }
@@ -232,6 +250,11 @@ export function RoutingPolicyCard({
    *  get the danger treatment. */
   const leavingAccount = loosening && residencyRank(draft.residency) === 0
 
+  /** Turning strict on can start failing requests that are answered today,
+   *  for every key at once, so it is confirmed. Turning it off is not: nothing
+   *  that works stops working. */
+  const strictening = draft.params_mode === 'strict' && saved.params_mode !== 'strict'
+
   const canSave = changed && !saving && !emptyAllowlist && !defaultOutsideAllowlist
 
   const commit = async () => {
@@ -270,6 +293,10 @@ export function RoutingPolicyCard({
       setConfirmKind('tighten')
       return
     }
+    if (strictening) {
+      setConfirmKind('strict')
+      return
+    }
     void commit()
   }
 
@@ -301,6 +328,9 @@ export function RoutingPolicyCard({
               {residencyRank(saved.residency) === 0 && <EgressGlyph />}
               {residencyLabel(saved.residency)}
             </span>
+            {saved.params_mode !== null && (
+              <span className={styles.currentRung}>{paramsModeChip(saved.params_mode)}</span>
+            )}
             <span className={styles.updated}>
               Changed {new Date(policy.updated_at).toLocaleDateString()}
             </span>
@@ -470,6 +500,51 @@ export function RoutingPolicyCard({
             )}
           </fieldset>
 
+          {draft.params_mode !== null && (
+            <fieldset className={styles.field}>
+              <legend className={styles.legend}>Request parameters a model can't use</legend>
+              <p className={styles.fieldNote}>{PARAMS_MODE_NOTE}</p>
+              <div
+                className={styles.options}
+                role="radiogroup"
+                aria-label="Request parameters a model can't use"
+              >
+                {PARAMS_MODE_OPTIONS.map((o) => (
+                  <label
+                    key={o.value}
+                    className={`${styles.option} ${draft.params_mode === o.value ? styles.optionChecked : ''}`}
+                  >
+                    <span className={styles.optionTop}>
+                      {/* Named by the option, described by its consequence —
+                          the same split ResidencyLadder makes, so a screen
+                          reader does not read the paragraph as the name. */}
+                      <input
+                        className={styles.radio}
+                        type="radio"
+                        name="org-params-mode"
+                        checked={draft.params_mode === o.value}
+                        disabled={saving}
+                        aria-label={o.label}
+                        aria-describedby={`org-params-mode-${o.value}`}
+                        onChange={() => setDraft((p) => ({ ...p, params_mode: o.value }))}
+                      />
+                      <span className={styles.optionLabel} aria-hidden="true">{o.label}</span>
+                      {o.value === 'lenient' && (
+                        <span className={styles.defaultChip}>
+                          Default
+                          <span className={styles.srOnly}> — this is what Darkplum ships with</span>
+                        </span>
+                      )}
+                    </span>
+                    <span className={styles.optionConsequence} id={`org-params-mode-${o.value}`}>
+                      {o.consequence}
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </fieldset>
+          )}
+
           {/* affected counts only principals with a policy of their own whose
               allowed set actually shrank — never "has a row". orgNarrowed is
               the separate question of whether everyone who simply inherits now
@@ -594,7 +669,9 @@ export function RoutingPolicyCard({
               ? leavingAccount
                 ? 'Allow prompts to leave your cloud account?'
                 : 'Widen where requests may run?'
-              : 'Narrow what the organisation can reach?'
+              : confirmKind === 'strict'
+                ? PARAMS_MODE_STRICT_CONFIRM.title
+                : 'Narrow what the organisation can reach?'
         }
         description={
           confirmKind === 'warnings'
@@ -603,7 +680,9 @@ export function RoutingPolicyCard({
               ? leavingAccount
                 ? "Requests will be allowed to run at a model vendor's own API, using your organisation's key."
                 : 'More of what is already enabled will be allowed to answer.'
-              : 'Everyone inherits this. A user or key that already has its own policy keeps it, but can never reach past the organisation.'
+              : confirmKind === 'strict'
+                ? PARAMS_MODE_STRICT_CONFIRM.description
+                : 'Everyone inherits this. A user or key that already has its own policy keeps it, but can never reach past the organisation.'
         }
       >
         <div className={styles.confirmBody}>
@@ -680,6 +759,9 @@ export function RoutingPolicyCard({
                     : `${openedByDraft.length === 1 ? '1 enabled model starts' : `${openedByDraft.length} enabled models start`} answering again. They all run inside your cloud account.`}
                 </p>
               )}
+              {strictening && (
+                <p className={styles.confirmText}>{PARAMS_MODE_STRICT_CONFIRM.alsoLine}</p>
+              )}
               <p className={styles.confirmText}>{POLICY_TIMING}</p>
               <div className={styles.confirmFooter}>
                 <Button type="button" variant="ghost" onClick={() => setConfirmKind('none')}>
@@ -692,6 +774,23 @@ export function RoutingPolicyCard({
                   disabled={saving}
                 >
                   {saving ? 'Saving…' : leavingAccount ? 'Allow external models' : 'Save policy'}
+                </Button>
+              </div>
+            </>
+          )}
+
+          {confirmKind === 'strict' && (
+            <>
+              {PARAMS_MODE_STRICT_CONFIRM.body.map((t) => (
+                <p key={t} className={styles.confirmText}>{t}</p>
+              ))}
+              <p className={styles.confirmText}>{POLICY_TIMING}</p>
+              <div className={styles.confirmFooter}>
+                <Button type="button" variant="ghost" onClick={() => setConfirmKind('none')}>
+                  Cancel
+                </Button>
+                <Button type="button" onClick={() => void commit()} disabled={saving}>
+                  {saving ? 'Saving…' : PARAMS_MODE_STRICT_CONFIRM.action}
                 </Button>
               </div>
             </>
@@ -733,6 +832,9 @@ export function RoutingPolicyCard({
                   Nothing enabled today is refused by this, so no one loses access right now. The
                   policy still applies to anything you enable later.
                 </p>
+              )}
+              {strictening && (
+                <p className={styles.confirmText}>{PARAMS_MODE_STRICT_CONFIRM.alsoLine}</p>
               )}
               <p className={styles.confirmText}>{POLICY_TIMING}</p>
               <div className={styles.confirmFooter}>

@@ -1,0 +1,1244 @@
+{
+  "backends": [
+    "openai",
+    "openaicompat",
+    "anthropic",
+    "bedrock"
+  ],
+  "dispositions": [
+    "forward",
+    "translate",
+    "accept-default",
+    "drop-recorded",
+    "contract-refuse"
+  ],
+  "excluded": {
+    "mock": "The mock backend is a development stand-in that returns canned text and receives no customer traffic. It has no column here and is dispatched with the openaicompat column."
+  },
+  "unknown_keys": {
+    "lenient": "drop-recorded",
+    "strict": "contract-refuse",
+    "note": "A key the gateway does not know -- at the top level of the body, or inside stream_options or response_format -- is dropped and recorded under its own name; in strict mode it is refused. A null value is silent."
+  },
+  "rows": [
+    {
+      "param": "functions",
+      "when": "non-default",
+      "backends": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      },
+      "before_route": true,
+      "refusal_param": "functions",
+      "reason": "the legacy functions API is not implemented; send tools",
+      "note": "Legacy functions API. An empty array or null is the default."
+    },
+    {
+      "param": "functions",
+      "when": "default",
+      "backends": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      },
+      "strict": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      }
+    },
+    {
+      "param": "function_call",
+      "when": "non-default",
+      "backends": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      },
+      "before_route": true,
+      "reason": "the legacy functions API is not implemented; send tool_choice",
+      "note": "Anything other than \"none\" or null."
+    },
+    {
+      "param": "function_call",
+      "when": "default",
+      "backends": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      },
+      "strict": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      }
+    },
+    {
+      "param": "response_format",
+      "when": "json_schema",
+      "backends": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      },
+      "before_route": true,
+      "reason": "structured JSON output is not implemented on any backend",
+      "note": "Structured outputs."
+    },
+    {
+      "param": "response_format",
+      "when": "unknown-type",
+      "backends": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      },
+      "before_route": true,
+      "reason": "response_format type must be text or json_object",
+      "note": "A type other than text, json_object or json_schema."
+    },
+    {
+      "param": "messages",
+      "when": "non-text-content",
+      "backends": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      },
+      "before_route": true,
+      "refusal_param": "messages[].content",
+      "reason": "images, audio and files in message content are not supported",
+      "note": "A content array containing anything but text parts."
+    },
+    {
+      "param": "model",
+      "when": "any",
+      "backends": {
+        "anthropic": "forward",
+        "bedrock": "forward",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "strict": {
+        "anthropic": "forward",
+        "bedrock": "forward",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "note": "An alias resolves to a concrete model id first."
+    },
+    {
+      "param": "messages",
+      "when": "text",
+      "backends": {
+        "anthropic": "translate",
+        "bedrock": "translate",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "strict": {
+        "anthropic": "translate",
+        "bedrock": "translate",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "note": "Translated to the backend's own message schema where it differs."
+    },
+    {
+      "param": "stream",
+      "when": "any",
+      "backends": {
+        "anthropic": "translate",
+        "bedrock": "translate",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "strict": {
+        "anthropic": "translate",
+        "bedrock": "translate",
+        "openai": "forward",
+        "openaicompat": "forward"
+      }
+    },
+    {
+      "param": "stream_options",
+      "when": "object",
+      "backends": {
+        "anthropic": "forward",
+        "bedrock": "forward",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "strict": {
+        "anthropic": "forward",
+        "bedrock": "forward",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "note": "Container: its keys are the rows below. Without stream: true it is a 400 invalid_stream_options."
+    },
+    {
+      "param": "stream_options.include_usage",
+      "when": "true",
+      "backends": {
+        "anthropic": "translate",
+        "bedrock": "translate",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "strict": {
+        "anthropic": "translate",
+        "bedrock": "translate",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "reason": "a usage chunk cannot be produced on this backend",
+      "note": "Anthropic and Bedrock report usage differently; the gateway ends the stream with OpenAI's usage chunk (choices: [])."
+    },
+    {
+      "param": "stream_options.include_usage",
+      "when": "default",
+      "backends": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      },
+      "strict": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      },
+      "note": "false."
+    },
+    {
+      "param": "stream_options.include_obfuscation",
+      "when": "any",
+      "backends": {
+        "anthropic": "drop-recorded",
+        "bedrock": "drop-recorded",
+        "openai": "drop-recorded",
+        "openaicompat": "drop-recorded"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      },
+      "note": "OpenAI-specific stream padding; the gateway does not forward it."
+    },
+    {
+      "param": "max_tokens",
+      "when": "any",
+      "backends": {
+        "anthropic": "translate",
+        "bedrock": "translate",
+        "openai": "translate",
+        "openaicompat": "forward"
+      },
+      "strict": {
+        "anthropic": "translate",
+        "bedrock": "translate",
+        "openai": "translate",
+        "openaicompat": "forward"
+      },
+      "note": "OpenAI receives it as max_completion_tokens."
+    },
+    {
+      "param": "max_tokens",
+      "when": "with-thinking",
+      "backends": {
+        "anthropic": "translate",
+        "bedrock": "translate",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "strict": {
+        "anthropic": "translate",
+        "bedrock": "translate",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "dynamic": true,
+      "note": "With reasoning_effort translated to extended thinking the value sent is the caller's plus the thinking budget, capped at the model limit; the change is reported as max_tokens=raised."
+    },
+    {
+      "param": "max_completion_tokens",
+      "when": "any",
+      "backends": {
+        "anthropic": "translate",
+        "bedrock": "translate",
+        "openai": "forward",
+        "openaicompat": "translate"
+      },
+      "strict": {
+        "anthropic": "translate",
+        "bedrock": "translate",
+        "openai": "forward",
+        "openaicompat": "translate"
+      },
+      "note": "The same limit as max_tokens under its newer name."
+    },
+    {
+      "param": "max_completion_tokens",
+      "when": "conflicts-with-max_tokens",
+      "backends": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      },
+      "before_route": true,
+      "reason": "max_tokens and max_completion_tokens are the same limit and were sent with different values; send one",
+      "note": "Both sent and different."
+    },
+    {
+      "param": "temperature",
+      "when": "any",
+      "backends": {
+        "anthropic": "forward",
+        "bedrock": "forward",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "strict": {
+        "anthropic": "forward",
+        "bedrock": "forward",
+        "openai": "forward",
+        "openaicompat": "forward"
+      }
+    },
+    {
+      "param": "temperature",
+      "when": "with-thinking",
+      "backends": {
+        "anthropic": "drop-recorded",
+        "bedrock": "drop-recorded",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "dynamic": true,
+      "note": "Extended thinking forbids a caller temperature; it is dropped when reasoning_effort becomes thinking."
+    },
+    {
+      "param": "top_p",
+      "when": "any",
+      "backends": {
+        "anthropic": "forward",
+        "bedrock": "forward",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "strict": {
+        "anthropic": "forward",
+        "bedrock": "forward",
+        "openai": "forward",
+        "openaicompat": "forward"
+      }
+    },
+    {
+      "param": "top_p",
+      "when": "with-thinking",
+      "backends": {
+        "anthropic": "drop-recorded",
+        "bedrock": "drop-recorded",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "dynamic": true,
+      "note": "A top_p below 0.95 is dropped when reasoning_effort becomes extended thinking."
+    },
+    {
+      "param": "seed",
+      "when": "any",
+      "backends": {
+        "anthropic": "drop-recorded",
+        "bedrock": "drop-recorded",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "note": "Dropping it removes reproducibility: the same request can return different text. Anthropic and Bedrock have no seed."
+    },
+    {
+      "param": "frequency_penalty",
+      "when": "default",
+      "backends": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      },
+      "strict": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      },
+      "note": "0."
+    },
+    {
+      "param": "frequency_penalty",
+      "when": "non-default",
+      "backends": {
+        "anthropic": "drop-recorded",
+        "bedrock": "drop-recorded",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "note": "Dropping it changes the output: the model repeats itself more."
+    },
+    {
+      "param": "presence_penalty",
+      "when": "default",
+      "backends": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      },
+      "strict": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      },
+      "note": "0."
+    },
+    {
+      "param": "presence_penalty",
+      "when": "non-default",
+      "backends": {
+        "anthropic": "drop-recorded",
+        "bedrock": "drop-recorded",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "note": "Dropping it changes the output."
+    },
+    {
+      "param": "n",
+      "when": "default",
+      "backends": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      },
+      "strict": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      },
+      "note": "1."
+    },
+    {
+      "param": "n",
+      "when": "non-default",
+      "backends": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      },
+      "reason": "only one choice per request is supported",
+      "note": "Anything but 1."
+    },
+    {
+      "param": "stop",
+      "when": "any",
+      "backends": {
+        "anthropic": "translate",
+        "bedrock": "translate",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "strict": {
+        "anthropic": "translate",
+        "bedrock": "translate",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "note": "Anthropic stop_sequences, Bedrock stopSequences."
+    },
+    {
+      "param": "logit_bias",
+      "when": "default",
+      "backends": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      },
+      "strict": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      },
+      "note": "Empty."
+    },
+    {
+      "param": "logit_bias",
+      "when": "non-default",
+      "backends": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "reason": "this backend does not apply logit_bias"
+    },
+    {
+      "param": "logprobs",
+      "when": "default",
+      "backends": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      },
+      "strict": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      },
+      "note": "false."
+    },
+    {
+      "param": "logprobs",
+      "when": "true",
+      "backends": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "reason": "this backend does not return logprobs"
+    },
+    {
+      "param": "top_logprobs",
+      "when": "default",
+      "backends": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      },
+      "strict": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      },
+      "note": "0."
+    },
+    {
+      "param": "top_logprobs",
+      "when": "non-default",
+      "backends": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "reason": "this backend does not return logprobs",
+      "note": "Requires logprobs: true, which a backend that cannot return logprobs refuses first."
+    },
+    {
+      "param": "tools",
+      "when": "default",
+      "backends": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      },
+      "strict": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      },
+      "note": "Empty array."
+    },
+    {
+      "param": "tools",
+      "when": "non-empty",
+      "backends": {
+        "anthropic": "translate",
+        "bedrock": "translate",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "strict": {
+        "anthropic": "translate",
+        "bedrock": "translate",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "note": "Translated to Anthropic tools and Bedrock toolConfig."
+    },
+    {
+      "param": "tool_choice",
+      "when": "auto-or-none",
+      "backends": {
+        "anthropic": "translate",
+        "bedrock": "translate",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "strict": {
+        "anthropic": "translate",
+        "bedrock": "translate",
+        "openai": "forward",
+        "openaicompat": "forward"
+      }
+    },
+    {
+      "param": "tool_choice",
+      "when": "required-or-named",
+      "backends": {
+        "anthropic": "translate",
+        "bedrock": "translate",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "strict": {
+        "anthropic": "translate",
+        "bedrock": "translate",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "reason": "this backend cannot enforce a required or named tool call",
+      "note": "A refusal is the answer for a backend that cannot enforce it; every current backend can."
+    },
+    {
+      "param": "parallel_tool_calls",
+      "when": "default",
+      "backends": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      },
+      "strict": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      },
+      "note": "true."
+    },
+    {
+      "param": "parallel_tool_calls",
+      "when": "false-with-tools",
+      "backends": {
+        "anthropic": "translate",
+        "bedrock": "contract-refuse",
+        "openai": "forward",
+        "openaicompat": "contract-refuse"
+      },
+      "strict": {
+        "anthropic": "translate",
+        "bedrock": "contract-refuse",
+        "openai": "forward",
+        "openaicompat": "contract-refuse"
+      },
+      "reason": "this backend cannot restrict a turn to a single tool call",
+      "note": "Anthropic receives disable_parallel_tool_use. vLLM and Bedrock cannot enforce it."
+    },
+    {
+      "param": "parallel_tool_calls",
+      "when": "false-without-tools",
+      "backends": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      },
+      "strict": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      },
+      "note": "Nothing to restrict without tools."
+    },
+    {
+      "param": "response_format",
+      "when": "text",
+      "backends": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      },
+      "strict": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      },
+      "note": "The default."
+    },
+    {
+      "param": "response_format",
+      "when": "json_object",
+      "backends": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "reason": "this backend has no JSON mode"
+    },
+    {
+      "param": "response_format.type",
+      "when": "any",
+      "backends": {
+        "anthropic": "forward",
+        "bedrock": "forward",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "strict": {
+        "anthropic": "forward",
+        "bedrock": "forward",
+        "openai": "forward",
+        "openaicompat": "forward"
+      },
+      "note": "Selects the response_format row above."
+    },
+    {
+      "param": "response_format.json_schema",
+      "when": "any",
+      "backends": {
+        "anthropic": "drop-recorded",
+        "bedrock": "drop-recorded",
+        "openai": "drop-recorded",
+        "openaicompat": "drop-recorded"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      },
+      "note": "Only meaningful with type json_schema, which is refused before this is reached."
+    },
+    {
+      "param": "user",
+      "when": "any",
+      "backends": {
+        "anthropic": "translate",
+        "bedrock": "translate",
+        "openai": "translate",
+        "openaicompat": "forward"
+      },
+      "strict": {
+        "anthropic": "translate",
+        "bedrock": "translate",
+        "openai": "translate",
+        "openaicompat": "forward"
+      },
+      "dynamic": true,
+      "note": "In-cluster vLLM receives the value as sent. OpenAI (user), Anthropic (metadata.user_id) and Bedrock (requestMetadata) receive a keyed HMAC, never the raw value. If the HMAC secret is not installed it is dropped and recorded."
+    },
+    {
+      "param": "store",
+      "when": "default",
+      "backends": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "forward",
+        "openaicompat": "accept-default"
+      },
+      "strict": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "forward",
+        "openaicompat": "accept-default"
+      },
+      "note": "false, or null. OpenAI receives store: false."
+    },
+    {
+      "param": "store",
+      "when": "true",
+      "backends": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      },
+      "reason": "completions are never stored by a vendor on this gateway's behalf; send store:false or omit it",
+      "note": "true."
+    },
+    {
+      "param": "reasoning_effort",
+      "when": "none",
+      "backends": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "forward",
+        "openaicompat": "accept-default"
+      },
+      "strict": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "forward",
+        "openaicompat": "accept-default"
+      },
+      "dynamic": true,
+      "note": "No reasoning requested; nothing is sent or recorded except to OpenAI, where none is a real setting."
+    },
+    {
+      "param": "reasoning_effort",
+      "when": "other",
+      "backends": {
+        "anthropic": "translate",
+        "bedrock": "translate",
+        "openai": "forward",
+        "openaicompat": "drop-recorded"
+      },
+      "strict": {
+        "anthropic": "translate",
+        "bedrock": "translate",
+        "openai": "forward",
+        "openaicompat": "contract-refuse"
+      },
+      "dynamic": true,
+      "note": "OpenAI forwards it. Anthropic and Anthropic models on Bedrock translate it to extended thinking (low and minimal 1024, medium 4096, high and xhigh 16384 budget tokens); it is dropped and recorded for a model without extended thinking and on any turn after a tool call, and refused with a required or named tool_choice. Other backends drop it."
+    },
+    {
+      "param": "metadata",
+      "when": "default",
+      "backends": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      },
+      "strict": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      },
+      "note": "Empty object."
+    },
+    {
+      "param": "metadata",
+      "when": "non-default",
+      "backends": {
+        "anthropic": "drop-recorded",
+        "bedrock": "drop-recorded",
+        "openai": "drop-recorded",
+        "openaicompat": "drop-recorded"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      }
+    },
+    {
+      "param": "service_tier",
+      "when": "default",
+      "backends": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      },
+      "strict": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      },
+      "note": "auto or default."
+    },
+    {
+      "param": "service_tier",
+      "when": "non-default",
+      "backends": {
+        "anthropic": "drop-recorded",
+        "bedrock": "drop-recorded",
+        "openai": "drop-recorded",
+        "openaicompat": "drop-recorded"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      }
+    },
+    {
+      "param": "modalities",
+      "when": "default",
+      "backends": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      },
+      "strict": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      },
+      "note": "[\"text\"]."
+    },
+    {
+      "param": "modalities",
+      "when": "non-default",
+      "backends": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      },
+      "reason": "audio output is not produced by any backend; the reply is text only",
+      "note": "Anything but [\"text\"], i.e. a request for audio output."
+    },
+    {
+      "param": "audio",
+      "when": "any",
+      "backends": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      },
+      "reason": "audio output is not produced by any backend"
+    },
+    {
+      "param": "prediction",
+      "when": "any",
+      "backends": {
+        "anthropic": "drop-recorded",
+        "bedrock": "drop-recorded",
+        "openai": "drop-recorded",
+        "openaicompat": "drop-recorded"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      }
+    },
+    {
+      "param": "web_search_options",
+      "when": "any",
+      "backends": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      },
+      "reason": "web search is not available on any backend; the model would answer without it",
+      "note": "A request for web search is refused rather than answered without it."
+    },
+    {
+      "param": "verbosity",
+      "when": "default",
+      "backends": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      },
+      "strict": {
+        "anthropic": "accept-default",
+        "bedrock": "accept-default",
+        "openai": "accept-default",
+        "openaicompat": "accept-default"
+      },
+      "note": "medium."
+    },
+    {
+      "param": "verbosity",
+      "when": "non-default",
+      "backends": {
+        "anthropic": "drop-recorded",
+        "bedrock": "drop-recorded",
+        "openai": "drop-recorded",
+        "openaicompat": "drop-recorded"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      }
+    },
+    {
+      "param": "safety_identifier",
+      "when": "any",
+      "backends": {
+        "anthropic": "drop-recorded",
+        "bedrock": "drop-recorded",
+        "openai": "drop-recorded",
+        "openaicompat": "drop-recorded"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      }
+    },
+    {
+      "param": "prompt_cache_key",
+      "when": "any",
+      "backends": {
+        "anthropic": "drop-recorded",
+        "bedrock": "drop-recorded",
+        "openai": "drop-recorded",
+        "openaicompat": "drop-recorded"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      }
+    },
+    {
+      "param": "prompt_cache_retention",
+      "when": "any",
+      "backends": {
+        "anthropic": "drop-recorded",
+        "bedrock": "drop-recorded",
+        "openai": "drop-recorded",
+        "openaicompat": "drop-recorded"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      }
+    },
+    {
+      "param": "top_k",
+      "when": "any",
+      "backends": {
+        "anthropic": "drop-recorded",
+        "bedrock": "drop-recorded",
+        "openai": "drop-recorded",
+        "openaicompat": "forward"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "forward"
+      },
+      "note": "Anthropic has a top_k of its own but the gateway does not translate it."
+    },
+    {
+      "param": "min_p",
+      "when": "any",
+      "backends": {
+        "anthropic": "drop-recorded",
+        "bedrock": "drop-recorded",
+        "openai": "drop-recorded",
+        "openaicompat": "forward"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "forward"
+      }
+    },
+    {
+      "param": "repetition_penalty",
+      "when": "any",
+      "backends": {
+        "anthropic": "drop-recorded",
+        "bedrock": "drop-recorded",
+        "openai": "drop-recorded",
+        "openaicompat": "forward"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "forward"
+      }
+    },
+    {
+      "param": "guided_json",
+      "when": "any",
+      "backends": {
+        "anthropic": "drop-recorded",
+        "bedrock": "drop-recorded",
+        "openai": "drop-recorded",
+        "openaicompat": "forward"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "forward"
+      }
+    },
+    {
+      "param": "chat_template_kwargs",
+      "when": "any",
+      "backends": {
+        "anthropic": "drop-recorded",
+        "bedrock": "drop-recorded",
+        "openai": "drop-recorded",
+        "openaicompat": "forward"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "contract-refuse",
+        "openai": "contract-refuse",
+        "openaicompat": "forward"
+      },
+      "note": "Only enable_thinking, thinking and reasoning_effort, scalar values."
+    }
+  ]
+}

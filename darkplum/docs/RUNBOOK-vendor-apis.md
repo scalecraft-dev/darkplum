@@ -140,6 +140,58 @@ if the old key is already revoked at the vendor, vendor requests fail with
 `502 provider_auth_failed`; local and Bedrock models are unaffected. Revoke the
 old key at the vendor *after* the new one is answering.
 
+### 3b. The end-user identifier sent to Anthropic and Bedrock (`darkplum-user-hmac`)
+
+The OpenAI `user` field goes raw only to in-cluster vLLM and LM Studio. To
+OpenAI (`user`), Anthropic (`metadata.user_id`) and Bedrock
+(`requestMetadata.user_id`) it goes only as `<key id>:<hex HMAC-SHA256(secret,
+user)>`, for example `k1:9f2c...` (67 characters, inside every vendor's
+256-character limit and Bedrock's value charset). All three vendors receive the
+SAME value for the same person; correlating one person across vendors is
+therefore possible for anyone who sees more than one vendor's logs (accepted). The secret is the Kubernetes Secret `darkplum-user-hmac` in
+`darkplum-system` (files `user-hmac-key`, `user-hmac-key-id`), created by
+`make deploy-platform` and kept if it already exists. It exists nowhere else:
+not Postgres, not the control plane, not an env var, never logged.
+
+Same user plus same secret gives the same value, so the vendor can still tell
+one end user from another; without the secret the value cannot be traced to a
+person. Check it with `kubectl get secret darkplum-user-hmac -n darkplum-system`.
+
+If the Secret is absent, unreadable, or the key is shorter than 16 characters,
+the gateway starts normally and the field is left off OpenAI, Anthropic and Bedrock
+requests (never sent raw). The gateway logs one WARNING
+(`userid: user-hmac secret unavailable ...`) until the secret is usable again.
+Each omission is recorded like any other dropped parameter: `user` appears in the
+`X-Darkplum-Dropped-Params` response header, in the request's `dropped_params`
+in Admin > Activity, and in the first-time `inference.param_dropped` audit event.
+In strict mode such a request is refused with 400 instead.
+
+**Rotating.** Rotating changes every pseudonym a vendor has seen, so vendor-side
+per-user history stops lining up across the cut. Do it only on suspected
+compromise or a policy requirement.
+
+1. Choose a new key id (`k2`; lowercase letters, digits, `_` or `-`, up to 16
+   characters) so old and new values are distinguishable in vendor logs.
+2. Replace both files in one command:
+   `kubectl create secret generic darkplum-user-hmac -n darkplum-system
+   --from-literal=user-hmac-key="$(openssl rand -base64 48)"
+   --from-literal=user-hmac-key-id=k2 --dry-run=client -o yaml | kubectl apply -f -`
+3. No restart: the gateway re-reads the mounted files (kubelet sync, about a
+   minute, then up to 3 seconds). Until the sync lands the old `k1:` values keep
+   being sent; there is no window with a raw value.
+4. `make deploy-platform` generates a key only when the Secret is NotFound; any
+   other kubectl error aborts it, so a bad context can never replace a live key.
+   Re-running it keeps the installed key and id. To rotate
+   through make, run it with `USER_HMAC_KEY` and `USER_HMAC_KEY_ID` set.
+
+## 3c. Strict parameter mode (`params_mode`)
+
+By default a request parameter a backend cannot honour is dropped and reported in `X-Darkplum-Dropped-Params`, the Activity `dropped_params` column and a first-time audit event. An admin can set `params_mode: "strict"` on `PUT /api/v1/routing-policy` so every drop becomes a 400 `unsupported_parameter` instead.
+
+- Strict only takes effect on gateways running the release that reads it. Until migration 029 is applied the gateway treats every organisation as lenient and logs `principal_routing_policies.params_mode does not exist yet`.
+- `make deploy-platform` rolls the api, then the gateway, in one run. A strict value set before the gateway has rolled is ignored by the old gateways; verify with a request carrying an unknown key (strict answers 400 naming it).
+- In strict mode a `user` that cannot be pseudonymised (no `darkplum-user-hmac` secret, e.g. the dev overlay) is a 400 naming `user`, because the field would otherwise be dropped. Install the secret (3b) before enabling strict mode.
+
 ## 4. When a vendor is not answering
 
 `GET /health` on the gateway carries a `providers` array, and **Admin > Models >

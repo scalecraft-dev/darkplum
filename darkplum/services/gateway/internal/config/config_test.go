@@ -503,3 +503,19 @@ func TestLoad_AnthropicWorkspaceID(t *testing.T) {
 		})
 	}
 }
+
+func TestLoad_UserHMACDirDefaultAndOverride(t *testing.T) {
+	baseEnv(t)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.UserHMACDir != "/var/run/darkplum/user-hmac" {
+		t.Errorf("UserHMACDir = %q, want the default", cfg.UserHMACDir)
+	}
+	t.Setenv("USER_HMAC_DIR", "/tmp/custom-hmac")
+	cfg, err = Load()
+	if err != nil || cfg.UserHMACDir != "/tmp/custom-hmac" {
+		t.Errorf("UserHMACDir = %q err=%v", cfg.UserHMACDir, err)
+	}
+}

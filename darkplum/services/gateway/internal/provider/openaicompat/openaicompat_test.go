@@ -807,3 +807,261 @@ func TestStreamDoneSSE(t *testing.T) {
 		t.Errorf("StreamDoneSSE = %q, want %q", provider.StreamDoneSSE, "data: [DONE]\n\n")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Phase A1 parameter honesty: json_object, max_tokens, include_usage.
+// ---------------------------------------------------------------------------
+
+func TestParamCaps_OpenAICompat(t *testing.T) {
+	want := provider.ParamCaps{
+		JSONMode: true, Stop: true, ForcedToolChoice: true,
+		Logprobs: true, LogitBias: true, UserID: provider.UserIDRaw,
+	}
+	if got := newTestProvider(t, "http://127.0.0.1:1").ParamCaps(); got != want {
+		t.Errorf("ParamCaps = %+v, want %+v", got, want)
+	}
+}
+
+// captureUpstream serves respond for every request and records the decoded
+// request bodies.
+func captureUpstream(t *testing.T, respond func(w http.ResponseWriter)) (*httptest.Server, *[]map[string]any) {
+	t.Helper()
+	var bodies []map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var b map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&b)
+		bodies = append(bodies, b)
+		respond(w)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &bodies
+}
+
+func TestComplete_JSONModeAndMaxTokensOnTheWire(t *testing.T) {
+	srv, bodies := captureUpstream(t, func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(buildMockCompletion("id", "llama-3-8b", "{}", 1, 1))
+	})
+	p := newTestProvider(t, srv.URL)
+
+	req := testRequest()
+	req.JSONMode = true
+	req.MaxTokens = 123
+	if _, err := p.Complete(context.Background(), req); err != nil {
+		t.Fatal(err)
+	}
+	b := (*bodies)[0]
+	if rf, _ := b["response_format"].(map[string]any); rf["type"] != "json_object" {
+		t.Errorf("response_format = %v, want json_object", b["response_format"])
+	}
+	if b["max_tokens"] != float64(123) {
+		t.Errorf("max_tokens = %v, want 123 (vLLM's wire field)", b["max_tokens"])
+	}
+	if _, has := b["max_completion_tokens"]; has {
+		t.Error("vLLM takes max_tokens; max_completion_tokens must not be sent")
+	}
+
+	if _, err := p.Complete(context.Background(), testRequest()); err != nil {
+		t.Fatal(err)
+	}
+	if _, has := (*bodies)[1]["response_format"]; has {
+		t.Error("response_format must be omitted unless json_object was requested")
+	}
+}
+
+func sseFrames(t *testing.T, out string) []map[string]any {
+	t.Helper()
+	var frames []map[string]any
+	for _, line := range strings.Split(out, "\n") {
+		payload, ok := strings.CutPrefix(line, "data: ")
+		if !ok || payload == "[DONE]" {
+			continue
+		}
+		var m map[string]any
+		if err := json.Unmarshal([]byte(payload), &m); err != nil {
+			t.Fatalf("decode %q: %v", payload, err)
+		}
+		frames = append(frames, m)
+	}
+	return frames
+}
+
+// vLLM answers include_usage itself: a usage-only chunk with choices [] right
+// before [DONE]. It reaches the caller once, as sent.
+func vllmStreamWithUsageChunk() string {
+	return `data: {"id":"c1","object":"chat.completion.chunk","model":"llama-3-8b","choices":[{"index":0,"delta":{"role":"assistant","content":"Hi"},"finish_reason":null}],"usage":null}` + "\n\n" +
+		`data: {"id":"c1","object":"chat.completion.chunk","model":"llama-3-8b","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":null}` + "\n\n" +
+		`data: {"id":"c1","object":"chat.completion.chunk","model":"llama-3-8b","choices":[],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}` + "\n\n" +
+		"data: [DONE]\n\n"
+}
+
+func TestStream_IncludeUsageAskedOfUpstreamOnlyWhenRequested(t *testing.T) {
+	srv, bodies := captureUpstream(t, func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, vllmStreamWithUsageChunk())
+	})
+	p := newTestProvider(t, srv.URL)
+
+	req := testRequest()
+	req.Stream = true
+	req.IncludeUsage = true
+	var buf bytes.Buffer
+	stats, err := p.Stream(context.Background(), req, &buf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if so, _ := (*bodies)[0]["stream_options"].(map[string]any); so["include_usage"] != true {
+		t.Errorf("upstream stream_options = %v, want include_usage true", (*bodies)[0]["stream_options"])
+	}
+	if stats.PromptTokens != 5 || stats.CompletionTokens != 2 {
+		t.Errorf("stats = %+v, want 5/2", stats)
+	}
+	frames := sseFrames(t, buf.String())
+	if len(frames) != 3 {
+		t.Fatalf("frames = %d, want 3 (the upstream's own usage chunk, not duplicated): %v", len(frames), frames)
+	}
+	if ch, ok := frames[2]["choices"].([]any); !ok || len(ch) != 0 || frames[2]["usage"] == nil {
+		t.Errorf("last frame = %v, want choices [] with usage", frames[2])
+	}
+
+	req.IncludeUsage = false
+	if _, err := p.Stream(context.Background(), req, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, has := (*bodies)[1]["stream_options"]; has {
+		t.Error("stream_options must not be sent when the caller did not ask for include_usage")
+	}
+}
+
+// An upstream that ignores stream_options but reports usage on the finish
+// chunk still yields the usage-only chunk the caller asked for.
+func TestStream_IncludeUsageSynthesizedWhenUpstreamIgnoresIt(t *testing.T) {
+	srv, _ := captureUpstream(t, func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, buildMockStreamingResponse("c2", "llama-3-8b", "Hi", 5, 2))
+	})
+	p := newTestProvider(t, srv.URL)
+	req := testRequest()
+	req.Stream = true
+	req.IncludeUsage = true
+	var buf bytes.Buffer
+	if _, err := p.Stream(context.Background(), req, &buf); err != nil {
+		t.Fatal(err)
+	}
+	frames := sseFrames(t, buf.String())
+	last := frames[len(frames)-1]
+	if ch, ok := last["choices"].([]any); !ok || len(ch) != 0 {
+		t.Fatalf("last frame = %v, want a usage-only chunk (choices [])", last)
+	}
+	if u := last["usage"].(map[string]any); u["prompt_tokens"] != float64(5) || u["completion_tokens"] != float64(2) || u["total_tokens"] != float64(7) {
+		t.Errorf("usage = %v", u)
+	}
+	if last["id"] != "c2" {
+		t.Errorf("usage chunk id = %v, want c2", last["id"])
+	}
+	if !strings.HasSuffix(buf.String(), "data: [DONE]\n\n") {
+		t.Errorf("stream must still end with [DONE], got %q", buf.String())
+	}
+}
+
+// Without include_usage the passthrough is untouched: no chunk is added.
+func TestStream_NoIncludeUsageAddsNothing(t *testing.T) {
+	srv, _ := captureUpstream(t, func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, buildMockStreamingResponse("c3", "llama-3-8b", "Hi", 5, 2))
+	})
+	p := newTestProvider(t, srv.URL)
+	req := testRequest()
+	req.Stream = true
+	var buf bytes.Buffer
+	if _, err := p.Stream(context.Background(), req, &buf); err != nil {
+		t.Fatal(err)
+	}
+	if frames := sseFrames(t, buf.String()); len(frames) != 2 {
+		t.Errorf("frames = %d, want 2 (content, finish+usage) as before", len(frames))
+	}
+}
+
+// A JSON-answering upstream (stream flag ignored) is adapted to the same
+// two-chunk ending when include_usage was asked.
+func TestStream_JSONUpstreamAdaptedWithIncludeUsage(t *testing.T) {
+	srv, _ := captureUpstream(t, func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(buildMockCompletion("c4", "llama-3-8b", "Hello", 11, 6))
+	})
+	p := newTestProvider(t, srv.URL)
+	req := testRequest()
+	req.Stream = true
+	req.IncludeUsage = true
+	var buf bytes.Buffer
+	if _, err := p.Stream(context.Background(), req, &buf); err != nil {
+		t.Fatal(err)
+	}
+	frames := sseFrames(t, buf.String())
+	if len(frames) != 3 {
+		t.Fatalf("frames = %d, want 3 (content, finish, usage): %v", len(frames), frames)
+	}
+	if frames[1]["usage"] != nil {
+		t.Errorf("finish frame usage = %v, want null", frames[1]["usage"])
+	}
+	if ch := frames[2]["choices"].([]any); len(ch) != 0 || frames[2]["usage"].(map[string]any)["total_tokens"] != float64(17) {
+		t.Errorf("usage frame = %v", frames[2])
+	}
+}
+
+// include_usage is never silently unanswered: an upstream that reports no
+// usage and no id still gets a usage chunk (zero counts, generated id).
+func TestStream_IncludeUsageAnsweredWithZeroCountsAndGeneratedID(t *testing.T) {
+	srv, _ := captureUpstream(t, func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, `data: {"choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}`+"\n\n"+
+			`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`+"\n\n"+"data: [DONE]\n\n")
+	})
+	p := newTestProvider(t, srv.URL)
+	req := testRequest()
+	req.Stream = true
+	req.IncludeUsage = true
+	var buf bytes.Buffer
+	if _, err := p.Stream(context.Background(), req, &buf); err != nil {
+		t.Fatal(err)
+	}
+	frames := sseFrames(t, buf.String())
+	last := frames[len(frames)-1]
+	if ch, ok := last["choices"].([]any); !ok || len(ch) != 0 {
+		t.Fatalf("last frame = %v, want usage-only chunk", last)
+	}
+	if u := last["usage"].(map[string]any); u["total_tokens"] != float64(0) || u["prompt_tokens"] != float64(0) {
+		t.Errorf("usage = %v, want zero counts", u)
+	}
+	if id, _ := last["id"].(string); !strings.HasPrefix(id, "chatcmpl-") {
+		t.Errorf("id = %q, want a generated chatcmpl- id", last["id"])
+	}
+}
+
+// Wire: MaxTokens (the handler's folded max_completion_tokens) is the
+// upstream max_tokens, and stream_options is absent unless asked for.
+func TestWire_MaxTokensAndStreamOptions(t *testing.T) {
+	srv, bodies := captureUpstream(t, func(w http.ResponseWriter) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, buildMockStreamingResponse("c5", "llama-3-8b", "Hi", 1, 1))
+	})
+	p := newTestProvider(t, srv.URL)
+	for _, ask := range []bool{true, false} {
+		req := testRequest()
+		req.Stream = true
+		req.MaxTokens = 99
+		req.IncludeUsage = ask
+		if _, err := p.Stream(context.Background(), req, &bytes.Buffer{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if (*bodies)[0]["max_tokens"] != float64(99) {
+		t.Errorf("max_tokens = %v, want 99", (*bodies)[0]["max_tokens"])
+	}
+	if so, _ := (*bodies)[0]["stream_options"].(map[string]any); so["include_usage"] != true {
+		t.Errorf("asked: stream_options = %v", (*bodies)[0]["stream_options"])
+	}
+	if _, has := (*bodies)[1]["stream_options"]; has {
+		t.Error("not asked: stream_options must be absent")
+	}
+}

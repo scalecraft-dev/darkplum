@@ -354,3 +354,159 @@ func TestExportUsage_PurposeFilterAndColumns(t *testing.T) {
 		t.Fatalf("?purpose=all rows = %v, want header + 2 rows", rows)
 	}
 }
+
+// TestUsage_DroppedParams covers inference_events.dropped_params (migration
+// 029) reaching both the list JSON (an array, null when nothing was dropped)
+// and the CSV export (a dropped_params column, entries joined with ";").
+func TestUsage_DroppedParams(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	userID := newTestUser(t, ctx, pool)
+
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO inference_events (request_id, user_id, model, status_code, latency_ms, dropped_params)
+		VALUES ('req-dropped', $1, 'claude-sonnet', 200, 10, ARRAY['seed', 'logprobs', 'max_tokens=raised'])
+	`, userID); err != nil {
+		t.Fatalf("insert dropped row: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO inference_events (request_id, user_id, model, status_code, latency_ms)
+		VALUES ('req-clean', $1, 'llama3', 200, 10)
+	`, userID); err != nil {
+		t.Fatalf("insert clean row: %v", err)
+	}
+
+	r := newActivityTestRouter(NewActivityHandler(pool))
+
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/usage", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	// Decode loosely too, so the wire shape (null vs absent) is checked and
+	// not only what the Go struct makes of it.
+	var raw struct {
+		Events []map[string]json.RawMessage `json:"events"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	seen := 0
+	for _, e := range raw.Events {
+		var reqID string
+		_ = json.Unmarshal(e["request_id"], &reqID)
+		dp, ok := e["dropped_params"]
+		if !ok {
+			t.Fatalf("event %s has no dropped_params key: %v", reqID, e)
+		}
+		switch reqID {
+		case "req-dropped":
+			seen++
+			var got []string
+			if err := json.Unmarshal(dp, &got); err != nil {
+				t.Fatalf("decode dropped_params: %v", err)
+			}
+			if strings.Join(got, ",") != "seed,logprobs,max_tokens=raised" {
+				t.Fatalf("req-dropped dropped_params = %v", got)
+			}
+		case "req-clean":
+			seen++
+			if string(dp) != "null" {
+				t.Fatalf("req-clean dropped_params = %s, want null", dp)
+			}
+		}
+	}
+	if seen != 2 {
+		t.Fatalf("saw %d of the 2 rows: %s", seen, rec.Body.String())
+	}
+
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/usage/export", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("export status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	rows, err := csv.NewReader(strings.NewReader(rec.Body.String())).ReadAll()
+	if err != nil {
+		t.Fatalf("parse csv: %v", err)
+	}
+	col, reqCol := -1, -1
+	for i, h := range rows[0] {
+		switch h {
+		case "dropped_params":
+			col = i
+		case "request_id":
+			reqCol = i
+		}
+	}
+	if col == -1 {
+		t.Fatalf("csv header %v missing dropped_params", rows[0])
+	}
+	got := map[string]string{}
+	for _, row := range rows[1:] {
+		got[row[reqCol]] = row[col]
+	}
+	if got["req-dropped"] != "seed;logprobs;max_tokens=raised" {
+		t.Fatalf("req-dropped csv dropped_params = %q", got["req-dropped"])
+	}
+	if v, ok := got["req-clean"]; !ok || v != "" {
+		t.Fatalf("req-clean csv dropped_params = %q (present %v), want empty", v, ok)
+	}
+}
+
+// TestExportUsage_DroppedParamsFormulaNeutralised covers a dropped_params
+// entry that starts with a spreadsheet formula character. An unknown key's
+// name is chosen by the caller, so the cell goes through csvSafeText like the
+// other caller-supplied text.
+func TestExportUsage_DroppedParamsFormulaNeutralised(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	userID := newTestUser(t, ctx, pool)
+
+	cases := map[string]string{
+		"req-eq":   "=cmd",
+		"req-plus": "+cmd",
+		"req-dash": "-cmd",
+		"req-at":   "@cmd",
+	}
+	for reqID, name := range cases {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO inference_events (request_id, user_id, model, status_code, latency_ms, dropped_params)
+			VALUES ($1, $2, 'llama3', 200, 10, ARRAY[$3::text, 'seed'])
+		`, reqID, userID, name); err != nil {
+			t.Fatalf("insert %s: %v", reqID, err)
+		}
+	}
+
+	r := newActivityTestRouter(NewActivityHandler(pool))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/usage/export", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+	}
+	rows, err := csv.NewReader(strings.NewReader(rec.Body.String())).ReadAll()
+	if err != nil {
+		t.Fatalf("parse csv: %v", err)
+	}
+	col, reqCol := -1, -1
+	for i, h := range rows[0] {
+		switch h {
+		case "dropped_params":
+			col = i
+		case "request_id":
+			reqCol = i
+		}
+	}
+	if col == -1 || reqCol == -1 {
+		t.Fatalf("csv header %v missing dropped_params or request_id", rows[0])
+	}
+	got := map[string]string{}
+	for _, row := range rows[1:] {
+		got[row[reqCol]] = row[col]
+	}
+	for reqID, name := range cases {
+		want := "'" + name + ";seed"
+		if got[reqID] != want {
+			t.Errorf("%s dropped_params = %q, want %q", reqID, got[reqID], want)
+		}
+	}
+}

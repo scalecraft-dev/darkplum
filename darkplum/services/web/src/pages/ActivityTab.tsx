@@ -45,6 +45,7 @@ import {
   type EventVariant,
   inferenceEventLabel,
 } from '../lib/activityEvents'
+import { droppedParamsBadge, droppedParamsTitle } from '../lib/chatParams'
 import {
   DENIAL_CODES,
   denialLabel,
@@ -164,6 +165,11 @@ interface UnifiedEvent {
   /** Requests only, and only when the class was recorded: this one left the
    *  organisation's cloud account, to the vendor named here. */
   egress: string | null
+  /** Requests only: the request parameters the gateway did not send as asked,
+   *  as the badge says them ("Dropped · seed, logprobs +2") and in full for
+   *  its title. Both null when nothing was dropped. */
+  dropped: string | null
+  dropped_detail: string | null
   /** Requests only: total tokens as "in → out", the full split (cache
    *  included) for its tooltip, and the estimated cost. A null cost on a row
    *  that has tokens is an unpriced model, not a free one. */
@@ -244,6 +250,8 @@ function adminEventToUnified(e: ActivityEvent): UnifiedEvent {
     route:          null,
     reason:         null,
     egress:         null,
+    dropped:        null,
+    dropped_detail: null,
     tokens:         null,
     tokens_detail:  null,
     cost:           null,
@@ -302,6 +310,8 @@ function inferenceEventToUnified(e: InferenceEvent): UnifiedEvent {
       cls !== null && isEgress(displayClassOf({ backend_class: cls }))
         ? vendorLabel(e.provider)
         : null,
+    dropped:        droppedParamsBadge(e.dropped_params),
+    dropped_detail: droppedParamsTitle(e.dropped_params),
     tokens:
       e.prompt_tokens == null && e.completion_tokens == null
         ? null
@@ -1067,6 +1077,19 @@ export function ActivityTab() {
                           >
                             <EgressGlyph />
                             Left cloud account · {e.egress}
+                            <span className={styles.srOnly}>
+                              {`. This request ran at ${e.egress}'s own API, using your organisation's key. It left your cloud account.`}
+                            </span>
+                          </Badge>
+                        )}
+                        {/* Quieter than egress (no border, no glyph): the
+                            request was answered, but not exactly as asked. */}
+                        {e.dropped && (
+                          <Badge variant="warning" title={e.dropped_detail ?? undefined}>
+                            {e.dropped}
+                            {e.dropped_detail && (
+                              <span className={styles.srOnly}>{`. ${e.dropped_detail}`}</span>
+                            )}
                           </Badge>
                         )}
                       </div>

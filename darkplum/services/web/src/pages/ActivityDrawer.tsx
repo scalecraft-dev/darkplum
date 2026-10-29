@@ -14,6 +14,7 @@ import { getUsageStats, listActivity, listUsage } from '../lib/api'
 import { useTheme } from '../context/ThemeContext'
 import type { InferenceEvent, KeyUsageSummary, TimeRange, UsageBucket, UserUsageSummary } from '../types'
 import { eventLabel, eventVariant, formatEventDetail, inferenceEventLabel, type EventVariant } from '../lib/activityEvents'
+import { droppedParamsBadge, droppedParamsTitle } from '../lib/chatParams'
 import {
   denialLabel,
   displayClassOf,
@@ -93,6 +94,8 @@ function inferenceToRow(e: InferenceEvent): {
   variant: EventVariant
   detail: string
   egress: string | null
+  dropped: string | null
+  droppedDetail: string | null
 } {
   const { label, variant } = inferenceEventLabel(e)
   const cls = e.backend_class ?? null
@@ -124,6 +127,8 @@ function inferenceToRow(e: InferenceEvent): {
     variant,
     detail,
     egress: display !== null && isEgress(display) ? vendorLabel(e.provider) : null,
+    dropped: droppedParamsBadge(e.dropped_params),
+    droppedDetail: droppedParamsTitle(e.dropped_params),
   }
 }
 
@@ -175,6 +180,10 @@ export function ActivityDrawer({ open, onClose, user, apiKey, timeRange }: Drawe
       /** The vendor a request went out to, or null. Admin events never leave
        *  the account, so theirs is always null. */
       egress: string | null
+      /** Request parameters not sent as asked, as the badge says them, and
+       *  in full for its title. Null on admin events. */
+      dropped: string | null
+      droppedDetail: string | null
     }>
   >([])
   const [loadingChart, setLoadingChart] = useState(false)
@@ -220,6 +229,8 @@ export function ActivityDrawer({ open, onClose, user, apiKey, timeRange }: Drawe
           variant: eventVariant(e.event_type),
           detail: e.detail ? formatEventDetail(e.detail) : '',
           egress: null,
+          dropped: null,
+          droppedDetail: null,
         }))
 
         const inferenceMapped = usageRes.events.map(inferenceToRow)
@@ -410,6 +421,17 @@ export function ActivityDrawer({ open, onClose, user, apiKey, timeRange }: Drawe
                       >
                         <EgressGlyph />
                         Left cloud account · {e.egress}
+                        <span className={styles.srOnly}>
+                          {`. This request ran at ${e.egress}'s own API, using your organisation's key. It left your cloud account.`}
+                        </span>
+                      </Badge>
+                    )}
+                    {e.dropped && (
+                      <Badge variant="warning" title={e.droppedDetail ?? undefined}>
+                        {e.dropped}
+                        {e.droppedDetail && (
+                          <span className={styles.srOnly}>{`. ${e.droppedDetail}`}</span>
+                        )}
                       </Badge>
                     )}
                     {e.detail && (

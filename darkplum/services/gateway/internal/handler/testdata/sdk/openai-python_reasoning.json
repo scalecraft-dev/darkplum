@@ -1,0 +1,70 @@
+{
+  "sdk": "openai-python",
+  "representative": true,
+  "provenance": "Hand-assembled from the SDK's documented request serialisation, not a verbatim packet capture; the keys, defaults and nulls are the ones that SDK (or an app using it) sends.",
+  "description": "reasoning_effort='medium' with max_completion_tokens=2000 (a reasoning-model call)",
+  "expect": {
+    "lenient": {
+      "openai": {
+        "status": 200,
+        "dropped": []
+      },
+      "openaicompat": {
+        "status": 200,
+        "dropped": [
+          "reasoning_effort"
+        ]
+      },
+      "anthropic": {
+        "status": 200,
+        "dropped": [
+          "max_tokens=raised"
+        ]
+      },
+      "bedrock": {
+        "status": 200,
+        "dropped": [
+          "max_tokens=raised"
+        ]
+      }
+    },
+    "strict": {
+      "openai": {
+        "status": 200,
+        "dropped": []
+      },
+      "openaicompat": {
+        "status": 400,
+        "param": "reasoning_effort"
+      },
+      "anthropic": {
+        "status": 200,
+        "dropped": [
+          "max_tokens=raised"
+        ]
+      },
+      "bedrock": {
+        "status": 200,
+        "dropped": [
+          "max_tokens=raised"
+        ]
+      }
+    }
+  },
+  "body": {
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are concise."
+      },
+      {
+        "role": "user",
+        "content": "Say hi"
+      }
+    ],
+    "model": "m",
+    "reasoning_effort": "medium",
+    "max_completion_tokens": 2000,
+    "stream": false
+  }
+}

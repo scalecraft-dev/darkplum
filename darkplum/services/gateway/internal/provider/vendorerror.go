@@ -44,6 +44,9 @@ type vendorErrorDetail struct {
 	Message string `json:"message"`
 	Type    string `json:"type"`
 	Code    string `json:"code,omitempty"`
+	// Param names the request field a vendor 400 refers to, set only by
+	// WithParam from a closed allowlist, never from vendor text.
+	Param string `json:"param,omitempty"`
 }
 
 // VendorAPIError implements APIError. It is the ONLY error type a direct
@@ -113,6 +116,24 @@ func (e *VendorAPIError) ResponseBody() []byte { return e.Body }
 func (e *VendorAPIError) RetryAfterSeconds() int { return e.RetryAfter }
 
 var _ APIError = (*VendorAPIError)(nil)
+
+// WithParam re-renders e's body to name the request field the vendor
+// rejected, so a 400 on response_format or max_completion_tokens tells the
+// caller which parameter this model does not accept instead of the generic
+// "rejected this request". param must come from the calling package's own
+// allowlist (never a vendor-supplied string); the message stays static text.
+func (e *VendorAPIError) WithParam(param string) *VendorAPIError {
+	body, err := json.Marshal(vendorErrorBody{Error: vendorErrorDetail{
+		Message: fmt.Sprintf("the model provider does not accept parameter %q for this model", param),
+		Type:    "invalid_request_error",
+		Code:    "invalid_request",
+		Param:   param,
+	}})
+	if err == nil {
+		e.Body = body
+	}
+	return e
+}
 
 // NewVendorAPIError builds a VendorAPIError with a fully-rendered
 // OpenAI-compatible body. message must already be safe to show a caller —

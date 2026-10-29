@@ -57,7 +57,7 @@ func (p *Provider) Stream(ctx context.Context, req provider.ChatRequest, w io.Wr
 
 		retry, ok := detectUnsupportedParam(errBody, drop)
 		if !ok {
-			return nil, translateVendorError(http.StatusBadRequest, nil, p.cfg.Status)
+			return nil, translateVendor400(nil, p.cfg.Status, errBody)
 		}
 
 		slog.Info("openai: retrying stream without unsupported sampling parameter", "model", req.Model)
@@ -72,6 +72,11 @@ func (p *Provider) Stream(ctx context.Context, req provider.ChatRequest, w io.Wr
 		// A second failure (including a second 400) is returned as-is —
 		// never retried again.
 		header := resp.Header
+		if resp.StatusCode == http.StatusBadRequest {
+			errBody, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			return nil, translateVendor400(header, p.cfg.Status, errBody)
+		}
 		resp.Body.Close()
 		return nil, translateVendorError(resp.StatusCode, header, p.cfg.Status)
 	}
@@ -152,27 +157,37 @@ func (p *Provider) Stream(ctx context.Context, req provider.ChatRequest, w io.Wr
 			}
 		}
 
-		if content == "" && len(toolDeltas) == 0 {
+		var logprobs json.RawMessage
+		if req.Logprobs {
+			logprobs = provider.NormalizeLogprobs(choice.Logprobs)
+		}
+
+		if content == "" && len(toolDeltas) == 0 && logprobs == nil {
 			// Skip empty deltas and role-only chunks — there is nothing to
 			// render.
 			continue
 		}
 
 		var out [][]byte
-		if content != "" {
-			sseChunk, buildErr := provider.BuildStreamingChunkSSE(completionID, stats.Model, content)
+		// The choice's logprobs ride on the first chunk emitted for this
+		// delta (text if there is any, else the first tool-call fragment), so
+		// they are never dropped and never duplicated.
+		if content != "" || (logprobs != nil && len(toolDeltas) == 0) {
+			sseChunk, buildErr := provider.BuildStreamingChunkLogprobsSSE(completionID, stats.Model, content, logprobs)
 			if buildErr != nil {
 				return nil, fmt.Errorf("openai: building streaming chunk: %w", buildErr)
 			}
 			out = append(out, sseChunk)
+			logprobs = nil
 		}
 		// Tool-call fragments keep the vendor's index and arrival order, so
 		// parallel calls reassemble correctly on the client.
 		for _, d := range toolDeltas {
-			sseChunk, buildErr := provider.BuildToolCallDeltaSSE(completionID, stats.Model, d)
+			sseChunk, buildErr := provider.BuildToolCallDeltaLogprobsSSE(completionID, stats.Model, d, logprobs)
 			if buildErr != nil {
 				return nil, fmt.Errorf("openai: building tool-call chunk: %w", buildErr)
 			}
+			logprobs = nil
 			out = append(out, sseChunk)
 		}
 		for _, sseChunk := range out {
@@ -197,7 +212,7 @@ func (p *Provider) Stream(ctx context.Context, req provider.ChatRequest, w io.Wr
 		stats.FinishReason = "stop"
 	}
 
-	finalChunk, err := provider.BuildFinalChunkSSE(completionID, stats.Model, stats.FinishReason, stats)
+	finalChunk, err := provider.BuildFinalChunksSSE(completionID, stats.Model, stats.FinishReason, stats, req.IncludeUsage)
 	if err != nil {
 		return nil, fmt.Errorf("openai: building final chunk: %w", err)
 	}

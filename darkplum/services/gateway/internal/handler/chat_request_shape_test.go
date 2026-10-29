@@ -297,22 +297,6 @@ func TestHandleChatCompletions_ResponseFormatJSONSchemaRejected(t *testing.T) {
 	assertUnsupportedParameter(t, w, c, prov, "response_format")
 }
 
-// TestHandleChatCompletions_ResponseFormatJSONObjectIgnored asserts plain
-// JSON mode (no schema) is left alone — only the structured-output shape is
-// refused.
-func TestHandleChatCompletions_ResponseFormatJSONObjectIgnored(t *testing.T) {
-	h, prov := requestShapeTestHandler(t)
-	body := baseChatBody("llama-3-8b")
-	body["response_format"] = map[string]any{"type": "json_object"}
-	w, _ := doRawChat(t, h, body)
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200 for response_format:json_object, got %d; body=%s", w.Code, w.Body.String())
-	}
-	if prov.completeCalls != 1 {
-		t.Errorf("expected dispatch to proceed, got %d calls", prov.completeCalls)
-	}
-}
-
 // TestHandleChatCompletions_NonTextContentBlockRejected asserts an image
 // content block (or any non-"text" block) is refused before dispatch, on a
 // self_hosted route just as much as any other — request-shape honesty is
@@ -333,16 +317,14 @@ func TestHandleChatCompletions_NonTextContentBlockRejected(t *testing.T) {
 }
 
 // TestHandleChatCompletions_InertUnknownFieldsIgnored asserts fields the
-// gateway has no reason to inspect (user, n, seed, logit_bias, metadata) are
+// gateway has no reason to inspect (user, seed, metadata) are
 // silently ignored rather than producing any 400 — request-shape honesty is
 // a closed list, not a strict-schema rejection of every unrecognised field.
 func TestHandleChatCompletions_InertUnknownFieldsIgnored(t *testing.T) {
 	h, prov := requestShapeTestHandler(t)
 	body := baseChatBody("llama-3-8b")
 	body["user"] = "end-user-123"
-	body["n"] = 1
 	body["seed"] = 42
-	body["logit_bias"] = map[string]int{"50256": -100}
 	body["metadata"] = map[string]string{"trace": "abc"}
 	w, _ := doRawChat(t, h, body)
 	if w.Code != http.StatusOK {
@@ -389,16 +371,28 @@ func TestHandleChatCompletions_ToolsRefusedOnEveryClassWithoutSupport(t *testing
 type capturingProvider struct {
 	name, kind string
 	lastReq    provider.ChatRequest
+	calls      int
+	// caps overrides the default (vllmCaps) ParamCaps when non-nil.
+	caps *provider.ParamCaps
+}
+
+func (p *capturingProvider) ParamCaps() provider.ParamCaps {
+	if p.caps != nil {
+		return *p.caps
+	}
+	return vllmCaps
 }
 
 func (p *capturingProvider) Name() string { return p.name }
 func (p *capturingProvider) Kind() string { return p.kind }
 func (p *capturingProvider) Complete(_ context.Context, req provider.ChatRequest) (*provider.ChatResponse, error) {
 	p.lastReq = req
+	p.calls++
 	return &provider.ChatResponse{ID: "id", Model: req.Model, Content: "ok", FinishReason: "stop"}, nil
 }
 func (p *capturingProvider) Stream(_ context.Context, req provider.ChatRequest, w io.Writer) (*provider.StreamStats, error) {
 	p.lastReq = req
+	p.calls++
 	return &provider.StreamStats{Model: req.Model, FinishReason: "stop"}, nil
 }
 

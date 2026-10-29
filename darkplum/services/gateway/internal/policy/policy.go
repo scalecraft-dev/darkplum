@@ -138,6 +138,11 @@ type Snapshot struct {
 	// per-principal enforcement must use EffectiveFor's strictest value
 	// instead, not this field directly.
 	Residency string
+	// ParamsMode is principal_routing_policies.params_mode of the org row
+	// (migration 029): "strict" turns every dropped request parameter into a
+	// 400 unsupported_parameter; "" and "lenient" (a NULL column, or a
+	// database without the column) drop and record. See handler.paramsModeStrict.
+	ParamsMode string
 
 	// OrgPolicy is the org level's own precomputed EffectivePolicy (chain of
 	// exactly the org row). Every principal with no row of its own shares

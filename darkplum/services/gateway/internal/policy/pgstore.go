@@ -357,6 +357,13 @@ func (s *PgStore) loadWith(ctx context.Context, q policyQuerier) (Snapshot, erro
 	}
 	built := buildPrincipalPolicies(principalRows, residency)
 
+	// params_mode (migration 029) may not exist yet mid-rollout: lenient for
+	// this snapshot, with a warning, exactly as on_route_unavailable.
+	paramsMode, err := s.loadParamsMode(ctx, q)
+	if err != nil {
+		return Snapshot{}, err
+	}
+
 	// api_keys ownership (ALL non-revoked keys, not just the ones with an
 	// explicit principal_routing_policies row) -- feeds Snapshot.KeyOwner/
 	// UserKeys, which the POST /v1/policy/effective override path uses to
@@ -409,6 +416,7 @@ func (s *PgStore) loadWith(ctx context.Context, q policyQuerier) (Snapshot, erro
 		RegisteredClass: registeredClass,
 		Aliases:         buildAliases(aliasRows, routeRows),
 		Residency:       residency,
+		ParamsMode:      paramsMode,
 		OrgPolicy:       built.OrgPolicy,
 		UserPolicies:    built.UserPolicies,
 		KeyPolicies:     built.KeyPolicies,
@@ -420,6 +428,30 @@ func (s *PgStore) loadWith(ctx context.Context, q policyQuerier) (Snapshot, erro
 		UserKeys:        userKeys,
 		VendorFilters:   vendorFilters,
 	}, nil
+}
+
+// loadParamsMode reads the org row's params_mode. A missing column (SQLSTATE
+// 42703: the api has not run migration 029) or table reads as lenient, with a
+// warning; a NULL column or no org row is lenient too.
+func (s *PgStore) loadParamsMode(ctx context.Context, q policyQuerier) (string, error) {
+	var mode *string
+	err := inSavepoint(ctx, q, func(pq policyQuerier) error {
+		return pq.QueryRow(ctx, `SELECT params_mode FROM principal_routing_policies WHERE principal_type = 'org'`).Scan(&mode)
+	})
+	switch {
+	case err == nil:
+	case errors.Is(err, pgx.ErrNoRows), isUndefinedTableError(err):
+		return "", nil
+	case isUndefinedColumnError(err):
+		log.Printf("policy: WARNING principal_routing_policies.params_mode does not exist yet (migration 029 not applied) — request parameters are handled leniently for this snapshot")
+		return "", nil
+	default:
+		return "", fmt.Errorf("policy: query principal_routing_policies.params_mode: %w", err)
+	}
+	if mode == nil {
+		return "", nil
+	}
+	return *mode, nil
 }
 
 // loadVendorFilters queries every row of vendor_provider_settings (migration

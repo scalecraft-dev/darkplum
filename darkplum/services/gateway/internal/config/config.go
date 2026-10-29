@@ -97,6 +97,11 @@ type Config struct {
 	// directory itself not existing at all (e.g. the Secret was never
 	// created) is handled the same way, not as a startup error.
 	ProviderKeysDir string
+	// UserHMACDir is where the darkplum-user-hmac Secret is mounted (files
+	// "user-hmac-key" and, optionally, "user-hmac-key-id"). USER_HMAC_DIR,
+	// default /var/run/darkplum/user-hmac. Absent is a supported state: the
+	// OpenAI `user` field is then omitted on Anthropic and Bedrock requests.
+	UserHMACDir string
 	// AnthropicModelFilter restricts which discovered Anthropic model ids
 	// enter the route table, as path.Match globs. Unlike
 	// BedrockModelFilter, an EMPTY filter means "no vendor models" (not
@@ -307,6 +312,11 @@ func Load() (*Config, error) {
 		providerKeysDir = "/var/run/darkplum/provider-keys"
 	}
 
+	userHMACDir := os.Getenv("USER_HMAC_DIR")
+	if userHMACDir == "" {
+		userHMACDir = "/var/run/darkplum/user-hmac"
+	}
+
 	anthropicModelFilter := parseVendorGlobList(os.Getenv("ANTHROPIC_MODEL_FILTER"))
 	anthropicModelFilterSetAt := parseVendorFilterSetAt(os.Getenv("ANTHROPIC_MODEL_FILTER_SET_AT"))
 
@@ -361,6 +371,7 @@ func Load() (*Config, error) {
 		SemanticRouterMinConfidence:  semanticRouterMinConfidence,
 
 		ProviderKeysDir:           providerKeysDir,
+		UserHMACDir:               userHMACDir,
 		AnthropicModelFilter:      anthropicModelFilter,
 		AnthropicModelFilterSetAt: anthropicModelFilterSetAt,
 		AnthropicWorkspaceID:      anthropicWorkspaceID,

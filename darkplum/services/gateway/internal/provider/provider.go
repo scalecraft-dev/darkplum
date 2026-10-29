@@ -58,6 +58,65 @@ type ChatRequest struct {
 	// which is the closest it offers -- see each provider).
 	Tools      []Tool
 	ToolChoice json.RawMessage
+	// JSONMode is response_format {"type":"json_object"}. Only ever true for
+	// a provider whose ParamCaps().JSONMode is set; the handler refuses it
+	// for every other backend.
+	JSONMode bool
+	// IncludeUsage is stream_options.include_usage on a stream: the provider
+	// ends the stream with OpenAI's separate usage chunk (choices: []). When
+	// false a stream keeps usage on the finish_reason chunk, as before.
+	IncludeUsage bool
+
+	// The fields below are set by the handler only for a request the resolved
+	// backend can honour them on (see ParamCaps), and only when the caller
+	// sent a non-default value; a provider forwards what it is given.
+
+	// Seed is the OpenAI `seed`.
+	Seed *int64
+	// FrequencyPenalty and PresencePenalty are non-zero values only.
+	FrequencyPenalty *float64
+	PresencePenalty  *float64
+	// Logprobs is logprobs:true; TopLogprobs is the caller's top_logprobs
+	// (only meaningful with Logprobs). The provider returns the logprobs in
+	// ChatResponse.Logprobs / on the stream chunks, in OpenAI's shape.
+	Logprobs    bool
+	TopLogprobs *int
+	// LogitBias is a non-empty logit_bias (token id -> bias).
+	LogitBias map[string]float64
+	// ParallelToolCalls is non-nil only for parallel_tool_calls:false on a
+	// request that carries tools.
+	ParallelToolCalls *bool
+	// NoStore is store:false (store:true is refused by the handler).
+	NoStore bool
+	// User is the `user` value in the form this backend is to receive it:
+	// raw, or already pseudonymised, per ParamCaps().UserID. Empty means
+	// send nothing.
+	User string
+	// ReasoningEffort is the OpenAI reasoning_effort, set only for a
+	// provider whose PlanReasoning said ReasoningForward (OpenAI).
+	ReasoningEffort string
+	// ThinkingBudget > 0 turns Anthropic extended thinking on with that
+	// budget_tokens, set only after PlanReasoning said ReasoningThinking.
+	// MaxTokens already exceeds it, and the handler has unset Temperature
+	// (thinking forbids it). Thinking output is never returned to the caller.
+	ThinkingBudget int
+	// VLLM carries the vLLM sampling extensions; only the openaicompat
+	// provider reads it.
+	VLLM VLLMExtensions
+}
+
+// VLLMExtensions are request fields outside the OpenAI schema that vLLM's
+// OpenAI-compatible server accepts. Forwarded by the openaicompat provider
+// only; every other backend ignores them, as it always has.
+type VLLMExtensions struct {
+	TopK              *int
+	MinP              *float64
+	RepetitionPenalty *float64
+	// GuidedJSON is the JSON schema (or schema string) for guided decoding,
+	// relayed as sent.
+	GuidedJSON json.RawMessage
+	// ChatTemplateKwargs is a JSON object handed to the chat template.
+	ChatTemplateKwargs json.RawMessage
 }
 
 // Message is a single turn in a conversation. Content can be a plain string
@@ -153,6 +212,10 @@ type ChatResponse struct {
 	// ToolCalls is what the model asked the caller to run; FinishReason is
 	// "tool_calls" when non-empty.
 	ToolCalls []ToolCall
+	// Logprobs is the choice's logprobs object ({"content":[...],
+	// "refusal":...}) relayed as the backend sent it; nil when the caller
+	// did not ask for logprobs or the backend sent none.
+	Logprobs json.RawMessage
 }
 
 // StreamStats holds the token-count and finish metadata extracted from the
@@ -186,10 +249,11 @@ type openAICompletion struct {
 }
 
 type completionChoice struct {
-	Index        int            `json:"index"`
-	Message      *choiceMessage `json:"message,omitempty"`
-	Delta        *choiceDelta   `json:"delta,omitempty"`
-	FinishReason *string        `json:"finish_reason"`
+	Index        int             `json:"index"`
+	Message      *choiceMessage  `json:"message,omitempty"`
+	Delta        *choiceDelta    `json:"delta,omitempty"`
+	Logprobs     json.RawMessage `json:"logprobs,omitempty"`
+	FinishReason *string         `json:"finish_reason"`
 }
 
 type choiceMessage struct {
@@ -230,6 +294,7 @@ func BuildCompletionJSON(resp *ChatResponse) ([]byte, error) {
 					Content:   completionContent(resp),
 					ToolCalls: resp.ToolCalls,
 				},
+				Logprobs:     NormalizeLogprobs(resp.Logprobs),
 				FinishReason: &finishReason,
 			},
 		},
@@ -258,6 +323,12 @@ func completionContent(resp *ChatResponse) *string {
 // concatenates string fields across deltas, and OpenAI itself sends the role
 // only on a stream's first chunk.
 func BuildToolCallDeltaSSE(id, model string, delta ToolCallDelta) ([]byte, error) {
+	return BuildToolCallDeltaLogprobsSSE(id, model, delta, nil)
+}
+
+// BuildToolCallDeltaLogprobsSSE is BuildToolCallDeltaSSE for a chunk that also
+// carries the choice's logprobs.
+func BuildToolCallDeltaLogprobsSSE(id, model string, delta ToolCallDelta, logprobs json.RawMessage) ([]byte, error) {
 	noReason := (*string)(nil)
 	chunk := openAICompletion{
 		ID:      id,
@@ -268,6 +339,44 @@ func BuildToolCallDeltaSSE(id, model string, delta ToolCallDelta) ([]byte, error
 			{
 				Index:        0,
 				Delta:        &choiceDelta{ToolCalls: []ToolCallDelta{delta}},
+				Logprobs:     NormalizeLogprobs(logprobs),
+				FinishReason: noReason,
+			},
+		},
+	}
+	data, err := json.Marshal(chunk)
+	if err != nil {
+		return nil, err
+	}
+	return fmt.Appendf(nil, "data: %s\n\n", data), nil
+}
+
+// NormalizeLogprobs returns raw, or nil when it is absent or the JSON null a
+// backend sends for "no logprobs on this choice", so the field is omitted
+// rather than relayed as an empty object.
+func NormalizeLogprobs(raw json.RawMessage) json.RawMessage {
+	t := strings.TrimSpace(string(raw))
+	if t == "" || t == "null" {
+		return nil
+	}
+	return raw
+}
+
+// BuildStreamingChunkLogprobsSSE is BuildStreamingChunkSSE for a delta that
+// also carries the choice's logprobs (OpenAI places them beside delta, on the
+// choice). With empty logprobs it is identical to BuildStreamingChunkSSE.
+func BuildStreamingChunkLogprobsSSE(id, model, contentDelta string, logprobs json.RawMessage) ([]byte, error) {
+	noReason := (*string)(nil)
+	chunk := openAICompletion{
+		ID:      id,
+		Object:  "chat.completion.chunk",
+		Created: time.Now().Unix(),
+		Model:   model,
+		Choices: []completionChoice{
+			{
+				Index:        0,
+				Delta:        &choiceDelta{Role: "assistant", Content: contentDelta},
+				Logprobs:     NormalizeLogprobs(logprobs),
 				FinishReason: noReason,
 			},
 		},
@@ -336,6 +445,79 @@ func BuildFinalChunkSSE(id, model, finishReason string, stats *StreamStats) ([]b
 		},
 	}
 	data, err := json.Marshal(chunk)
+	if err != nil {
+		return nil, err
+	}
+	return fmt.Appendf(nil, "data: %s\n\n", data), nil
+}
+
+// BuildFinishChunkSSE builds the finish_reason chunk of a stream whose caller
+// asked for stream_options.include_usage: OpenAI's shape, with usage null on
+// it (the usage follows in its own chunk, see BuildUsageChunkSSE).
+func BuildFinishChunkSSE(id, model, finishReason string) ([]byte, error) {
+	fr := finishReason
+	return marshalChunk(usageChunk{
+		ID:      id,
+		Object:  "chat.completion.chunk",
+		Created: time.Now().Unix(),
+		Model:   model,
+		Choices: []completionChoice{{Index: 0, Delta: &choiceDelta{}, FinishReason: &fr}},
+	})
+}
+
+// BuildUsageChunkSSE builds the usage-only chunk stream_options.include_usage
+// adds after the finish_reason chunk: choices is an empty array and usage is
+// set, exactly what OpenAI's own SDK stream accumulators expect.
+func BuildUsageChunkSSE(id, model string, stats *StreamStats) ([]byte, error) {
+	return marshalChunk(usageChunk{
+		ID:      id,
+		Object:  "chat.completion.chunk",
+		Created: time.Now().Unix(),
+		Model:   model,
+		Choices: []completionChoice{},
+		Usage: &usageInfo{
+			PromptTokens:     stats.PromptTokens,
+			CompletionTokens: stats.CompletionTokens,
+			TotalTokens:      stats.PromptTokens + stats.CompletionTokens,
+		},
+	})
+}
+
+// BuildFinalChunksSSE is the stream's terminal chunk(s) for a provider that
+// knows its usage by the time it finishes. Without include_usage it is
+// BuildFinalChunkSSE unchanged (usage on the finish_reason chunk, which
+// callers that never asked for stream_options already receive and may rely
+// on); with it, the finish_reason chunk carries usage null and the usage
+// follows in its own choices: [] chunk.
+func BuildFinalChunksSSE(id, model, finishReason string, stats *StreamStats, includeUsage bool) ([]byte, error) {
+	if !includeUsage {
+		return BuildFinalChunkSSE(id, model, finishReason, stats)
+	}
+	finish, err := BuildFinishChunkSSE(id, model, finishReason)
+	if err != nil {
+		return nil, err
+	}
+	usage, err := BuildUsageChunkSSE(id, model, stats)
+	if err != nil {
+		return nil, err
+	}
+	return append(finish, usage...), nil
+}
+
+// usageChunk is a chat.completion.chunk whose usage is a pointer, so it
+// renders null (finish chunk) or an object (usage chunk) rather than the
+// always-present zero object openAICompletion carries.
+type usageChunk struct {
+	ID      string             `json:"id"`
+	Object  string             `json:"object"`
+	Created int64              `json:"created"`
+	Model   string             `json:"model"`
+	Choices []completionChoice `json:"choices"`
+	Usage   *usageInfo         `json:"usage"`
+}
+
+func marshalChunk(c usageChunk) ([]byte, error) {
+	data, err := json.Marshal(c)
 	if err != nil {
 		return nil, err
 	}

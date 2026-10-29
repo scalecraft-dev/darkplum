@@ -1050,3 +1050,76 @@ func waitForGoroutineSettle(baseline int) int {
 	}
 	return last
 }
+
+// ---------------------------------------------------------------------------
+// Phase A1 parameter honesty: max_tokens wire field, include_usage shape.
+// ---------------------------------------------------------------------------
+
+func TestParamCaps_Anthropic(t *testing.T) {
+	want := provider.ParamCaps{Stop: true, ForcedToolChoice: true, SerialToolCalls: true, UserID: provider.UserIDHMAC}
+	if got := New(&fakeCreds{key: "k"}, Config{}).ParamCaps(); got != want {
+		t.Errorf("ParamCaps = %+v, want %+v", got, want)
+	}
+}
+
+// max_completion_tokens reaches the Messages API as max_tokens (the handler
+// folds both names into ChatRequest.MaxTokens).
+func TestMaxTokens_ReachesWireOnStream(t *testing.T) {
+	srv := newFakeAnthropicServer(t)
+	srv.messagesResponses = []func(w http.ResponseWriter, r *http.Request, body map[string]any){
+		func(w http.ResponseWriter, r *http.Request, body map[string]any) {
+			if got := requestMaxTokens(t, body); got != 321 {
+				t.Errorf("max_tokens = %d, want 321", got)
+			}
+			sseCompletion(w, "msg_1", "claude-haiku-4-5", []string{"x"}, "end_turn", 1, 1)
+		},
+	}
+	p := newTestProvider(t, srv, nil, Config{DefaultMaxTokens: 100})
+	req := basicRequest("claude-haiku-4-5")
+	req.MaxTokens = 321
+	if _, err := p.Stream(context.Background(), req, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestStream_IncludeUsageShape(t *testing.T) {
+	run := func(t *testing.T, includeUsage bool) []string {
+		srv := newFakeAnthropicServer(t)
+		srv.messagesResponses = []func(w http.ResponseWriter, r *http.Request, body map[string]any){
+			func(w http.ResponseWriter, _ *http.Request, _ map[string]any) {
+				sseCompletion(w, "msg_u", "claude-haiku-4-5", []string{"Hi"}, "end_turn", 8, 3)
+			},
+		}
+		p := newTestProvider(t, srv, nil, Config{DefaultMaxTokens: 100})
+		req := basicRequest("claude-haiku-4-5")
+		req.IncludeUsage = includeUsage
+		var buf bytes.Buffer
+		if _, err := p.Stream(context.Background(), req, &buf); err != nil {
+			t.Fatal(err)
+		}
+		var frames []string
+		for _, line := range strings.Split(buf.String(), "\n") {
+			if p, ok := strings.CutPrefix(line, "data: "); ok && p != "[DONE]" {
+				frames = append(frames, p)
+			}
+		}
+		return frames
+	}
+
+	frames := run(t, true)
+	if len(frames) != 3 {
+		t.Fatalf("frames = %d, want 3 (content, finish, usage): %v", len(frames), frames)
+	}
+	if !strings.Contains(frames[1], `"finish_reason":"stop"`) || !strings.Contains(frames[1], `"usage":null`) {
+		t.Errorf("finish frame = %s", frames[1])
+	}
+	if !strings.Contains(frames[2], `"choices":[]`) || !strings.Contains(frames[2], `"prompt_tokens":8`) ||
+		!strings.Contains(frames[2], `"completion_tokens":3`) || !strings.Contains(frames[2], `"total_tokens":11`) {
+		t.Errorf("usage frame = %s", frames[2])
+	}
+
+	frames = run(t, false)
+	if len(frames) != 2 || !strings.Contains(frames[1], `"total_tokens":11`) {
+		t.Errorf("without include_usage want 2 frames with usage on the finish chunk, got %v", frames)
+	}
+}

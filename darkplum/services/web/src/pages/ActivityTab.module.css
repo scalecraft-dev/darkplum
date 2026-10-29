@@ -537,3 +537,17 @@
 th.numCol.numCol {
   text-align: right;
 }
+
+/* Screen-reader text inside a badge: the sentence its title carries for mouse
+   users, so keyboard and screen-reader users get the same detail. */
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}

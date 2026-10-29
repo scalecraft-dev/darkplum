@@ -172,6 +172,33 @@ func buildRequestBody(req provider.ChatRequest, stream bool, drop droppedParams)
 	if len(req.Stop) > 0 && !drop.stop {
 		body.Stop = req.Stop
 	}
+	if req.JSONMode {
+		body.ResponseFormat = &responseFormat{Type: "json_object"}
+	}
+	// Non-default sampling/behaviour parameters go on the wire as sent; they
+	// are never part of droppedParams, so the adaptive retry cannot swallow
+	// them (a vendor 400 on one comes back naming it, see translateVendor400).
+	body.Seed = req.Seed
+	body.FrequencyPenalty = req.FrequencyPenalty
+	body.PresencePenalty = req.PresencePenalty
+	if req.Logprobs {
+		t := true
+		body.Logprobs = &t
+		body.TopLogprobs = req.TopLogprobs
+	}
+	if len(req.LogitBias) > 0 {
+		body.LogitBias = req.LogitBias
+	}
+	// OpenAI refuses parallel_tool_calls on a request without tools.
+	if req.ParallelToolCalls != nil && len(req.Tools) > 0 {
+		body.ParallelToolCalls = req.ParallelToolCalls
+	}
+	if req.NoStore {
+		f := false
+		body.Store = &f
+	}
+	body.User = req.User
+	body.ReasoningEffort = req.ReasoningEffort
 	if stream {
 		body.Stream = true
 		body.StreamOptions = &streamOptions{IncludeUsage: true}
@@ -243,6 +270,9 @@ func (p *Provider) Complete(ctx context.Context, req provider.ChatRequest) (*pro
 		// retried again.
 	}
 
+	if statusCode == http.StatusBadRequest {
+		return nil, translateVendor400(header, p.cfg.Status, respBody)
+	}
 	if statusCode != http.StatusOK {
 		return nil, translateVendorError(statusCode, header, p.cfg.Status)
 	}
@@ -283,6 +313,7 @@ func toChatResponse(cr *chatCompletionResponse) (*provider.ChatResponse, error) 
 		Model:        cr.Model,
 		Content:      content,
 		FinishReason: mapFinishReason(finishReason),
+		Logprobs:     provider.NormalizeLogprobs(choice.Logprobs),
 	}
 	if choice.Message != nil {
 		for _, tc := range choice.Message.ToolCalls {
@@ -302,5 +333,25 @@ func toChatResponse(cr *chatCompletionResponse) (*provider.ChatResponse, error) 
 
 // SupportsTools makes this a tool-capable backend (provider.ToolCapable).
 func (p *Provider) SupportsTools() bool { return true }
+
+// PlanReasoning implements provider.ReasoningCapable: reasoning_effort is
+// forwarded as sent. A model that does not take it (a non-reasoning model)
+// answers 400 with param reasoning_effort, which is relayed by name.
+func (p *Provider) PlanReasoning(_, _ string, _ int) provider.ReasoningPlan {
+	return provider.ReasoningPlan{Mode: provider.ReasoningForward}
+}
+
+// ParamCaps implements provider.ParamCapable. Everything OpenAI's Chat
+// Completions API takes that the gateway exposes is forwarded: json_object,
+// stop, forced tool_choice, parallel_tool_calls:false, logprobs (relayed back
+// in OpenAI's shape on both paths) and logit_bias. `user` goes as the HMAC
+// pseudonym, never raw: OpenAI is a third party outside the customer's boundary.
+func (p *Provider) ParamCaps() provider.ParamCaps {
+	return provider.ParamCaps{
+		JSONMode: true, Stop: true, ForcedToolChoice: true,
+		Logprobs: true, LogitBias: true, SerialToolCalls: true,
+		UserID: provider.UserIDHMAC,
+	}
+}
 
 var _ provider.Provider = (*Provider)(nil)

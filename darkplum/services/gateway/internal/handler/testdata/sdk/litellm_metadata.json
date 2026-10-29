@@ -1,0 +1,39 @@
+{
+  "sdk": "LiteLLM",
+  "representative": true,
+  "provenance": "Hand-assembled from the SDK's documented request serialisation, not a verbatim packet capture; the keys, defaults and nulls are the ones that SDK (or an app using it) sends.",
+  "description": "litellm.completion(..., metadata={'generation_name': ...}): a non-empty metadata is dropped and recorded everywhere, refused in strict mode",
+  "expect": {
+    "lenient": {
+      "*": {
+        "status": 200,
+        "dropped": [
+          "metadata"
+        ]
+      }
+    },
+    "strict": {
+      "*": {
+        "status": 400,
+        "param": "metadata"
+      }
+    }
+  },
+  "body": {
+    "model": "m",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are concise."
+      },
+      {
+        "role": "user",
+        "content": "Say hi"
+      }
+    ],
+    "stream": false,
+    "metadata": {
+      "generation_name": "chat"
+    }
+  }
+}

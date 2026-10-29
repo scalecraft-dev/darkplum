@@ -1,6 +1,7 @@
 package openai
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -79,6 +80,43 @@ func translateVendorErrorBody(statusCode int, header http.Header, status authFai
 		apiErr.VendorErrorType = provider.SanitizeVendorErrorType(body)
 	}
 	return err
+}
+
+// rejectableParams are the request fields a vendor 400 is allowed to be
+// attributed to by name: the ones this package sends that a given model can
+// legitimately refuse (see translateVendor400). Matched against the vendor's
+// structured error.param, never its message, and never relayed verbatim.
+var rejectableParams = map[string]bool{
+	"response_format":       true,
+	"max_completion_tokens": true,
+	"seed":                  true,
+	"frequency_penalty":     true,
+	"presence_penalty":      true,
+	"logprobs":              true,
+	"top_logprobs":          true,
+	"logit_bias":            true,
+	"parallel_tool_calls":   true,
+	"store":                 true,
+	"user":                  true,
+	"reasoning_effort":      true,
+}
+
+// translateVendor400 is translateVendorErrorBody for a 400, additionally
+// naming the offending field when the vendor's structured error.param is one
+// of rejectableParams (e.g. response_format on a model with no JSON mode).
+func translateVendor400(header http.Header, status authFailureReporter, body []byte) error {
+	err := translateVendorErrorBody(http.StatusBadRequest, header, status, body)
+	apiErr, ok := err.(*APIError)
+	if !ok {
+		return err
+	}
+	var env vendorErrorEnvelope
+	if json.Unmarshal(body, &env) == nil {
+		if param := strings.ToLower(strings.TrimSpace(env.Error.Param)); rejectableParams[param] {
+			apiErr.WithParam(param)
+		}
+	}
+	return apiErr
 }
 
 func retryAfterSeconds(h http.Header) int {

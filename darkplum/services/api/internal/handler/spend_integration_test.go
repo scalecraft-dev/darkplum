@@ -287,16 +287,22 @@ func TestListUsageAndExport_CostColumns(t *testing.T) {
 	if err != nil || len(recs) != 6 {
 		t.Fatalf("csv: %v %d", err, len(recs))
 	}
+	// Columns are looked up by name: later columns (dropped_params,
+	// migration 029) are appended after cost_cents.
 	h := recs[0]
-	n := len(h)
-	if h[n-3] != "cache_read_tokens" || h[n-2] != "cache_creation_tokens" || h[n-1] != "cost_cents" {
+	idx := map[string]int{}
+	for i, name := range h {
+		idx[name] = i
+	}
+	cr, cc, cost := idx["cache_read_tokens"], idx["cache_creation_tokens"], idx["cost_cents"]
+	if _, ok := idx["cost_cents"]; !ok || cr == 0 || cc == 0 || cost != cc+1 || cc != cr+1 {
 		t.Fatalf("csv header %v", h)
 	}
 	for _, rec := range recs[1:] {
-		if rec[1] == "e1" && (rec[n-3] != "400000" || rec[n-2] != "100000" || rec[n-1] != "349.5000") {
+		if rec[1] == "e1" && (rec[cr] != "400000" || rec[cc] != "100000" || rec[cost] != "349.5000") {
 			t.Fatalf("e1 row %v", rec)
 		}
-		if rec[1] == "e4" && rec[n-1] != "" {
+		if rec[1] == "e4" && rec[cost] != "" {
 			t.Fatalf("unpriced csv cost must be blank: %v", rec)
 		}
 	}
