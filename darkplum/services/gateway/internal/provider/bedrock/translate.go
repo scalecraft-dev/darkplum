@@ -167,7 +167,9 @@ func translateRequest(req provider.ChatRequest) (system []types.SystemContentBlo
 	inferenceConfig = &types.InferenceConfiguration{
 		MaxTokens: int32Ptr(maxTokens),
 	}
-	if req.Temperature != nil {
+	// Extended thinking forbids temperature (it must stay at its default);
+	// the handler already unset it, and it is not set here either way.
+	if req.Temperature != nil && !thinkingOn(req) {
 		temp := float32(*req.Temperature)
 		inferenceConfig.Temperature = &temp
 	}

@@ -95,6 +95,11 @@ type Provider struct {
 
 	modelsMu        sync.RWMutex
 	maxOutputTokens map[string]int64
+	// thinkingModels is the set of models whose discovered capabilities say
+	// extended thinking of type "enabled" (budget_tokens) is supported.
+	// Absent = unsupported: a model discovery has not described never gets
+	// a thinking field.
+	thinkingModels map[string]bool
 }
 
 // New builds a Provider. creds supplies the API key (see credsource.Source);
@@ -108,6 +113,7 @@ func New(creds credentialSource, cfg Config) *Provider {
 		client:            provider.NewVendorHTTPClient(),
 		streamIdleTimeout: streamIdleTimeout,
 		maxOutputTokens:   make(map[string]int64),
+		thinkingModels:    make(map[string]bool),
 	}
 }
 
@@ -212,11 +218,11 @@ func (p *Provider) Complete(ctx context.Context, req provider.ChatRequest) (*pro
 	params := buildParams(req, norm, maxTokens, true)
 
 	reqOpts := p.requestOptions(ctx)
-	msg, err := client.Messages.New(ctx, params, reqOpts...)
+	msg, err := p.messagesNew(ctx, client, params, reqOpts)
 	if err != nil && isSamplingParamUnsupportedError(err) {
 		slog.Info("anthropic: retrying without sampling parameters (temperature, top_p)", "model", req.Model)
 		params = buildParams(req, norm, maxTokens, false)
-		msg, err = client.Messages.New(ctx, params, reqOpts...)
+		msg, err = p.messagesNew(ctx, client, params, reqOpts)
 	}
 	if err != nil {
 		return nil, translateError(err, p.cfg.Status, p.Name())
@@ -224,6 +230,67 @@ func (p *Provider) Complete(ctx context.Context, req provider.ChatRequest) (*pro
 
 	return toChatResponse(msg), nil
 }
+
+// messagesNew is client.Messages.New, except that it streams internally and
+// assembles the same Message in exactly two cases:
+//
+//  1. Extended thinking is on (params.Thinking enabled). A non-streaming call
+//     sends no response headers until generation finishes, and the vendor
+//     HTTP client's ResponseHeaderTimeout (60s, provider/httpclient.go) would
+//     504 a medium/high budget long before the SDK's own limit.
+//  2. The SDK's non-streaming duration guard refuses the request
+//     (CalculateNonStreamingTimeout: max_tokens implies more than ten
+//     minutes, about 21k tokens, or a per-model limit).
+//
+// Every other call is a plain non-streaming request. Thinking blocks are
+// accumulated by the SDK like any other but toChatResponse never reads them.
+// A stream that ends without a stop_reason is an error, never a truncated
+// answer reported as finish_reason "stop".
+func (p *Provider) messagesNew(ctx context.Context, client *sdk.Client, params sdk.MessageNewParams, reqOpts []option.RequestOption) (*sdk.Message, error) {
+	thinking := params.Thinking.OfEnabled != nil
+	if _, guard := sdk.CalculateNonStreamingTimeout(int(params.MaxTokens), params.Model, reqOpts); guard == nil && !thinking {
+		return client.Messages.New(ctx, params, reqOpts...)
+	}
+
+	idleCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	stream := client.Messages.NewStreaming(idleCtx, params, reqOpts...)
+	defer stream.Close()
+	if err := stream.Err(); err != nil {
+		return nil, err
+	}
+	idleTimeout := p.streamIdleTimeout
+	idleTimer := time.AfterFunc(idleTimeout, func() {
+		cancel(&idleTimeoutError{timeout: idleTimeout.String()})
+	})
+	defer idleTimer.Stop()
+
+	acc := sdk.Message{}
+	for stream.Next() {
+		idleTimer.Reset(idleTimeout)
+		if err := acc.Accumulate(stream.Current()); err != nil {
+			return nil, fmt.Errorf("anthropic: accumulating stream event: %w", err)
+		}
+	}
+	if err := stream.Err(); err != nil {
+		if cause := context.Cause(idleCtx); cause != nil {
+			var idleErr *idleTimeoutError
+			if errors.As(cause, &idleErr) {
+				return nil, idleErr
+			}
+		}
+		return nil, err
+	}
+	if acc.StopReason == "" {
+		return nil, errStreamTruncated
+	}
+	return &acc, nil
+}
+
+// errStreamTruncated: the upstream stream closed cleanly but never reported a
+// stop_reason (no message_delta / message_stop), so the content is partial.
+// translateError maps it to a generic 502 upstream_error; no vendor text.
+var errStreamTruncated = errors.New("anthropic: stream ended before message_stop")
 
 // Stream implements provider.Provider. Rendered ONLY through
 // provider.BuildStreamingChunkSSE / BuildFinalChunkSSE / StreamDoneSSE, per
@@ -360,9 +427,11 @@ func (p *Provider) Stream(ctx context.Context, req provider.ChatRequest, w io.Wr
 					flusher.Flush()
 				}
 			}
-			// Every other delta type (thinking_delta,
-			// signature_delta, citations_delta) carries nothing the
-			// OpenAI-compatible surface renders; skipped by omission.
+			// Every other delta type (thinking_delta, signature_delta,
+			// citations_delta) is skipped by omission. thinking_delta and
+			// signature_delta in particular must never reach the caller or
+			// any store: the reasoning is not part of the OpenAI response,
+			// and the signature is only meaningful to Anthropic.
 		}
 	}
 	idleTimer.Stop()
@@ -377,6 +446,9 @@ func (p *Provider) Stream(ctx context.Context, req provider.ChatRequest, w io.Wr
 		return nil, translateError(err, p.cfg.Status, p.Name())
 	}
 
+	if acc.StopReason == "" {
+		return nil, translateError(errStreamTruncated, p.cfg.Status, p.Name())
+	}
 	finishReason := mapFinishReason(acc.StopReason)
 	stats := &provider.StreamStats{
 		Model:               model,
@@ -429,8 +501,17 @@ func buildParams(req provider.ChatRequest, norm normalizedRequest, maxTokens int
 	if len(req.Stop) > 0 {
 		params.StopSequences = req.Stop
 	}
+	// Extended thinking (reasoning_effort translated by the handler). The
+	// budget must be below max_tokens; a request that violates that is sent
+	// without thinking rather than as a guaranteed 400. Thinking forbids
+	// temperature (the handler already unset it; belt and braces here) and
+	// top_k, which this provider never sends.
+	thinking := req.ThinkingBudget > 0 && int64(req.ThinkingBudget) < maxTokens
+	if thinking {
+		params.Thinking = sdk.ThinkingConfigParamOfEnabled(int64(req.ThinkingBudget))
+	}
 	if includeSampling {
-		if req.Temperature != nil {
+		if req.Temperature != nil && !thinking {
 			params.Temperature = sdk.Float(*req.Temperature)
 		}
 		if req.TopP != nil {
@@ -487,6 +568,33 @@ func (p *Provider) ParamCaps() provider.ParamCaps {
 		Stop: true, ForcedToolChoice: true, SerialToolCalls: true,
 		UserID: provider.UserIDHMAC,
 	}
+}
+
+// PlanReasoning implements provider.ReasoningCapable. Extended thinking is
+// decided per model from discovery (capabilities.thinking.types.enabled): a
+// model discovery did not report as supporting it is ReasoningNone. max_tokens
+// is raised above the budget when the caller's cap leaves no room, clamped to
+// the model's discovered output limit (same limit resolveMaxTokens applies);
+// if that clamp leaves less than the minimum budget the model is treated as
+// not supporting thinking for this request.
+func (p *Provider) PlanReasoning(model, effort string, maxTokens int) provider.ReasoningPlan {
+	budget := provider.ThinkingBudget(effort)
+	if budget == 0 {
+		return provider.ReasoningPlan{Mode: provider.ReasoningThinking}
+	}
+	p.modelsMu.RLock()
+	ok := p.thinkingModels[model]
+	limit := p.maxOutputTokens[model]
+	p.modelsMu.RUnlock()
+	if !ok {
+		return provider.ReasoningPlan{}
+	}
+	visible := int(p.resolveMaxTokens(model, maxTokens))
+	max, budget, fits := provider.PlanThinking(visible, budget, int(limit))
+	if !fits {
+		return provider.ReasoningPlan{}
+	}
+	return provider.ReasoningPlan{Mode: provider.ReasoningThinking, Budget: budget, MaxTokens: max}
 }
 
 // toSDKTools translates the request's tools and tool_choice. tool_choice

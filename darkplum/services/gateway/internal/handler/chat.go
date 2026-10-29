@@ -161,6 +161,10 @@ type chatCompletionRequest struct {
 	FrequencyPenalty  *float64           `json:"frequency_penalty,omitempty"`
 	PresencePenalty   *float64           `json:"presence_penalty,omitempty"`
 	User              string             `json:"user,omitempty"`
+	// ReasoningEffort: forwarded on openai, translated to extended thinking on
+	// Anthropic and Anthropic-on-Bedrock models that support it, dropped
+	// (recorded) elsewhere; see planReasoning.
+	ReasoningEffort *string `json:"reasoning_effort,omitempty"`
 
 	// vLLM sampling extensions, forwarded by the openaicompat provider only
 	// (ignored by every other backend, as before).
@@ -241,6 +245,9 @@ func effectiveMaxTokens(req chatCompletionRequest) (tokens int, conflict bool) {
 // backend instead of whatever the backend does with an out-of-range value
 // (the Anthropic path would otherwise accept and ignore them).
 func invalidParam(req chatCompletionRequest) (param, msg string) {
+	if v := req.ReasoningEffort; v != nil && !provider.ValidReasoningEffort(*v) {
+		return "reasoning_effort", invalidReasoningEffort(*v)
+	}
 	if req.TopLogprobs != nil {
 		if *req.TopLogprobs < 0 || *req.TopLogprobs > 20 {
 			return "top_logprobs", "top_logprobs must be between 0 and 20"
@@ -1396,7 +1403,12 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 	// (n>1, JSON mode, logprobs, logit_bias, stop, forced tool_choice,
 	// serial tool calls) are refused the same way, here, before any
 	// provider call and in every mode.
-	if param, reason := backendParamRefusal(req, provider.CapsOf(prov)); param != "" {
+	reasoning := planReasoning(req, prov, resolvedModel, maxTokens)
+	param, reason := backendParamRefusal(req, provider.CapsOf(prov))
+	if param == "" {
+		param, reason = reasoning.RefuseParam, reasoning.RefuseReason
+	}
+	if param != "" {
 		c.Set("denial_code", "unsupported_parameter")
 		logDenial(c, "unsupported_parameter", req.Model, resolvedModel, route.Class)
 		c.JSON(http.StatusBadRequest, openAIError{
@@ -1444,6 +1456,8 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 		IncludeUsage: req.Stream && req.StreamOptions != nil && req.StreamOptions.IncludeUsage,
 	}
 	h.applyForwardedParams(&chatReq, req, provider.CapsOf(prov))
+	reasoning.apply(&chatReq)
+	recordParamActions(c, reasoning.Dropped)
 	if wantsTools(req) {
 		chatReq.Tools = req.Tools
 		chatReq.ToolChoice = req.ToolChoice

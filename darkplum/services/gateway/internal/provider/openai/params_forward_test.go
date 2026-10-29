@@ -283,3 +283,38 @@ func TestStream_ToolCallDeltaKeepsLogprobs(t *testing.T) {
 		t.Errorf("tool-call fragments lost:\n%s", buf.String())
 	}
 }
+
+// Phase A3: reasoning_effort goes on the wire as sent, only when the handler
+// set it, and a vendor 400 on it is relayed naming the field.
+func TestBuildRequestBody_ReasoningEffort(t *testing.T) {
+	req := basicRequest("gpt-5")
+	if _, has := wireBody(t, req, false)["reasoning_effort"]; has {
+		t.Error("reasoning_effort sent when not set")
+	}
+	for _, e := range []string{"none", "minimal", "low", "medium", "high", "xhigh"} {
+		req.ReasoningEffort = e
+		for _, stream := range []bool{false, true} {
+			if got := wireBody(t, req, stream)["reasoning_effort"]; got != e {
+				t.Errorf("stream=%v: reasoning_effort = %v, want %s", stream, got, e)
+			}
+		}
+	}
+}
+
+func TestPlanReasoning_Forwards(t *testing.T) {
+	if got := (&Provider{}).PlanReasoning("any", "high", 0); got.Mode != provider.ReasoningForward {
+		t.Errorf("plan = %+v", got)
+	}
+}
+
+func TestVendor400OnReasoningEffortIsNamed(t *testing.T) {
+	body := []byte(`{"error":{"message":"Unrecognized request argument supplied: reasoning_effort","type":"invalid_request_error","param":"reasoning_effort","code":null}}`)
+	err := translateVendor400(http.Header{}, nil, body)
+	ae, ok := err.(*APIError)
+	if !ok {
+		t.Fatalf("err = %T", err)
+	}
+	if !strings.Contains(string(ae.ResponseBody()), `"param":"reasoning_effort"`) {
+		t.Errorf("body = %s", ae.ResponseBody())
+	}
+}

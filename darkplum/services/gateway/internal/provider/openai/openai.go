@@ -198,6 +198,7 @@ func buildRequestBody(req provider.ChatRequest, stream bool, drop droppedParams)
 		body.Store = &f
 	}
 	body.User = req.User
+	body.ReasoningEffort = req.ReasoningEffort
 	if stream {
 		body.Stream = true
 		body.StreamOptions = &streamOptions{IncludeUsage: true}
@@ -332,6 +333,13 @@ func toChatResponse(cr *chatCompletionResponse) (*provider.ChatResponse, error) 
 
 // SupportsTools makes this a tool-capable backend (provider.ToolCapable).
 func (p *Provider) SupportsTools() bool { return true }
+
+// PlanReasoning implements provider.ReasoningCapable: reasoning_effort is
+// forwarded as sent. A model that does not take it (a non-reasoning model)
+// answers 400 with param reasoning_effort, which is relayed by name.
+func (p *Provider) PlanReasoning(_, _ string, _ int) provider.ReasoningPlan {
+	return provider.ReasoningPlan{Mode: provider.ReasoningForward}
+}
 
 // ParamCaps implements provider.ParamCapable. Everything OpenAI's Chat
 // Completions API takes that the gateway exposes is forwarded: json_object,

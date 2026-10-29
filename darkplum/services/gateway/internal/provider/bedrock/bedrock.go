@@ -134,12 +134,13 @@ func (p *BedrockProvider) Complete(ctx context.Context, req provider.ChatRequest
 	}
 
 	out, err := p.client.Converse(ctx, &bedrockruntime.ConverseInput{
-		ModelId:         aws.String(req.Model),
-		Messages:        messages,
-		System:          system,
-		InferenceConfig: inferenceConfig,
-		ToolConfig:      toolConfig,
-		RequestMetadata: requestMetadata(req),
+		ModelId:                      aws.String(req.Model),
+		Messages:                     messages,
+		System:                       system,
+		InferenceConfig:              inferenceConfig,
+		ToolConfig:                   toolConfig,
+		RequestMetadata:              requestMetadata(req),
+		AdditionalModelRequestFields: additionalModelRequestFields(req),
 	})
 	if err != nil {
 		return nil, p.wrapError(req.Model, err, toolConfig != nil)
@@ -174,12 +175,13 @@ func (p *BedrockProvider) Stream(ctx context.Context, req provider.ChatRequest, 
 	}
 
 	out, err := p.client.ConverseStream(ctx, &bedrockruntime.ConverseStreamInput{
-		ModelId:         aws.String(req.Model),
-		Messages:        messages,
-		System:          system,
-		InferenceConfig: inferenceConfig,
-		ToolConfig:      toolConfig,
-		RequestMetadata: requestMetadata(req),
+		ModelId:                      aws.String(req.Model),
+		Messages:                     messages,
+		System:                       system,
+		InferenceConfig:              inferenceConfig,
+		ToolConfig:                   toolConfig,
+		RequestMetadata:              requestMetadata(req),
+		AdditionalModelRequestFields: additionalModelRequestFields(req),
 	})
 	if err != nil {
 		return nil, p.wrapError(req.Model, err, toolConfig != nil)

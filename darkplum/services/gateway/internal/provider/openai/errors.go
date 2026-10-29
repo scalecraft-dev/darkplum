@@ -98,6 +98,7 @@ var rejectableParams = map[string]bool{
 	"parallel_tool_calls":   true,
 	"store":                 true,
 	"user":                  true,
+	"reasoning_effort":      true,
 }
 
 // translateVendor400 is translateVendorErrorBody for a 400, additionally

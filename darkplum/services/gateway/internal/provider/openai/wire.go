@@ -56,6 +56,7 @@ type chatRequest struct {
 	LogitBias         map[string]float64 `json:"logit_bias,omitempty"`
 	ParallelToolCalls *bool              `json:"parallel_tool_calls,omitempty"`
 	Store             *bool              `json:"store,omitempty"`
+	ReasoningEffort   string             `json:"reasoning_effort,omitempty"`
 	User              string             `json:"user,omitempty"`
 }
 

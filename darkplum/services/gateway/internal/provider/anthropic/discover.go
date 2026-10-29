@@ -30,6 +30,7 @@ func (p *Provider) DiscoverModels(ctx context.Context) (map[string]bool, error) 
 
 	ids := make(map[string]bool)
 	maxTokens := make(map[string]int64)
+	thinking := make(map[string]bool)
 
 	iter := client.Models.ListAutoPaging(discoverCtx, sdk.ModelListParams{}, p.requestOptions(ctx)...)
 	for iter.Next() {
@@ -38,6 +39,9 @@ func (p *Provider) DiscoverModels(ctx context.Context) (map[string]bool, error) 
 			continue
 		}
 		ids[m.ID] = true
+		if m.Capabilities.Thinking.Supported && m.Capabilities.Thinking.Types.Enabled.Supported {
+			thinking[m.ID] = true
+		}
 		if m.MaxTokens > 0 {
 			maxTokens[m.ID] = m.MaxTokens
 		}
@@ -48,6 +52,7 @@ func (p *Provider) DiscoverModels(ctx context.Context) (map[string]bool, error) 
 
 	p.modelsMu.Lock()
 	p.maxOutputTokens = maxTokens
+	p.thinkingModels = thinking
 	p.modelsMu.Unlock()
 
 	return ids, nil

@@ -92,6 +92,14 @@ type ChatRequest struct {
 	// raw, or already pseudonymised, per ParamCaps().UserID. Empty means
 	// send nothing.
 	User string
+	// ReasoningEffort is the OpenAI reasoning_effort, set only for a
+	// provider whose PlanReasoning said ReasoningForward (OpenAI).
+	ReasoningEffort string
+	// ThinkingBudget > 0 turns Anthropic extended thinking on with that
+	// budget_tokens, set only after PlanReasoning said ReasoningThinking.
+	// MaxTokens already exceeds it, and the handler has unset Temperature
+	// (thinking forbids it). Thinking output is never returned to the caller.
+	ThinkingBudget int
 	// VLLM carries the vLLM sampling extensions; only the openaicompat
 	// provider reads it.
 	VLLM VLLMExtensions

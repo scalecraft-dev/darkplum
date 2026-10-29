@@ -30,12 +30,12 @@ func newHeaderRecorder(t *testing.T) *headerRecorder {
 		h.mu.Lock()
 		h.seen[r.URL.Path] = append(h.seen[r.URL.Path], v)
 		h.mu.Unlock()
-		_, _ = io.Copy(io.Discard, r.Body)
+		reqBody, _ := io.ReadAll(r.Body)
 		switch r.URL.Path {
 		case "/v1/models":
 			modelsPage([]map[string]any{modelInfo("claude-haiku-4-5", 8192)})(w)
 		default:
-			if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
+			if strings.Contains(string(reqBody), `"stream":true`) {
 				sseCompletion(w, "msg_1", "claude-haiku-4-5", []string{"hi"}, "end_turn", 1, 1)
 				return
 			}
