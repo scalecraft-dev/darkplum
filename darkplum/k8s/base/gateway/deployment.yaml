@@ -143,7 +143,7 @@ spec:
             secretName: darkplum-provider-keys
             optional: true
         # Optional: without it the gateway starts and serves normally, and the
-        # `user` field is simply left off Anthropic and Bedrock requests (one
+        # `user` field is simply left off OpenAI, Anthropic and Bedrock requests (one
         # WARNING in the gateway log) rather than sent raw.
         - name: user-hmac
           secret:
