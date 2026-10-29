@@ -49,6 +49,17 @@ const (
 	// principal_type plus the before/after policy objects (policy shape
 	// only, never content).
 	RoutingPolicyPrincipalChanged EventType = "routing_policy.principal_changed"
+	// RoutingPolicyParamsModeChanged is recorded when PUT
+	// /api/v1/routing-policy changes params_mode (lenient|strict), the
+	// organisation-wide switch between dropping-and-recording a request
+	// parameter a backend cannot honour and refusing it. Detail carries
+	// {previous, new}. It is recorded in addition to routing_policy.org_changed.
+	RoutingPolicyParamsModeChanged EventType = "routing_policy.params_mode_changed"
+	// InferenceParamDropped is written by the gateway, not the api, the first
+	// time a given principal (api key, or the user for webchat traffic) has a
+	// given request parameter dropped. Detail carries {param, action, backend,
+	// model} -- names only, never the value.
+	InferenceParamDropped EventType = "inference.param_dropped"
 	// SettingsSystemPromptChanged is recorded on PUT
 	// /api/v1/settings/system-prompt. Detail carries whether a custom prompt
 	// is now set and its length -- never the prompt text itself.

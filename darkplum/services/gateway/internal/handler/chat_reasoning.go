@@ -131,9 +131,8 @@ func planReasoning(req chatCompletionRequest, prov provider.Provider, model stri
 				d.clearTopP = true
 				d.Dropped = append(d.Dropped, paramAction{"top_p", actionDropped})
 			}
-			if req.TopK != nil {
-				d.Dropped = append(d.Dropped, paramAction{"top_k", actionDropped})
-			}
+			// top_k needs no entry here: the registry drops it on every
+			// backend that has extended thinking (it is a vLLM extension).
 		}
 	default:
 		if effort != "none" {

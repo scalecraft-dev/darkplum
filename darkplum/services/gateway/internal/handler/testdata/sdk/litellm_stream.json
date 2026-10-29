@@ -1,0 +1,39 @@
+{
+  "sdk": "LiteLLM",
+  "representative": true,
+  "provenance": "Hand-assembled from the SDK's documented request serialisation, not a verbatim packet capture; the keys, defaults and nulls are the ones that SDK (or an app using it) sends.",
+  "description": "litellm.completion(..., stream=True, stream_options={'include_usage': True})",
+  "expect": {
+    "lenient": {
+      "*": {
+        "status": 200,
+        "dropped": []
+      }
+    },
+    "strict": {
+      "*": {
+        "status": 200,
+        "dropped": []
+      }
+    }
+  },
+  "body": {
+    "model": "m",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are concise."
+      },
+      {
+        "role": "user",
+        "content": "Say hi"
+      }
+    ],
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    },
+    "temperature": 0.2,
+    "max_tokens": 100
+  }
+}

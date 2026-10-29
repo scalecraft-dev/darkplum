@@ -804,7 +804,7 @@ func corsMiddleware() gin.HandlerFunc {
 		AllowOrigins:     origins,
 		AllowMethods:     []string{"GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization", "X-Request-Id", "X-Requested-With"},
-		ExposeHeaders:    []string{"Content-Type", "X-Request-Id", "X-Darkplum-Model", "X-Darkplum-Route", "X-Darkplum-Router-Reason"},
+		ExposeHeaders:    []string{"Content-Type", "X-Request-Id", "X-Darkplum-Model", "X-Darkplum-Route", "X-Darkplum-Router-Reason", "X-Darkplum-Dropped-Params"},
 		AllowCredentials: true,
 		MaxAge:           12 * time.Hour,
 	}

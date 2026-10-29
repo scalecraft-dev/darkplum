@@ -1050,8 +1050,12 @@ type routingPolicyResponse struct {
 	Residency     string    `json:"residency"`
 	AllowedModels *[]string `json:"allowed_models"`
 	DefaultModel  *string   `json:"default_model"`
-	UpdatedAt     time.Time `json:"updated_at"`
-	Warnings      []string  `json:"warnings,omitempty"`
+	// ParamsMode is "lenient" (a request parameter a backend cannot honour is
+	// dropped and recorded) or "strict" (it is refused). NULL stores as
+	// lenient. Org level only.
+	ParamsMode string    `json:"params_mode"`
+	UpdatedAt  time.Time `json:"updated_at"`
+	Warnings   []string  `json:"warnings,omitempty"`
 	// AlreadyLockedOut names principals with nothing reachable both before
 	// and after this save -- not caused by it (so not a 409), but shown.
 	AlreadyLockedOut   []string `json:"already_locked_out,omitempty"`
@@ -1073,18 +1077,37 @@ func orgResidencyString(dbResidency *string) string {
 	return *dbResidency
 }
 
+// params_mode values (principal_routing_policies.params_mode, migration 029).
+const (
+	paramsModeLenient = "lenient"
+	paramsModeStrict  = "strict"
+)
+
+// validParamsMode mirrors the column's CHECK.
+func validParamsMode(v string) bool { return v == paramsModeLenient || v == paramsModeStrict }
+
+// paramsModeString converts the nullable column to the wire value (NULL is
+// lenient).
+func paramsModeString(db *string) string {
+	if db == nil {
+		return paramsModeLenient
+	}
+	return *db
+}
+
 // GetRoutingPolicy handles GET /api/v1/routing-policy.
 func (h *RoutingHandler) GetRoutingPolicy(c *gin.Context) {
-	var dbResidency *string
+	var dbResidency, dbParamsMode *string
 	var resp routingPolicyResponse
 	err := h.db.QueryRow(c.Request.Context(),
-		`SELECT residency, allowed_models, default_model, updated_at FROM principal_routing_policies WHERE principal_type = 'org'`,
-	).Scan(&dbResidency, &resp.AllowedModels, &resp.DefaultModel, &resp.UpdatedAt)
+		`SELECT residency, allowed_models, default_model, params_mode, updated_at FROM principal_routing_policies WHERE principal_type = 'org'`,
+	).Scan(&dbResidency, &resp.AllowedModels, &resp.DefaultModel, &dbParamsMode, &resp.UpdatedAt)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "get routing policy failed"})
 		return
 	}
 	resp.Residency = orgResidencyString(dbResidency)
+	resp.ParamsMode = paramsModeString(dbParamsMode)
 	c.JSON(http.StatusOK, resp)
 }
 
@@ -1092,6 +1115,9 @@ type putRoutingPolicyRequest struct {
 	Residency     string    `json:"residency"`
 	AllowedModels *[]string `json:"allowed_models"`
 	DefaultModel  *string   `json:"default_model"`
+	// ParamsMode is optional: omitted keeps the current value, so older
+	// clients that never send it neither fail nor change it.
+	ParamsMode *string `json:"params_mode"`
 }
 
 // orgPolicyTightened reports whether newReq narrows what oldResidency/oldAM
@@ -1196,6 +1222,10 @@ func (h *RoutingHandler) PutRoutingPolicy(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "residency must be 'any', 'cloud_account_only', or 'self_hosted_only'"})
 		return
 	}
+	if req.ParamsMode != nil && !validParamsMode(*req.ParamsMode) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "params_mode must be 'lenient' or 'strict'"})
+		return
+	}
 
 	ctx := c.Request.Context()
 
@@ -1214,11 +1244,11 @@ func (h *RoutingHandler) PutRoutingPolicy(c *gin.Context) {
 		}
 	}
 
-	var oldDBResidency *string
+	var oldDBResidency, oldDBParamsMode *string
 	var oldAM *[]string
 	if err := h.db.QueryRow(ctx,
-		`SELECT residency, allowed_models FROM principal_routing_policies WHERE principal_type = 'org'`,
-	).Scan(&oldDBResidency, &oldAM); err != nil {
+		`SELECT residency, allowed_models, params_mode FROM principal_routing_policies WHERE principal_type = 'org'`,
+	).Scan(&oldDBResidency, &oldAM, &oldDBParamsMode); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "read current routing policy failed"})
 		return
 	}
@@ -1290,21 +1320,24 @@ func (h *RoutingHandler) PutRoutingPolicy(c *gin.Context) {
 	}
 
 	var resp routingPolicyResponse
-	var newDBResidency *string
+	var newDBResidency, newDBParamsMode *string
 	err := h.db.QueryRow(ctx, `
-		INSERT INTO principal_routing_policies (principal_type, residency, allowed_models, default_model, updated_at, updated_by)
-		VALUES ('org', $1, $2, $3, now(), $4)
+		INSERT INTO principal_routing_policies (principal_type, residency, allowed_models, default_model, params_mode, updated_at, updated_by)
+		VALUES ('org', $1, $2, $3, $5, now(), $4)
 		ON CONFLICT (principal_type) WHERE principal_type = 'org' DO UPDATE
 			SET residency = EXCLUDED.residency, allowed_models = EXCLUDED.allowed_models,
-				default_model = EXCLUDED.default_model, updated_at = now(), updated_by = EXCLUDED.updated_by
-		RETURNING residency, allowed_models, default_model, updated_at
-	`, dbResidency, req.AllowedModels, req.DefaultModel, updatedBy).
-		Scan(&newDBResidency, &resp.AllowedModels, &resp.DefaultModel, &resp.UpdatedAt)
+				default_model = EXCLUDED.default_model,
+				params_mode = COALESCE($5, principal_routing_policies.params_mode),
+				updated_at = now(), updated_by = EXCLUDED.updated_by
+		RETURNING residency, allowed_models, default_model, params_mode, updated_at
+	`, dbResidency, req.AllowedModels, req.DefaultModel, updatedBy, req.ParamsMode).
+		Scan(&newDBResidency, &resp.AllowedModels, &resp.DefaultModel, &newDBParamsMode, &resp.UpdatedAt)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "update routing policy failed"})
 		return
 	}
 	resp.Residency = orgResidencyString(newDBResidency)
+	resp.ParamsMode = paramsModeString(newDBParamsMode)
 
 	if resp.Residency != residencyAny {
 		warnings, err := h.residencyRouteWarnings(ctx, resp.Residency)
@@ -1340,6 +1373,16 @@ func (h *RoutingHandler) PutRoutingPolicy(c *gin.Context) {
 		"unresolved_models":   resp.UnresolvedModels,
 	}
 	h.activity.Record(ctx, evt)
+
+	// params_mode decides whether a request the gateway used to accept
+	// (dropping a parameter) is now refused, so a change is its own event
+	// with both values.
+	if prev := paramsModeString(oldDBParamsMode); prev != resp.ParamsMode {
+		pe := activity.FromContext(c, activity.RoutingPolicyParamsModeChanged)
+		pe.TargetType = activity.StrPtr("routing_policy")
+		pe.Detail = map[string]any{"previous": prev, "new": resp.ParamsMode}
+		h.activity.Record(ctx, pe)
+	}
 
 	c.JSON(http.StatusOK, resp)
 }

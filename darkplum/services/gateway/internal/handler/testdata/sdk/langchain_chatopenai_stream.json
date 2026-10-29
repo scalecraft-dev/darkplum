@@ -1,0 +1,39 @@
+{
+  "sdk": "LangChain ChatOpenAI",
+  "representative": true,
+  "provenance": "Hand-assembled from the SDK's documented request serialisation, not a verbatim packet capture; the keys, defaults and nulls are the ones that SDK (or an app using it) sends.",
+  "description": "ChatOpenAI(...).stream(...): stream_options include_usage, n=1, temperature",
+  "expect": {
+    "lenient": {
+      "*": {
+        "status": 200,
+        "dropped": []
+      }
+    },
+    "strict": {
+      "*": {
+        "status": 200,
+        "dropped": []
+      }
+    }
+  },
+  "body": {
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are concise."
+      },
+      {
+        "role": "user",
+        "content": "Say hi"
+      }
+    ],
+    "model": "m",
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    },
+    "n": 1,
+    "temperature": 0.7
+  }
+}

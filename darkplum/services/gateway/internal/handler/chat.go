@@ -84,14 +84,13 @@ type responseFormatField struct {
 }
 
 // chatCompletionRequest is the subset of the OpenAI chat/completions request
-// body that the gateway needs to inspect for routing, recording, and
-// request-shape honesty. Inert fields (user, n, seed, logit_bias, metadata,
-// ...) are deliberately not modelled here — Go's json package silently
-// ignores fields with no matching struct tag, which is exactly the
-// "round-tripped transparently" behaviour those fields should get, except
-// that today's providers rebuild the outbound request from ChatRequest and
-// so never actually forward them; see unsupportedRequestParam for the
-// fields that must NOT be silently dropped this way.
+// body that the gateway needs to inspect for routing, recording and the
+// parameter contract. It is NOT where a parameter's treatment is decided:
+// that is the registry (internal/chatparams, rendered to docs/chat-params.json),
+// applied by planParams / earlyRefusal in chat_params_plan.go to the raw body.
+// Fields here are only the typed values the registry's rows and the providers
+// need; a request key with no field is still handled (dropped and recorded by
+// the catch-all rule), never silently ignored.
 // chatBodyMaxBytes caps a chat completion body; the api's proxy and
 // nginx.conf apply the same 16 MiB so every hop refuses the same request.
 // 16 MiB is ~4M tokens of text, past any model's context, and small enough
@@ -181,42 +180,6 @@ type chatCompletionRequest struct {
 	Functions      []json.RawMessage    `json:"functions,omitempty"`
 	FunctionCall   json.RawMessage      `json:"function_call,omitempty"`
 	ResponseFormat *responseFormatField `json:"response_format,omitempty"`
-}
-
-// unsupportedRequestParam inspects req for fields the gateway does not
-// implement on ANY backend (the legacy functions API, structured JSON
-// output, and multi-part image/audio content) and returns the OpenAI-style
-// parameter name to report in a 400 unsupported_parameter response, or ""
-// if none of them are present. This runs before route resolution, for EVERY
-// request, regardless of which class the resolved model belongs to — a
-// caller must get an honest, immediate 400 rather than have the parameter
-// silently dropped no matter which backend it lands on.
-//
-// tools/tool_choice are NOT here any more: they are supported per backend
-// (provider.ToolCapable) and refused after route resolution when the
-// resolved backend lacks support -- see the capability check in
-// HandleChatCompletions. functions is refused only when non-empty;
-// function_call only when set to something other than "none" — an SDK
-// that always includes an empty/off default must not be penalised for it.
-// Inert fields (user, seed, metadata, ...) are deliberately not inspected
-// here; n, logprobs, logit_bias and parallel_tool_calls are per backend and
-// refused after route resolution (backendParamRefusal).
-func unsupportedRequestParam(req chatCompletionRequest) string {
-	if len(req.Functions) > 0 {
-		return "functions"
-	}
-	if isSetAndNotNone(req.FunctionCall) {
-		return "function_call"
-	}
-	if req.ResponseFormat != nil && req.ResponseFormat.Type == "json_schema" {
-		return "response_format"
-	}
-	for _, m := range req.Messages {
-		if m.HasNonTextContent {
-			return "messages[].content"
-		}
-	}
-	return ""
 }
 
 // streamOptionsField is the subset of OpenAI's stream_options the gateway
@@ -394,54 +357,91 @@ func backendParamRefusal(req chatCompletionRequest, caps provider.ParamCaps) (pa
 	return "", ""
 }
 
-// applyForwardedParams copies the parameters the backend can honour onto
-// chatReq, each only when the caller sent a non-default value, so the field is
-// absent from the outbound body otherwise. A parameter the backend has no
-// equivalent for is simply not copied (seed and penalties on Anthropic and
-// Bedrock keep today's behaviour); the ones that would be a wrong answer
-// were already refused by backendParamRefusal.
-func (h *ChatHandler) applyForwardedParams(chatReq *provider.ChatRequest, req chatCompletionRequest, caps provider.ParamCaps) {
-	chatReq.Seed = req.Seed
-	if v := req.FrequencyPenalty; v != nil && *v != 0 {
+// refuseParam writes the 400 unsupported_parameter for a field the resolved
+// backend will not take.
+func (h *ChatHandler) refuseParam(c *gin.Context, requested, resolved string, route routing.Route, param, reason string) {
+	c.Set("denial_code", "unsupported_parameter")
+	logDenial(c, "unsupported_parameter", requested, resolved, route.Class)
+	c.JSON(http.StatusBadRequest, openAIError{
+		Error: openAIErrorBody{
+			Message: fmt.Sprintf("parameter %q is not supported by the backend serving model %q (%s): %s", param, resolved, route.Kind, reason),
+			Type:    "invalid_request_error",
+			Code:    "unsupported_parameter",
+			Param:   param,
+		},
+	})
+}
+
+// applyForwardedParams copies onto chatReq the parameters the registry says
+// this backend takes (plan.forwards), each only when the caller sent a
+// non-default value, so the field is absent from the outbound body otherwise.
+// A parameter whose row is anything else never reaches the provider: it is
+// either at its default, refused, or dropped and recorded by planParams. The
+// returned actions are the one drop the registry cannot know in advance: a
+// `user` that could not be pseudonymised.
+func (h *ChatHandler) applyForwardedParams(chatReq *provider.ChatRequest, req chatCompletionRequest, caps provider.ParamCaps, plan paramPlan) []paramAction {
+	var acts []paramAction
+	if plan.forwards("seed") {
+		chatReq.Seed = req.Seed
+	}
+	if v := req.FrequencyPenalty; v != nil && *v != 0 && plan.forwards("frequency_penalty") {
 		chatReq.FrequencyPenalty = v
 	}
-	if v := req.PresencePenalty; v != nil && *v != 0 {
+	if v := req.PresencePenalty; v != nil && *v != 0 && plan.forwards("presence_penalty") {
 		chatReq.PresencePenalty = v
 	}
-	if caps.Logprobs && req.Logprobs != nil && *req.Logprobs {
+	if caps.Logprobs && plan.forwards("logprobs") && req.Logprobs != nil && *req.Logprobs {
 		chatReq.Logprobs = true
-		chatReq.TopLogprobs = req.TopLogprobs
+		if plan.forwards("top_logprobs") {
+			chatReq.TopLogprobs = req.TopLogprobs
+		}
 	}
-	if caps.LogitBias && len(req.LogitBias) > 0 {
+	if caps.LogitBias && plan.forwards("logit_bias") && len(req.LogitBias) > 0 {
 		chatReq.LogitBias = req.LogitBias
 	}
-	if req.ParallelToolCalls != nil && !*req.ParallelToolCalls {
+	if req.ParallelToolCalls != nil && !*req.ParallelToolCalls && plan.forwards("parallel_tool_calls") {
 		chatReq.ParallelToolCalls = req.ParallelToolCalls
 	}
-	chatReq.NoStore = req.Store != nil && !*req.Store
+	chatReq.NoStore = req.Store != nil && !*req.Store && plan.forwards("store")
 
 	// `user`: raw only where the backend takes it raw; an HMAC pseudonym where
-	// the backend must not see the person's identifier; otherwise nothing.
-	// The raw value is never copied for a UserIDHMAC backend, so no provider
-	// can send it.
-	switch caps.UserID {
-	case provider.UserIDRaw:
-		chatReq.User = req.User
-	case provider.UserIDHMAC:
-		if req.User != "" && h.userPseudonym != nil {
-			if v, ok := h.userPseudonym.Pseudonym(req.User); ok {
-				chatReq.User = v
+	// the backend must not see the person's identifier; otherwise nothing. The
+	// raw value is never copied for a UserIDHMAC backend, so no provider can
+	// send it. Whenever a non-empty user does not go out, that is a recorded
+	// drop.
+	if req.User != "" {
+		sent := false
+		switch caps.UserID {
+		case provider.UserIDRaw:
+			chatReq.User, sent = req.User, true
+		case provider.UserIDHMAC:
+			if h.userPseudonym != nil {
+				if v, ok := h.userPseudonym.Pseudonym(req.User); ok {
+					chatReq.User, sent = v, true
+				}
 			}
+		}
+		if !sent {
+			acts = append(acts, paramAction{"user", actionDropped})
 		}
 	}
 
-	chatReq.VLLM = provider.VLLMExtensions{
-		TopK:               req.TopK,
-		MinP:               req.MinP,
-		RepetitionPenalty:  req.RepetitionPenalty,
-		GuidedJSON:         rawJSONOrNil(req.GuidedJSON),
-		ChatTemplateKwargs: rawJSONOrNil(req.ChatTemplateKwargs),
+	if plan.forwards("top_k") {
+		chatReq.VLLM.TopK = req.TopK
 	}
+	if plan.forwards("min_p") {
+		chatReq.VLLM.MinP = req.MinP
+	}
+	if plan.forwards("repetition_penalty") {
+		chatReq.VLLM.RepetitionPenalty = req.RepetitionPenalty
+	}
+	if plan.forwards("guided_json") {
+		chatReq.VLLM.GuidedJSON = rawJSONOrNil(req.GuidedJSON)
+	}
+	if plan.forwards("chat_template_kwargs") {
+		chatReq.VLLM.ChatTemplateKwargs = rawJSONOrNil(req.ChatTemplateKwargs)
+	}
+	return acts
 }
 
 // wantsTools reports whether the request involves tool calling at all: a
@@ -576,6 +576,10 @@ type ChatHandler struct {
 	// userPseudonym, when set (SetUserPseudonymizer), pseudonymises `user`
 	// for Anthropic and Bedrock.
 	userPseudonym UserPseudonymizer
+
+	// dropNotifier, when set (SetDropNotifier), is told which parameters a
+	// request had dropped so the first drop per (key, parameter) is audited.
+	dropNotifier DropNotifier
 }
 
 // UserPseudonymizer turns the caller's OpenAI `user` into the value a backend
@@ -1012,7 +1016,35 @@ func lastUserTurn(messages []provider.Message) provider.Message {
 // across instance renames or multiple instances of the same kind.
 func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 	var req chatCompletionRequest
-	if err := json.NewDecoder(http.MaxBytesReader(c.Writer, c.Request.Body, chatBodyMaxBytes)).Decode(&req); err != nil {
+	body, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, chatBodyMaxBytes))
+	// raw is the body as a map of its top-level keys, which is what the
+	// parameter registry is applied to. Go's decoder matches struct fields
+	// case-insensitively, so a key spelled "Temperature" would be read as
+	// temperature (or fail the typed decode). Such keys are taken out BEFORE
+	// the typed decode and stay in raw as plain unknown keys, so every key is
+	// honoured exactly as spelled or treated as unknown.
+	var raw map[string]json.RawMessage
+	var stray []string
+	if err == nil {
+		if json.NewDecoder(bytes.NewReader(body)).Decode(&raw) == nil {
+			if stray = nonCanonicalKeys(raw); len(stray) > 0 {
+				typed := make(map[string]json.RawMessage, len(raw))
+				for k, v := range raw {
+					typed[k] = v
+				}
+				for _, k := range stray {
+					delete(typed, k)
+				}
+				if filtered, merr := json.Marshal(typed); merr == nil {
+					body = filtered
+				}
+			}
+		} else {
+			raw = nil
+		}
+		err = json.NewDecoder(bytes.NewReader(body)).Decode(&req)
+	}
+	if err != nil {
 		var tooLarge *http.MaxBytesError
 		if errors.As(err, &tooLarge) {
 			c.Set("denial_code", "invalid_request")
@@ -1039,6 +1071,9 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 			},
 		})
 		return
+	}
+	if raw == nil {
+		_ = json.NewDecoder(bytes.NewReader(body)).Decode(&raw)
 	}
 
 	// A user-key caller that omits `model` gets its effective default_model,
@@ -1100,15 +1135,15 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 	// first would mean the caller only sometimes gets told, depending on
 	// what the request happened to resolve to. (Tools are per backend and
 	// handled after resolution; see wantsTools and the capability check.)
-	if param := unsupportedRequestParam(req); param != "" {
+	if ref := earlyRefusal(raw, &req); ref != nil {
 		c.Set("denial_code", "unsupported_parameter")
 		logDenial(c, "unsupported_parameter", req.Model, "", "")
 		c.JSON(http.StatusBadRequest, openAIError{
 			Error: openAIErrorBody{
-				Message: fmt.Sprintf("parameter %q is not supported by this gateway on any backend", param),
+				Message: fmt.Sprintf("parameter %q is not supported by this gateway on any backend: %s", ref.Param, ref.Reason),
 				Type:    "invalid_request_error",
 				Code:    "unsupported_parameter",
-				Param:   param,
+				Param:   ref.Param,
 			},
 		})
 		return
@@ -1144,20 +1179,9 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 		})
 		return
 	}
-	maxTokens, maxTokensConflict := effectiveMaxTokens(req)
-	if maxTokensConflict {
-		c.Set("denial_code", "unsupported_parameter")
-		logDenial(c, "unsupported_parameter", req.Model, "", "")
-		c.JSON(http.StatusBadRequest, openAIError{
-			Error: openAIErrorBody{
-				Message: `parameters "max_tokens" and "max_completion_tokens" are the same limit and were sent with different values; send one`,
-				Type:    "invalid_request_error",
-				Code:    "unsupported_parameter",
-				Param:   "max_completion_tokens",
-			},
-		})
-		return
-	}
+	// max_tokens vs max_completion_tokens conflicts were refused above
+	// (registry row max_completion_tokens / conflicts-with-max_tokens).
+	maxTokens, _ := effectiveMaxTokens(req)
 
 	// Tool shape: a malformed tools array, tool_choice, or an unpaired
 	// tool turn is refused here with the field named, before any backend
@@ -1399,26 +1423,26 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 		return
 	}
 
-	// The rest of the parameters a backend may not be able to honour
-	// (n>1, JSON mode, logprobs, logit_bias, stop, forced tool_choice,
-	// serial tool calls) are refused the same way, here, before any
-	// provider call and in every mode.
+	// Every other parameter is decided by the registry for the backend that
+	// will serve the request, here, before any provider call: a contract
+	// refusal is a 400 in every mode (n>1, JSON mode, logprobs, logit_bias,
+	// store:true, ...). capsRefusal is the same list asked of the provider's
+	// own ParamCaps, so a registry row that promises more than the provider
+	// reports it can do still fails closed (a test pins the two equal).
+	plan := planParams(raw, &req, route.Kind)
 	reasoning := planReasoning(req, prov, resolvedModel, maxTokens)
-	param, reason := backendParamRefusal(req, provider.CapsOf(prov))
+	var param, reason string
+	if plan.refuse != nil {
+		param, reason = plan.refuse.Param, plan.refuse.Reason
+	}
+	if param == "" {
+		param, reason = backendParamRefusal(req, provider.CapsOf(prov))
+	}
 	if param == "" {
 		param, reason = reasoning.RefuseParam, reasoning.RefuseReason
 	}
 	if param != "" {
-		c.Set("denial_code", "unsupported_parameter")
-		logDenial(c, "unsupported_parameter", req.Model, resolvedModel, route.Class)
-		c.JSON(http.StatusBadRequest, openAIError{
-			Error: openAIErrorBody{
-				Message: fmt.Sprintf("parameter %q is not supported by the backend serving model %q (%s): %s", param, resolvedModel, route.Kind, reason),
-				Type:    "invalid_request_error",
-				Code:    "unsupported_parameter",
-				Param:   param,
-			},
-		})
+		h.refuseParam(c, req.Model, resolvedModel, route, param, reason)
 		return
 	}
 
@@ -1455,13 +1479,24 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 		JSONMode:     req.ResponseFormat != nil && req.ResponseFormat.Type == "json_object",
 		IncludeUsage: req.Stream && req.StreamOptions != nil && req.StreamOptions.IncludeUsage,
 	}
-	h.applyForwardedParams(&chatReq, req, provider.CapsOf(prov))
+	userActs := h.applyForwardedParams(&chatReq, req, provider.CapsOf(prov), plan)
 	reasoning.apply(&chatReq)
-	recordParamActions(c, reasoning.Dropped)
 	if wantsTools(req) {
 		chatReq.Tools = req.Tools
 		chatReq.ToolChoice = req.ToolChoice
 	}
+
+	// Everything the gateway did not pass on as sent, decided before the first
+	// byte goes out. In an organisation's strict mode a dropped parameter is a
+	// refusal instead: nothing has been sent to the provider yet.
+	acts := append(append(append([]paramAction(nil), reasoning.Dropped...), plan.acts...), userActs...)
+	if snap.ParamsMode == paramsModeStrict {
+		if ref := strictRefusal(acts); ref != nil {
+			h.refuseParam(c, req.Model, resolvedModel, route, ref.Param, ref.Reason)
+			return
+		}
+	}
+	h.publishParamActions(c, acts, route.Kind, resolvedModel)
 
 	if req.Stream {
 		h.handleStream(c, prov, chatReq)

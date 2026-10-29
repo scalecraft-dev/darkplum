@@ -182,6 +182,14 @@ compromise or a policy requirement.
    Re-running it keeps the installed key and id. To rotate
    through make, run it with `USER_HMAC_KEY` and `USER_HMAC_KEY_ID` set.
 
+## 3c. Strict parameter mode (`params_mode`)
+
+By default a request parameter a backend cannot honour is dropped and reported in `X-Darkplum-Dropped-Params`, the Activity `dropped_params` column and a first-time audit event. An admin can set `params_mode: "strict"` on `PUT /api/v1/routing-policy` so every drop becomes a 400 `unsupported_parameter` instead.
+
+- Strict only takes effect on gateways running the release that reads it. Until migration 029 is applied the gateway treats every organisation as lenient and logs `principal_routing_policies.params_mode does not exist yet`.
+- `make deploy-platform` rolls the api, then the gateway, in one run. A strict value set before the gateway has rolled is ignored by the old gateways; verify with a request carrying an unknown key (strict answers 400 naming it).
+- In strict mode a `user` that cannot be pseudonymised (no `darkplum-user-hmac` secret, e.g. the dev overlay) is a 400 naming `user`, because the field would otherwise be dropped. Install the secret (3b) before enabling strict mode.
+
 ## 4. When a vendor is not answering
 
 `GET /health` on the gateway carries a `providers` array, and **Admin > Models >

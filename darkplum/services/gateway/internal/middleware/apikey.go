@@ -18,6 +18,10 @@ const (
 	ContextKeyID   = "key_id"
 	ContextUserID  = "user_id"
 	ContextKeyType = "key_type"
+	// ContextDroppedParams holds the []string of dropped_params entries the
+	// chat handler decided for this request (see handler.paramEntries); the
+	// Recording middleware writes it to inference_events.dropped_params.
+	ContextDroppedParams = "dropped_param_entries"
 )
 
 // Key types stored under ContextKeyType. A "service" key is the api service's

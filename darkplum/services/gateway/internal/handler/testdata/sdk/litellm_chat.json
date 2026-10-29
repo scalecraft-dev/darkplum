@@ -1,0 +1,44 @@
+{
+  "sdk": "LiteLLM",
+  "representative": true,
+  "provenance": "Hand-assembled from the SDK's documented request serialisation, not a verbatim packet capture; the keys, defaults and nulls are the ones that SDK (or an app using it) sends.",
+  "description": "litellm.completion(model='openai/m', ...) forwarded to an OpenAI-compatible base_url: provider-agnostic nulls, an empty metadata, legacy functions/function_call as null",
+  "expect": {
+    "lenient": {
+      "*": {
+        "status": 200,
+        "dropped": []
+      }
+    },
+    "strict": {
+      "*": {
+        "status": 200,
+        "dropped": []
+      }
+    }
+  },
+  "body": {
+    "model": "m",
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are concise."
+      },
+      {
+        "role": "user",
+        "content": "Say hi"
+      }
+    ],
+    "stream": false,
+    "temperature": 0.2,
+    "max_tokens": 100,
+    "user": "u-1",
+    "metadata": {},
+    "response_format": null,
+    "tool_choice": null,
+    "functions": null,
+    "function_call": null,
+    "stream_options": null,
+    "parallel_tool_calls": null
+  }
+}

@@ -55,8 +55,8 @@ func TestForwardedParams_TypedAndOnlyWhenNonDefault(t *testing.T) {
 			if r.Seed != nil || r.FrequencyPenalty != nil || r.PresencePenalty != nil || r.ParallelToolCalls != nil || r.Logprobs || r.LogitBias != nil || r.User != "" {
 				t.Errorf("default values were forwarded: %+v", r)
 			}
-			if !r.NoStore {
-				t.Error("store:false must reach the provider (NoStore)")
+			if r.NoStore != (be.name == "openai") {
+				t.Errorf("NoStore = %v on %s; store:false is forwarded to OpenAI only (accept-default elsewhere)", r.NoStore, be.name)
 			}
 
 			// Non-default values.
@@ -89,18 +89,24 @@ func TestForwardedParams_TypedAndOnlyWhenNonDefault(t *testing.T) {
 				t.Fatalf("status = %d: %s", w.Code, w.Body.String())
 			}
 			r = prov.lastReq
-			if r.Seed == nil || *r.Seed != 42 {
-				t.Errorf("Seed = %v", r.Seed)
+			sentSeed := be.name == "openai" || be.name == "vllm"
+			if sentSeed != (r.Seed != nil && *r.Seed == 42) {
+				t.Errorf("Seed = %v on %s, forwarded only where the registry says forward", r.Seed, be.name)
 			}
-			if r.FrequencyPenalty == nil || *r.FrequencyPenalty != 0.5 || r.PresencePenalty == nil || *r.PresencePenalty != -0.5 {
-				t.Errorf("penalties = %v / %v", r.FrequencyPenalty, r.PresencePenalty)
+			if sentSeed != (r.FrequencyPenalty != nil && *r.FrequencyPenalty == 0.5 && r.PresencePenalty != nil && *r.PresencePenalty == -0.5) {
+				t.Errorf("penalties = %v / %v on %s", r.FrequencyPenalty, r.PresencePenalty, be.name)
 			}
 			if r.ParallelToolCalls == nil || *r.ParallelToolCalls {
 				t.Errorf("ParallelToolCalls = %v, want false", r.ParallelToolCalls)
 			}
-			if r.VLLM.TopK == nil || *r.VLLM.TopK != 40 || r.VLLM.MinP == nil || r.VLLM.RepetitionPenalty == nil ||
-				string(r.VLLM.GuidedJSON) != `{"type":"object"}` || string(r.VLLM.ChatTemplateKwargs) != `{"enable_thinking":false}` {
-				t.Errorf("VLLM extensions = %+v", r.VLLM)
+			ext := r.VLLM
+			if be.name == "vllm" {
+				if ext.TopK == nil || *ext.TopK != 40 || ext.MinP == nil || ext.RepetitionPenalty == nil ||
+					string(ext.GuidedJSON) != `{"type":"object"}` || string(ext.ChatTemplateKwargs) != `{"enable_thinking":false}` {
+					t.Errorf("VLLM extensions = %+v", ext)
+				}
+			} else if ext.TopK != nil || ext.MinP != nil || ext.RepetitionPenalty != nil || len(ext.GuidedJSON) != 0 || len(ext.ChatTemplateKwargs) != 0 {
+				t.Errorf("vLLM extensions reached %s: %+v", be.name, ext)
 			}
 			if be.caps.Logprobs && (!r.Logprobs || r.TopLogprobs == nil || *r.TopLogprobs != 3) {
 				t.Errorf("logprobs = %v / %v", r.Logprobs, r.TopLogprobs)

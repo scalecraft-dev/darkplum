@@ -19,6 +19,7 @@ import (
 	"github.com/scalecraft-dev/darkplum/gateway/internal/handler"
 	"github.com/scalecraft-dev/darkplum/gateway/internal/health"
 	"github.com/scalecraft-dev/darkplum/gateway/internal/middleware"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/paramnotice"
 	"github.com/scalecraft-dev/darkplum/gateway/internal/policy"
 	"github.com/scalecraft-dev/darkplum/gateway/internal/provider"
 	"github.com/scalecraft-dev/darkplum/gateway/internal/provider/anthropic"
@@ -257,6 +258,7 @@ func main() {
 	chatHandler := handler.NewChatHandler(reg, routeMgr, polStore, rulesClassifier, semanticClassifier, providerStatus)
 	chatHandler.SetPolicyRefresher(polStore.Refresh)
 	chatHandler.SetUserPseudonymizer(userid.New(cfg.UserHMACDir))
+	chatHandler.SetDropNotifier(paramnotice.New(dbPool))
 
 	// providersHandler serves the two machine-only routes the api calls (with
 	// the service key) to verify and activate a vendor key an admin installs

@@ -129,8 +129,8 @@ func TestWriteBatch_FallsBackThenRecoversAcrossSchemaLevels(t *testing.T) {
 	if n != 1 {
 		t.Fatalf("event must be written exactly once via the legacy insert, got %d rows", n)
 	}
-	if r.schemaLevel != 4 {
-		t.Fatalf("expected the recorder to settle on the legacy schema (level 4), got %d", r.schemaLevel)
+	if r.schemaLevel != 5 {
+		t.Fatalf("expected the recorder to settle on the legacy schema (level 5), got %d", r.schemaLevel)
 	}
 	if !r.nextSchemaProbe.After(time.Now()) {
 		t.Fatal("recorder should schedule a future re-probe of newer schemas")
@@ -171,8 +171,8 @@ func TestWriteBatch_FallsBackThenRecoversAcrossSchemaLevels(t *testing.T) {
 		denial == nil || *denial != "model_not_enabled" || status != 403 {
 		t.Fatalf("audit row wrong: model=%q requested=%v denial=%v status=%d", model, requested, denial, status)
 	}
-	if r.schemaLevel != 3 {
-		t.Fatalf("expected the recorder to settle on the requested_model schema (level 3), got %d", r.schemaLevel)
+	if r.schemaLevel != 4 {
+		t.Fatalf("expected the recorder to settle on the requested_model schema (level 4), got %d", r.schemaLevel)
 	}
 
 	// Migration 013 lands, but not yet 016 (backend_class). The next
@@ -207,8 +207,8 @@ func TestWriteBatch_FallsBackThenRecoversAcrossSchemaLevels(t *testing.T) {
 		routerReason == nil || *routerReason != "rules:default" || routerLatency == nil || *routerLatency != 42 {
 		t.Fatalf("got purpose=%q route_name=%v router_reason=%v router_latency_ms=%v", purpose, routeName, routerReason, routerLatency)
 	}
-	if r.schemaLevel != 2 {
-		t.Fatalf("expected the recorder to settle on the routing schema (level 2) with backend_class still missing, got %d", r.schemaLevel)
+	if r.schemaLevel != 3 {
+		t.Fatalf("expected the recorder to settle on the routing schema (level 3) with backend_class still missing, got %d", r.schemaLevel)
 	}
 
 	// Migration 016 lands (backend_class). The next re-probe recovers all
@@ -230,8 +230,8 @@ func TestWriteBatch_FallsBackThenRecoversAcrossSchemaLevels(t *testing.T) {
 	if backendClass == nil || *backendClass != "cloud_managed" {
 		t.Fatalf("backend_class = %v, want cloud_managed", backendClass)
 	}
-	if r.schemaLevel != 1 {
-		t.Fatalf("expected the recorder to recover to the backend_class schema (level 1), got %d", r.schemaLevel)
+	if r.schemaLevel != 2 {
+		t.Fatalf("expected the recorder to recover to the backend_class schema (level 2), got %d", r.schemaLevel)
 	}
 
 	// Migration 021 lands (cache_read_tokens, cache_creation_tokens). The
@@ -252,8 +252,8 @@ func TestWriteBatch_FallsBackThenRecoversAcrossSchemaLevels(t *testing.T) {
 	if gotPT == nil || *gotPT != 100 || gotRead == nil || *gotRead != 60 || gotCreate == nil || *gotCreate != 30 {
 		t.Fatalf("got prompt=%v read=%v create=%v, want 100/60/30", gotPT, gotRead, gotCreate)
 	}
-	if r.schemaLevel != 0 {
-		t.Fatalf("expected the recorder to recover to the cache_tokens schema (level 0), got %d", r.schemaLevel)
+	if r.schemaLevel != 1 {
+		t.Fatalf("expected the recorder to recover to the cache_tokens schema (level 1), got %d", r.schemaLevel)
 	}
 
 	// Usage reported with no cache fields stores 0; no usage stores NULL.
@@ -270,6 +270,32 @@ func TestWriteBatch_FallsBackThenRecoversAcrossSchemaLevels(t *testing.T) {
 		if wantNull != (a == nil && b == nil) || (!wantNull && (*a != 0 || *b != 0)) {
 			t.Fatalf("%s: cache cols = %v/%v, wantNull=%v", id, a, b, wantNull)
 		}
+	}
+
+	// Migration 029 lands (dropped_params). The next re-probe recovers to the
+	// newest schema; entries are stored as given and an event that dropped
+	// nothing stores NULL.
+	if _, err := pool.Exec(ctx, `ALTER TABLE inference_events ADD COLUMN dropped_params TEXT[]`); err != nil {
+		t.Fatalf("alter: %v", err)
+	}
+	r.nextSchemaProbe = time.Now().Add(-time.Second)
+	r.writeBatch([]InferenceEvent{
+		{RequestID: "after-029", Model: "m", StatusCode: 200, DroppedParams: []string{"seed", "max_tokens=raised"}},
+		{RequestID: "after-029-none", Model: "m", StatusCode: 200},
+	})
+	var dropped []string
+	if err := pool.QueryRow(ctx, `SELECT dropped_params FROM inference_events WHERE request_id = 'after-029'`).Scan(&dropped); err != nil {
+		t.Fatalf("select: %v", err)
+	}
+	if len(dropped) != 2 || dropped[0] != "seed" || dropped[1] != "max_tokens=raised" {
+		t.Fatalf("dropped_params = %v, want [seed max_tokens=raised]", dropped)
+	}
+	var none []string
+	if err := pool.QueryRow(ctx, `SELECT dropped_params FROM inference_events WHERE request_id = 'after-029-none'`).Scan(&none); err != nil || none != nil {
+		t.Fatalf("an event that dropped nothing must store NULL, got %v (err %v)", none, err)
+	}
+	if r.schemaLevel != 0 {
+		t.Fatalf("expected the recorder to recover to the dropped_params schema (level 0), got %d", r.schemaLevel)
 	}
 }
 

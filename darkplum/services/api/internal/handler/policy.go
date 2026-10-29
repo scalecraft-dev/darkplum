@@ -78,6 +78,21 @@ type policyObject struct {
 	Residency     *string   `json:"residency"`
 	AllowedModels *[]string `json:"allowed_models"`
 	DefaultModel  *string   `json:"default_model"`
+	// ParamsMode exists only so a user or key policy that carries it can be
+	// refused by name (400): the setting belongs to the organisation row. It
+	// is never stored from here and omitted when nil.
+	ParamsMode *string `json:"params_mode,omitempty"`
+}
+
+// rejectParamsMode answers 400 when a user or api_key policy body sets
+// params_mode, which is an organisation-level setting. It reports whether it
+// responded.
+func rejectParamsMode(c *gin.Context, req policyObject) bool {
+	if req.ParamsMode == nil {
+		return false
+	}
+	c.JSON(http.StatusBadRequest, gin.H{"error": "params_mode is an organisation setting; set it with PUT /api/v1/routing-policy, not on a user or key policy"})
+	return true
 }
 
 // principalPolicyResponse is GET/PUT .../routing-policy's response shape for
@@ -710,6 +725,9 @@ func (h *PolicyHandler) PutUserPolicy(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if rejectParamsMode(c, req) {
+		return
+	}
 
 	eff, err := h.validateAndPreviewWrite(ctx, principalTypeUser, id, "", &req)
 	if err != nil {
@@ -771,6 +789,9 @@ func (h *PolicyHandler) PutAPIKeyPolicy(c *gin.Context) {
 	var req policyObject
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if rejectParamsMode(c, req) {
 		return
 	}
 
@@ -1081,6 +1102,9 @@ func (h *PolicyHandler) PreviewUserPolicy(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if rejectParamsMode(c, req) {
+		return
+	}
 	if req.AllowedModels != nil {
 		if err := validateAllowedModelIDs(ctx, h.db, *req.AllowedModels); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -1165,6 +1189,9 @@ func (h *PolicyHandler) PreviewAPIKeyPolicy(c *gin.Context) {
 	var req policyObject
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if rejectParamsMode(c, req) {
 		return
 	}
 	if req.AllowedModels != nil {
