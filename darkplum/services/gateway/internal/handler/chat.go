@@ -1140,7 +1140,7 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 		logDenial(c, "unsupported_parameter", req.Model, "", "")
 		c.JSON(http.StatusBadRequest, openAIError{
 			Error: openAIErrorBody{
-				Message: fmt.Sprintf("parameter %q is not supported by this gateway on any backend: %s", ref.Param, ref.Reason),
+				Message: fmt.Sprintf("parameter %q is refused: %s", ref.Param, ref.Reason),
 				Type:    "invalid_request_error",
 				Code:    "unsupported_parameter",
 				Param:   ref.Param,
