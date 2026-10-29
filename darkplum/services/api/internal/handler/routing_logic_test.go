@@ -262,3 +262,25 @@ func TestValidResidency(t *testing.T) {
 		}
 	}
 }
+
+func TestValidateRoutedAliasShape_OnRouteUnavailable(t *testing.T) {
+	base := func(v *string) putAliasRequest {
+		return putAliasRequest{
+			DefaultRoute:       "general",
+			OnRouteUnavailable: v,
+			Classifier:         &putAliasClassifierInput{Kind: "rules"},
+			Routes:             []putAliasRouteInput{validRouteInput("general", "llama3")},
+		}
+	}
+	s := func(v string) *string { return &v }
+	for _, ok := range []*string{nil, s("refuse"), s("fallback_same_or_stricter"), s("fallback_any_permitted")} {
+		if _, err := validateRoutedAliasShape(base(ok)); err != nil {
+			t.Errorf("%v: unexpected error %v", ok, err)
+		}
+	}
+	for _, bad := range []string{"", "fallback", "Refuse", "fallback_any", "fallback_same_or_stricter "} {
+		if _, err := validateRoutedAliasShape(base(s(bad))); err == nil {
+			t.Errorf("%q must be rejected", bad)
+		}
+	}
+}

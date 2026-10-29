@@ -232,18 +232,21 @@ func (s *PgStore) loadFromDB(ctx context.Context) (Snapshot, error) {
 
 func (s *PgStore) loadWith(ctx context.Context, q policyQuerier) (Snapshot, error) {
 	enabled := make(map[string]bool)
-	rows, err := q.Query(ctx, `SELECT model_id, enabled FROM models`)
+	modelClass := make(map[string]string)
+	rows, err := q.Query(ctx, `SELECT model_id, enabled, backend_class FROM models`)
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("policy: query models: %w", err)
 	}
 	for rows.Next() {
 		var id string
 		var en bool
-		if err := rows.Scan(&id, &en); err != nil {
+		var class string
+		if err := rows.Scan(&id, &en, &class); err != nil {
 			rows.Close()
 			return Snapshot{}, fmt.Errorf("policy: scan models row: %w", err)
 		}
 		enabled[id] = en
+		modelClass[id] = class
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -299,6 +302,37 @@ func (s *PgStore) loadWith(ctx context.Context, q policyQuerier) (Snapshot, erro
 	}
 	arows.Close()
 
+	// on_route_unavailable (migration 027) may not exist yet on a customer
+	// database whose api has not migrated: every alias then reads as the
+	// column default (empty here, which the handler treats as
+	// fallback_same_or_stricter), never a load failure.
+	onUnavailable := make(map[string]string)
+	err = inSavepoint(ctx, q, func(pq policyQuerier) error {
+		orows, err := pq.Query(ctx, `SELECT alias, on_route_unavailable FROM model_aliases`)
+		if err != nil {
+			return err
+		}
+		defer orows.Close()
+		for orows.Next() {
+			var alias, v string
+			if err := orows.Scan(&alias, &v); err != nil {
+				return err
+			}
+			onUnavailable[alias] = v
+		}
+		return orows.Err()
+	})
+	if err != nil {
+		if !isUndefinedColumnError(err) {
+			return Snapshot{}, fmt.Errorf("policy: query model_aliases.on_route_unavailable: %w", err)
+		}
+		log.Printf("policy: WARNING model_aliases.on_route_unavailable does not exist yet (migration 027 not applied) — routed aliases use fallback_same_or_stricter for this snapshot")
+		onUnavailable = nil
+	}
+	for i := range aliasRows {
+		aliasRows[i].OnRouteUnavailable = onUnavailable[aliasRows[i].Alias]
+	}
+
 	var residency string
 	if err := inSavepoint(ctx, q, func(pq policyQuerier) error {
 		return pq.QueryRow(ctx, `SELECT residency FROM routing_policy WHERE id = true`).Scan(&residency)
@@ -353,8 +387,26 @@ func (s *PgStore) loadWith(ctx context.Context, q policyQuerier) (Snapshot, erro
 		vendorFilters = nil
 	}
 
+	// model_registered_classes (migration 028) may not exist yet mid-rollout.
+	// Missing table => no registrations => no class-downgrade check, exactly
+	// the behaviour before the table existed; it never fails the snapshot.
+	var registeredClass map[string]string
+	err = inSavepoint(ctx, q, func(pq policyQuerier) (err error) {
+		registeredClass, err = loadRegisteredClasses(ctx, pq)
+		return err
+	})
+	if err != nil {
+		if !isUndefinedTableError(err) {
+			return Snapshot{}, fmt.Errorf("policy: query model_registered_classes: %w", err)
+		}
+		log.Printf("policy: WARNING model_registered_classes does not exist yet (migration 028 not applied) — a model id may be served by a looser backend class than it normally runs on")
+		registeredClass = nil
+	}
+
 	return Snapshot{
 		Enabled:         enabled,
+		ModelClass:      modelClass,
+		RegisteredClass: registeredClass,
 		Aliases:         buildAliases(aliasRows, routeRows),
 		Residency:       residency,
 		OrgPolicy:       built.OrgPolicy,
@@ -710,6 +762,9 @@ type rawAliasRow struct {
 	Target         *string
 	DefaultRoute   *string
 	ClassifierKind *string
+	// OnRouteUnavailable is model_aliases.on_route_unavailable, "" when the
+	// column does not exist yet (see loadWith).
+	OnRouteUnavailable string
 }
 
 // buildAliases assembles the Aliases map of a Snapshot from the raw scanned
@@ -777,6 +832,7 @@ func buildAliases(aliasRows []rawAliasRow, routeRows []rawRouteRow) map[string]A
 		if a.ClassifierKind != nil {
 			def.ClassifierKind = *a.ClassifierKind
 		}
+		def.OnRouteUnavailable = a.OnRouteUnavailable
 		if def.ClassifierKind == legacyClassifierKindModel {
 			// See buildAliases's doc comment: the model classifier is gone,
 			// but a not-yet-migrated (or pre-migration-014) row may still
@@ -810,3 +866,22 @@ const legacyClassifierKindModel = "model"
 
 // compile-time interface check.
 var _ Store = (*PgStore)(nil)
+
+// loadRegisteredClasses reads model_registered_classes: model_id -> the
+// strictest class that has ever served it.
+func loadRegisteredClasses(ctx context.Context, q policyQuerier) (map[string]string, error) {
+	rows, err := q.Query(ctx, `SELECT model_id, registered_class FROM model_registered_classes`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := make(map[string]string)
+	for rows.Next() {
+		var id, class string
+		if err := rows.Scan(&id, &class); err != nil {
+			return nil, err
+		}
+		out[id] = class
+	}
+	return out, rows.Err()
+}

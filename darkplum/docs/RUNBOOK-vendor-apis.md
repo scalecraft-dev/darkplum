@@ -188,7 +188,22 @@ Model vendors** shows the same state:
 What a caller sees: `429 provider_rate_limited` with the vendor's `Retry-After`;
 `502 provider_auth_failed`; `502 upstream_error`; `504 upstream_timeout`. None
 carries vendor error text. **There is no failover**: a vendor failure is never
-retried on a local model, and a local failure is never retried on a vendor. A
+retried on a local model or another vendor. The one exception is a routed
+alias: when its picked route is down it may move to the alias's default route,
+only as the alias's *If the model on a chosen route is down* setting allows (by default never
+to a looser backend class, so a local outage is not sent to a vendor), and a
+classifier failure always uses the default route. Separately, when a model id is registered with a stricter backend class and
+only a looser class can answer it now, the request is refused with
+`503 model_class_downgraded` rather than sent there (for example a self-hosted
+id whose backend is down while a vendor lists the same id). The conditions: api
+migration 028 applied and a gateway that reads it (apply api migrations first;
+until then there is no check); the id must have been registered by a sync (an id
+served only between two syncs is not); and an in-cluster source that once lists
+a vendor's id pins that id to self-hosted. After upgrading, compare
+`model_registered_classes` with your self-hosted inventory. To fix a wrong row,
+or to move a model on purpose, accept the class it is discovered under now:
+`PATCH /api/v1/models/:id` `{"accept_class": true}` (audited as
+`model.class_accepted`; API only). A
 vendor outage never affects self-hosted or Bedrock models, and never affects
 gateway readiness.
 

@@ -380,6 +380,11 @@ export type AliasClassifier =
   | { kind: 'semantic_router'; model_id?: null }
   | { kind: 'model'; model_id: string }
 
+/** What a routed alias does when the route the classifier picked cannot answer
+ *  (its model is off or unreachable). Never applies to a classifier failure,
+ *  which always uses the default route. */
+export type OnRouteUnavailable = 'refuse' | 'fallback_same_or_stricter' | 'fallback_any_permitted'
+
 export interface ModelAlias extends AliasTargetHealth {
   alias: string
   /** Absent on older APIs — treat a missing value as 'static'. */
@@ -388,6 +393,8 @@ export interface ModelAlias extends AliasTargetHealth {
   target_model_id: string | null
   /** Routed aliases only. */
   default_route?: string | null
+  /** Absent on older APIs — read as the default, fallback_same_or_stricter. */
+  on_route_unavailable?: OnRouteUnavailable | null
   classifier?: AliasClassifier | null
   routes?: ModelAliasRoute[]
   /** Configure-time notes from the API, one readable sentence each — e.g. the
@@ -412,6 +419,7 @@ export type ModelAliasInput =
   | {
       kind: 'routed'
       default_route: string
+      on_route_unavailable: OnRouteUnavailable
       classifier: { kind: AliasClassifierChoice }
       routes: ModelAliasRouteInput[]
     }

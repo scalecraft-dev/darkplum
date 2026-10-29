@@ -50,8 +50,9 @@ func setupPolicyDB(t *testing.T) *pgxpool.Pool {
 
 	if _, err := pool.Exec(ctx, `
 		CREATE TABLE models (
-			model_id TEXT PRIMARY KEY,
-			enabled  BOOLEAN NOT NULL DEFAULT true
+			model_id      TEXT PRIMARY KEY,
+			enabled       BOOLEAN NOT NULL DEFAULT true,
+			backend_class TEXT NOT NULL DEFAULT 'self_hosted'
 		);
 		CREATE TABLE model_alias_routes (
 			alias           TEXT,

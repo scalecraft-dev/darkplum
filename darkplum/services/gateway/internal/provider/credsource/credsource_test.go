@@ -315,7 +315,10 @@ func TestSetTemporaryRecheckInterval_ShortensAndReverts(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	s.SetTemporaryRecheckInterval(5*time.Millisecond, 20*time.Millisecond)
+	// The window must outlast the file write and Key() below even on a loaded
+	// CI runner under -race; at 20ms the revert could fire first and Key()
+	// would return the cached key. The revert loop below waits up to 2s.
+	s.SetTemporaryRecheckInterval(5*time.Millisecond, 500*time.Millisecond)
 
 	if err := os.WriteFile(path, []byte("sk-after"), 0o644); err != nil {
 		t.Fatal(err)

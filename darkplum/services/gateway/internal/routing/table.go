@@ -47,6 +47,15 @@ func rankOfClass(class string) int {
 	return len(classRank)
 }
 
+// ClassRank is the public form of the class ordering: lower is stricter
+// (self_hosted 0, cloud_managed 1, external_api 2). ok is false for an
+// unrecognised or empty class, which callers comparing classes must treat as
+// fail-closed. Same ladder policy.ResidencyPermits enforces.
+func ClassRank(class string) (rank int, ok bool) {
+	rank, ok = classRank[class]
+	return rank, ok
+}
+
 // Route describes how a single resolved model id is served.
 type Route struct {
 	// ProviderKey is the key this model routes to in the caller's provider

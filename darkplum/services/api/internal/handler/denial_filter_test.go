@@ -9,6 +9,12 @@ func TestValidDenialCodeFilter_ModelRequiresDataRetention(t *testing.T) {
 	if !validDenialCodeFilter("model_requires_data_retention") {
 		t.Fatal("model_requires_data_retention must be an accepted denial_code filter")
 	}
+	if !validDenialCodeFilter("route_target_unavailable") {
+		t.Fatal("route_target_unavailable must be an accepted denial_code filter")
+	}
+	if !validDenialCodeFilter("model_class_downgraded") {
+		t.Fatal("model_class_downgraded must be an accepted denial_code filter")
+	}
 	if validDenialCodeFilter("model_requires_something_else") {
 		t.Fatal("unknown codes must still be rejected")
 	}

@@ -54,8 +54,16 @@ import {
   aliasReferenceConsequence,
   aliasReferencesTo,
   denialLabel,
+  classificationFailureWarning,
+  refusalCause,
+  refusalSuffix,
   isRouteTargetRefusal,
-  routeFallbackHint,
+  ON_ROUTE_UNAVAILABLE_DEFAULT,
+  ROUTE_TARGET_UNAVAILABLE_CODE,
+  MODEL_CLASS_DOWNGRADED_CODE,
+  onRouteUnavailableOf,
+  routeOutcome,
+  routeUnavailableHint,
   routeFallbackOf,
   routerReasonText,
   failedVendorLabel,
@@ -1235,38 +1243,171 @@ if (!WEB_PORT_FORWARD_COMMAND.startsWith('kubectl port-forward -n darkplum-syste
   )
 }
 
-// --- a routed alias falling back to its default route ----------------------
-// The gateway answers a non-default route whose target is disabled or not
-// reachable on the alias's default route, and records why. Policy refusals
-// never fall back. These pin what the UI says about it, before and after.
+// --- a routed alias whose picked route is down -------------------------------
+// What happens is the alias's on_route_unavailable setting applied to the two
+// classes (the gateway's resolveRoutedPick): refuse never uses another route;
+// fallback_same_or_stricter (the default) uses the default route only when its
+// class is the same as or stricter than the picked route's; fallback_any_permitted
+// uses it whenever it can answer. Unknown or unrecorded classes refuse. A
+// classifier failure is a different case and always uses the default route.
 
 {
+  check('default setting', ON_ROUTE_UNAVAILABLE_DEFAULT, 'fallback_same_or_stricter')
+  check('onRouteUnavailableOf(absent) is the default', onRouteUnavailableOf({}), 'fallback_same_or_stricter')
+  check('onRouteUnavailableOf(null) is the default', onRouteUnavailableOf({ on_route_unavailable: null }), 'fallback_same_or_stricter')
+  check('onRouteUnavailableOf(refuse)', onRouteUnavailableOf({ on_route_unavailable: 'refuse' }), 'refuse')
+  check('onRouteUnavailableOf(<future value>) fails closed', onRouteUnavailableOf({ on_route_unavailable: 'whatever' }), 'refuse')
+
+  // historical and current reason text (a) -----------------------------------
   check(
     'routerReasonText(fallback disabled)',
     routerReasonText('fallback:route_target_disabled:code'),
-    "Fell back to the default route — the model on route 'code' is disabled",
+    "The default route answered instead — the model on route 'code' was disabled at the time",
   )
   check(
     'routerReasonText(fallback unreachable)',
     routerReasonText('fallback:route_target_unreachable:code'),
-    "Fell back to the default route — the model on route 'code' is not reachable",
+    "The default route answered instead — the model on route 'code' was not reachable at the time",
   )
   check('routeFallbackOf(timeout) is null', routeFallbackOf('fallback:timeout'), null)
   check('routeFallbackOf(disabled).route', routeFallbackOf('fallback:route_target_disabled:code')?.route, 'code')
+  check('ROUTE_TARGET_UNAVAILABLE_CODE matches the gateway', ROUTE_TARGET_UNAVAILABLE_CODE, 'route_target_unavailable')
+  check('MODEL_CLASS_DOWNGRADED_CODE matches the gateway', MODEL_CLASS_DOWNGRADED_CODE, 'model_class_downgraded')
+  check('denialLabel(model_class_downgraded)', denialLabel(MODEL_CLASS_DOWNGRADED_CODE), 'Usual backend unavailable')
   check(
-    'routeFallbackHint(disabled)',
-    routeFallbackHint('disabled', 'general'),
-    'This model is turned off, so messages that take this route fall back to the default route general until it is fixed.',
+    'DENIAL_CODES offers model_class_downgraded (api accepts the filter)',
+    (DENIAL_CODES as readonly string[]).includes(MODEL_CLASS_DOWNGRADED_CODE),
+    true,
   )
-  // The gateway's two no-fallback sentences (chat.go resolveRoutedPick).
+  // It is a model-level refusal, not a routed pick: chat must not send an
+  // admin to Routing for it.
+  check('isRouteTargetRefusal(model_class_downgraded) is false', isRouteTargetRefusal(MODEL_CLASS_DOWNGRADED_CODE, 'model "m" normally runs in your own cluster'), false)
+
+  // routeOutcome: every setting x class relation -----------------------------
+  type C = 'self_hosted' | 'cloud_managed' | 'external_api' | 'unknown'
+  const def = (cls: C, usable = true) => ({ name: 'general', class: cls, usable })
+  const kindOf = (setting: Parameters<typeof routeOutcome>[0], pick: C, d: ReturnType<typeof def> | null) =>
+    routeOutcome(setting, pick, d).kind
+  const matrix: [string, C, ReturnType<typeof def> | null, string, string, string][] = [
+    // name, pick class, default, refuse, same_or_stricter, any_permitted
+    ['same class', 'self_hosted', def('self_hosted'), 'refused', 'fallback', 'fallback'],
+    ['stricter default', 'cloud_managed', def('self_hosted'), 'refused', 'fallback', 'fallback'],
+    ['looser default (issue 13)', 'self_hosted', def('external_api'), 'refused', 'refused', 'fallback'],
+    ['one rung looser', 'self_hosted', def('cloud_managed'), 'refused', 'refused', 'fallback'],
+    ['unknown default class (refused by residency after the pick)', 'self_hosted', def('unknown'), 'refused', 'refused', 'refused'],
+    ['unknown picked class', 'unknown', def('self_hosted'), 'refused', 'refused', 'fallback'],
+    ['default unusable', 'self_hosted', def('self_hosted', false), 'refused', 'refused', 'refused'],
+    ['no default', 'self_hosted', null, 'refused', 'refused', 'refused'],
+  ]
+  for (const [name, pick, d, refuse, same, any] of matrix) {
+    check(`outcome refuse / ${name}`, kindOf('refuse', pick, d), refuse)
+    check(`outcome same_or_stricter / ${name}`, kindOf('fallback_same_or_stricter', pick, d), same)
+    check(`outcome any_permitted / ${name}`, kindOf('fallback_any_permitted', pick, d), any)
+  }
+
+  // hints (b), (c) and the fallback wording ------------------------------------
+  const refuseOutcome = routeOutcome('refuse', 'self_hosted', def('self_hosted'))
+  const looserOutcome = routeOutcome('fallback_same_or_stricter', 'self_hosted', def('external_api'))
+  const anyOutcome = routeOutcome('fallback_any_permitted', 'self_hosted', def('external_api'))
+  const sameOutcome = routeOutcome('fallback_same_or_stricter', 'self_hosted', def('self_hosted'))
   check(
-    'isRouteTargetRefusal(both unusable)',
+    'hint(unreachable, refuse)',
+    routeUnavailableHint('unreachable', refuseOutcome),
+    'This model is not reachable right now, so messages that take this route are refused until the backend is back. They are never sent to another model. This alias is set to refuse rather than use another route.',
+  )
+  check('hint(disabled, refused) suffix', routeUnavailableHint('disabled', refuseOutcome).includes('are refused until it is fixed.'), true)
+  check('hint(missing, refused) suffix', routeUnavailableHint('missing', refuseOutcome).includes('are refused until it is fixed.'), true)
+  check('hint(unreachable) never says "until it is fixed"', routeUnavailableHint('unreachable', looserOutcome).includes('until it is fixed'), false)
+  check(
+    'hint(disabled, looser default) names both classes',
+    routeUnavailableHint('disabled', looserOutcome),
+    'This model is turned off, so messages that take this route are refused until it is fixed. They are never sent to another model. This alias only falls back to the same or a stricter class, and the default route general (outside your cloud account) is looser than this route (in your own cluster).',
+  )
+  check(
+    'hint(disabled, same class) falls back',
+    routeUnavailableHint('disabled', sameOutcome),
+    'This model is turned off, so messages that take this route are answered on the default route general (in your own cluster) until it is fixed.',
+  )
+  check(
+    'hint(any_permitted, looser default) says where prompts go',
+    routeUnavailableHint('disabled', anyOutcome),
+    'This model is turned off, so messages that take this route are answered on the default route general (outside your cloud account) until it is fixed. That is looser than this route (in your own cluster); this alias\'s setting allows it.',
+  )
+  check(
+    'hint(default route) adds the classification-failure sentence',
+    routeUnavailableHint('unreachable', null),
+    'This model is not reachable right now, so messages that take this route are refused until the backend is back. They are never sent to another model. It is also the default route, so messages are refused when classification fails.',
+  )
+  check('hint(refused, no default) names it', routeUnavailableHint('disabled', routeOutcome('fallback_any_permitted', 'self_hosted', def('self_hosted', false))).includes('The default route general cannot answer either.'), true)
+
+  // The gateway's test for the default route is "in the route table and
+  // enabled" -- not recent discovery. A default whose target_available is
+  // false must therefore still count as usable, or the UI prints a refusal
+  // ("never sent to another model") the gateway does not make.
+  {
+    const rt = (name: string, target: string, avail: boolean | undefined, cls: C = 'self_hosted'): ModelAliasRoute => ({
+      route_name: name, description: '', target_model_id: target, keywords: [],
+      target_exists: true, target_enabled: true, target_available: avail, target_backend_class: cls,
+    })
+    const a = (setting: ModelAlias['on_route_unavailable'], avail: boolean | undefined): ModelAlias => ({
+      alias: 'auto', kind: 'routed', default_route: 'general', on_route_unavailable: setting,
+      target_model_id: null, created_at: '', updated_at: '',
+      routes: [rt('general', 'llama', avail), rt('code', 'fable', true)],
+    } as ModelAlias)
+    check('disable: default not recently discovered still takes over (same class)',
+      aliasReferencesTo('fable', [a('fallback_same_or_stricter', false)])[0]?.outcome, 'fallback')
+    check('disable: default not recently discovered still takes over (any_permitted)',
+      aliasReferencesTo('fable', [a('fallback_any_permitted', false)])[0]?.outcome, 'fallback')
+    check('disable: refuse is still refuse when the default is available',
+      aliasReferencesTo('fable', [a('refuse', true)])[0]?.outcome, 'refused')
+  }
+  check('refusalSuffix(unknown)', refusalSuffix('unknown'), 'refused until a backend reports where the model runs')
+  check('refusalSuffix(blocked)', refusalSuffix('blocked'), 'refused under the current policy')
+  check('refusalCause(unknown default, any_permitted)',
+    refusalCause(routeOutcome('fallback_any_permitted', 'self_hosted', def('unknown'))),
+    'The default route general has not reported where it runs, and a model whose class is unknown is refused under every policy.')
+  check('refusalCause(unknown picked, same_or_stricter)',
+    refusalCause(routeOutcome('fallback_same_or_stricter', 'unknown', def('self_hosted'))),
+    'This alias only falls back to a known same or stricter class, and the class of this route is not reported.')
+  check('unknown picked class falls back under any_permitted (gateway: only the default is residency-checked)',
+    kindOf('fallback_any_permitted', 'unknown', def('self_hosted')), 'fallback')
+
+  // classification-failure warning in the editor -------------------------------
+  check(
+    'classificationFailureWarning(vendor default, local other)',
+    classificationFailureWarning('general', 'external_api', ['self_hosted', 'external_api']),
+    'If classification fails, messages go to general (outside your cloud account), whatever the setting below says. Make a stricter route the default if that is not acceptable.',
+  )
+  check('classificationFailureWarning(default is the strictest)', classificationFailureWarning('general', 'self_hosted', ['external_api']), null)
+  check('classificationFailureWarning(equal classes)', classificationFailureWarning('general', 'cloud_managed', ['cloud_managed']), null)
+  check('classificationFailureWarning(no other routes)', classificationFailureWarning('general', 'external_api', []), null)
+  check(
+    'classificationFailureWarning(unknown default)',
+    classificationFailureWarning('general', 'unknown', ['self_hosted']),
+    'If classification fails, messages go to general (where it runs is not known), whatever the setting below says. Make a stricter route the default if that is not acceptable.',
+  )
+
+  check(
+    'denialLabel(route_target_unavailable)',
+    denialLabel(ROUTE_TARGET_UNAVAILABLE_CODE),
+    'Route target unavailable',
+  )
+  check(
+    'DENIAL_CODES offers route_target_unavailable (api accepts the filter)',
+    (DENIAL_CODES as readonly string[]).includes(ROUTE_TARGET_UNAVAILABLE_CODE),
+    true,
+  )
+  // The 503 the gateway sends for a non-default route (chat.go resolveRoutedPick).
+  check(
+    'isRouteTargetRefusal(route_target_unavailable)',
     isRouteTargetRefusal(
-      'model_not_enabled',
-      `route "code" of alias "auto" selects model "a", which is disabled, and the alias's default route "general" selects "b", which is also disabled. Enable one of them on the Models page or retarget the route.`,
+      ROUTE_TARGET_UNAVAILABLE_CODE,
+      `route "code" of alias "auto" selects model "a", which is disabled. The request was not sent anywhere else.`,
     ),
     true,
   )
+  check('isRouteTargetRefusal(route_target_unavailable, empty message)', isRouteTargetRefusal(ROUTE_TARGET_UNAVAILABLE_CODE, ''), true)
+  // The refusal the gateway keeps for a pick of the default route itself.
   check(
     'isRouteTargetRefusal(default route)',
     isRouteTargetRefusal(
@@ -1274,6 +1415,11 @@ if (!WEB_PORT_FORWARD_COMMAND.startsWith('kubectl port-forward -n darkplum-syste
       `route "general" of alias "auto" is the alias's default route and selects model "b", which is not available on this gateway. Enable it on the Models page or retarget the route.`,
     ),
     true,
+  )
+  check(
+    'isRouteTargetRefusal(plain model_not_enabled) is false',
+    isRouteTargetRefusal('model_not_enabled', 'model "x" is not enabled'),
+    false,
   )
   check(
     'isRouteTargetRefusal(residency) is false',
@@ -1284,14 +1430,15 @@ if (!WEB_PORT_FORWARD_COMMAND.startsWith('kubectl port-forward -n darkplum-syste
     false,
   )
 
-  const route = (name: string, target: string, enabled = true): ModelAliasRoute => ({
+  // disable-model confirmation: computed from the alias setting and classes ----
+  const route = (name: string, target: string, cls: C = 'self_hosted', enabled = true): ModelAliasRoute => ({
     route_name: name,
     description: '',
     target_model_id: target,
     keywords: [],
     target_exists: true,
     target_enabled: enabled,
-    target_backend_class: 'self_hosted',
+    target_backend_class: cls === 'unknown' ? null : cls,
   })
   const alias = (a: Partial<ModelAlias> & { alias: string }): ModelAlias => ({
     target_model_id: null,
@@ -1302,45 +1449,75 @@ if (!WEB_PORT_FORWARD_COMMAND.startsWith('kubectl port-forward -n darkplum-syste
     updated_at: '',
     ...a,
   })
-  const aliases: ModelAlias[] = [
-    alias({
-      alias: 'auto',
-      kind: 'routed',
-      default_route: 'general',
-      routes: [route('general', 'llama'), route('code', 'fable')],
-    }),
-    alias({ alias: 'default-chat', kind: 'static', target_model_id: 'fable' }),
-    alias({
-      alias: 'smart',
-      kind: 'routed',
-      default_route: 'general',
-      routes: [route('general', 'off', false), route('deep', 'fable')],
-    }),
-  ]
-  const refs = aliasReferencesTo('fable', aliases)
-  check('aliasReferencesTo(fable).length', refs.length, 3)
-  check('auto/code outcome', refs[0]?.outcome, 'fallback')
+  const routed = (name: string, setting: ModelAlias['on_route_unavailable'], general: ModelAliasRoute, other: ModelAliasRoute) =>
+    alias({ alias: name, kind: 'routed', default_route: 'general', on_route_unavailable: setting, routes: [general, other] })
+  const consequence = (aliases: ModelAlias[], model: string, index = 0) => {
+    const r = aliasReferencesTo(model, aliases)[index]
+    return r ? aliasReferenceConsequence(r) : undefined
+  }
+
+  // same-class default: falls back under the default and any_permitted, not refuse
+  const sameClass = (setting: ModelAlias['on_route_unavailable']) =>
+    [routed('auto', setting, route('general', 'llama'), route('code', 'fable'))]
   check(
-    'auto/code consequence',
-    refs[0] && aliasReferenceConsequence(refs[0]),
-    'messages will use its default route general (llama) instead',
+    'disable: same class default, default setting',
+    consequence(sameClass(undefined), 'fable'),
+    'messages that take this route will use the default route general (in your own cluster) instead.',
   )
-  check('default-chat outcome', refs[1]?.outcome, 'refused')
+  check('disable: same class default, same_or_stricter', consequence(sameClass('fallback_same_or_stricter'), 'fable')?.includes('will use the default route general'), true)
+  check('disable: same class default, any_permitted', consequence(sameClass('fallback_any_permitted'), 'fable')?.includes('will use the default route general'), true)
   check(
-    'default-chat consequence',
-    refs[1] && aliasReferenceConsequence(refs[1]),
-    'refused until it is retargeted or the model is re-enabled',
+    'disable: same class default, refuse',
+    consequence(sameClass('refuse'), 'fable'),
+    'messages that take this route will be refused, never sent to another model, until it is retargeted or re-enabled. This alias is set to refuse rather than use another route.',
   )
-  check('smart/deep outcome (default disabled)', refs[2]?.outcome, 'refused')
-  const llamaRefs = aliasReferencesTo('llama', aliases)
-  check('aliasReferencesTo(llama).length', llamaRefs.length, 1)
-  check('auto/general isDefault', llamaRefs[0]?.isDefault, true)
+  // looser default: only any_permitted moves the prompt, and it says where
+  const looser = (setting: ModelAlias['on_route_unavailable']) =>
+    [routed('auto', setting, route('general', 'gpt', 'external_api'), route('code', 'fable'))]
   check(
-    'auto/general consequence',
-    llamaRefs[0] && aliasReferenceConsequence(llamaRefs[0]),
-    'messages that land here will be refused until it is retargeted or re-enabled',
+    'disable: looser default, default setting refuses and names both classes',
+    consequence(looser(undefined), 'fable'),
+    'messages that take this route will be refused, never sent to another model, until it is retargeted or re-enabled. This alias only falls back to the same or a stricter class, and the default route general (outside your cloud account) is looser than this route (in your own cluster).',
   )
-  check('aliasReferencesTo(unused).length', aliasReferencesTo('nothing', aliases).length, 0)
+  check(
+    'disable: looser default, any_permitted says where prompts go',
+    consequence(looser('fallback_any_permitted'), 'fable'),
+    'messages that take this route will use the default route general (outside your cloud account) instead. That is looser than this route (in your own cluster); this alias\'s setting allows it.',
+  )
+  check('disable: looser default, outcome field', aliasReferencesTo('fable', looser(undefined))[0]?.outcome, 'refused')
+  check('disable: looser default any_permitted, outcome field', aliasReferencesTo('fable', looser('fallback_any_permitted'))[0]?.outcome, 'fallback')
+  // unknown class on the picked route (a model no backend has reported)
+  check(
+    'disable: unknown picked class refuses under the default setting',
+    aliasReferencesTo('fable', [routed('auto', undefined, route('general', 'llama'), route('code', 'fable', 'unknown'))])[0]?.outcome,
+    'refused',
+  )
+  // default cannot answer: disabled already, or the very model being turned off
+  check(
+    'disable: default already disabled refuses even under any_permitted',
+    aliasReferencesTo('fable', [routed('auto', 'fallback_any_permitted', route('general', 'off', 'self_hosted', false), route('code', 'fable'))])[0]?.outcome,
+    'refused',
+  )
+  check(
+    'disable: default targets the same model refuses',
+    aliasReferencesTo('fable', [routed('auto', 'fallback_any_permitted', route('general', 'fable'), route('code', 'fable'))]).map((r) => r.outcome).join(','),
+    'refused,refused',
+  )
+  // residency, when the caller passes it, can make the default unusable
+  check(
+    'disable: default class the policy refuses cannot take over',
+    aliasReferencesTo('fable', looser('fallback_any_permitted'), 'cloud_account_only')[0]?.outcome,
+    'refused',
+  )
+  // the default route itself, and static aliases
+  const statics = [alias({ alias: 'default-chat', kind: 'static', target_model_id: 'fable' })]
+  check('disable: static alias', consequence(statics, 'fable'), 'refused until it is retargeted or the model is re-enabled')
+  check(
+    'disable: the default route itself adds the classification-failure sentence',
+    consequence(sameClass(undefined), 'llama'),
+    'messages that take this route will be refused until it is retargeted or re-enabled. It is also the default route, so messages are refused when classification fails.',
+  )
+  check('aliasReferencesTo(unused).length', aliasReferencesTo('nothing', sameClass(undefined)).length, 0)
 }
 
 // --- estimated spend: money, shares, labels, CSV ------------------------------
@@ -1636,5 +1813,5 @@ if (failures.length > 0) {
 }
 
 console.log(
-  `Residency truth table holds (${table.cells.length} cells from ${RESIDENCY_TRUTH_TABLE_PATH} + ladder order + restricted rule + class rank, model fallback, empty-state claim, vendor rate-limit wait, who a vendor failure names, and the vendor-key helpers: glob matching, filter serialisation over every subset of a catalogue, the checklist's headings, what a Replace opens on, the key entry line, the installing and removing windows, the transport gate, which of the two transport faults each refusal names, the admitted diff, the Bedrock data-retention opt-in copy, and the routed-alias fallback: reason text, route hints, the no-fallback refusal, and which aliases a disable affects; and the spend helpers: cost display, exact CSV dollars, $/MTok, price input, shares, coverage caption, grouping labels, chart buckets, the one-read class timeline; and the billing-key helpers: state copy, verify errors, the signed difference, the Pull now cooldown, the audit labels).`,
+  `Residency truth table holds (${table.cells.length} cells from ${RESIDENCY_TRUTH_TABLE_PATH} + ladder order + restricted rule + class rank, model fallback, empty-state claim, vendor rate-limit wait, who a vendor failure names, and the vendor-key helpers: glob matching, filter serialisation over every subset of a catalogue, the checklist's headings, what a Replace opens on, the key entry line, the installing and removing windows, the transport gate, which of the two transport faults each refusal names, the admitted diff, the Bedrock data-retention opt-in copy, and the routed-alias on_route_unavailable rule: reason text, the setting x class outcome matrix, route hints, the classification-failure warning, the route_target_unavailable refusal, and what a disable does to each alias; and the spend helpers: cost display, exact CSV dollars, $/MTok, price input, shares, coverage caption, grouping labels, chart buckets, the one-read class timeline; and the billing-key helpers: state copy, verify errors, the signed difference, the Pull now cooldown, the audit labels).`,
 )

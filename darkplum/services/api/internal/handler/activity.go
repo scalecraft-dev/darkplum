@@ -261,7 +261,7 @@ func validDenialCodeFilter(v string) bool {
 	switch v {
 	case "", "any", "model_not_found", "model_not_enabled", "model_residency_violation",
 		"model_not_allowed", "invalid_request", "policy_unavailable", "request_canceled",
-		"model_requires_data_retention":
+		"model_requires_data_retention", "route_target_unavailable", "model_class_downgraded":
 		return true
 	default:
 		return false
@@ -272,7 +272,7 @@ func validDenialCodeFilter(v string) bool {
 func appendDenialCodeFilter(c *gin.Context, where string, args []any, argN int) (string, []any, int, error) {
 	v := c.Query("denial_code")
 	if !validDenialCodeFilter(v) {
-		return where, args, argN, fmt.Errorf("denial_code must be one of any, model_not_found, model_not_enabled, model_residency_violation, model_not_allowed, invalid_request, policy_unavailable, request_canceled, model_requires_data_retention")
+		return where, args, argN, fmt.Errorf("denial_code must be one of any, model_not_found, model_not_enabled, model_residency_violation, model_not_allowed, invalid_request, policy_unavailable, request_canceled, model_requires_data_retention, route_target_unavailable, model_class_downgraded")
 	}
 	switch v {
 	case "":

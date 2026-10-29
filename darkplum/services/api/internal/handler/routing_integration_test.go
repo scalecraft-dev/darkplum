@@ -1110,3 +1110,72 @@ func mustJSON(t *testing.T, v any) []byte {
 	}
 	return b
 }
+
+// A static alias has no routes to fall back between: a body that carries
+// on_route_unavailable is rejected rather than silently dropped.
+func TestPutAlias_Static_RejectsOnRouteUnavailable(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	userID := newTestUser(t, ctx, pool)
+	insertModel(t, ctx, pool, "llama3", backendClassSelfHosted, true)
+	h := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
+	r := newRoutingTestRouter(h, userID)
+
+	resp := doJSON(t, r, http.MethodPut, "/api/v1/model-aliases/default", map[string]string{
+		"target_model_id": "llama3", "on_route_unavailable": "refuse",
+	})
+	if resp.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body = %s", resp.Code, resp.Body.String())
+	}
+	if msg := decodeErrorBody(t, resp); !strings.Contains(msg, "on_route_unavailable") || !strings.Contains(msg, "routed") {
+		t.Errorf("message %q must name the field and say it is for routed aliases", msg)
+	}
+	var n int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM model_aliases`).Scan(&n); err != nil || n != 0 {
+		t.Errorf("a rejected PUT must write nothing: n=%d err=%v", n, err)
+	}
+}
+
+// Widening egress must be visible in the audit trail: the updated event
+// records both the previous and the new value.
+func TestPutAlias_Routed_AuditRecordsPreviousAndNewOnRouteUnavailable(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	userID := newTestUser(t, ctx, pool)
+	insertModel(t, ctx, pool, "llama3", backendClassSelfHosted, true)
+	insertModel(t, ctx, pool, "llama3-code", backendClassSelfHosted, true)
+	h := NewRoutingHandler(pool, activity.NewRecorder(pool), "http://unused.invalid", "unused")
+	r := newRoutingTestRouter(h, userID)
+
+	body := routedBody("general", [2]string{"general", "llama3"}, [2]string{"code", "llama3-code"})
+	if resp := doJSON(t, r, http.MethodPut, "/api/v1/model-aliases/smart", body); resp.Code != http.StatusOK {
+		t.Fatalf("create: %d %s", resp.Code, resp.Body.String())
+	}
+	body["on_route_unavailable"] = "fallback_any_permitted"
+	if resp := doJSON(t, r, http.MethodPut, "/api/v1/model-aliases/smart", body); resp.Code != http.StatusOK {
+		t.Fatalf("update: %d %s", resp.Code, resp.Body.String())
+	}
+	var raw []byte
+	if err := pool.QueryRow(ctx,
+		`SELECT detail FROM activity_events WHERE event_type = $1`, string(activity.ModelAliasUpdated),
+	).Scan(&raw); err != nil {
+		t.Fatalf("fetch updated event: %v", err)
+	}
+	var detail map[string]any
+	if err := json.Unmarshal(raw, &detail); err != nil {
+		t.Fatal(err)
+	}
+	if detail["previous_on_route_unavailable"] != "fallback_same_or_stricter" || detail["on_route_unavailable"] != "fallback_any_permitted" {
+		t.Errorf("detail = %+v, want previous=fallback_same_or_stricter new=fallback_any_permitted", detail)
+	}
+	// The creating event has no previous value.
+	if err := pool.QueryRow(ctx,
+		`SELECT detail FROM activity_events WHERE event_type = $1`, string(activity.ModelAliasCreated),
+	).Scan(&raw); err != nil {
+		t.Fatalf("fetch created event: %v", err)
+	}
+	_ = json.Unmarshal(raw, &detail)
+	if detail["previous_on_route_unavailable"] != "" {
+		t.Errorf("created event previous = %v, want empty", detail["previous_on_route_unavailable"])
+	}
+}
