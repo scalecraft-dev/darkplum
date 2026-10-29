@@ -55,6 +55,12 @@ export const EVENT_LABELS: Record<string, { label: string; variant: EventVariant
   'routing_policy.org_changed':       { label: 'Org Policy Changed',       variant: 'warning' },
   'settings.system_prompt_changed':   { label: 'System Prompt Changed',    variant: 'warning' },
   'routing_policy.principal_changed': { label: 'Principal Policy Changed', variant: 'warning' },
+  // Request parameters (GitHub #3). The switch moves every key at once, so it
+  // is amber like the other org-wide changes. A drop is written by the
+  // gateway once per key (or webchat user) and parameter, never per request:
+  // a notice, not an alarm, so it is info.
+  'routing_policy.params_mode_changed': { label: 'Parameter Mode Changed', variant: 'warning' },
+  'inference.param_dropped':            { label: 'Parameter Dropped',      variant: 'info'    },
 
   // Vendor keys. The three that touch the credential are amber, like the API
   // key events above and for the same reason: a reviewer scanning this log for
@@ -109,6 +115,21 @@ const DETAIL_VALUE_LABELS: Record<string, Record<string, string>> = {
     anthropic: 'Anthropic',
     openai: 'OpenAI',
   },
+  // routing_policy.params_mode_changed carries {previous, new}; these two
+  // keys appear on no other event.
+  previous: {
+    lenient: 'drop and report',
+    strict: 'refuse',
+  },
+  new: {
+    lenient: 'drop and report',
+    strict: 'refuse',
+  },
+  // inference.param_dropped's action.
+  action: {
+    dropped: 'dropped',
+    raised: 'raised',
+  },
   filter_source: {
     db: 'Darkplum',
     env: 'the command line',
@@ -127,6 +148,12 @@ const DETAIL_KEY_LABELS: Record<string, string> = {
   allowed_models_before: 'allowed before',
   allowed_models_after: 'allowed after',
   default_model: 'default',
+  // inference.param_dropped. `param` is a parameter NAME (an unknown key's
+  // name is caller-chosen); the value is never recorded.
+  param: 'parameter',
+  backend: 'backend',
+  previous: 'was',
+  new: 'now',
   principal_type: 'principal',
   affected_principals: 'principals affected',
 
@@ -190,10 +217,29 @@ export function formatDetailValue(value: unknown): string {
   return String(value)
 }
 
+/**
+ * Detail keys pinned to the front or the back of the rendered string. The
+ * stored order is not the recorded order (JSONB sorts keys by length), and the
+ * table cell is truncated, so what identifies a row has to come first and
+ * fixed explanatory text last. Every other key keeps its stored order.
+ */
+const DETAIL_KEYS_FIRST = ['param']
+const DETAIL_KEYS_LAST = ['note', 'visible']
+
+function detailKeyRank(k: string): number {
+  if (DETAIL_KEYS_FIRST.includes(k)) return -1
+  if (DETAIL_KEYS_LAST.includes(k)) return 1
+  return 0
+}
+
 /** "alias: fast, target: llama-3.1-8b" — or an em dash when there is nothing. */
 export function formatEventDetail(detail: Record<string, unknown> | null): string {
   if (!detail) return '—'
-  const parts = Object.entries(detail).map(([k, v]) => {
+  const entries = Object.entries(detail)
+    .map((e, i) => ({ e, i }))
+    .sort((a, b) => detailKeyRank(a.e[0]) - detailKeyRank(b.e[0]) || a.i - b.i)
+    .map(({ e }) => e)
+  const parts = entries.map(([k, v]) => {
     const key = DETAIL_KEY_LABELS[k] ?? k.replace(/_/g, ' ')
     const raw = formatDetailValue(v)
     const value = DETAIL_VALUE_LABELS[k]?.[raw] ?? raw

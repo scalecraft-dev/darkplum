@@ -161,8 +161,10 @@ If the Secret is absent, unreadable, or the key is shorter than 16 characters,
 the gateway starts normally and the field is left off OpenAI, Anthropic and Bedrock
 requests (never sent raw). The gateway logs one WARNING
 (`userid: user-hmac secret unavailable ...`) until the secret is usable again.
-The omission is not yet recorded per request; the dropped-parameter record is
-part of the next phase of GitHub #3.
+Each omission is recorded like any other dropped parameter: `user` appears in the
+`X-Darkplum-Dropped-Params` response header, in the request's `dropped_params`
+in Admin > Activity, and in the first-time `inference.param_dropped` audit event.
+In strict mode such a request is refused with 400 instead.
 
 **Rotating.** Rotating changes every pseudonym a vendor has seen, so vendor-side
 per-user history stops lining up across the cut. Do it only on suspected

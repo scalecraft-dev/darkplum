@@ -135,6 +135,17 @@ import {
 } from '../src/lib/spend.ts'
 import { EVENT_LABELS } from '../src/lib/activityEvents.ts'
 import {
+  DROPPED_NAME_MAX,
+  PARAMS_MODE_NOTE,
+  PARAMS_MODE_OPTIONS,
+  PARAMS_MODE_STRICT_CONFIRM,
+  droppedParamsBadge,
+  droppedParamsTitle,
+  paramsModeChip,
+  paramsModeOf,
+} from '../src/lib/chatParams.ts'
+import { eventLabel, eventVariant } from '../src/lib/activityEvents.ts'
+import {
   BILLING_KEY_NAME,
   PULL_COOLDOWN_MS,
   RECONCILIATION_DELTA_NOTE,
@@ -1799,6 +1810,109 @@ check(
     ['installed', 'rotated', 'removed'].every((k) => EVENT_LABELS[`provider.billing_key_${k}`]?.variant === 'warning'),
     true,
   )
+
+  // Request parameters (GitHub #3): the audit labels, the usage-log badge,
+  // and the org switch's copy.
+  check('event param dropped label', eventLabel('inference.param_dropped'), 'Parameter Dropped')
+  check('event param dropped is a notice', eventVariant('inference.param_dropped'), 'info')
+  check('event params mode label', eventLabel('routing_policy.params_mode_changed'), 'Parameter Mode Changed')
+  check('event params mode is amber', eventVariant('routing_policy.params_mode_changed'), 'warning')
+  check(
+    'params mode detail in words',
+    formatEventDetail({ previous: 'lenient', new: 'strict' }),
+    'was: drop and report, now: refuse',
+  )
+  check(
+    'param dropped detail names the parameter first, boilerplate last',
+    formatEventDetail({ note: 'n', action: 'dropped', model: 'm', param: 'seed', backend: 'anthropic', visible: 'v' }),
+    'parameter: seed, action: dropped, model: m, backend: anthropic, note: n, visible: v',
+  )
+  check(
+    'detail keys without a pin keep their stored order',
+    formatEventDetail({ alias: 'fast', target_model_id: 'llama' }),
+    'alias: fast, target: llama',
+  )
+
+  check('dropped badge: null', droppedParamsBadge(null), null)
+  check('dropped badge: absent', droppedParamsBadge(undefined), null)
+  check('dropped badge: empty', droppedParamsBadge([]), null)
+  check('dropped badge: one', droppedParamsBadge(['seed']), 'Dropped · seed')
+  check('dropped badge: two', droppedParamsBadge(['seed', 'logprobs']), 'Dropped · seed, logprobs')
+  check(
+    'dropped badge: four',
+    droppedParamsBadge(['seed', 'logprobs', 'top_k', 'frequency_penalty']),
+    'Dropped · seed, logprobs +2',
+  )
+  check(
+    'dropped badge: drops before adjustments',
+    droppedParamsBadge(['max_tokens=raised', 'temperature']),
+    'Dropped · temperature, raised max_tokens',
+  )
+  check('dropped badge: adjustment only', droppedParamsBadge(['max_tokens=raised']), 'Adjusted · raised max_tokens')
+  check(
+    'dropped badge: unknown overflow counts N',
+    droppedParamsBadge(['a', 'b', 'c', 'unknown_keys=more_7']),
+    'Dropped · a, b +8',
+  )
+  check('dropped badge: only overflow', droppedParamsBadge(['unknown_keys=more_1']), 'Dropped · 1 unknown key')
+  check(
+    'dropped badge: caller-chosen name is capped',
+    (droppedParamsBadge(['x'.repeat(200)]) ?? '').length,
+    'Dropped · '.length + DROPPED_NAME_MAX,
+  )
+  check(
+    'dropped title: every entry, raised worded as a change',
+    droppedParamsTitle(['seed', 'logprobs', 'top_k', 'max_tokens=raised', 'unknown_keys=more_3']),
+    'Not sent to the model: seed, logprobs, top_k, 3 more unknown keys. Changed by the gateway: raised max_tokens. The request was answered without them, so the output may differ from what the caller asked for.',
+  )
+  check(
+    'dropped title: adjustment only',
+    droppedParamsTitle(['max_tokens=raised']),
+    'Changed by the gateway: raised max_tokens. The request was answered with that change.',
+  )
+  check('dropped title: none', droppedParamsTitle([]), null)
+  // Only known actions are adjustments; any other "=" is part of a name.
+  check('parse: max_tokens=raised is an adjustment', droppedParamsBadge(['max_tokens=raised']), 'Adjusted · raised max_tokens')
+  check('parse: foo=bar is a dropped name', droppedParamsBadge(['foo=bar']), 'Dropped · foo=bar')
+  check(
+    'parse: foo=bar title is not reworded as an action',
+    droppedParamsTitle(['foo=bar'])?.startsWith('Not sent to the model: foo=bar.'),
+    true,
+  )
+  check('parse: unknown_keys=more_3 is an overflow of 3', droppedParamsBadge(['unknown_keys=more_3']), 'Dropped · 3 unknown keys')
+  check('parse: unknown_keys=more_x is a dropped name', droppedParamsBadge(['unknown_keys=more_x']), 'Dropped · unknown_keys=more_x')
+  check(
+    'dropped title: nested names survive',
+    droppedParamsTitle(['stream_options.include_obfuscation'])?.startsWith(
+      'Not sent to the model: stream_options.include_obfuscation.',
+    ),
+    true,
+  )
+
+  check('params mode: null is lenient', paramsModeOf(null), 'lenient')
+  check('params mode: unknown is lenient', paramsModeOf('bogus'), 'lenient')
+  check('params mode: strict', paramsModeOf('strict'), 'strict')
+  check('params mode options: lenient first', PARAMS_MODE_OPTIONS.map((o) => o.value).join(','), 'lenient,strict')
+  check('params mode lenient label', PARAMS_MODE_OPTIONS[0].label, "Drop and report parameters a model can't use")
+  check('params mode strict label', PARAMS_MODE_OPTIONS[1].label, 'Refuse requests that include them')
+  check(
+    'lenient consequence says dropping changes outputs',
+    ['seed', 'penalty', 'changes the output'].every((w) => PARAMS_MODE_OPTIONS[0].consequence.includes(w)),
+    true,
+  )
+  check(
+    'strict consequence says 400 for every key',
+    ['400', 'Every key'].every((w) => PARAMS_MODE_OPTIONS[1].consequence.includes(w)),
+    true,
+  )
+  check(
+    'params note: always-refused and rollout',
+    ['always refused', 'gateways running this release'].every((w) => PARAMS_MODE_NOTE.includes(w)),
+    true,
+  )
+  check('strict confirm names the blast radius', PARAMS_MODE_STRICT_CONFIRM.description.includes('every API key'), true)
+  check('params chip lenient', paramsModeChip('lenient'), 'Parameters: dropped and reported')
+  check('params chip strict', paramsModeChip('strict'), 'Parameters: refused')
 }
 
 // --- report ------------------------------------------------------------------
@@ -1813,5 +1927,5 @@ if (failures.length > 0) {
 }
 
 console.log(
-  `Residency truth table holds (${table.cells.length} cells from ${RESIDENCY_TRUTH_TABLE_PATH} + ladder order + restricted rule + class rank, model fallback, empty-state claim, vendor rate-limit wait, who a vendor failure names, and the vendor-key helpers: glob matching, filter serialisation over every subset of a catalogue, the checklist's headings, what a Replace opens on, the key entry line, the installing and removing windows, the transport gate, which of the two transport faults each refusal names, the admitted diff, the Bedrock data-retention opt-in copy, and the routed-alias on_route_unavailable rule: reason text, the setting x class outcome matrix, route hints, the classification-failure warning, the route_target_unavailable refusal, and what a disable does to each alias; and the spend helpers: cost display, exact CSV dollars, $/MTok, price input, shares, coverage caption, grouping labels, chart buckets, the one-read class timeline; and the billing-key helpers: state copy, verify errors, the signed difference, the Pull now cooldown, the audit labels).`,
+  `Residency truth table holds (${table.cells.length} cells from ${RESIDENCY_TRUTH_TABLE_PATH} + ladder order + restricted rule + class rank, model fallback, empty-state claim, vendor rate-limit wait, who a vendor failure names, and the vendor-key helpers: glob matching, filter serialisation over every subset of a catalogue, the checklist's headings, what a Replace opens on, the key entry line, the installing and removing windows, the transport gate, which of the two transport faults each refusal names, the admitted diff, the Bedrock data-retention opt-in copy, and the routed-alias on_route_unavailable rule: reason text, the setting x class outcome matrix, route hints, the classification-failure warning, the route_target_unavailable refusal, and what a disable does to each alias; and the spend helpers: cost display, exact CSV dollars, $/MTok, price input, shares, coverage caption, grouping labels, chart buckets, the one-read class timeline; and the billing-key helpers: state copy, verify errors, the signed difference, the Pull now cooldown, the audit labels; and the request-parameter helpers: the dropped badge and its title, the params-mode copy and audit labels).`,
 )

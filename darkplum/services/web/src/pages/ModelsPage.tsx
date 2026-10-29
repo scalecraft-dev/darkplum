@@ -837,6 +837,9 @@ function ModelsPageBody() {
         residency: draft.residency,
         allowed_models: draft.allowed_models,
         default_model: draft.default_model,
+        // Only when the api reported it: an older api would ignore it, and the
+        // card would show a strict mode that is not stored.
+        ...(draft.params_mode !== null ? { params_mode: draft.params_mode } : {}),
       })
       setPolicy(updated)
       toast('Routing policy saved', 'success')

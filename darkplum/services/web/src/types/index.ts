@@ -461,6 +461,11 @@ export interface RoutingPolicy {
   /** Used when a request names no model, and preselected in the chat picker.
    *  May be an alias. Absent on older APIs — treat as null. */
   default_model?: string | null
+  /** The organisation-wide switch for request parameters a backend cannot
+   *  use: 'lenient' drops and records them, 'strict' refuses the request.
+   *  Absent on an api older than migration 029 — the card then hides the
+   *  control and never sends it. */
+  params_mode?: 'lenient' | 'strict'
   updated_at: string
   /** Returned by PUT: routed aliases whose routes will now be refused. One
    *  readable sentence each, written by the API. */
@@ -646,6 +651,12 @@ export interface InferenceEvent {
   stream: boolean
   ip_address: string | null
   created_at: string
+  /** Request parameters the gateway did not send as asked (migration 029):
+   *  bare names that were dropped ("seed"), name=action for an adjustment
+   *  ("max_tokens=raised"), and "unknown_keys=more_N" past the cap. Names
+   *  only. null when nothing was dropped; absent on an older api. Read
+   *  through lib/chatParams, never split here. */
+  dropped_params?: string[] | null
 }
 
 export interface UsageBucket {
