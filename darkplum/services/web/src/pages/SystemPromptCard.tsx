@@ -55,7 +55,7 @@ export function SystemPromptCard() {
       const s = await updateSystemPrompt(value)
       setSetting(s)
       setDraft(s.system_prompt)
-      toast(s.custom ? 'System prompt saved. Chat uses it from the next turn.' : 'System prompt reset to the built-in default.', 'success')
+      toast(s.custom ? 'System prompt saved. Webchat uses it from the next turn.' : 'System prompt reset to the built-in default.', 'success')
     } catch (err) {
       toast(err instanceof ApiError ? err.message : 'Could not save the system prompt', 'error')
     } finally {
@@ -69,8 +69,8 @@ export function SystemPromptCard() {
         <div>
           <h2 id="system-prompt-heading" className={styles.title}>System prompt</h2>
           <p id="system-prompt-scope" className={styles.subtitle}>
-            Sent as the system message on every chat request that doesn't include one: webchat, and
-            API-key calls without their own. <code>{'{{current_date}}'}</code> becomes today's date.
+            Sent as the system message on every webchat turn. API-key requests reach the model exactly
+            as sent, without it. <code>{'{{current_date}}'}</code> becomes today's date.
           </p>
         </div>
         <div className={styles.headMeta}>
