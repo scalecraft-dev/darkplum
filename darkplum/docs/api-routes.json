@@ -347,7 +347,7 @@
     "path": "/api/v1/settings/system-prompt",
     "auth": "admin",
     "surface": "ui",
-    "reason": "Set (string, <= 20000 chars) or reset (null/blank) the organisation's system prompt; chat turns use the new text within 5 s; recorded as settings.system_prompt_changed (length only, never the text)"
+    "reason": "Set (string, <= 20000 chars) or reset (null/blank) the organisation's system prompt; webchat turns use the new text within 5 s; recorded as settings.system_prompt_changed (length only, never the text)"
   },
   {
     "service": "api",

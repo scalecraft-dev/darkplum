@@ -2,16 +2,21 @@ package handler
 
 import (
 	"bufio"
+	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // TestProxyChat_GatewayErrorPassthrough verifies that a gateway error body
@@ -201,6 +206,9 @@ func TestProxyChat_StreamOutlivesServerWriteTimeout(t *testing.T) {
 // three-field struct and re-encode it, which silently dropped max_tokens,
 // temperature, top_p and stop on every request -- and hid tools from the
 // gateway, the one place that refuses it by name.
+//
+// This is the SESSION path (the org system prompt is prepended); Bearer
+// requests are forwarded untouched, see TestProxyChat_Bearer*.
 func TestProxyChat_RequestBodyReachesGatewayIntact(t *testing.T) {
 	var seen map[string]json.RawMessage
 	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -220,7 +228,7 @@ func TestProxyChat_RequestBodyReachesGatewayIntact(t *testing.T) {
 		`"tools":[{"type":"function","function":{"name":"f"}}],` +
 		`"messages":[{"role":"user","name":"ada","content":[{"type":"text","text":"hi"}]}]}`
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
-	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Content-Type", "application/json") // no Authorization: session path
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
@@ -323,5 +331,234 @@ func TestWithSystemPrompt_RejectsNonObjectAndEmptyMessages(t *testing.T) {
 	}
 	if _, _, err := withSystemPrompt([]byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`)); err != nil {
 		t.Fatalf("valid body refused: %v", err)
+	}
+}
+
+// bearerGateway is a gateway stub that records the raw body and Authorization
+// header of the last request it saw.
+type bearerGateway struct {
+	*httptest.Server
+	mu   sync.Mutex
+	body []byte
+	auth string
+}
+
+func newBearerGateway(t *testing.T, respond func(w http.ResponseWriter, r *http.Request)) *bearerGateway {
+	t.Helper()
+	g := &bearerGateway{}
+	g.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		g.mu.Lock()
+		g.body, g.auth = b, r.Header.Get("Authorization")
+		g.mu.Unlock()
+		respond(w, r)
+	}))
+	t.Cleanup(g.Close)
+	return g
+}
+
+func (g *bearerGateway) seen() ([]byte, string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.body, g.auth
+}
+
+func bearerRouter(gwURL string) *gin.Engine {
+	gin.SetMode(gin.TestMode)
+	h := NewChatHandler(gwURL, "dp_test_service_key_000000000000000000000", nil)
+	r := gin.New()
+	r.POST("/v1/chat/completions", h.ProxyChat)
+	return r
+}
+
+func okJSON(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{}`))
+}
+
+func postBearer(r http.Handler, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer dp_user_x")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	return rec
+}
+
+// TestProxyChat_BearerBodyForwardedByteForByte: an API-key caller's body
+// reaches the gateway exactly as sent. The body is deliberately non-canonical
+// in every way a re-marshal would normalise: unsorted keys, whitespace, HTML
+// characters, U+2028, a duplicate top-level key, 1.0, non-ASCII; it leads
+// with a "developer" message and has no system message.
+func TestProxyChat_BearerBodyForwardedByteForByte(t *testing.T) {
+	gw := newBearerGateway(t, okJSON)
+	r := bearerRouter(gw.URL)
+
+	body := "{ \"temperature\" : 1.0 ,\"model\":\"m\",  \"zeta\":1,\"model\":\"m2\",\n" +
+		"\"messages\" : [ {\"role\":\"developer\",\"content\":\"<tag> & x \u2028 \u00e9 caf\u00e9 \u2028\"} ,\n" +
+		"  {\"role\":\"user\",\"content\":\"h\u00e9llo <b>&</b>\"} ] }"
+	rec := postBearer(r, body)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", rec.Code, rec.Body.String())
+	}
+	got, auth := gw.seen()
+	if !bytes.Equal(got, []byte(body)) {
+		t.Fatalf("gateway body differs from what the caller sent\n got: %q\nwant: %q", got, body)
+	}
+	if bytes.Contains(got, []byte(`"role":"system"`)) {
+		t.Errorf("a system message was injected into an API-key request: %s", got)
+	}
+	if auth != "Bearer dp_user_x" {
+		t.Errorf("gateway Authorization = %q, want the caller's own key", auth)
+	}
+}
+
+// TestProxyChat_BearerSkipsOrgPrompt: the org prompt (built-in default here,
+// custom when a database is available) never reaches an API-key request, and
+// the same org prompt does reach a session request.
+func TestProxyChat_BearerSkipsOrgPrompt(t *testing.T) {
+	const custom = "ORG-PROMPT-SENTINEL-7f3a"
+	var pool *pgxpool.Pool
+	if os.Getenv("TEST_DATABASE_URL") != "" {
+		pool = setupTestDB(t)
+		if _, err := pool.Exec(context.Background(),
+			`INSERT INTO org_settings (key, value, updated_at) VALUES ($1, $2, now())
+			 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`, settingSystemPrompt, custom); err != nil {
+			t.Fatalf("seed custom prompt: %v", err)
+		}
+		systemPromptCache.invalidate()
+		t.Cleanup(systemPromptCache.invalidate)
+	}
+	gw := newBearerGateway(t, okJSON)
+	gin.SetMode(gin.TestMode)
+	h := NewChatHandler(gw.URL, "dp_test_service_key_000000000000000000000", pool)
+	r := gin.New()
+	r.POST("/v1/chat/completions", h.ProxyChat)
+
+	want := resolvedSystemPrompt(systemPrompt)
+	if pool != nil {
+		want = custom
+	}
+
+	body := `{"model":"m","messages":[{"role":"user","content":"hi"}]}`
+	if rec := postBearer(r, body); rec.Code != http.StatusOK {
+		t.Fatalf("bearer status = %d; %s", rec.Code, rec.Body.String())
+	}
+	got, _ := gw.seen()
+	if string(got) != body || strings.Contains(string(got), want) {
+		t.Fatalf("bearer body carries the org prompt or was changed: %s", got)
+	}
+
+	// Control: the same handler on the session path does prepend it.
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	got, _ = gw.seen()
+	if rec.Code != http.StatusOK || !strings.Contains(string(got), `"role":"system"`) || !strings.Contains(string(got), want[:20]) {
+		t.Fatalf("session path lost the org prompt (control failed): status %d body %s", rec.Code, got)
+	}
+}
+
+func sseChunks(w http.ResponseWriter, _ *http.Request) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+	f := w.(http.Flusher)
+	for i := 0; i < 3; i++ {
+		fmt.Fprintf(w, "data: chunk-%d\n\n", i)
+		f.Flush()
+		time.Sleep(30 * time.Millisecond)
+	}
+}
+
+// serveStreamed runs the router on a real server and returns the arrival time
+// of each chunk, to tell a per-chunk flush from a buffered response.
+func serveStreamed(t *testing.T, r http.Handler, body string, bearer bool) (arrivals []time.Duration, got string) {
+	t.Helper()
+	srv := httptest.NewServer(r)
+	defer srv.Close()
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/v1/chat/completions", strings.NewReader(body))
+	if bearer {
+		req.Header.Set("Authorization", "Bearer dp_user_x")
+	}
+	start := time.Now()
+	resp, err := srv.Client().Do(req)
+	if err != nil {
+		t.Fatalf("request: %v", err)
+	}
+	defer resp.Body.Close()
+	sc := bufio.NewScanner(resp.Body)
+	var sb strings.Builder
+	for sc.Scan() {
+		if line := sc.Text(); line != "" {
+			arrivals = append(arrivals, time.Since(start))
+			sb.WriteString(line + "\n")
+		}
+	}
+	return arrivals, sb.String()
+}
+
+func TestProxyChat_BearerStreamFlushesPerChunk(t *testing.T) {
+	gw := newBearerGateway(t, sseChunks)
+	body := `{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}`
+	arrivals, got := serveStreamed(t, bearerRouter(gw.URL), body, true)
+	if len(arrivals) != 3 || got != "data: chunk-0\ndata: chunk-1\ndata: chunk-2\n" {
+		t.Fatalf("chunks = %q (%d)", got, len(arrivals))
+	}
+	if spread := arrivals[2] - arrivals[0]; spread < 40*time.Millisecond {
+		t.Errorf("chunks arrived together (spread %v): the response was buffered, not flushed per chunk", spread)
+	}
+	if sent, _ := gw.seen(); string(sent) != body {
+		t.Errorf("body changed: %s", sent)
+	}
+}
+
+// An unparseable body yields stream=false from peekStream; a gateway answer
+// with Content-Type text/event-stream must still be flushed per chunk.
+func TestProxyChat_SSEContentTypeFlushesWithoutStreamFlag(t *testing.T) {
+	gw := newBearerGateway(t, sseChunks)
+	arrivals, got := serveStreamed(t, bearerRouter(gw.URL), `{not json`, true)
+	if len(arrivals) != 3 || got != "data: chunk-0\ndata: chunk-1\ndata: chunk-2\n" {
+		t.Fatalf("chunks = %q (%d)", got, len(arrivals))
+	}
+	if spread := arrivals[2] - arrivals[0]; spread < 40*time.Millisecond {
+		t.Errorf("chunks arrived together (spread %v): SSE response was buffered", spread)
+	}
+}
+
+// null and an empty messages array are the gateway's to refuse for an API-key
+// caller: the proxy forwards them unchanged and passes the 400 through.
+func TestProxyChat_BearerMalformedBodiesReachGateway(t *testing.T) {
+	const refusal = `{"error":{"message":"nope","type":"invalid_request_error","code":"invalid_messages"}}`
+	for _, body := range []string{`null`, `{"messages":[]}`} {
+		t.Run(body, func(t *testing.T) {
+			gw := newBearerGateway(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(refusal))
+			})
+			rec := postBearer(bearerRouter(gw.URL), body)
+			if got, _ := gw.seen(); string(got) != body {
+				t.Errorf("gateway saw %q, want %q", got, body)
+			}
+			if rec.Code != http.StatusBadRequest || rec.Body.String() != refusal {
+				t.Errorf("response = %d %s, want the gateway's 400 passed through", rec.Code, rec.Body.String())
+			}
+		})
+	}
+}
+
+func TestProxyChat_BearerWithLibraryHeaderRefused(t *testing.T) {
+	gw := newBearerGateway(t, okJSON)
+	r := bearerRouter(gw.URL)
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	req.Header.Set("Authorization", "Bearer dp_user_x")
+	req.Header.Set(libraryItemsHeader, "00000000-0000-0000-0000-000000000001")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "library_requires_session") {
+		t.Fatalf("response = %d %s, want 400 library_requires_session", rec.Code, rec.Body.String())
+	}
+	if got, _ := gw.seen(); got != nil {
+		t.Errorf("a refused request reached the gateway: %s", got)
 	}
 }

@@ -152,10 +152,31 @@ func (h *ChatHandler) effectiveSystemPrompt(ctx context.Context) string {
 	return resolvedSystemPrompt(systemPrompt)
 }
 
+// hasBearerAuth reports whether an Authorization header is a Bearer
+// credential (case-sensitive "Bearer ", as everywhere in this service).
+func hasBearerAuth(authorization string) bool {
+	return strings.HasPrefix(authorization, "Bearer ")
+}
+
+// peekStream reads only the "stream" flag, decoding exactly as the gateway
+// does; any error means false.
+func peekStream(body []byte) bool {
+	var req struct {
+		Stream bool `json:"stream"`
+	}
+	if err := json.NewDecoder(bytes.NewReader(body)).Decode(&req); err != nil {
+		return false
+	}
+	return req.Stream
+}
+
 // ProxyChat handles POST /v1/chat/completions.
 //
-// Injects the system prompt and service API key, then proxies to the gateway,
-// streaming the response back to the browser.
+// Session (webchat) requests get the organisation system prompt prepended and
+// the service API key, then are proxied to the gateway, streaming the
+// response back to the browser. The org prompt is session-only: Bearer
+// (API-key) requests are forwarded to the gateway byte for byte, with the
+// caller's own key, and the gateway alone validates and refuses them.
 //
 // Clears this response's write deadline (http.ResponseController,
 // SetWriteDeadline(zero) -- "no deadline") before writing anything: the
@@ -191,7 +212,7 @@ func (h *ChatHandler) ProxyChat(c *gin.Context) {
 
 	// Library attachments (chat_library.go). Resolved before the body is
 	// rewritten so a refusal costs nothing else.
-	isBearer := strings.HasPrefix(c.GetHeader("Authorization"), "Bearer ")
+	isBearer := hasBearerAuth(c.GetHeader("Authorization"))
 	itemIDs, refusal := parseLibraryHeader(c.GetHeader(libraryItemsHeader))
 	if refusal != nil {
 		refusal.write(c)
@@ -217,13 +238,30 @@ func (h *ChatHandler) ProxyChat(c *gin.Context) {
 		slog.InfoContext(c.Request.Context(), "library attachments", "request_id", c.GetString("request_id"), "user_id", c.GetString("user_id"), "items", itemIDs, "text_items", len(att.text), "tool_servers", len(att.tools), "resolve_ms", time.Since(resolveStart).Milliseconds())
 	}
 
-	modified, stream, err := withSystemPromptText(body, h.effectiveSystemPrompt(c.Request.Context()))
-	if err != nil {
-		slog.WarnContext(c.Request.Context(), "parse request body", "err", err)
-		c.JSON(http.StatusBadRequest, chatProxyError("invalid request body: expected a JSON object with a messages array", "invalid_request_error", "invalid_body"))
-		return
+	var modified []byte
+	var stream bool
+	if isBearer {
+		// API-key traffic is the caller's own conversation: the org system
+		// prompt is a webchat setting, so the body goes to the gateway byte
+		// for byte (no re-marshal, no prompt, no systemPromptCache read).
+		// The gateway validates it and owns every refusal.
+		modified = body
+		stream = peekStream(body)
+	} else {
+		// Session path. This re-marshals the body (key order, escaping and
+		// number formatting are not preserved) and prepends the org prompt
+		// unless the first message has role "system"; a leading "developer"
+		// message still gets the prompt (unchanged behaviour).
+		var err error
+		modified, stream, err = withSystemPromptText(body, h.effectiveSystemPrompt(c.Request.Context()))
+		if err != nil {
+			slog.WarnContext(c.Request.Context(), "parse request body", "err", err)
+			c.JSON(http.StatusBadRequest, chatProxyError("invalid request body: expected a JSON object with a messages array", "invalid_request_error", "invalid_body"))
+			return
+		}
 	}
 	if att != nil {
+		var err error
 		modified, err = withLibraryMessage(modified, composeLibraryText(att.text))
 		if err != nil {
 			c.JSON(http.StatusBadRequest, chatProxyError("invalid request body", "invalid_request_error", "invalid_body"))
@@ -274,7 +312,7 @@ func (h *ChatHandler) ProxyChat(c *gin.Context) {
 	c.Status(resp.StatusCode)
 	copyProxyHeaders(c, resp)
 
-	if flusher, ok := c.Writer.(http.Flusher); ok && stream {
+	if flusher, ok := c.Writer.(http.Flusher); ok && (stream || strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream")) {
 		buf := make([]byte, 4096)
 		for {
 			n, readErr := resp.Body.Read(buf)
@@ -306,7 +344,7 @@ func (h *ChatHandler) ProxyChat(c *gin.Context) {
 // can reach the gateway.
 func (h *ChatHandler) setProxyHeaders(c *gin.Context, proxyReq *http.Request) {
 	proxyReq.Header.Set("Content-Type", "application/json")
-	if clientAuth := c.GetHeader("Authorization"); strings.HasPrefix(clientAuth, "Bearer ") {
+	if clientAuth := c.GetHeader("Authorization"); hasBearerAuth(clientAuth) {
 		proxyReq.Header.Set("Authorization", clientAuth)
 	} else {
 		proxyReq.Header.Set("Authorization", "Bearer "+h.serviceKey)
