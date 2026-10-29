@@ -1,0 +1,53 @@
+# NVIDIA device plugin: advertises nvidia.com/gpu on the GPU node so the vLLM
+# pod can be scheduled. The EKS AL2023_x86_64_NVIDIA AMI ships the driver and
+# container toolkit but not this plugin; without it the node is Ready but has
+# no allocatable GPU and `make deploy` waits forever.
+#
+# Upstream deployments/static/nvidia-device-plugin.yml at v0.20.1 (Apache-2.0,
+# github.com/NVIDIA/k8s-device-plugin), with a nodeSelector so it runs only on
+# darkplum's GPU node group and the darkplum part-of label. Pinned by the multi-arch index digest
+# (docker buildx imagetools inspect <image>:<tag>); bump the tag and the digest
+# together. Not covered by any image allowlist or admission policy in this repo
+# (none exists); a customer running one must allow nvcr.io/nvidia/k8s-device-plugin.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: nvidia-device-plugin-daemonset
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: nvidia-device-plugin
+    app.kubernetes.io/part-of: darkplum
+spec:
+  selector:
+    matchLabels:
+      name: nvidia-device-plugin-ds
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        name: nvidia-device-plugin-ds
+    spec:
+      nodeSelector:
+        darkplum.ai/node-type: gpu-inference
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      priorityClassName: system-node-critical
+      containers:
+        - image: nvcr.io/nvidia/k8s-device-plugin:v0.20.1@sha256:27c1b2553a690ca3d29889dcd61df97525d46f58272c0be8dc63c2b18f120075
+          name: nvidia-device-plugin-ctr
+          env: []
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: kubelet-device-plugins-dir
+              mountPath: /var/lib/kubelet/device-plugins
+      volumes:
+        - name: kubelet-device-plugins-dir
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+            type: Directory

@@ -653,6 +653,28 @@ Verified so far against the mock model, a fake MCP server and the file-mount
 credential path. Live Anthropic, OpenAI and Bedrock tool turns, a real MCP
 server and the cluster Secret write path have not yet been exercised.
 
+## Upgrading existing AWS installs
+
+NetworkPolicy enforcement turns on with this release. Earlier releases set the
+vpc-cni add-on option in a form the add-on ignored, so the policies in
+`k8s/base/network-policies/` were stored but never enforced. Now they are, so:
+
+- the gateway may only reach DNS, HTTPS (not 169.254.0.0/16), the Pod Identity
+  agent, the vLLM backends (`:8000`), the semantic router (`:8080`) and the
+  database (VPC CIDR, `:5432`) - anything else, including other pods and
+  custom egress you added, is dropped;
+- the api accepts connections only from the web pod; use `kubectl port-forward`
+  (node-local, unaffected) for operator access;
+- vLLM Services become headless (`clusterIP: None`); `make deploy-k8s` and
+  `make deploy-model` recreate an old one (a brief gap while it is deleted);
+- Pod Identity role trust now also requires this cluster's ARN and account.
+
+Run `make deploy-infra` (enables enforcement, tightens role trust), then
+`make deploy-k8s` if you self-host models, then `make deploy-platform`.
+Do not run `deploy-platform` first: it would apply policies the cluster still
+does not enforce. The EKS control-plane log group is kept after `make destroy`
+(Kubernetes audit logs) and re-adopted by the next `make deploy-infra`.
+
 ## Troubleshooting
 
 **GPU node not ready**: Check node events — `kubectl describe node <gpu-node>`. Common cause: g5 capacity unavailable in the selected AZ. Try a different region.

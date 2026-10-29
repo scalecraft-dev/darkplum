@@ -77,6 +77,8 @@ spec:
         - protocol: TCP
           port: 8080
 
-    - ports:
-        - protocol: TCP
-          port: 5432
+    # No Postgres (:5432) rule here on purpose. A rule with no `to:` allows any
+    # destination, the internet included. The database is reached through:
+    #   - AWS: gateway-egress-database (the VPC CIDR; RDS has no pod to select),
+    #     applied by `make deploy-platform`.
+    #   - dev: the in-cluster postgres pod, via overlays/dev/patches/gateway-egress.yaml.

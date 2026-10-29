@@ -23,6 +23,12 @@ metadata:
     darkplum.ai/model-instance: MODEL_INSTANCE
 spec:
   replicas: 1
+  # One model per GPU: a rolling update would start the new pod before the old
+  # one frees the GPU, so it stays Pending forever. Recreate stops the old pod
+  # first (a short outage while the model reloads).
+  strategy:
+    type: Recreate
+    rollingUpdate: null
   selector:
     matchLabels:
       app.kubernetes.io/name: vllm-MODEL_INSTANCE
@@ -104,6 +110,13 @@ spec:
             # only for a trusted model that ships no safetensors.
             - --load-format
             - safetensors
+            # Never log prompts: vLLM logs every request's full prompt at INFO by default,
+            # which would put prompt text in container logs (and any log shipping).
+            # NOTE: --disable-log-requests is the vLLM 0.6.x spelling. Newer vLLM logs
+            # request prompts only when asked (--enable-log-requests) and REMOVES this
+            # flag, so it fails to start. When upgrading the image, drop this flag
+            # (and confirm prompts still are not logged).
+            - --disable-log-requests
           ports:
             - name: http
               containerPort: 8000
@@ -156,7 +169,11 @@ metadata:
     app.kubernetes.io/component: inference-backend
     darkplum.ai/model-instance: MODEL_INSTANCE
 spec:
-  type: ClusterIP
+  # Headless: the gateway resolves the pod IP and dials it directly. A ClusterIP
+  # would be matched by the VPC CNI's egress NetworkPolicy before kube-proxy
+  # rewrites it to the pod IP, so the gateway-egress pod selector would not allow
+  # it. clusterIP is immutable; the Makefile recreates a Service that still has one.
+  clusterIP: None
   selector:
     app.kubernetes.io/name: vllm-MODEL_INSTANCE
   ports:

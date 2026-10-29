@@ -1,0 +1,31 @@
+# Gateway egress to the database (Postgres :5432) on AWS.
+#
+# RDS is not a pod, so it cannot be selected; it sits in the VPC's private
+# subnets. Scope the rule to the VPC CIDR instead of "any destination on 5432"
+# (which would also allow the internet). The RDS security group is the Layer 1
+# control that decides which hosts in the VPC may actually connect.
+#
+# Not in kustomization.yaml: PLACEHOLDER_VPC_CIDR is substituted by
+# `make deploy-platform` from the `vpc_cidr` Terraform output. Dev uses the
+# in-cluster postgres pod instead (overlays/dev/patches/gateway-egress.yaml).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-egress-database
+  namespace: darkplum-system
+  labels:
+    app.kubernetes.io/name: darkplum-gateway
+    app.kubernetes.io/part-of: darkplum
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: darkplum-gateway
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: PLACEHOLDER_VPC_CIDR
+      ports:
+        - protocol: TCP
+          port: 5432

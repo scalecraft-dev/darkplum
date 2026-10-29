@@ -1,0 +1,33 @@
+# Gateway egress to the semantic router Service (:8080), AWS only.
+#
+# The router's Service comes from its Helm chart and is a normal ClusterIP. The
+# AWS VPC CNI network-policy agent matches egress BEFORE kube-proxy rewrites the
+# ClusterIP to a pod IP, so gateway-egress's pod selector (which renders to pod
+# IPs) never matches and the traffic is dropped. This allows the cluster's
+# service range on :8080 only. GKE Dataplane V2 evaluates after DNAT and does not
+# need it. The vLLM Services are headless (clusterIP: None), so the gateway dials
+# pod IPs directly and gateway-egress's selector already covers them.
+#
+# Not in kustomization.yaml: PLACEHOLDER_SERVICE_CIDR is substituted by
+# `make deploy-platform` from the cluster's kubernetesNetworkConfig.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: gateway-egress-services
+  namespace: darkplum-system
+  labels:
+    app.kubernetes.io/name: darkplum-gateway
+    app.kubernetes.io/part-of: darkplum
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: darkplum-gateway
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: PLACEHOLDER_SERVICE_CIDR
+      ports:
+        - protocol: TCP
+          port: 8080

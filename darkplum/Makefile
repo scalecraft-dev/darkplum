@@ -7,6 +7,9 @@ SHELL := /bin/bash
 CLOUD ?= aws
 TF_DIR := terraform/$(CLOUD)
 K8S_DIR := k8s
+# Platform the cluster's nodes run. Without it an Apple-silicon build machine
+# produces arm64 images and the x86 node groups fail with "exec format error".
+IMAGE_PLATFORM ?= linux/amd64
 NAMESPACE := darkplum-inference
 DEV_CLUSTER := darkplum-dev
 # Host port the local dev stack is published on. Override when 8080 is taken:
@@ -29,6 +32,16 @@ ifneq ($(filter $(PROD_TARGETS),$(MAKECMDGOALS)),)
 # found" warning to STDOUT (exit 0) before apply, which -raw would capture as the
 # value. -json yields "{}" so these stay empty and the _require-outputs guard fires.
 PROVIDER_REGION := $(shell cd $(TF_DIR) && terraform output -json 2>/dev/null | jq -r '.provider_region.value // empty')
+# The README has customers set aws_profile in terraform.tfvars. Terraform reads
+# it, but every aws/kubectl call here (ECR push, update-kubeconfig and the
+# kubeconfig's token exec, describe-cluster) would otherwise use the DEFAULT
+# credentials, i.e. possibly another account. Export the same profile, read
+# from tfvars (outputs don't exist yet on a first deploy). A profile already in
+# the environment wins.
+TFVARS_AWS_PROFILE := $(shell sed -nE 's/^[[:space:]]*aws_profile[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' $(TF_DIR)/terraform.tfvars 2>/dev/null | tail -1)
+ifneq ($(TFVARS_AWS_PROFILE),)
+export AWS_PROFILE ?= $(TFVARS_AWS_PROFILE)
+endif
 CONTAINER_REGISTRY := $(shell cd $(TF_DIR) && terraform output -json 2>/dev/null | jq -r '.container_registry.value // empty')
 INFERENCE_REGION := $(shell cd $(TF_DIR) && terraform output -json 2>/dev/null | jq -r '.inference_region.value // empty')
 BEDROCK_MODEL_FILTER := $(shell cd $(TF_DIR) && terraform output -json 2>/dev/null | jq -r '.bedrock_model_filter.value // empty')
@@ -65,6 +78,23 @@ _require-outputs:
 deploy-infra: check-prereqs ## Provision cloud infrastructure with Terraform (CLOUD=aws|gcp)
 	@echo "Initializing Terraform..."
 	@cd $(TF_DIR) && terraform init -input=false
+	@# The EKS control-plane log group outlives `make destroy` on purpose (see
+	@# destroy). On a reinstall Terraform would try to create it and fail with
+	@# ResourceAlreadyExistsException, so adopt it into state first. A no-op when
+	@# the group does not exist or is already managed.
+	@cd $(TF_DIR) && CLUSTER=$$(echo 'var.cluster_name' | terraform console -no-color 2>/dev/null | tr -d '"'); \
+	REGION=$$(echo 'var.aws_region' | terraform console -no-color 2>/dev/null | tr -d '"'); \
+	ADDR='module.eks.module.eks.aws_cloudwatch_log_group.this[0]'; \
+	if [ -n "$$CLUSTER" ] && [ -n "$$REGION" ]; then \
+		LG="/aws/eks/$$CLUSTER/cluster"; \
+		if terraform state list 2>/dev/null | grep -qxF "$$ADDR"; then \
+			echo "Log group $$LG already in Terraform state."; \
+		elif [ "$$(aws logs describe-log-groups --log-group-name-prefix "$$LG" --region "$$REGION" \
+				--query "length(logGroups[?logGroupName=='$$LG'])" --output text 2>/dev/null)" = "1" ]; then \
+			echo "Adopting existing log group $$LG (kept from a previous install) into Terraform state..."; \
+			terraform import -input=false "$$ADDR" "$$LG" || exit 1; \
+		fi; \
+	fi
 	@echo "Applying Terraform (this takes 15-20 minutes)..."
 	@cd $(TF_DIR) && terraform apply -auto-approve -input=false
 	@echo "Updating kubeconfig..."
@@ -87,9 +117,20 @@ deploy-k8s: ## Deploy Kubernetes workloads (self-hosted vLLM inference; skipped 
 		$(MAKE) --no-print-directory _deploy-vllm CLOUD=$(CLOUD); \
 	fi
 
+# Make a vLLM Service headless. clusterIP is immutable, so a Service from an
+# earlier release (with a ClusterIP) must be deleted and re-created; one that is
+# already headless is left alone, so this is idempotent. Usage: $(call HEADLESS_SVC,<name>)
+define HEADLESS_SVC
+CUR=$$(kubectl get svc $(1) -n $(NAMESPACE) -o jsonpath='{.spec.clusterIP}' 2>/dev/null); \
+if [ -n "$$CUR" ] && [ "$$CUR" != "None" ]; then \
+	echo "Recreating Service $(1) as headless (was ClusterIP $$CUR)..."; \
+	kubectl delete svc $(1) -n $(NAMESPACE) >/dev/null; \
+fi
+endef
+
 _deploy-vllm:
-	@echo "NOTE: NVIDIA device plugin is a cluster prerequisite."
-	@echo "Ensure it is installed on GPU nodes before proceeding."
+	@echo "Installing the NVIDIA device plugin (advertises nvidia.com/gpu on GPU nodes)..."
+	@kubectl apply -f $(K8S_DIR)/overlays/prod/resources/nvidia-device-plugin.yaml
 	@echo "Waiting for GPU node to be ready..."
 	@echo "(this may take 5-10 minutes for the node to register and GPU driver to initialize)"
 	@for i in $$(seq 1 60); do \
@@ -100,7 +141,8 @@ _deploy-vllm:
 			break; \
 		fi; \
 		if [ $$i -eq 60 ]; then \
-			echo "ERROR: Timed out waiting for GPU node. Check: kubectl get nodes -l darkplum.ai/node-type=gpu-inference"; \
+			echo "ERROR: Timed out waiting for an allocatable GPU. Check the node joined: kubectl get nodes -l darkplum.ai/node-type=gpu-inference"; \
+			echo "and the device plugin runs on it: kubectl get pods -n kube-system -l name=nvidia-device-plugin-ds -o wide"; \
 			exit 1; \
 		fi; \
 		echo "  Waiting for GPU node... ($$i/60)"; \
@@ -116,6 +158,7 @@ _deploy-vllm:
 			-e "s|PLACEHOLDER_MODEL_REVISION|$$MODEL_REV|g" \
 			-e "s|PLACEHOLDER_SERVED_MODEL_NAME|$$SERVED_NAME|g" \
 			$(K8S_DIR)/overlays/prod/resources/vllm-deployment.yaml | kubectl apply -f -
+	@$(call HEADLESS_SVC,vllm-inference)
 	@kubectl apply -f $(K8S_DIR)/overlays/prod/resources/vllm-service.yaml
 	@kubectl apply -f $(K8S_DIR)/base/network-policies/vllm-ingress.yaml
 	@kubectl apply -f $(K8S_DIR)/base/network-policies/inference-egress.yaml
@@ -155,12 +198,12 @@ cli: ## Build the darkplum operator CLI (bin/darkplum)
 	@echo "Built bin/darkplum — operator commands: doctor / admin / sso / status"
 
 build-images: _require-outputs ## Build Docker images for gateway, api, and web
-	@echo "Building gateway image..."
-	@docker build -t darkplum-gateway:latest -t $(CONTAINER_REGISTRY)/darkplum-gateway:latest services/gateway/
-	@echo "Building api image..."
-	@docker build -t darkplum-api:latest -t $(CONTAINER_REGISTRY)/darkplum-api:latest services/api/
-	@echo "Building web image..."
-	@docker build -t darkplum-web:latest -t $(CONTAINER_REGISTRY)/darkplum-web:latest services/web/
+	@echo "Building gateway image ($(IMAGE_PLATFORM))..."
+	@docker build --platform $(IMAGE_PLATFORM) -t darkplum-gateway:latest -t $(CONTAINER_REGISTRY)/darkplum-gateway:latest services/gateway/
+	@echo "Building api image ($(IMAGE_PLATFORM))..."
+	@docker build --platform $(IMAGE_PLATFORM) -t darkplum-api:latest -t $(CONTAINER_REGISTRY)/darkplum-api:latest services/api/
+	@echo "Building web image ($(IMAGE_PLATFORM))..."
+	@docker build --platform $(IMAGE_PLATFORM) -t darkplum-web:latest -t $(CONTAINER_REGISTRY)/darkplum-web:latest services/web/
 	@echo "Images built and tagged for ECR."
 
 push-images: _require-outputs ## Push Docker images to the container registry (AWS ECR today)
@@ -285,6 +328,14 @@ deploy-platform: build-images push-images ## Build, push, and deploy gateway + w
 	@echo "Applying network policies..."
 	@kubectl apply -f $(K8S_DIR)/base/network-policies/vllm-ingress.yaml
 	@kubectl apply -f $(K8S_DIR)/base/network-policies/gateway-egress.yaml
+	@SVC_CIDR=$$(aws eks describe-cluster --name "$$(cd $(TF_DIR) && terraform output -raw cluster_name)" --region $(PROVIDER_REGION) \
+		--query cluster.kubernetesNetworkConfig.serviceIpv4Cidr --output text); \
+	[[ "$$SVC_CIDR" =~ ^[0-9.]+/[0-9]+$$ ]] || { echo "ERROR: could not read the cluster's service CIDR (got '$$SVC_CIDR')."; exit 1; }; \
+	sed "s|PLACEHOLDER_SERVICE_CIDR|$$SVC_CIDR|" $(K8S_DIR)/base/network-policies/gateway-egress-services.yaml | kubectl apply -f -
+	@VPC_CIDR=$$(cd $(TF_DIR) && terraform output -json | jq -r '.vpc_cidr.value // empty'); \
+	[[ "$$VPC_CIDR" =~ ^[0-9.]+/[0-9]+$$ ]] || { echo "ERROR: no vpc_cidr Terraform output (got '$$VPC_CIDR'). Run 'make deploy-infra' first."; exit 1; }; \
+	sed "s|PLACEHOLDER_VPC_CIDR|$$VPC_CIDR|" $(K8S_DIR)/base/network-policies/gateway-egress-database.yaml | kubectl apply -f -
+	@kubectl apply -f $(K8S_DIR)/base/network-policies/api-ingress.yaml
 	@kubectl apply -f $(K8S_DIR)/base/network-policies/gateway-ingress.yaml
 	@echo ""
 	@echo "Platform components deployed to darkplum-system."
@@ -423,6 +474,8 @@ destroy: ## Tear down all resources
 	@kubectl delete -f $(K8S_DIR)/base/web/deployment.yaml --ignore-not-found 2>/dev/null || true
 	@kubectl delete -f $(K8S_DIR)/base/network-policies/vllm-ingress.yaml --ignore-not-found 2>/dev/null || true
 	@kubectl delete -f $(K8S_DIR)/base/network-policies/gateway-egress.yaml --ignore-not-found 2>/dev/null || true
+	@kubectl delete networkpolicy gateway-egress-services gateway-egress-database -n darkplum-system --ignore-not-found 2>/dev/null || true
+	@kubectl delete -f $(K8S_DIR)/base/network-policies/api-ingress.yaml --ignore-not-found 2>/dev/null || true
 	@kubectl delete -f $(K8S_DIR)/base/network-policies/gateway-ingress.yaml --ignore-not-found 2>/dev/null || true
 	@kubectl delete -f $(K8S_DIR)/base/network-policies/inference-egress.yaml --ignore-not-found 2>/dev/null || true
 	@helm uninstall semantic-router -n darkplum-system >/dev/null 2>&1 || true
@@ -451,9 +504,15 @@ destroy: ## Tear down all resources
 		terraform apply -auto-approve -input=false -var db_deletion_protection=false -target=module.rds.aws_db_instance.this || exit 1; \
 		echo "$$snapshot" > .destroy-snapshot; \
 	fi
+	@# Keep the control-plane log group (Kubernetes API audit logs) past teardown:
+	@# forget it in state so terraform destroy does not delete it.
+	@cd $(TF_DIR) && terraform state rm 'module.eks.module.eks.aws_cloudwatch_log_group.this[0]' >/dev/null 2>&1 || true
 	@echo "Destroying infrastructure (this takes 10-15 minutes)..."
 	@cd $(TF_DIR) && terraform destroy -auto-approve -input=false
 	@echo "All resources destroyed."
+	@echo "NOTE: the EKS control-plane CloudWatch log group (/aws/eks/<cluster_name>/cluster) is kept deliberately: it holds"
+	@echo "      Kubernetes API audit logs, which customers retain for compliance. It is not removed by terraform destroy"
+	@echo "      (the next 'make deploy-infra' re-adopts it). Delete it yourself if you are sure: aws logs delete-log-group --log-group-name /aws/eks/<cluster_name>/cluster"
 	@cd $(TF_DIR) && if [ -s .destroy-snapshot ]; then \
 		echo "The database was kept as snapshot $$(cat .destroy-snapshot). It costs storage until you delete it: aws rds delete-db-snapshot --db-snapshot-identifier $$(cat .destroy-snapshot)"; \
 	fi; rm -f .destroy-snapshot
@@ -595,6 +654,7 @@ deploy-model: ## Add a self-hosted model: make deploy-model NAME=qwen MODEL=Qwen
 	fi; \
 	[ "$(REVISION)" != "main" ] || echo "NOTE: REVISION=main is a moving target. Pin a commit SHA (REVISION=<sha>) so weights cannot change under you."; \
 	echo "Deploying vllm-$(NAME): $(MODEL)@$(REVISION) served as '$$SERVED'..."; \
+	$(call HEADLESS_SVC,vllm-$(NAME)); \
 	sed -e "s|MODEL_INSTANCE|$(NAME)|g" \
 		-e "s|PLACEHOLDER_MODEL_NAME|$(MODEL)|g" \
 		-e "s|PLACEHOLDER_MODEL_REVISION|$(REVISION)|g" \
