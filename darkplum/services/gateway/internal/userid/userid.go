@@ -121,30 +121,57 @@ func (p *Pseudonymizer) material() (secret, id string, err error) {
 	return p.secret, p.id, p.err
 }
 
-// readPair reads key and id twice and accepts them only when both reads agree.
-// kubelet swaps the whole Secret atomically, but the two files are opened
-// separately: a swap between the opens would pair the new key with the old id
-// (or the reverse). Two identical consecutive reads cannot straddle a swap, so
-// a mismatch is retried.
+// readPair reads key and id as one version. kubelet writes each version of a
+// Secret into its own timestamped directory and swaps the dir/..data symlink to
+// it atomically; the files inside a version directory never change. So both
+// files are read from the directory ..data names, and the read is kept only if
+// ..data still names it afterwards (a version directory can be deleted after a
+// swap). Comparing two reads of dir/<file> instead is not enough: an A→B→A
+// flip can produce the same mismatched pair twice.
+//
+// A mount without ..data (plain files, e.g. a hand-made dev directory) has no
+// versions to pin; it is read twice and accepted when both reads agree.
 func (p *Pseudonymizer) readPair() (secret, id string, err error) {
+	dataLink := filepath.Join(p.dir, "..data")
 	for range 5 {
-		k1, i1, e1 := p.readOnce()
-		if e1 != nil {
-			return "", "", e1
+		target, lerr := os.Readlink(dataLink)
+		if lerr != nil {
+			if !errors.Is(lerr, os.ErrNotExist) {
+				return "", "", fmt.Errorf("reading ..data: %w", lerr)
+			}
+			k1, i1, e1 := p.readOnce(p.dir)
+			if e1 != nil {
+				return "", "", e1
+			}
+			k2, i2, e2 := p.readOnce(p.dir)
+			if e2 != nil {
+				return "", "", e2
+			}
+			if k1 == k2 && i1 == i2 {
+				return k1, i1, nil
+			}
+			continue
 		}
-		k2, i2, e2 := p.readOnce()
-		if e2 != nil {
-			return "", "", e2
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(p.dir, target)
 		}
-		if k1 == k2 && i1 == i2 {
-			return k1, i1, nil
+		k, i, e := p.readOnce(target)
+		after, aerr := os.Readlink(dataLink)
+		if aerr == nil && !filepath.IsAbs(after) {
+			after = filepath.Join(p.dir, after)
+		}
+		if aerr == nil && after == target {
+			if e != nil {
+				return "", "", e
+			}
+			return k, i, nil
 		}
 	}
 	return "", "", errUnstable
 }
 
-func (p *Pseudonymizer) readOnce() (secret, id string, err error) {
-	raw, err := os.ReadFile(filepath.Join(p.dir, KeyFile))
+func (p *Pseudonymizer) readOnce(dir string) (secret, id string, err error) {
+	raw, err := os.ReadFile(filepath.Join(dir, KeyFile))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return "", "", errNotMounted
@@ -155,7 +182,7 @@ func (p *Pseudonymizer) readOnce() (secret, id string, err error) {
 	if len(secret) < minKeyLen {
 		return "", "", errKeyShort
 	}
-	idRaw, err := os.ReadFile(filepath.Join(p.dir, KeyIDFile))
+	idRaw, err := os.ReadFile(filepath.Join(dir, KeyIDFile))
 	switch {
 	case errors.Is(err, os.ErrNotExist):
 		id = DefaultKeyID
