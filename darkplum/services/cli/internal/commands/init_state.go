@@ -1,0 +1,254 @@
+package commands
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+)
+
+// statePlan is where an S3 install keeps its Terraform state, decided before
+// anything is written.
+type statePlan struct {
+	bucket, key string
+	kept        bool // bucket and key come from an existing backend.tf
+	st          backendState
+
+	// Terraform's saved backend settings (.terraform/terraform.tfstate) naming
+	// another bucket or key than the one init writes. Left alone, the next
+	// `terraform init` stops with "Backend configuration changed".
+	cache          *backendCache
+	staleEmpty     bool // that earlier state is empty or gone: set the settings aside
+	staleResources int  // that earlier state still has resources: never moved by init
+}
+
+// backendCache is the backend Terraform last initialised this directory with.
+type backendCache struct {
+	Type, Bucket, Key, Region string
+}
+
+func (b *backendCache) url() string { return "s3://" + b.Bucket + "/" + b.Key }
+
+func backendCachePath(dir string) string {
+	return filepath.Join(dir, ".terraform", "terraform.tfstate")
+}
+
+// readBackendCache returns nil (and no error) when the directory was never
+// initialised or was initialised without a backend.
+func readBackendCache(dir string) (*backendCache, error) {
+	b, err := os.ReadFile(backendCachePath(dir))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var f struct {
+		Backend *struct {
+			Type   string `json:"type"`
+			Config struct {
+				Bucket string `json:"bucket"`
+				Key    string `json:"key"`
+				Region string `json:"region"`
+			} `json:"config"`
+		} `json:"backend"`
+	}
+	if err := json.Unmarshal(b, &f); err != nil {
+		return nil, fmt.Errorf("not valid JSON: %w", err)
+	}
+	if f.Backend == nil || f.Backend.Type == "" {
+		return nil, nil
+	}
+	return &backendCache{Type: f.Backend.Type, Bucket: f.Backend.Config.Bucket, Key: f.Backend.Config.Key, Region: f.Backend.Config.Region}, nil
+}
+
+// setAsideBackendCache renames the saved backend settings to
+// terraform.tfstate.stale-<timestamp>, inside .terraform, so the next
+// `terraform init` starts clean. Only called when the state they name is empty.
+func setAsideBackendCache(dir string, now time.Time) error {
+	p := backendCachePath(dir)
+	return os.Rename(p, p+".stale-"+now.UTC().Format("20060102T150405Z"))
+}
+
+func migrateCmd(dir, profile string) string {
+	cmd := "cd " + dir + " && terraform init -migrate-state"
+	if profile != "" {
+		arg := "-backend-config=profile=" + profile
+		if strings.ContainsAny(arg, " \t\"'$`\\!*?[]{}();&|<>#~") {
+			arg = shellQuote(arg)
+		}
+		cmd += " " + arg
+	}
+	return cmd
+}
+
+// planState picks the bucket and key, checks them, and looks at the saved
+// backend settings. Read-only: it may ask questions, but creates, moves and
+// writes nothing.
+//
+//   - An existing backend.tf for this account and region is kept exactly, bucket
+//     and key: re-running init never moves an install's state.
+//   - Otherwise a Darkplum state bucket already in the account and region is
+//     reused (one: silently; several: the one the saved settings name, else
+//     asked, else the newest under --yes), and only with none is one created.
+//   - A new install's key carries the cluster name, and a key that already
+//     holds resources belongs to another install: refused (or, interactively,
+//     another cluster name is asked for).
+func (c *InitCmd) planState(env *initEnv, s *settings, dir string, cloud initCloud) (statePlan, error) {
+	w := env.out
+	var p statePlan
+	record := func(r checkResult) {
+		printCheckTo(w, r)
+		s.checks = append(s.checks, r)
+	}
+
+	cache, cacheErr := readBackendCache(dir)
+	if cacheErr != nil {
+		return p, env.fail("terraform backend", "saved settings unreadable: "+firstLine(cacheErr.Error()),
+			"check "+filepath.Join(dir, ".terraform")+" (remove it if no deploy has run from this checkout), then re-run", "cannot read Terraform's saved backend settings")
+	}
+	if cache != nil && cache.Type != "s3" {
+		cache = nil // local state is handled by the local-state check
+	}
+
+	reused := false
+	if eb, ek, er, ok := existingBackend(filepath.Join(dir, "backend.tf")); ok && er == s.region && strings.HasPrefix(eb, "darkplum-tfstate-"+s.account+"-") {
+		p.bucket, p.key, p.kept, reused = eb, ek, true, true
+	} else {
+		fmt.Fprintf(w, "%s resolving Darkplum state buckets in %s…\n", sDim("…"), s.region)
+		buckets, err := cloud.StateBuckets(s.region)
+		if err != nil {
+			record(checkResult{name: "state buckets", status: checkWarn, detail: "could not list: " + firstLine(err.Error()),
+				hint: "needs s3:ListAllMyBuckets to reuse an existing bucket; a new one will be created"})
+		}
+		switch len(buckets) {
+		case 0:
+			p.bucket = stateBucketName(s.account, s.region, env.suffix())
+		case 1:
+			p.bucket, reused = buckets[0].Name, true
+		default:
+			if p.bucket, err = pickStateBucket(env, buckets, cache); err != nil {
+				return p, err
+			}
+			reused = true
+		}
+		p.key = stateKeyFor(s.cluster)
+	}
+
+	fmt.Fprintf(w, "%s checking state bucket %s and key %s…\n", sDim("…"), p.bucket, stateKeyAlias)
+	st, err := cloud.Inspect(p.bucket, s.region)
+	if err != nil {
+		return p, env.fail("state bucket", firstLine(err.Error()), "fix the above, pick --backend local, or remove the bucket named in backend.tf", "cannot use the state backend")
+	}
+	p.st = st
+
+	// A new install's key must be free in a reused bucket.
+	for !p.kept && st.BucketExists {
+		fmt.Fprintf(w, "%s resolving state of %s in %s…\n", sDim("…"), s.cluster, p.bucket)
+		n, _, err := cloud.StateResources(p.bucket, p.key, s.region)
+		if err != nil {
+			return p, env.fail("state key", "could not read s3://"+p.bucket+"/"+p.key+": "+firstLine(err.Error()),
+				"needs s3:GetObject on the bucket and kms:Decrypt on "+stateKeyAlias, "cannot read the state key")
+		}
+		if n == 0 {
+			break
+		}
+		msg := "another install named " + s.cluster + " already keeps state here"
+		printCheckTo(w, checkResult{name: "state key", status: checkFail, detail: fmt.Sprintf("%d resources at s3://%s/%s", n, p.bucket, p.key),
+			hint: msg + "; choose another --cluster-name, or destroy that install first"})
+		if !env.interactive {
+			return p, reportedErr("%s", msg)
+		}
+		name, err := env.prompt.Ask("Cluster name", s.cluster+"-2", validateClusterName)
+		if err != nil {
+			return p, err
+		}
+		if s.cluster, err = chooseCluster(env, cloud, s.region, name, record); err != nil {
+			return p, err
+		}
+		p.key = stateKeyFor(s.cluster)
+	}
+
+	detail := "S3 " + p.bucket
+	if reused {
+		detail += " (reused)"
+	}
+	record(checkResult{name: "terraform state", status: checkPass, detail: detail})
+
+	// Saved settings that name another location.
+	if cache != nil && (cache.Bucket != p.bucket || cache.Key != p.key) {
+		p.cache = cache
+		region := cache.Region
+		if region == "" {
+			region = s.region
+		}
+		fmt.Fprintf(w, "%s resolving earlier state at %s…\n", sDim("…"), cache.url())
+		n, found, err := cloud.StateResources(cache.Bucket, cache.Key, region)
+		switch {
+		case err != nil:
+			return p, env.fail("earlier state", "could not read "+cache.url()+": "+firstLine(err.Error()),
+				"this checkout was last deployed with that state; check that the profile can read it (s3:GetObject, kms:Decrypt, same account) and re-run. Nothing was moved",
+				"cannot read the earlier state")
+		case !found || n == 0:
+			p.staleEmpty = true
+		default:
+			p.staleResources = n
+		}
+	}
+	return p, nil
+}
+
+// pickStateBucket chooses among several reusable buckets: the one Terraform's
+// saved settings name, else the operator's choice, else (--yes) the newest.
+func pickStateBucket(env *initEnv, buckets []stateBucket, cache *backendCache) (string, error) {
+	if cache != nil {
+		for _, b := range buckets {
+			if b.Name == cache.Bucket {
+				return b.Name, nil
+			}
+		}
+	}
+	if !env.interactive {
+		fmt.Fprintf(env.out, "  %s\n", sDim(fmt.Sprintf("%d Darkplum state buckets in this account and region; using the newest, %s", len(buckets), buckets[0].Name)))
+		return buckets[0].Name, nil
+	}
+	opts := make([]Option, len(buckets))
+	for i, b := range buckets {
+		d := "created " + b.Created.UTC().Format("2006-01-02 15:04 MST")
+		if b.Created.IsZero() {
+			d = ""
+		}
+		opts[i] = Option{b.Name, d}
+	}
+	i, err := env.prompt.Select("Several Darkplum state buckets exist here. Which one should hold this install's state?", opts, 0)
+	if err != nil {
+		return "", err
+	}
+	return buckets[i].Name, nil
+}
+
+// confirmStaleState: state with resources at the earlier location stays where
+// it is. --yes refuses; an interactive run may write the new backend only after
+// saying so, and the migrate step is printed again at the end.
+func (c *InitCmd) confirmStaleState(env *initEnv, s *settings, dir string, p statePlan) error {
+	cmd := migrateCmd(dir, s.profile)
+	detail := fmt.Sprintf("%d resources at %s", p.staleResources, p.cache.url())
+	if !env.interactive {
+		return env.fail("earlier state", detail,
+			"this checkout was last deployed with that state and init will not move it. Destroy that install first, or run init interactively and then move it: "+cmd,
+			"earlier state still has resources; --yes will not switch the backend away from it")
+	}
+	printCheckTo(env.out, checkResult{name: "earlier state", status: checkWarn, detail: detail,
+		hint: "it will not move by itself; after init run: " + cmd})
+	ok, err := env.prompt.Confirm("Point Terraform at the new state location? The earlier state stays where it is until you migrate it", false)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return errAborted
+	}
+	return nil
+}

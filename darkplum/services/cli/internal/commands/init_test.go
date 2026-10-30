@@ -38,6 +38,14 @@ type fakeCloud struct {
 	createErr   error
 	createdWith backendState
 
+	// Existing state buckets and objects ("bucket/key" -> resources; absent =
+	// no object). objectErr makes a read fail.
+	buckets    []stateBucket
+	bucketsErr error
+	objects    map[string]int
+	objectErr  map[string]error
+	reads      []string
+
 	// Route53 / ACM (init_web.go).
 	hzones      map[string]hostedZone // by name: public hosted zones in the account
 	records     map[string][]string   // "zoneID name" -> record types
@@ -91,6 +99,16 @@ func (f *fakeCloud) NameCollisions(_, _ string) []checkResult { return f.collisi
 func (f *fakeCloud) CheckRegion(string) error                 { return f.regionErr }
 func (f *fakeCloud) Inspect(string, string) (backendState, error) {
 	return f.state, f.inspectErr
+}
+func (f *fakeCloud) StateBuckets(string) ([]stateBucket, error) { return f.buckets, f.bucketsErr }
+func (f *fakeCloud) StateResources(bucket, key, _ string) (int, bool, error) {
+	k := bucket + "/" + key
+	f.reads = append(f.reads, k)
+	if err := f.objectErr[k]; err != nil {
+		return 0, false, err
+	}
+	n, ok := f.objects[k]
+	return n, ok, nil
 }
 func (f *fakeCloud) CreateBackend(_, _ string, st backendState) (string, error) {
 	f.createCalls++
