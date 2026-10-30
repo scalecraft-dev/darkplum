@@ -429,6 +429,7 @@ func (a *awsCloud) StateBuckets(region string) ([]stateBucket, error) {
 // stateContents is what a Terraform state object holds.
 type stateContents struct {
 	Resources, Outputs int
+	ClusterName        string // the EKS cluster the state manages; "" = unknown
 }
 
 // empty: no resources and no outputs. A state with outputs but no resources
@@ -460,14 +461,50 @@ func (a *awsCloud) ReadState(bucket, key, region string) (sc stateContents, foun
 		}
 		return sc, false, err
 	}
-	var st struct {
-		Resources []json.RawMessage          `json:"resources"`
-		Outputs   map[string]json.RawMessage `json:"outputs"`
-	}
-	if err := json.Unmarshal([]byte(out), &st); err != nil {
+	sc, err = parseState([]byte(out))
+	if err != nil {
 		return sc, true, fmt.Errorf("s3://%s/%s is not a Terraform state file", bucket, key)
 	}
-	return stateContents{Resources: len(st.Resources), Outputs: len(st.Outputs)}, true, nil
+	return sc, true, nil
+}
+
+// parseState counts a state's resources and outputs and finds the EKS cluster
+// it manages: the aws_eks_cluster resource's name, else the cluster_name output.
+func parseState(b []byte) (stateContents, error) {
+	var st struct {
+		Resources []struct {
+			Type      string `json:"type"`
+			Instances []struct {
+				Attributes struct {
+					Name string `json:"name"`
+				} `json:"attributes"`
+			} `json:"instances"`
+		} `json:"resources"`
+		Outputs map[string]struct {
+			Value json.RawMessage `json:"value"`
+		} `json:"outputs"`
+	}
+	if err := json.Unmarshal(b, &st); err != nil {
+		return stateContents{}, err
+	}
+	sc := stateContents{Resources: len(st.Resources), Outputs: len(st.Outputs)}
+	for _, r := range st.Resources {
+		if r.Type == "aws_eks_cluster" {
+			for _, in := range r.Instances {
+				if in.Attributes.Name != "" {
+					sc.ClusterName = in.Attributes.Name
+					return sc, nil
+				}
+			}
+		}
+	}
+	if o, ok := st.Outputs["cluster_name"]; ok {
+		var name string
+		if json.Unmarshal(o.Value, &name) == nil {
+			sc.ClusterName = name
+		}
+	}
+	return sc, nil
 }
 
 // bucketCommands are the s3api calls that create and harden the bucket, with

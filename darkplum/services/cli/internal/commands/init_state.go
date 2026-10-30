@@ -31,8 +31,9 @@ func cacheExists(dir string) bool {
 }
 
 // findLiveInstall stops when any reusable bucket already keeps non-empty state
-// under the legacy key or this cluster's key, and prints the backend.tf that
-// lets this checkout manage that install.
+// for this cluster (its own key, or the legacy key when the state there names
+// this cluster or no cluster at all), and prints the backend.tf that lets this
+// checkout manage that install.
 func (c *InitCmd) findLiveInstall(env *initEnv, s *settings, dir string, cloud initCloud, buckets []stateBucket) error {
 	w := env.out
 	keys := []string{legacyStateKey, stateKeyFor(s.cluster)}
@@ -46,6 +47,13 @@ func (c *InitCmd) findLiveInstall(env *initEnv, s *settings, dir string, cloud i
 					"cannot read existing state")
 			}
 			if !found || sc.empty() {
+				continue
+			}
+			// The legacy key is shared by every older install: only one for
+			// this cluster name (or one whose name cannot be read, so it might
+			// be) stops init. Another named install is left alone.
+			if k == legacyStateKey && sc.ClusterName != "" && sc.ClusterName != s.cluster {
+				fmt.Fprintf(w, "  %s\n", sDim(fmt.Sprintf("another install (%s) keeps state at the earlier key in %s; left untouched", sc.ClusterName, b.Name)))
 				continue
 			}
 			arn := kmsKeyPlaceholder

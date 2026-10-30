@@ -11,6 +11,63 @@ import (
 
 const fakeKMS = "arn:aws:kms:us-east-2:" + testAccount + ":key/abc" // what fakeCloud.CreateBackend returns
 
+// The legacy key is shared by older installs: it stops init only for the same
+// cluster name, or when the name cannot be read.
+func TestInitStateLegacyKeyByClusterName(t *testing.T) {
+	run := func(t *testing.T, sc stateContents) (error, string, *fakeCloud, string) {
+		dir := t.TempDir()
+		cloud := newFakeCloud()
+		cloud.buckets = []stateBucket{{Name: bucketN("111111")}}
+		cloud.state = backendState{KeyARN: fakeKMS, BucketExists: true}
+		cloud.objectsFull = map[string]stateContents{bucketN("111111") + "/" + legacyStateKey: sc}
+		env, out := testEnv(t, cloud, nil, "-")
+		err := s3Cmd(dir, nil).execute(env) // cluster "darkplum"
+		return err, out.String(), cloud, dir
+	}
+	restore := `key          = "` + legacyStateKey + `"`
+
+	t.Run("same name stops", func(t *testing.T) {
+		err, out, cloud, _ := run(t, stateContents{Resources: 90, ClusterName: "darkplum"})
+		if err == nil || !strings.Contains(out, restore) || cloud.createCalls != 0 {
+			t.Fatalf("want stop with backend.tf to restore, got %v\n%s", err, out)
+		}
+	})
+	t.Run("unreadable name stops", func(t *testing.T) {
+		err, out, _, _ := run(t, stateContents{Resources: 90})
+		if err == nil || !strings.Contains(out, restore) {
+			t.Fatalf("want stop, got %v\n%s", err, out)
+		}
+	})
+	t.Run("other name is left alone", func(t *testing.T) {
+		err, out, cloud, dir := run(t, stateContents{Resources: 90, ClusterName: "prod"})
+		if err != nil {
+			t.Fatalf("%v\n%s", err, out)
+		}
+		if !strings.Contains(out, "another install (prod) keeps state at the earlier key in "+bucketN("111111")+"; left untouched") {
+			t.Errorf("no note:\n%s", out)
+		}
+		if got := backendLine(t, dir, "key"); !strings.Contains(got, "darkplum/aws/darkplum/terraform.tfstate") || !cloud.createdWith.BucketExists {
+			t.Errorf("want the shared bucket under the cluster key: %s", got)
+		}
+	})
+}
+
+func TestParseStateClusterName(t *testing.T) {
+	eks := `{"version":4,"resources":[{"module":"module.eks.module.eks","mode":"managed","type":"aws_eks_cluster","name":"this",
+		"instances":[{"index_key":0,"attributes":{"name":"prod","arn":"x"}}]},{"type":"aws_vpc","instances":[{"attributes":{"id":"v"}}]}],
+		"outputs":{"cluster_name":{"value":"ignored","type":"string"}}}`
+	if sc, err := parseState([]byte(eks)); err != nil || sc.ClusterName != "prod" || sc.Resources != 2 || sc.Outputs != 1 {
+		t.Errorf("resource name: %+v %v", sc, err)
+	}
+	out := `{"version":4,"resources":[{"type":"aws_vpc","instances":[{"attributes":{}}]}],"outputs":{"cluster_name":{"value":"staging","type":"string"}}}`
+	if sc, _ := parseState([]byte(out)); sc.ClusterName != "staging" {
+		t.Errorf("output fallback: %+v", sc)
+	}
+	if sc, _ := parseState([]byte(`{"resources":[{"type":"aws_vpc"}]}`)); sc.ClusterName != "" {
+		t.Errorf("no name: %+v", sc)
+	}
+}
+
 func bucketN(suffix string) string { return stateBucketName(testAccount, "us-east-2", suffix) }
 
 func s3Cmd(dir string, extra func(*InitCmd)) *InitCmd {
