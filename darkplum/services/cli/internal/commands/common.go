@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 
 	"golang.org/x/term"
 )
@@ -36,12 +38,41 @@ func readPassword(fromStdin bool, label string) (string, error) {
 		return strings.TrimRight(string(data), "\r\n"), nil
 	}
 	fmt.Printf("%s: ", label)
-	b, err := term.ReadPassword(int(os.Stdin.Fd()))
+	fd := int(os.Stdin.Fd())
+	stop := restoreTerminalOnSignal(fd)
+	b, err := term.ReadPassword(fd)
+	stop()
 	fmt.Println()
 	if err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(string(b)), nil
+}
+
+// restoreTerminalOnSignal puts the terminal back (ReadPassword turns echo off)
+// and exits if the process is interrupted, hung up or terminated while a
+// password is being typed. The returned func stops watching.
+func restoreTerminalOnSignal(fd int) (stop func()) {
+	state, err := term.GetState(fd)
+	if err != nil {
+		return func() {}
+	}
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+	quit := make(chan struct{})
+	go func() {
+		select {
+		case <-sigs:
+			_ = term.Restore(fd, state)
+			fmt.Println()
+			os.Exit(130)
+		case <-quit:
+		}
+	}()
+	return func() {
+		signal.Stop(sigs)
+		close(quit)
+	}
 }
 
 // yamlSingleQuote renders s as a YAML single-quoted scalar (only ' needs

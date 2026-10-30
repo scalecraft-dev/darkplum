@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -21,6 +22,7 @@ type AdminCreateCmd struct {
 	Email         string `help:"Admin email address." required:""`
 	Name          string `help:"Admin display name." required:""`
 	PasswordStdin bool   `name:"password-stdin" help:"Read the password from stdin instead of prompting."`
+	Context       string `name:"context" help:"Kubeconfig context to act on. Needed only where there are no install settings (run from darkplum/ after darkplum init)." default:""`
 }
 
 // waitForJob polls until the Job reaches Complete or Failed. We poll rather than
@@ -45,6 +47,12 @@ func waitForJob(c *kube.Client, name string, timeout time.Duration) error {
 
 // Run executes `darkplum admin create`.
 func (c *AdminCreateCmd) Run(g *Globals) error {
+	// Resolve the cluster first, so a wrong context fails before the prompt.
+	kc, err := installKube(os.Stdout, g.Namespace, c.Context)
+	if err != nil {
+		return err
+	}
+
 	password, err := readPassword(c.PasswordStdin, "New admin password")
 	if err != nil {
 		return err
@@ -52,8 +60,6 @@ func (c *AdminCreateCmd) Run(g *Globals) error {
 	if len(password) < 8 {
 		return errors.New("password must be at least 8 characters")
 	}
-
-	kc := kube.New(g.Namespace)
 
 	// Run the bootstrap from the SAME image the api deployment runs, so it rides
 	// the existing signed-image admission gate (no second artifact).

@@ -6,9 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
-
-	"github.com/scalecraft-dev/darkplum/cli/internal/kube"
 )
 
 // SSOCmd groups SSO/OIDC operations.
@@ -22,14 +21,16 @@ type SSOConfigureCmd struct {
 	ClientID    string `name:"client-id" help:"OIDC client ID."`
 	RedirectURL string `name:"redirect-url" help:"OIDC redirect URL."`
 	SecretStdin bool   `name:"secret-stdin" help:"Read the client secret from stdin instead of prompting."`
+	Context     string `name:"context" help:"Kubeconfig context to act on. Needed only where there are no install settings (run from darkplum/ after darkplum init)." default:""`
 }
 
 // Run executes `darkplum sso configure`.
 func (c *SSOConfigureCmd) Run(g *Globals) error {
-	kc := kube.New(g.Namespace)
-	if ctx, err := kc.Run(nil, "config", "current-context"); err == nil {
-		fmt.Println(sDim(fmt.Sprintf("Configuring SSO on context %q, namespace %q", strings.TrimSpace(ctx), g.Namespace)))
+	kc, err := installKube(os.Stdout, g.Namespace, c.Context)
+	if err != nil {
+		return err
 	}
+	fmt.Println(sDim(fmt.Sprintf("Configuring SSO in namespace %q", g.Namespace)))
 
 	issuer := promptIfEmpty(c.Issuer, "OIDC Issuer URL (e.g. https://acme.us.auth0.com/)")
 	clientID := promptIfEmpty(c.ClientID, "OIDC Client ID")
