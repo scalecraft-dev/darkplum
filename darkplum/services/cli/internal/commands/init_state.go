@@ -30,12 +30,36 @@ func cacheExists(dir string) bool {
 	return err == nil
 }
 
+// isFreshCheckout: no backend.tf and no saved backend settings, so nothing
+// local says which state this checkout manages.
+func isFreshCheckout(dir string) bool {
+	_, err := os.Stat(filepath.Join(dir, "backend.tf"))
+	return err != nil && !cacheExists(dir)
+}
+
+// preflightLiveInstall runs the live-install lookup for the requested cluster
+// name before the name-collision check, so a fresh checkout of a live install
+// is told to restore its backend.tf instead of being offered "<name>-2".
+// Read-only; a bucket listing that fails is left to planState to report.
+func (c *InitCmd) preflightLiveInstall(env *initEnv, s *settings, dir string, cloud initCloud) error {
+	if c.Backend == "local" || !isFreshCheckout(dir) {
+		return nil
+	}
+	fmt.Fprintf(env.out, "%s resolving Darkplum state buckets in %s…\n", sDim("…"), s.region)
+	buckets, err := cloud.StateBuckets(s.region)
+	if err != nil || len(buckets) == 0 {
+		return nil
+	}
+	return c.findLiveInstall(env, s, dir, cloud, buckets)
+}
+
 // findLiveInstall stops when any reusable bucket already keeps non-empty state
 // for this cluster (its own key, or the legacy key when the state there names
 // this cluster or no cluster at all), and prints the backend.tf that lets this
 // checkout manage that install.
 func (c *InitCmd) findLiveInstall(env *initEnv, s *settings, dir string, cloud initCloud, buckets []stateBucket) error {
 	w := env.out
+	s.liveChecked = s.cluster
 	keys := []string{legacyStateKey, stateKeyFor(s.cluster)}
 	for _, b := range buckets {
 		for _, k := range keys {
@@ -61,7 +85,11 @@ func (c *InitCmd) findLiveInstall(env *initEnv, s *settings, dir string, cloud i
 				arn = st.KeyARN
 			}
 			block := renderBackend(backendSpec{Bucket: b.Name, Key: k, Region: s.region, KMSKeyARN: arn})
-			hint := "an install already keeps state there. To manage it from this checkout, save the following as backend.tf in " + dir +
+			who := "install " + s.cluster
+			if sc.ClusterName == "" && k == legacyStateKey {
+				who = "an install whose cluster name cannot be read (it may be " + s.cluster + ")"
+			}
+			hint := who + " already exists and keeps its state there: this is that install, not a name clash. To manage it from this checkout, save the following as backend.tf in " + dir +
 				" and re-run init (it keeps an existing backend's bucket, key and region)"
 			if k != legacyStateKey {
 				hint += "; to install beside it instead, pass another --cluster-name"
@@ -184,7 +212,7 @@ func (c *InitCmd) planState(env *initEnv, s *settings, dir string, cloud initClo
 		// A checkout with no backend.tf and no saved settings may be a fresh
 		// clone of a live install: find its state before choosing anything, so
 		// a reinstall never quietly becomes a second install beside it.
-		if freshCheckout {
+		if freshCheckout && s.liveChecked != s.cluster {
 			if err := c.findLiveInstall(env, s, dir, cloud, buckets); err != nil {
 				return p, err
 			}

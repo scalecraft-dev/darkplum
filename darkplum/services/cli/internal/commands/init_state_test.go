@@ -52,6 +52,36 @@ func TestInitStateLegacyKeyByClusterName(t *testing.T) {
 	})
 }
 
+// The live install's own resources collide by name; its state must answer
+// first: restore message, never a rename prompt.
+func TestInitStateLiveInstallBeatsNameCollision(t *testing.T) {
+	cloud := newFakeCloud()
+	cloud.collisions = []checkResult{{name: "cluster name free", status: checkFail, detail: "EKS cluster darkplum exists"}}
+	cloud.buckets = []stateBucket{{Name: bucketN("bf3057")}}
+	cloud.state = backendState{KeyARN: fakeKMS, BucketExists: true}
+	cloud.objectsFull = map[string]stateContents{bucketN("bf3057") + "/" + legacyStateKey: {Resources: 120, ClusterName: "darkplum"}}
+	for _, answers := range []string{"-", "\n"} { // --yes, and interactive (networks default; a rename prompt would hit EOF)
+		dir := t.TempDir()
+		env, out := testEnv(t, cloud, nil, answers)
+		c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Region: "us-east-2", Mode: "bedrock", Profile: "acme", Domain: "acme.com", Yes: answers == "-"}
+		err := c.execute(env)
+		if err == nil || errors.Is(err, errAborted) || !strings.Contains(err.Error(), "an install already keeps state at s3://"+bucketN("bf3057")+"/"+legacyStateKey) {
+			t.Fatalf("%q: want restore stop, got %v\n%s", answers, err, out)
+		}
+		for _, want := range []string{"install darkplum already exists", "not a name clash", `bucket       = "` + bucketN("bf3057") + `"`, `key          = "` + legacyStateKey + `"`} {
+			if !strings.Contains(out.String(), want) {
+				t.Errorf("%q: lacks %q:\n%s", answers, want, out)
+			}
+		}
+		if strings.Contains(out.String(), "darkplum-2") || strings.Contains(out.String(), "EKS cluster darkplum exists") {
+			t.Errorf("%q: name-collision path ran:\n%s", answers, out)
+		}
+		if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+			t.Errorf("wrote %v", entries)
+		}
+	}
+}
+
 func TestParseStateClusterName(t *testing.T) {
 	eks := `{"version":4,"resources":[{"module":"module.eks.module.eks","mode":"managed","type":"aws_eks_cluster","name":"this",
 		"instances":[{"index_key":0,"attributes":{"name":"prod","arn":"x"}}]},{"type":"aws_vpc","instances":[{"attributes":{"id":"v"}}]}],

@@ -171,6 +171,7 @@ type settings struct {
 	geo, bedrockRegion                string
 	throwaway                         bool
 	backend                           string // "s3" | "local"
+	liveChecked                       string // cluster name the live-install lookup already ran for
 	web                               webSettings
 	checks                            []checkResult
 }
@@ -440,6 +441,13 @@ func (c *InitCmd) execute(env *initEnv) error {
 				return reportedErr("stopped: raise the GPU quota (or choose Bedrock only) and re-run ./bin/darkplum init")
 			}
 		}
+	}
+
+	// A fresh checkout of a live install: its state answers before the name
+	// check, which would otherwise call the install's own cluster a clash.
+	s.cluster = c.ClusterName
+	if err := c.preflightLiveInstall(env, s, dir, cloud); err != nil {
+		return err
 	}
 
 	// Cluster name collisions.
