@@ -16,12 +16,15 @@ terraform/
 
 ```bash
 # AWS
-cd terraform/aws
-cp terraform.tfvars.example terraform.tfvars   # edit as needed
-terraform init && terraform apply
+./bin/darkplum init         # writes terraform/aws/terraform.tfvars (and backend.tf)
+make deploy                 # init, apply and the platform deploy
 ```
 
-The `Makefile` at the repo root drives the full install and selects the cloud
+`terraform.tfvars` is written by `darkplum init`; `terraform.tfvars.example` is
+an advanced reference for teams that manage tfvars from their own pipeline.
+Driving `terraform` by hand is fine once `init` has written the files.
+
+The `Makefile` in `darkplum/` drives the full install and selects the cloud
 via `CLOUD` (defaults to `aws`):
 
 ```bash
@@ -64,6 +67,10 @@ nothing branches yet; the key exists so the seam is ready when `vertex` lands.
 | `inference_region` | Region the hosted-model backend is called in |
 | `bedrock_model_filter` | Catalog globs for the gateway, derived from the hosted-model IAM allowlist (AWS: `bedrock_model_patterns`) |
 | `model_name` / `served_model_name` | Self-hosted vLLM model |
+| `web_url` / `web_hostname` | The team's private HTTPS address (empty without `web_domain`) |
+| `web_lb_private_ips` | The internal NLB's pinned addresses; `darkplum configure` trusts only these to pass client addresses |
+| `web_name_servers` | Name servers of a zone Terraform created for the address |
+| `web_allowed_cidrs` | Networks allowed to reach the address |
 
 When you add a new cloud root, copy this contract verbatim and resolve every
 cloud difference *inside* the Terraform so these outputs stay identical.

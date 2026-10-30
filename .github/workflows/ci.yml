@@ -12,6 +12,7 @@ jobs:
   go:
     name: Go (${{ matrix.service }})
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -61,6 +62,7 @@ jobs:
   web:
     name: Web
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: darkplum/services/web
@@ -87,6 +89,7 @@ jobs:
   terraform:
     name: Terraform
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: darkplum/terraform/aws
@@ -95,9 +98,45 @@ jobs:
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.14.9"
+          # The default wrapper (a node shim that captures output) does not pass
+          # stdin through, so `terraform console` below waits forever. No step
+          # reads the wrapper's outputs.
+          terraform_wrapper: false
       - run: terraform fmt -check -recursive -diff
       - run: terraform init -backend=false -input=false
       - run: terraform validate
+      # What `darkplum init` writes must be valid Terraform. Render a sample
+      # tfvars (hostile profile name included) and backend.tf from the Go code,
+      # validate the config with that backend.tf, then check Terraform reads the
+      # hostile value back unchanged.
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: darkplum/services/cli/go.mod
+          cache-dependency-path: darkplum/services/cli/go.sum
+      - name: terraform validate (rendered init output)
+        timeout-minutes: 5
+        run: |
+          samples="$RUNNER_TEMP/samples"; mkdir -p "$samples"
+          (cd ../../services/cli && DARKPLUM_RENDER_SAMPLES="$samples" go test ./internal/commands -run TestWriteRenderedSamples -count=1)
+          cp "$samples/backend.tf" backend.tf
+          terraform init -backend=false -input=false -reconfigure
+          terraform validate
+          rm backend.tf
+          terraform init -backend=false -input=false -reconfigure
+          # Read the value back with the variable declarations only: in the full
+          # config, `terraform console` configures the AWS provider, which waits on
+          # credential lookups (instance metadata) on a runner with no AWS access.
+          vars="$RUNNER_TEMP/vars-only"; mkdir -p "$vars"; cp variables.tf "$vars/"
+          got=$(cd "$vars" && echo 'var.aws_profile' | terraform console -var-file="$samples/sample.tfvars")
+          want='"we\"ird\\${x}%{y}"'
+          [ "$got" = "$want" ] || { echo "tfvars round trip changed the value: got $got want $want"; exit 1; }
+      # The Go validators in the CLI and the validation blocks in variables.tf are
+      # driven by one fixture table (tests/variable_cases.json).
+      - name: terraform test (variable validation)
+        run: |
+          ./tests/gen_validation_tests.sh > variables.tftest.hcl
+          terraform test
+          rm variables.tftest.hcl
       # Offline unit tests of the Bedrock IAM allowlist shape (no providers, no AWS).
       - name: terraform test (bedrock-allowlist)
         working-directory: darkplum/terraform/aws/modules/bedrock-allowlist
@@ -108,6 +147,7 @@ jobs:
   manifests:
     name: Kubernetes manifests and docs
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: darkplum
@@ -131,6 +171,21 @@ jobs:
             | python3 -c 'import sys, yaml; docs = list(yaml.safe_load_all(sys.stdin)); assert {d["kind"] for d in docs} == {"Deployment", "Service"}, docs'
       - name: Makefile parses
         run: make -n help > /dev/null
+      # Configuration comes from `darkplum init`; no README, docs/*.md or Makefile
+      # text may tell a user to copy or hand-edit terraform.tfvars (a deliberate
+      # GitOps section sits inside tfvars-manual:begin/end markers).
+      - name: docs do not say to copy or edit tfvars
+        working-directory: .
+        run: python3 -I .github/scripts/check-tfvars-docs.py
+      # make deploy must stop before doing any work when init has not run.
+      - name: make deploy refuses without terraform.tfvars
+        run: |
+          empty=$(mktemp -d)
+          for target in deploy deploy-infra; do
+            if out=$(make "$target" TF_DIR="$empty" 2>&1); then echo "make $target succeeded without tfvars"; exit 1; fi
+            echo "$out" | grep -q 'Run ./bin/darkplum init first' || { echo "no init hint from make $target:"; echo "$out"; exit 1; }
+            if echo "$out" | grep -qE 'Initializing Terraform|Building darkplum CLI'; then echo "make $target did work before the guard"; exit 1; fi
+          done
       - name: API reference is generated from the golden
         working-directory: darkplum/services/api
         run: |

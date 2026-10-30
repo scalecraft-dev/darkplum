@@ -1,6 +1,9 @@
 provider "aws" {
   region  = var.aws_region
   profile = var.aws_profile
+
+  # Pins the install to the account `darkplum init` recorded. Empty disables it.
+  allowed_account_ids = var.allowed_account_ids
 }
 
 # Account ID is needed to construct the ECR registry host, surfaced as the
@@ -48,6 +51,10 @@ module "vpc" {
   cidr = var.vpc_cidr
   azs  = var.azs
   tags = local.tags
+
+  # The web NLB's addresses are reserved with the subnets, before the cluster
+  # takes addresses from them. Off (no change) without web_domain.
+  reserve_lb_ips = var.web_domain != ""
 }
 
 module "eks" {
@@ -175,4 +182,24 @@ module "rds" {
   deletion_protection        = var.db_deletion_protection
   skip_final_snapshot        = var.db_skip_final_snapshot
   tags                       = local.tags
+}
+
+# The private HTTPS address the team uses (internal NLB + DNS + certificate).
+# Off for installs without web_domain.
+module "web_access" {
+  source = "./modules/web-access"
+  count  = var.web_domain != "" ? 1 : 0
+
+  name                        = var.cluster_name
+  domain                      = var.web_domain
+  hostname                    = var.web_hostname != "" ? var.web_hostname : "darkplum.${var.web_domain}"
+  zone_id                     = var.web_zone_id
+  certificate_arn             = var.web_certificate_arn
+  allowed_cidrs               = length(var.web_allowed_cidrs) > 0 ? var.web_allowed_cidrs : [var.vpc_cidr]
+  vpc_id                      = module.vpc.vpc_id
+  private_subnet_ids          = module.vpc.private_subnets
+  lb_private_ips              = module.vpc.lb_private_ips
+  node_security_group_id      = module.eks.cluster_primary_security_group_id
+  node_autoscaling_group_name = module.node_groups.cpu_autoscaling_group_name
+  tags                        = local.tags
 }

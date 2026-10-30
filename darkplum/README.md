@@ -19,10 +19,10 @@ License 2.0.
 │  │  EKS Cluster (private subnets)                             │      │
 │  │                                                            │      │
 │  │  darkplum-system (CPU nodes, m5.large x2)                  │      │
-│  │  ├── web      — chat + admin UI          ─┐ make expose-web│      │
-│  │  ├── api      — auth, catalog, aliases,   │ NLB (+ your ACM│      │
-│  │  │             routing policy, audit      │ certificate)   │      │
-│  │  └── gateway  — one OpenAI-compatible    ─┘                │      │
+│  │  ├── web      — chat + admin UI   ◄── internal NLB, HTTPS  │      │
+│  │  ├── api      — auth, catalog, aliases,  (ACM certificate, │      │
+│  │  │             routing policy, audit      private address) │      │
+│  │  └── gateway  — one OpenAI-compatible                      │      │
 │  │                 endpoint; enforces model,                  │      │
 │  │                 enabled flag, residency  ──► Bedrock via   │      │
 │  │                 on every request             PrivateLink   │      │
@@ -38,15 +38,15 @@ License 2.0.
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-Set `gpu_desired_size = 0` for a Bedrock-only install (no GPU node, no vLLM);
-raise it later to add self-hosted open-source models.
+Choose Bedrock only in `darkplum init` (`gpu_desired_size = 0`: no GPU node, no
+vLLM); re-run `init` later to add self-hosted open-source models.
 
 ## Prerequisites
 
 | Tool | Version | Install |
 |------|---------|---------|
 | AWS CLI | >= 2.x | https://aws.amazon.com/cli/ |
-| Terraform | >= 1.9 | https://developer.hashicorp.com/terraform/install |
+| Terraform | >= 1.10 | https://developer.hashicorp.com/terraform/install |
 | kubectl | >= 1.28 | https://kubernetes.io/docs/tasks/tools/ |
 | jq | any | https://jqlang.github.io/jq/download/ |
 
@@ -56,19 +56,25 @@ You must have AWS credentials configured (`aws configure` or environment variabl
 
 ```bash
 # Validate your environment first (tools, cloud creds, GPU quota).
-# Pass --profile/--region to match aws_profile/aws_region in your tfvars, so the
-# checks run against the account you actually install into.
+# Pass --profile/--region to match the account you install into.
 make cli && ./bin/darkplum doctor check --cloud aws --profile <your-profile>
+
+# Answer a few questions (account, region, Bedrock-only or self-hosted GPU model,
+# a domain you control for the team's private address, where Terraform keeps
+# state). Writes terraform/aws/terraform.tfvars; nothing is deployed yet.
+./bin/darkplum init --profile <your-profile>
 
 # Deploy everything (takes 35-50 minutes). CLOUD defaults to aws.
 make deploy             # equivalent to: make deploy CLOUD=aws
 
+# First run (~2 min, longer while a self-hosted model loads): create the first
+# admin, enable models, send a test chat, record client addresses for the audit
+# log, and print the team's address (https://darkplum.<domain>, reachable from
+# the networks you allowed). Safe to re-run; --wait waits for a loading model.
+./bin/darkplum configure
+
 # Prove the gateway's IAM role can only reach the Bedrock models you configured
 make verify-bedrock-iam
-
-# Publish the web UI (internal load balancer; add CERT_ARN=<ACM cert> for HTTPS)
-make expose-web
-# -> open the printed address, create the first admin, enable a model under Admin > Models
 
 # Check status while waiting for a self-hosted model to load (if gpu_desired_size > 0)
 make status
@@ -98,9 +104,8 @@ On-demand us-east-2 list prices, 24/7 (730 h/month). Region and usage change the
 Bedrock tokens are billed by AWS per model on top of this. The GPU node group
 scales to zero (`gpu_desired_size = 0`): `make deploy` then skips self-hosted
 vLLM and installs a Bedrock-only platform, the cheapest path to first chat;
-raise `gpu_desired_size` and run `make deploy` again to add self-hosted models.
-**Run `make destroy` when you are done testing** (`make unexpose-web` first if
-you published the UI, so the load balancer is removed cleanly).
+re-run `./bin/darkplum init` (choose Self-hosted GPU) and `make deploy` again to add self-hosted models.
+**Run `make destroy` when you are done testing.**
 
 ## Cloud selection
 
@@ -114,13 +119,37 @@ the Kubernetes/platform steps rely on.
 
 ## Configuration
 
-Configuration is via Terraform variables in `terraform/aws/`. All have working
-defaults; override only what you need:
+Configuration lives in `terraform/aws/terraform.tfvars`, written by
+`./bin/darkplum init`. Re-run `init` to change region, hosting mode, model or GPU
+type: it keeps a `.bak` copy of the previous file, then run `make deploy` again.
+`make deploy` refuses to start without that file and re-runs `darkplum doctor`
+first (session lifetime, account match, GPU quota).
 
-```bash
-cd terraform/aws
-cp terraform.tfvars.example terraform.tfvars   # edit, then `terraform apply` or `make deploy`
-```
+`init` keeps Terraform state in a versioned, KMS-encrypted, private S3 bucket in
+your own account (`--backend local` opts out; local state holds the database
+password in plain text, so keep it out of synced folders). It also pins the AWS
+provider to your account (`allowed_account_ids`), so credentials for another
+account fail at plan time. Preview everything with `darkplum init --dry-run`. The profile is not stored
+in `backend.tf`; `make deploy` passes it to `terraform init`. If you run
+`terraform init` yourself, add `-backend-config=profile=<your-profile>` (or set
+`AWS_PROFILE`). Never delete the `alias/darkplum-tfstate` KMS key: it makes all
+state in the bucket unrecoverable.
+
+**Upgrading.** The default self-hosted model is unchanged (Mistral-7B-Instruct-v0.3,
+served as `mistral-7b`), so an existing install keeps its model and API name on
+its next apply. `model_revision` now accepts a 40-hex commit SHA, or `main` for the
+default model only; any other `model_name` must set a SHA. `required_version`
+is now Terraform >= 1.10, and the AWS provider accepts `allowed_account_ids`
+(empty by default, no restriction). Re-running `darkplum init` writes all of these
+explicitly and pins the model to a reviewed SHA.
+
+<!-- tfvars-manual:begin -->
+Advanced (GitOps): teams that render tfvars from their own pipeline can start
+from `terraform/aws/terraform.tfvars.example` and keep `terraform.tfvars` in
+their own repository. `darkplum init` remains the supported path.
+<!-- tfvars-manual:end -->
+
+The variables are:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -135,6 +164,11 @@ cp terraform.tfvars.example terraform.tfvars   # edit, then `terraform apply` or
 | `bedrock_inference_geo` | us | Geography inference stays in (`us`, `eu`, `apac`); `global` profiles are never granted |
 | `bedrock_model_patterns` | Claude, Llama, Mistral | Bedrock model-ID globs the gateway may invoke (IAM allowlist + catalog filter) |
 | `model_revision` | main | Hugging Face revision of the default model — pin a commit SHA |
+| `web_domain` | (none) | A domain you control; the team's private address is `https://darkplum.<web_domain>`. Empty: no address (installs from before it existed) |
+| `web_hostname` | darkplum.<web_domain> | Name the team opens; must be inside `web_domain` |
+| `web_zone_id` | (created) | Existing public Route53 zone to put the name in, or the zone `darkplum init` created when your DNS is elsewhere; never managed |
+| `web_certificate_arn` | (issued) | Existing ACM certificate for the name; never managed |
+| `web_allowed_cidrs` | the VPC | Networks allowed to reach the address on 443 (VPN, Direct Connect, office); never `0.0.0.0/0` |
 
 See `terraform/aws/variables.tf` for the full list.
 
@@ -166,8 +200,7 @@ See `terraform/aws/variables.tf` for the full list.
 | `make deploy-semantic-router` | Install the open-source intent classifier for routed aliases |
 | `pnpm run check:parity` (in `services/web`) | Verify every API route has a UI and vice versa against `docs/api-routes.json` |
 | `make remove-semantic-router` | Remove it (routed aliases fall back to their default route) |
-| `make expose-web [SCHEME=internal] [CERT_ARN=]` | Publish the web UI on an AWS load balancer |
-| `make unexpose-web` | Back to cluster-internal (port-forward) |
+| `make expose-web` / `make unexpose-web` | Deprecated; conflicts with the private web address. Do not use |
 | `make test` | Send a test chat completion request |
 | `make status` | Show cluster, node, pod, and GPU status |
 | `make destroy` | Tear down all resources |
@@ -196,30 +229,40 @@ users, keys or policy yet — a reconciler has to drive `POST /auth/login` first
 
 ## Reaching the web UI
 
-`make deploy` leaves the web UI cluster-internal. `make expose-web` publishes it
-on an AWS Network Load Balancer:
+Every install gets a private HTTPS address: `https://darkplum.<domain>` for a
+domain you name in `darkplum init`. It is an internal Network Load Balancer in
+the cluster's private subnets with an ACM certificate, reachable only from the
+networks you allow (the VPC by default; add VPN, Direct Connect or office
+ranges). The name resolves publicly to private addresses: anyone can look the
+name up (and it appears in certificate transparency logs), only your networks
+can connect. Nothing is internet-facing.
 
-- `make expose-web` — internal NLB, plain HTTP. Reachable from inside the VPC /
-  your VPN only. Session cookies lose the Secure flag; use this to evaluate, not
-  to run. A vendor key cannot be installed from Admin > Models over plain HTTP;
-  until there is a certificate, reach the UI through a port-forward instead
-  (`kubectl port-forward -n darkplum-system svc/darkplum-web 8081:80`, then
-  `http://localhost:8081` — the tunnel to the cluster is TLS), or use
-  `make set-anthropic-key`.
-- `make expose-web CERT_ARN=arn:aws:acm:...` — HTTPS terminated at the NLB with
-  your ACM certificate. Add `SCHEME=internet-facing` to publish publicly. Point a
-  DNS CNAME at the printed hostname; the certificate must match that name.
-- `make unexpose-web` — back to cluster-internal.
+- **Your domain's DNS is a Route53 zone in the same account:** Terraform
+  creates a zone for the name, delegates it from yours, issues the certificate
+  and adds the record. All of it is removed by `make destroy`.
+- **Your DNS is elsewhere:** `darkplum init` creates the zone for the name
+  itself, prints four NS records to add at your DNS provider and waits until
+  they resolve (re-running init resumes). Terraform then issues the certificate
+  in it. `make destroy` leaves that zone, so your NS records never point at a
+  deleted zone; remove both yourself when you retire the install.
+- **Your own zone or certificate:** `darkplum init --zone-id` /
+  `--certificate-arn`. Records are added to a supplied zone; neither is ever
+  modified or deleted otherwise. A supplied certificate must be issued, valid
+  for 30+ more days and cover the name (a wildcard covers one label).
 
-Plain HTTP on an internet-facing load balancer is refused. Run `make configure-sso`
-after exposing; it uses the load balancer address for the OIDC redirect URL.
+The load balancer terminates TLS and passes each browser's address to nginx in
+a PROXY protocol header. `./bin/darkplum configure` writes the load balancer's
+own addresses into nginx's trusted list and a `web-ingress` NetworkPolicy, so
+the audit log records the browser's address and no other peer can claim one.
+Until it has run, the logged address is the load balancer's.
 
-The NLB is created by the AWS cloud controller that runs inside the EKS control
-plane (the subnets carry the `kubernetes.io/role/elb` tags it needs); no extra
-controller is installed. If the load balancer does not appear within five
-minutes, `expose-web` reverts to cluster-internal on its own and prints where to
-look. The AWS Load Balancer Controller (ALB, WAF, per-path routing) is the
-upgrade path when you need more than a TLS-terminating NLB.
+The operator's fallback is `./bin/darkplum configure`, which opens a private
+port-forward and prints its `http://localhost:<port>` address.
+
+`make expose-web` and `make unexpose-web` are deprecated: they turn the
+cluster-internal `darkplum-web` Service into a second, kubectl-managed load
+balancer (plain HTTP unless given a certificate) beside the private address,
+outside its allowed-networks rule and client-address audit. Do not use them.
 
 The gateway itself is never exposed: its `/health` endpoint reports routing and
 policy state and is meant for in-cluster probes and operators only.
@@ -269,16 +312,15 @@ prompt closest wins: self-hosted over cloud-managed over external API. A request
 never silently travels further than it has to.
 
 **Changing the default self-hosted model.** Any vLLM-supported, ungated Hugging
-Face model that fits in 24GB VRAM (A10G) works. Set in `terraform/aws/terraform.tfvars`:
-
-```hcl
-model_name        = "Qwen/Qwen2.5-7B-Instruct"
-served_model_name = "qwen-2.5-7b"
-```
+Face model that fits in 24GB VRAM (A10G) works. Re-run `./bin/darkplum init`,
+pick Self-hosted GPU and choose a model from the reviewed list or a custom
+Hugging Face id (`--model <id>` skips the prompt). `init` checks the repo is
+public and has safetensors weights, pins its current commit SHA and writes the
+result; then run `make deploy-infra` (and `make deploy-k8s`) to apply it.
 
 **Running more than one self-hosted model.** Each model is its own vLLM
 deployment and takes one GPU, so grow the GPU node group first
-(`gpu_desired_size = 2`, then `make deploy-infra`), then:
+(re-run `./bin/darkplum init --mode gpu --gpu-count 2`, then `make deploy-infra`), then:
 
 ```bash
 make deploy-model NAME=qwen MODEL=Qwen/Qwen2.5-7B-Instruct SERVED=qwen-2.5-7b REVISION=<commit-sha>
@@ -676,6 +718,11 @@ does not enforce. The EKS control-plane log group is kept after `make destroy`
 (Kubernetes audit logs) and re-adopted by the next `make deploy-infra`.
 
 ## Troubleshooting
+
+The `kubectl` commands below need the install's own kubeconfig. Run
+`eval "$(./bin/darkplum kubeconfig)"` in the shell first: it checks that the
+cluster belongs to the install's AWS account and points only that shell at a
+private kubeconfig, without touching `~/.kube/config` or your current context.
 
 **GPU node not ready**: Check node events — `kubectl describe node <gpu-node>`. Common cause: g5 capacity unavailable in the selected AZ. Try a different region.
 

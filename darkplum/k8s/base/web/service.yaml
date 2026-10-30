@@ -7,6 +7,9 @@ metadata:
     app.kubernetes.io/name: darkplum-web
     app.kubernetes.io/part-of: darkplum
 spec:
+  # Cluster-internal plain http: probes and the operator's port-forward
+  # (`darkplum configure`). Never published on the nodes: the team's address
+  # is darkplum-web-lb below.
   type: ClusterIP
   selector:
     app.kubernetes.io/name: darkplum-web
@@ -14,4 +17,35 @@ spec:
     - name: http
       port: 80
       targetPort: 80
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: darkplum-web-lb
+  namespace: darkplum-system
+  labels:
+    app.kubernetes.io/name: darkplum-web
+    app.kubernetes.io/part-of: darkplum
+spec:
+  # The install's private HTTPS address is an internal NLB that Terraform owns
+  # (terraform/aws/modules/web-access). It terminates TLS and sends each
+  # connection, with a PROXY protocol header, to NodePort 30080 on the CPU
+  # nodes; only the NLB's security group may reach that port. Only nginx's
+  # PROXY-protocol port is published, so nothing on the nodes serves plain
+  # http. externalTrafficPolicy Local keeps the NLB's address as the source
+  # the pod sees (no SNAT through another node), which the web-ingress
+  # NetworkPolicy and nginx's trusted-proxy list key on; a node without a web
+  # pod fails the NLB health check and gets no traffic.
+  #
+  # Same file as darkplum-web on purpose: the deploy applies this file as is.
+  type: NodePort
+  externalTrafficPolicy: Local
+  selector:
+    app.kubernetes.io/name: darkplum-web
+  ports:
+    - name: https-proxy
+      port: 8443
+      targetPort: 8443
+      nodePort: 30080
       protocol: TCP

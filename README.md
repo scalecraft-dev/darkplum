@@ -63,18 +63,25 @@ Models, and chat. Replies are mocked; LM Studio on port 1234 is picked up
 automatically on Docker Desktop (on Linux kind, see
 `k8s/overlays/dev/patches/gateway-deployment.yaml`).
 
-**On AWS** (AWS CLI, Terraform 1.9+, kubectl, jq):
+**On AWS** (AWS CLI, Terraform 1.10+, kubectl, jq):
 
 ```bash
 cd darkplum
 make cli && ./bin/darkplum doctor check --cloud aws --profile <your-profile>
-cp terraform/aws/terraform.tfvars.example terraform/aws/terraform.tfvars   # edit: region, profile, gpu_desired_size
+./bin/darkplum init --profile <your-profile>   # a few questions; writes terraform.tfvars
 make deploy
+./bin/darkplum configure                       # first admin, models, a test chat, then the web UI
 ```
 
-The default adds one GPU node for a self-hosted model and takes 35 to 50
-minutes. Set `gpu_desired_size = 0` in `terraform.tfvars` for a Bedrock-only
-install, about twenty minutes and the cheapest path to a first chat.
+`darkplum init` asks which account, region and model hosting you want, checks
+them against your account and writes the configuration, so there is no file to
+edit. Choosing a self-hosted GPU model takes 35 to 50 minutes; choosing Bedrock
+only takes about twenty minutes and is the cheapest path to a first chat. Re-run
+`darkplum init` to switch later. It also asks for a domain you control: your team
+reaches Darkplum at a private `https://darkplum.<domain>`, from your VPC and the
+networks you allow. `darkplum configure` then creates the first
+admin, enables models, sends a test chat and opens the web UI on a private local
+address; it is safe to re-run.
 
 The full install, configuration, cost, exposure, model and troubleshooting
 guide is [darkplum/README.md](darkplum/README.md).

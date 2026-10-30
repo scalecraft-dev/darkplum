@@ -1,5 +1,11 @@
-# Copy to terraform.tfvars and edit. All values have working defaults; override
-# only what you need. See variables.tf for the full list and descriptions.
+# ADVANCED / GitOps reference. Most installs should run `./bin/darkplum init`,
+# which asks a few questions, checks them against your account and writes
+# terraform.tfvars for you. Use this file only when you manage tfvars by hand
+# or from your own pipeline. All values have working defaults; see variables.tf
+# for the full list and descriptions.
+
+# Pin the install to one AWS account: the provider refuses any other account.
+# allowed_account_ids = ["123456789012"]
 
 # AWS CLI profile to authenticate with. Leave commented to use the default
 # credential chain (env vars / SSO / instance profile).
@@ -18,9 +24,9 @@
 # gpu_desired_size   = 1
 
 # Self-hosted model served by vLLM.
-# model_name        = "mistralai/Mistral-7B-Instruct-v0.3"
-# served_model_name = "mistral-7b"
-# model_revision    = "main"   # pin a commit SHA from the model's Hugging Face repo
+# model_name        = "Qwen/Qwen2.5-7B-Instruct"
+# served_model_name = "qwen-2.5-7b"
+# model_revision    = "a09a35458c702b33eeacc393d103063234e8bc28"   # full 40-hex commit SHA, validated
 
 # Database durability. The defaults keep a week of automated backups, take a
 # final snapshot on destroy and refuse deletion until protection is turned off.
@@ -39,3 +45,12 @@
 # bedrock_private_endpoints = true
 # bedrock_inference_geo  = "us"
 # bedrock_model_patterns = ["anthropic.claude-*", "meta.llama*", "mistral.*"]
+
+# Private web address (internal NLB + ACM certificate + DNS name). `darkplum init`
+# asks for the domain and checks the rest against your account. Empty
+# web_domain: no address.
+# web_domain          = "acme.com"            # team opens https://darkplum.acme.com
+# web_hostname        = "chat.acme.com"       # optional; inside web_domain
+# web_zone_id         = "Z0123456789ABCDEFGHIJ"  # optional existing public zone
+# web_certificate_arn = "arn:aws:acm:<region>:<account>:certificate/<id>"  # optional
+# web_allowed_cidrs   = ["10.0.0.0/16", "10.8.0.0/16"]  # default: the VPC

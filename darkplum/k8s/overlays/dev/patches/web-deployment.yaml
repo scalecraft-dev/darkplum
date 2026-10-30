@@ -4,6 +4,8 @@ metadata:
   name: darkplum-web
   namespace: darkplum-system
 spec:
+  # One node locally; one replica is enough.
+  replicas: 1
   template:
     spec:
       containers:

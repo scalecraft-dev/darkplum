@@ -1,27 +1,32 @@
 package commands
 
 import (
+	"encoding/base64"
 	"fmt"
+	"os"
 	"strings"
-
-	"github.com/scalecraft-dev/darkplum/cli/internal/kube"
 )
 
 // StatusCmd is `darkplum status`.
-type StatusCmd struct{}
+type StatusCmd struct {
+	Context string `name:"context" help:"Kubeconfig context to read. Needed only where there are no install settings (run from darkplum/ after darkplum init)." default:""`
+}
 
-// Run executes `darkplum status`.
+// Run executes `darkplum status`. Like every kube command it establishes and
+// validates the install's cluster first, and refuses rather than read
+// whatever cluster the current context points at.
 func (s *StatusCmd) Run(g *Globals) error {
-	c := kube.New(g.Namespace)
-
-	if ctx, err := c.Run(nil, "config", "current-context"); err == nil {
-		fmt.Printf("%s  %s\n", sDim("context"), strings.TrimSpace(ctx))
+	c, err := installKube(os.Stdout, g.Namespace, s.Context)
+	if err != nil {
+		return err
 	}
 
-	// OIDC on/off is read from the auth secret (no DB access needed).
+	// OIDC on/off is read from the auth secret (no DB access needed). make
+	// deploy writes the placeholder "unconfigured" when SSO is not set up; the
+	// api treats that as off (auth/config.go), so status must too.
 	issuer, _ := c.NS(nil, "get", "secret", "darkplum-auth",
 		"-o", "jsonpath={.data.OIDC_ISSUER}")
-	if strings.TrimSpace(issuer) != "" {
+	if oidcConfigured(issuer) {
 		fmt.Printf("%s     %s\n", sDim("auth"), sInfo("local + OIDC"))
 	} else {
 		fmt.Printf("%s     %s\n", sDim("auth"), sInfo("local only"))
@@ -73,4 +78,15 @@ func (s *StatusCmd) Run(g *Globals) error {
 	}
 	fmt.Println(sSuccess("✓ all pods ready"))
 	return nil
+}
+
+// oidcConfigured reports whether a base64 OIDC_ISSUER from the auth secret
+// names a real issuer rather than being empty or make deploy's placeholder.
+func oidcConfigured(b64 string) bool {
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(b64))
+	if err != nil {
+		return false
+	}
+	v := strings.TrimSpace(string(raw))
+	return v != "" && v != "unconfigured"
 }

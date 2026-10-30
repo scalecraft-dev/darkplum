@@ -21,3 +21,4 @@ func sSuccess(s string) string { return paint(ansiMoss, s) }           // ✓ ou
 func sInfo(s string) string    { return paint(ansiLilac, s) }          // in-progress steps
 func sDim(s string) string     { return paint(ansiSage, s) }           // secondary text
 func sFail(s string) string    { return paint(ansiRed, s) }            // failures / not-ready
+func sWarn(s string) string    { return paint(ansiAmber, s) }          // ! warnings
