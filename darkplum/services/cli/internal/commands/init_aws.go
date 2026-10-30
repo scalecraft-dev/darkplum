@@ -267,7 +267,7 @@ func (a *awsCloud) Inspect(bucket, region string) (backendState, error) {
 	switch {
 	case err == nil:
 		st.BucketExists = true
-	case isNotFound(err, "404", "Not Found", "NoSuchBucket"):
+	case isNotFound(err, "(404)", "Not Found", "NoSuchBucket"):
 	default:
 		return st, fmt.Errorf("bucket %s is not reachable or not owned by account %s: %w", bucket, a.account, err)
 	}
@@ -449,7 +449,7 @@ func (a *awsCloud) PrefixBuckets(region string) ([]string, error) {
 			continue
 		}
 		if _, err := a.aws("s3api", "head-bucket", "--bucket", n, "--region", region, "--expected-bucket-owner", a.account); err != nil {
-			if isNotFound(err, "404", "Not Found", "NoSuchBucket") {
+			if isNotFound(err, "(404)", "Not Found", "NoSuchBucket") {
 				continue // deleted since the listing
 			}
 			return nil, fmt.Errorf("bucket %s: %w", n, err)
@@ -482,7 +482,7 @@ func (c stateContents) String() string {
 // Read-only; the bucket's owner is asserted before the object is read.
 func (a *awsCloud) ReadState(bucket, key, region string) (sc stateContents, found bool, err error) {
 	if _, err := a.aws("s3api", "head-bucket", "--bucket", bucket, "--region", region, "--expected-bucket-owner", a.account); err != nil {
-		if isNotFound(err, "404", "Not Found", "NoSuchBucket") {
+		if isNotFound(err, "(404)", "Not Found", "NoSuchBucket") {
 			return sc, false, nil
 		}
 		return sc, false, fmt.Errorf("bucket %s is not readable or not owned by account %s: %w", bucket, a.account, err)
