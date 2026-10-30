@@ -277,6 +277,6 @@ func TestWriteRenderedSamples(t *testing.T) {
 		}
 	}
 	write("sample.tfvars", renderTFVars(s.tfvars(), fixedNow))
-	write("backend.tf", renderBackend(backendSpec{Bucket: stateBucketName(testAccount, "us-east-2", "a1b2c3"), Key: stateKey, Region: "us-east-2",
+	write("backend.tf", renderBackend(backendSpec{Bucket: stateBucketName(testAccount, "us-east-2", "a1b2c3"), Key: stateKeyFor(s.cluster), Region: "us-east-2",
 		KMSKeyARN: "arn:aws:kms:us-east-2:" + testAccount + ":key/abc"}))
 }

@@ -11,7 +11,7 @@ import (
 func writeBackendTF(t *testing.T, dir, bucket, region string) string {
 	t.Helper()
 	p := filepath.Join(dir, "backend.tf")
-	body := renderBackend(backendSpec{Bucket: bucket, Key: stateKey, Region: region, KMSKeyARN: kmsARN})
+	body := renderBackend(backendSpec{Bucket: bucket, Key: legacyStateKey, Region: region, KMSKeyARN: kmsARN})
 	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +35,7 @@ func TestInitS3ReRunReusesBucketFromBackendTF(t *testing.T) {
 	if !cloud.createdWith.BucketExists {
 		t.Error("CreateBackend must be told the bucket exists")
 	}
-	if !strings.Contains(out.String(), "reused from backend.tf") || !strings.Contains(out.String(), "unrecoverable") {
+	if !strings.Contains(out.String(), "S3 "+existing+" (reused; same bucket, key and region)") || !strings.Contains(out.String(), "unrecoverable") {
 		t.Errorf("output lacks reuse note or KMS warning:\n%s", out)
 	}
 }

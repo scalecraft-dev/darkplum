@@ -60,6 +60,9 @@ type initCloud interface {
 	NameCollisions(region, name string) []checkResult
 	CheckRegion(region string) error
 	Inspect(bucket, region string) (backendState, error)
+	StateBuckets(region string) ([]stateBucket, error)
+	PrefixBuckets(region string) ([]string, error)
+	ReadState(bucket, key, region string) (sc stateContents, found bool, err error)
 	CreateBackend(bucket, region string, st backendState) (string, error)
 
 	// Private web address (init_web.go). Read-only except CreateWebZone.
@@ -169,6 +172,7 @@ type settings struct {
 	geo, bedrockRegion                string
 	throwaway                         bool
 	backend                           string // "s3" | "local"
+	liveChecked                       string // cluster name the live-install lookup already ran for
 	web                               webSettings
 	checks                            []checkResult
 }
@@ -440,29 +444,17 @@ func (c *InitCmd) execute(env *initEnv) error {
 		}
 	}
 
+	// A fresh checkout of a live install: its state answers before the name
+	// check, which would otherwise call the install's own cluster a clash.
+	s.cluster = c.ClusterName
+	if err := c.preflightLiveInstall(env, s, dir, cloud); err != nil {
+		return err
+	}
+
 	// Cluster name collisions.
-	cluster := c.ClusterName
-	for {
-		rows := cloud.NameCollisions(region, cluster)
-		failed := false
-		for _, r := range rows {
-			// Only rows that need attention are shown; passes are summarised below.
-			if r.status != checkPass {
-				record(r)
-			}
-			failed = failed || r.status == checkFail
-		}
-		if !failed {
-			record(checkResult{name: "cluster name", status: checkPass, detail: cluster + " is free"})
-			break
-		}
-		if !env.interactive {
-			return reportedErr("cluster name %q collides with an existing resource; pass another --cluster-name", cluster)
-		}
-		var err error
-		if cluster, err = env.prompt.Ask("Cluster name", cluster+"-2", validateClusterName); err != nil {
-			return err
-		}
+	cluster, err := chooseCluster(env, cloud, region, c.ClusterName, record)
+	if err != nil {
+		return err
 	}
 	s.cluster = cluster
 
@@ -488,6 +480,33 @@ func (c *InitCmd) execute(env *initEnv) error {
 	}
 
 	return c.finish(env, s, dir, cloud)
+}
+
+// chooseCluster returns the first cluster name, starting at name, that collides
+// with nothing in the account. Interactive runs ask for another name; --yes stops.
+func chooseCluster(env *initEnv, cloud initCloud, region, name string, record func(checkResult)) (string, error) {
+	for {
+		rows := cloud.NameCollisions(region, name)
+		failed := false
+		for _, r := range rows {
+			// Only rows that need attention are shown; passes are summarised below.
+			if r.status != checkPass {
+				record(r)
+			}
+			failed = failed || r.status == checkFail
+		}
+		if !failed {
+			record(checkResult{name: "cluster name", status: checkPass, detail: name + " is free"})
+			return name, nil
+		}
+		if !env.interactive {
+			return "", reportedErr("cluster name %q collides with an existing resource; pass another --cluster-name", name)
+		}
+		var err error
+		if name, err = env.prompt.Ask("Cluster name", name+"-2", validateClusterName); err != nil {
+			return "", err
+		}
+	}
 }
 
 // chooseModel fills the model fields for gpu mode.
@@ -668,21 +687,21 @@ func (s *settings) tfvars() []tfvarsKV {
 	return kv
 }
 
-// existingBackend reads the bucket and region named in an existing backend.tf.
-func existingBackend(path string) (bucket, region string, ok bool) {
+// existingBackend reads the bucket, key and region named in an existing backend.tf.
+func existingBackend(path string) (bucket, key, region string, ok bool) {
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return "", "", false
+		return "", "", "", false
 	}
-	get := func(key string) string {
-		m := regexp.MustCompile(`(?m)^\s*` + key + `\s*=\s*"([^"]+)"`).FindSubmatch(b)
+	get := func(name string) string {
+		m := regexp.MustCompile(`(?m)^\s*` + name + `\s*=\s*"([^"]+)"`).FindSubmatch(b)
 		if m == nil {
 			return ""
 		}
 		return string(m[1])
 	}
-	bucket, region = get("bucket"), get("region")
-	return bucket, region, bucket != "" && region != ""
+	bucket, key, region = get("bucket"), get("key"), get("region")
+	return bucket, key, region, bucket != "" && key != "" && region != ""
 }
 
 // localStateResources counts resources in dir/terraform.tfstate (0 when there is
@@ -709,33 +728,19 @@ func (c *InitCmd) finish(env *initEnv, s *settings, dir string, cloud initCloud)
 	w := env.out
 	tfvarsPath := filepath.Join(dir, "terraform.tfvars")
 	backendPath := filepath.Join(dir, "backend.tf")
-	tfvarsText := renderTFVars(s.tfvars(), env.now())
 
-	// Bucket: reuse the one an existing backend.tf names (same account and
-	// region), else a new random-suffixed name.
-	bucket, reused := "", false
+	// Where state lives: kept from backend.tf, an existing Darkplum bucket, or a
+	// new one (init_state.go). May rename the cluster, so tfvars renders after.
+	var plan statePlan
 	if s.backend == "s3" {
-		if eb, er, ok := existingBackend(backendPath); ok && er == s.region && strings.HasPrefix(eb, "darkplum-tfstate-"+s.account+"-") {
-			bucket, reused = eb, true
-		} else {
-			bucket = stateBucketName(s.account, s.region, env.suffix())
-		}
-	}
-	var st backendState
-	if s.backend == "s3" {
-		fmt.Fprintf(w, "%s checking state bucket %s and key %s…\n", sDim("…"), bucket, stateKeyAlias)
 		var err error
-		if st, err = cloud.Inspect(bucket, s.region); err != nil {
-			return env.fail("state bucket", firstLine(err.Error()), "fix the above, pick --backend local, or remove the bucket named in backend.tf", "cannot use the state backend")
+		if plan, err = c.planState(env, s, dir, cloud); err != nil {
+			return err
 		}
-		detail := "S3 " + bucket
-		if reused {
-			detail += " (reused from backend.tf)"
-		}
-		s.checks = append(s.checks, checkResult{name: "terraform state", status: checkPass, detail: detail})
-		printCheckTo(w, s.checks[len(s.checks)-1])
 	}
-	spec := backendSpec{Bucket: bucket, Key: stateKey, Region: s.region, KMSKeyARN: st.KeyARN}
+	bucket, reused, st := plan.bucket, plan.kept, plan.st
+	tfvarsText := renderTFVars(s.tfvars(), env.now())
+	spec := backendSpec{Bucket: bucket, Key: plan.key, Region: s.region, KMSKeyARN: st.KeyARN}
 	if spec.KMSKeyARN == "" {
 		spec.KMSKeyARN = kmsKeyPlaceholder
 	}
@@ -769,6 +774,12 @@ func (c *InitCmd) finish(env *initEnv, s *settings, dir string, cloud initCloud)
 		}
 		if localResources > 0 {
 			fmt.Fprintf(w, "  %s %d resources in local state would NOT move to S3 automatically; after writing, run: cd %s && terraform init -migrate-state\n\n", sWarn("!"), localResources, dir)
+		}
+		if plan.staleEmpty {
+			fmt.Fprintf(w, "  %s\n\n", sDim("would set aside Terraform's saved settings for the earlier, empty state at "+plan.cache.url()))
+		}
+		if plan.staleLive != nil {
+			fmt.Fprintf(w, "  %s %s at %s would NOT move automatically; after writing, run: %s\n\n", sWarn("!"), *plan.staleLive, plan.cache.url(), migrateCmd(dir, s.profile))
 		}
 		c.summary(env, s, nil, true)
 		return nil
@@ -813,6 +824,13 @@ func (c *InitCmd) finish(env *initEnv, s *settings, dir string, cloud initCloud)
 			return errAborted
 		}
 	}
+	// The same for state in an earlier S3 location this checkout still points
+	// at: init never moves it, and --yes never writes a backend away from it.
+	if plan.staleLive != nil {
+		if err := c.confirmStaleState(env, s, dir, plan); err != nil {
+			return err
+		}
+	}
 	if env.interactive {
 		what := "Save these settings?"
 		if s.backend == "s3" && !st.BucketExists {
@@ -846,6 +864,12 @@ func (c *InitCmd) finish(env *initEnv, s *settings, dir string, cloud initCloud)
 			return env.fail("state bucket", firstLine(err.Error()), "needs s3:CreateBucket/PutBucket* and kms:CreateKey/CreateAlias in "+s.region+"; re-run init (it reuses what was created), or use --backend local", "could not create the state backend")
 		}
 		spec.KMSKeyARN = arn
+		if plan.staleEmpty {
+			if err := setAsideBackendCache(dir, env.now()); err != nil {
+				return reportedErr("could not set aside Terraform's saved backend settings in %s: %v", filepath.Join(dir, ".terraform"), err)
+			}
+			fmt.Fprintf(w, "  %s\n", sDim("set aside Terraform's saved settings for the earlier, empty state at "+plan.cache.url()))
+		}
 		if err := writeFileAtomic(backendPath, []byte(renderBackend(spec))); err != nil {
 			return err
 		}
@@ -864,6 +888,9 @@ func (c *InitCmd) finish(env *initEnv, s *settings, dir string, cloud initCloud)
 	fmt.Fprintln(w)
 	if s.backend == "s3" {
 		fmt.Fprintf(w, "  %s %s\n", sWarn("!"), kmsWarning)
+	}
+	if plan.staleLive != nil {
+		fmt.Fprintf(w, "  %s before make deploy, move the earlier state: %s\n", sWarn("!"), sCmd(migrateCmd(dir, s.profile)))
 	}
 	c.summary(env, s, wrote, false)
 	return nil
@@ -903,5 +930,5 @@ func (c *InitCmd) summary(env *initEnv, s *settings, wrote []string, dry bool) {
 	if s.gpu {
 		eta = "~35-50 min"
 	}
-	fmt.Fprintf(w, "\n  Next: %s  %s, then %s\n", sCmd("make deploy"), sDim("("+eta+")"), sCmd("./bin/darkplum status"))
+	fmt.Fprintf(w, "\n  Next: %s  %s, then %s\n", sCmd("make deploy"), sDim("("+eta+")"), sCmd("./bin/darkplum configure"))
 }

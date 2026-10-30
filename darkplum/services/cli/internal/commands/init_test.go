@@ -38,6 +38,17 @@ type fakeCloud struct {
 	createErr   error
 	createdWith backendState
 
+	// Existing state buckets and objects ("bucket/key" -> resources; absent =
+	// no object). objectErr makes a read fail.
+	buckets     []stateBucket
+	bucketsErr  error
+	prefixOnly  []string
+	prefixErr   error
+	objects     map[string]int
+	objectsFull map[string]stateContents // wins over objects (outputs, too)
+	objectErr   map[string]error
+	reads       []string
+
 	// Route53 / ACM (init_web.go).
 	hzones      map[string]hostedZone // by name: public hosted zones in the account
 	records     map[string][]string   // "zoneID name" -> record types
@@ -91,6 +102,32 @@ func (f *fakeCloud) NameCollisions(_, _ string) []checkResult { return f.collisi
 func (f *fakeCloud) CheckRegion(string) error                 { return f.regionErr }
 func (f *fakeCloud) Inspect(string, string) (backendState, error) {
 	return f.state, f.inspectErr
+}
+func (f *fakeCloud) StateBuckets(string) ([]stateBucket, error) { return f.buckets, f.bucketsErr }
+
+// PrefixBuckets: every prefixed bucket. Defaults to the reusable ones plus
+// prefixOnly (buckets that fail the reuse checks but exist).
+func (f *fakeCloud) PrefixBuckets(string) ([]string, error) {
+	if f.prefixErr != nil {
+		return nil, f.prefixErr
+	}
+	var names []string
+	for _, b := range f.buckets {
+		names = append(names, b.Name)
+	}
+	return append(names, f.prefixOnly...), nil
+}
+func (f *fakeCloud) ReadState(bucket, key, _ string) (stateContents, bool, error) {
+	k := bucket + "/" + key
+	f.reads = append(f.reads, k)
+	if err := f.objectErr[k]; err != nil {
+		return stateContents{}, false, err
+	}
+	if sc, ok := f.objectsFull[k]; ok {
+		return sc, true, nil
+	}
+	n, ok := f.objects[k]
+	return stateContents{Resources: n}, ok, nil
 }
 func (f *fakeCloud) CreateBackend(_, _ string, st backendState) (string, error) {
 	f.createCalls++

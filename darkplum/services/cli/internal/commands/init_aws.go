@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"sort"
 	"strings"
+	"time"
 )
 
 // cmdRunner runs an external command and returns trimmed stdout. On failure the
@@ -200,14 +201,27 @@ func firstLine(s string) string {
 }
 
 // stateBucketName: the random suffix keeps the globally unique S3 namespace from
-// being squatted or colliding; a re-run reuses the name recorded in backend.tf.
+// being squatted or colliding; a re-run reuses the name recorded in backend.tf,
+// and a new install reuses an existing Darkplum bucket (StateBuckets).
 func stateBucketName(account, region, suffix string) string {
-	return fmt.Sprintf("darkplum-tfstate-%s-%s-%s", account, region, suffix)
+	return stateBucketPrefix(account, region) + suffix
+}
+
+func stateBucketPrefix(account, region string) string {
+	return fmt.Sprintf("darkplum-tfstate-%s-%s-", account, region)
+}
+
+// stateKeyFor is the state object of a new install. The cluster name keeps two
+// installs that share an account, region and bucket apart.
+func stateKeyFor(cluster string) string {
+	return "darkplum/aws/" + cluster + "/terraform.tfstate"
 }
 
 const (
-	stateKeyAlias     = "alias/darkplum-tfstate"
-	stateKey          = "darkplum/aws/terraform.tfstate"
+	stateKeyAlias = "alias/darkplum-tfstate"
+	// legacyStateKey is the key every install used before the cluster name was
+	// part of it. An existing backend.tf keeps whatever key it names.
+	legacyStateKey    = "darkplum/aws/terraform.tfstate"
 	kmsKeyPlaceholder = "<kms-key-arn>"
 	kmsWarning        = "Deleting the KMS key alias/darkplum-tfstate makes every state file in the bucket unrecoverable."
 )
@@ -216,6 +230,7 @@ const (
 type backendState struct {
 	KeyARN       string // key to use: the alias's key, else the existing bucket's key; empty = create one
 	BucketExists bool
+	Versioning   string   // an existing bucket's versioning status ("" = could not tell)
 	Checks       []string // the read-only commands that were run, for --dry-run
 }
 
@@ -252,7 +267,7 @@ func (a *awsCloud) Inspect(bucket, region string) (backendState, error) {
 	switch {
 	case err == nil:
 		st.BucketExists = true
-	case isNotFound(err, "404", "Not Found", "NoSuchBucket"):
+	case isNotFound(err, "(404)", "Not Found", "NoSuchBucket"):
 	default:
 		return st, fmt.Errorf("bucket %s is not reachable or not owned by account %s: %w", bucket, a.account, err)
 	}
@@ -279,8 +294,250 @@ func (a *awsCloud) Inspect(bucket, region string) (backendState, error) {
 				bucket, bucketARN, stateKeyAlias, aliasARN)
 		}
 		st.KeyARN = bucketARN
+		// Not fatal: CreateBackend turns versioning on again; the caller warns.
+		if v, err := rec("s3api", "get-bucket-versioning", "--bucket", bucket, "--expected-bucket-owner", a.account,
+			"--query", "Status", "--output", "text"); err == nil {
+			if v == "" || v == "None" {
+				v = "Off"
+			}
+			st.Versioning = v
+		}
 	}
 	return st, nil
+}
+
+const (
+	purposeTagKey   = "darkplum:purpose"
+	purposeTagValue = "terraform-state"
+)
+
+// stateBucket is an existing Darkplum state bucket that StateBuckets found
+// usable: owned by the account, versioned, public access fully blocked,
+// encrypted with the state key.
+type stateBucket struct {
+	Name     string
+	Created  time.Time
+	Untagged bool // no darkplum:purpose tag: made by an earlier release
+}
+
+// StateBuckets lists this account's Darkplum state buckets for region, newest
+// first. Read-only. A bucket that is not owned by the account, not versioned,
+// not fully blocked from public access, not encrypted with the
+// alias/darkplum-tfstate key, or tagged for another purpose is left out: init
+// only reuses a bucket it would have created itself. An untagged bucket that
+// passes every other check is accepted (buckets from before the tag).
+func (a *awsCloud) StateBuckets(region string) ([]stateBucket, error) {
+	prefix := stateBucketPrefix(a.account, region)
+	out, err := a.aws("s3api", "list-buckets", "--query",
+		fmt.Sprintf("Buckets[?starts_with(Name, '%s')].{Name:Name,Created:CreationDate}", prefix), "--output", "json")
+	if err != nil {
+		return nil, err
+	}
+	var listed []struct {
+		Name    string `json:"Name"`
+		Created string `json:"Created"`
+	}
+	if out != "" && out != "null" {
+		if err := json.Unmarshal([]byte(out), &listed); err != nil {
+			return nil, fmt.Errorf("unexpected list-buckets output")
+		}
+	}
+	if len(listed) == 0 {
+		return nil, nil
+	}
+	aliasARN, err := a.keyARN(region, stateKeyAlias)
+	if err != nil {
+		if isNotFound(err, "NotFoundException") {
+			return nil, nil // without the state key no bucket qualifies
+		}
+		return nil, fmt.Errorf("check KMS alias %s: %w", stateKeyAlias, err)
+	}
+	owner := []string{"--expected-bucket-owner", a.account}
+	var found []stateBucket
+	for _, l := range listed {
+		if !strings.HasPrefix(l.Name, prefix) {
+			continue
+		}
+		v, err := a.aws(append([]string{"s3api", "get-bucket-versioning", "--bucket", l.Name, "--region", region,
+			"--query", "Status", "--output", "text"}, owner...)...)
+		if err != nil || v != "Enabled" {
+			continue
+		}
+		pab, err := a.aws(append([]string{"s3api", "get-public-access-block", "--bucket", l.Name, "--region", region,
+			"--query", "PublicAccessBlockConfiguration", "--output", "json"}, owner...)...)
+		if err != nil {
+			continue
+		}
+		var block struct {
+			A bool `json:"BlockPublicAcls"`
+			B bool `json:"IgnorePublicAcls"`
+			C bool `json:"BlockPublicPolicy"`
+			D bool `json:"RestrictPublicBuckets"`
+		}
+		if json.Unmarshal([]byte(pab), &block) != nil || !(block.A && block.B && block.C && block.D) {
+			continue
+		}
+		untagged := false
+		tags, err := a.aws(append([]string{"s3api", "get-bucket-tagging", "--bucket", l.Name, "--region", region,
+			"--query", "TagSet", "--output", "json"}, owner...)...)
+		switch {
+		case err != nil && isNotFound(err, "NoSuchTagSet"):
+			untagged = true
+		case err != nil:
+			continue
+		default:
+			var ts []struct{ Key, Value string }
+			if json.Unmarshal([]byte(tags), &ts) != nil {
+				continue
+			}
+			purpose := ""
+			for _, t := range ts {
+				if t.Key == purposeTagKey {
+					purpose = t.Value
+				}
+			}
+			if purpose == "" {
+				untagged = true
+			} else if purpose != purposeTagValue {
+				continue
+			}
+		}
+		enc, err := a.aws(append([]string{"s3api", "get-bucket-encryption", "--bucket", l.Name, "--region", region,
+			"--query", "ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault", "--output", "json"}, owner...)...)
+		if err != nil {
+			continue
+		}
+		var sse struct {
+			Alg string `json:"SSEAlgorithm"`
+			Key string `json:"KMSMasterKeyID"`
+		}
+		if json.Unmarshal([]byte(enc), &sse) != nil || sse.Alg != "aws:kms" || sse.Key == "" {
+			continue
+		}
+		if sse.Key != aliasARN {
+			if arn, err := a.keyARN(region, sse.Key); err != nil || arn != aliasARN {
+				continue
+			}
+		}
+		created, _ := time.Parse(time.RFC3339, l.Created)
+		found = append(found, stateBucket{Name: l.Name, Created: created, Untagged: untagged})
+	}
+	sort.SliceStable(found, func(i, j int) bool { return found[i].Created.After(found[j].Created) })
+	return found, nil
+}
+
+// PrefixBuckets lists every bucket with this account's Darkplum state prefix in
+// region, with ownership asserted by head-bucket, and nothing else checked: it
+// answers "where could an install keep state", not "which bucket may a new
+// install reuse". Read-only. Any failure is returned, never read as "none".
+func (a *awsCloud) PrefixBuckets(region string) ([]string, error) {
+	prefix := stateBucketPrefix(a.account, region)
+	out, err := a.aws("s3api", "list-buckets", "--query",
+		fmt.Sprintf("Buckets[?starts_with(Name, '%s')].Name", prefix), "--output", "json")
+	if err != nil {
+		return nil, err
+	}
+	var listed []string
+	if out != "" && out != "null" {
+		if err := json.Unmarshal([]byte(out), &listed); err != nil {
+			return nil, fmt.Errorf("unexpected list-buckets output")
+		}
+	}
+	var names []string
+	for _, n := range listed {
+		if !strings.HasPrefix(n, prefix) {
+			continue
+		}
+		if _, err := a.aws("s3api", "head-bucket", "--bucket", n, "--region", region, "--expected-bucket-owner", a.account); err != nil {
+			if isNotFound(err, "(404)", "Not Found", "NoSuchBucket") {
+				continue // deleted since the listing
+			}
+			return nil, fmt.Errorf("bucket %s: %w", n, err)
+		}
+		names = append(names, n)
+	}
+	return names, nil
+}
+
+// stateContents is what a Terraform state object holds.
+type stateContents struct {
+	Resources, Outputs int
+	ClusterName        string // the EKS cluster the state manages; "" = unknown
+}
+
+// empty: no resources and no outputs. A state with outputs but no resources
+// still belongs to someone.
+func (c stateContents) empty() bool { return c.Resources == 0 && c.Outputs == 0 }
+
+func (c stateContents) String() string {
+	s := fmt.Sprintf("%d resources", c.Resources)
+	if c.Outputs > 0 {
+		s += fmt.Sprintf(", %d outputs", c.Outputs)
+	}
+	return s
+}
+
+// ReadState reads a Terraform state object and counts its resources and
+// outputs. found is false when the bucket or the object does not exist.
+// Read-only; the bucket's owner is asserted before the object is read.
+func (a *awsCloud) ReadState(bucket, key, region string) (sc stateContents, found bool, err error) {
+	if _, err := a.aws("s3api", "head-bucket", "--bucket", bucket, "--region", region, "--expected-bucket-owner", a.account); err != nil {
+		if isNotFound(err, "(404)", "Not Found", "NoSuchBucket") {
+			return sc, false, nil
+		}
+		return sc, false, fmt.Errorf("bucket %s is not readable or not owned by account %s: %w", bucket, a.account, err)
+	}
+	out, err := a.aws("s3", "cp", "s3://"+bucket+"/"+key, "-", "--region", region)
+	if err != nil {
+		if isNotFound(err, "(404)", "does not exist", "NoSuchKey", "Not Found") {
+			return sc, false, nil
+		}
+		return sc, false, err
+	}
+	sc, err = parseState([]byte(out))
+	if err != nil {
+		return sc, true, fmt.Errorf("s3://%s/%s is not a Terraform state file", bucket, key)
+	}
+	return sc, true, nil
+}
+
+// parseState counts a state's resources and outputs and finds the EKS cluster
+// it manages: the aws_eks_cluster resource's name, else the cluster_name output.
+func parseState(b []byte) (stateContents, error) {
+	var st struct {
+		Resources []struct {
+			Type      string `json:"type"`
+			Instances []struct {
+				Attributes struct {
+					Name string `json:"name"`
+				} `json:"attributes"`
+			} `json:"instances"`
+		} `json:"resources"`
+		Outputs map[string]struct {
+			Value json.RawMessage `json:"value"`
+		} `json:"outputs"`
+	}
+	if err := json.Unmarshal(b, &st); err != nil {
+		return stateContents{}, err
+	}
+	sc := stateContents{Resources: len(st.Resources), Outputs: len(st.Outputs)}
+	for _, r := range st.Resources {
+		if r.Type == "aws_eks_cluster" {
+			for _, in := range r.Instances {
+				if in.Attributes.Name != "" {
+					sc.ClusterName = in.Attributes.Name
+					return sc, nil
+				}
+			}
+		}
+	}
+	if o, ok := st.Outputs["cluster_name"]; ok {
+		var name string
+		if json.Unmarshal(o.Value, &name) == nil {
+			sc.ClusterName = name
+		}
+	}
+	return sc, nil
 }
 
 // bucketCommands are the s3api calls that create and harden the bucket, with
@@ -298,7 +555,10 @@ func bucketCommands(profile, account, bucket, region, kmsARN string, exists bool
 	enc := fmt.Sprintf(`{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"aws:kms","KMSMasterKeyID":%q},"BucketKeyEnabled":true}]}`, kmsARN)
 	var cmds [][]string
 	if !exists {
-		cmds = append(cmds, create)
+		// Tagged like the KMS key, so a later init can tell its own buckets.
+		// Only at creation: put-bucket-tagging replaces the whole tag set.
+		cmds = append(cmds, create, append([]string{"s3api", "put-bucket-tagging", "--bucket", bucket, "--tagging",
+			`{"TagSet":[{"Key":"` + purposeTagKey + `","Value":"` + purposeTagValue + `"}]}`}, owner...))
 	}
 	cmds = append(cmds,
 		append([]string{"s3api", "put-public-access-block", "--bucket", bucket, "--public-access-block-configuration",
