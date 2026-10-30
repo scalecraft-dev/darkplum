@@ -230,6 +230,7 @@ const (
 type backendState struct {
 	KeyARN       string // key to use: the alias's key, else the existing bucket's key; empty = create one
 	BucketExists bool
+	Versioning   string   // an existing bucket's versioning status ("" = could not tell)
 	Checks       []string // the read-only commands that were run, for --dry-run
 }
 
@@ -293,21 +294,38 @@ func (a *awsCloud) Inspect(bucket, region string) (backendState, error) {
 				bucket, bucketARN, stateKeyAlias, aliasARN)
 		}
 		st.KeyARN = bucketARN
+		// Not fatal: CreateBackend turns versioning on again; the caller warns.
+		if v, err := rec("s3api", "get-bucket-versioning", "--bucket", bucket, "--expected-bucket-owner", a.account,
+			"--query", "Status", "--output", "text"); err == nil {
+			if v == "" || v == "None" {
+				v = "Off"
+			}
+			st.Versioning = v
+		}
 	}
 	return st, nil
 }
 
+const (
+	purposeTagKey   = "darkplum:purpose"
+	purposeTagValue = "terraform-state"
+)
+
 // stateBucket is an existing Darkplum state bucket that StateBuckets found
-// usable: owned by the account, versioned, encrypted with the state key.
+// usable: owned by the account, versioned, public access fully blocked,
+// encrypted with the state key.
 type stateBucket struct {
-	Name    string
-	Created time.Time
+	Name     string
+	Created  time.Time
+	Untagged bool // no darkplum:purpose tag: made by an earlier release
 }
 
 // StateBuckets lists this account's Darkplum state buckets for region, newest
-// first. Read-only. A bucket that is not versioned, not owned by the account or
-// not encrypted with the alias/darkplum-tfstate key is left out: init only
-// reuses a bucket it would have created itself.
+// first. Read-only. A bucket that is not owned by the account, not versioned,
+// not fully blocked from public access, not encrypted with the
+// alias/darkplum-tfstate key, or tagged for another purpose is left out: init
+// only reuses a bucket it would have created itself. An untagged bucket that
+// passes every other check is accepted (buckets from before the tag).
 func (a *awsCloud) StateBuckets(region string) ([]stateBucket, error) {
 	prefix := stateBucketPrefix(a.account, region)
 	out, err := a.aws("s3api", "list-buckets", "--query",
@@ -345,6 +363,45 @@ func (a *awsCloud) StateBuckets(region string) ([]stateBucket, error) {
 		if err != nil || v != "Enabled" {
 			continue
 		}
+		pab, err := a.aws(append([]string{"s3api", "get-public-access-block", "--bucket", l.Name, "--region", region,
+			"--query", "PublicAccessBlockConfiguration", "--output", "json"}, owner...)...)
+		if err != nil {
+			continue
+		}
+		var block struct {
+			A bool `json:"BlockPublicAcls"`
+			B bool `json:"IgnorePublicAcls"`
+			C bool `json:"BlockPublicPolicy"`
+			D bool `json:"RestrictPublicBuckets"`
+		}
+		if json.Unmarshal([]byte(pab), &block) != nil || !(block.A && block.B && block.C && block.D) {
+			continue
+		}
+		untagged := false
+		tags, err := a.aws(append([]string{"s3api", "get-bucket-tagging", "--bucket", l.Name, "--region", region,
+			"--query", "TagSet", "--output", "json"}, owner...)...)
+		switch {
+		case err != nil && isNotFound(err, "NoSuchTagSet"):
+			untagged = true
+		case err != nil:
+			continue
+		default:
+			var ts []struct{ Key, Value string }
+			if json.Unmarshal([]byte(tags), &ts) != nil {
+				continue
+			}
+			purpose := ""
+			for _, t := range ts {
+				if t.Key == purposeTagKey {
+					purpose = t.Value
+				}
+			}
+			if purpose == "" {
+				untagged = true
+			} else if purpose != purposeTagValue {
+				continue
+			}
+		}
 		enc, err := a.aws(append([]string{"s3api", "get-bucket-encryption", "--bucket", l.Name, "--region", region,
 			"--query", "ServerSideEncryptionConfiguration.Rules[0].ApplyServerSideEncryptionByDefault", "--output", "json"}, owner...)...)
 		if err != nil {
@@ -363,36 +420,54 @@ func (a *awsCloud) StateBuckets(region string) ([]stateBucket, error) {
 			}
 		}
 		created, _ := time.Parse(time.RFC3339, l.Created)
-		found = append(found, stateBucket{Name: l.Name, Created: created})
+		found = append(found, stateBucket{Name: l.Name, Created: created, Untagged: untagged})
 	}
 	sort.SliceStable(found, func(i, j int) bool { return found[i].Created.After(found[j].Created) })
 	return found, nil
 }
 
-// StateResources reads a Terraform state object and counts its resources.
-// found is false when the bucket or the object does not exist. Read-only; the
-// bucket's owner is asserted before the object is read.
-func (a *awsCloud) StateResources(bucket, key, region string) (n int, found bool, err error) {
+// stateContents is what a Terraform state object holds.
+type stateContents struct {
+	Resources, Outputs int
+}
+
+// empty: no resources and no outputs. A state with outputs but no resources
+// still belongs to someone.
+func (c stateContents) empty() bool { return c.Resources == 0 && c.Outputs == 0 }
+
+func (c stateContents) String() string {
+	s := fmt.Sprintf("%d resources", c.Resources)
+	if c.Outputs > 0 {
+		s += fmt.Sprintf(", %d outputs", c.Outputs)
+	}
+	return s
+}
+
+// ReadState reads a Terraform state object and counts its resources and
+// outputs. found is false when the bucket or the object does not exist.
+// Read-only; the bucket's owner is asserted before the object is read.
+func (a *awsCloud) ReadState(bucket, key, region string) (sc stateContents, found bool, err error) {
 	if _, err := a.aws("s3api", "head-bucket", "--bucket", bucket, "--region", region, "--expected-bucket-owner", a.account); err != nil {
 		if isNotFound(err, "404", "Not Found", "NoSuchBucket") {
-			return 0, false, nil
+			return sc, false, nil
 		}
-		return 0, false, fmt.Errorf("bucket %s is not readable or not owned by account %s: %w", bucket, a.account, err)
+		return sc, false, fmt.Errorf("bucket %s is not readable or not owned by account %s: %w", bucket, a.account, err)
 	}
 	out, err := a.aws("s3", "cp", "s3://"+bucket+"/"+key, "-", "--region", region)
 	if err != nil {
 		if isNotFound(err, "(404)", "does not exist", "NoSuchKey", "Not Found") {
-			return 0, false, nil
+			return sc, false, nil
 		}
-		return 0, false, err
+		return sc, false, err
 	}
 	var st struct {
-		Resources []json.RawMessage `json:"resources"`
+		Resources []json.RawMessage          `json:"resources"`
+		Outputs   map[string]json.RawMessage `json:"outputs"`
 	}
 	if err := json.Unmarshal([]byte(out), &st); err != nil {
-		return 0, true, fmt.Errorf("s3://%s/%s is not a Terraform state file", bucket, key)
+		return sc, true, fmt.Errorf("s3://%s/%s is not a Terraform state file", bucket, key)
 	}
-	return len(st.Resources), true, nil
+	return stateContents{Resources: len(st.Resources), Outputs: len(st.Outputs)}, true, nil
 }
 
 // bucketCommands are the s3api calls that create and harden the bucket, with
@@ -410,7 +485,10 @@ func bucketCommands(profile, account, bucket, region, kmsARN string, exists bool
 	enc := fmt.Sprintf(`{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"aws:kms","KMSMasterKeyID":%q},"BucketKeyEnabled":true}]}`, kmsARN)
 	var cmds [][]string
 	if !exists {
-		cmds = append(cmds, create)
+		// Tagged like the KMS key, so a later init can tell its own buckets.
+		// Only at creation: put-bucket-tagging replaces the whole tag set.
+		cmds = append(cmds, create, append([]string{"s3api", "put-bucket-tagging", "--bucket", bucket, "--tagging",
+			`{"TagSet":[{"Key":"` + purposeTagKey + `","Value":"` + purposeTagValue + `"}]}`}, owner...))
 	}
 	cmds = append(cmds,
 		append([]string{"s3api", "put-public-access-block", "--bucket", bucket, "--public-access-block-configuration",

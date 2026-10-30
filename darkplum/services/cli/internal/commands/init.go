@@ -61,7 +61,7 @@ type initCloud interface {
 	CheckRegion(region string) error
 	Inspect(bucket, region string) (backendState, error)
 	StateBuckets(region string) ([]stateBucket, error)
-	StateResources(bucket, key, region string) (n int, found bool, err error)
+	ReadState(bucket, key, region string) (sc stateContents, found bool, err error)
 	CreateBackend(bucket, region string, st backendState) (string, error)
 
 	// Private web address (init_web.go). Read-only except CreateWebZone.
@@ -769,8 +769,8 @@ func (c *InitCmd) finish(env *initEnv, s *settings, dir string, cloud initCloud)
 		if plan.staleEmpty {
 			fmt.Fprintf(w, "  %s\n\n", sDim("would set aside Terraform's saved settings for the earlier, empty state at "+plan.cache.url()))
 		}
-		if plan.staleResources > 0 {
-			fmt.Fprintf(w, "  %s %d resources at %s would NOT move automatically; after writing, run: %s\n\n", sWarn("!"), plan.staleResources, plan.cache.url(), migrateCmd(dir, s.profile))
+		if plan.staleLive != nil {
+			fmt.Fprintf(w, "  %s %s at %s would NOT move automatically; after writing, run: %s\n\n", sWarn("!"), *plan.staleLive, plan.cache.url(), migrateCmd(dir, s.profile))
 		}
 		c.summary(env, s, nil, true)
 		return nil
@@ -817,7 +817,7 @@ func (c *InitCmd) finish(env *initEnv, s *settings, dir string, cloud initCloud)
 	}
 	// The same for state in an earlier S3 location this checkout still points
 	// at: init never moves it, and --yes never writes a backend away from it.
-	if plan.staleResources > 0 {
+	if plan.staleLive != nil {
 		if err := c.confirmStaleState(env, s, dir, plan); err != nil {
 			return err
 		}
@@ -880,7 +880,7 @@ func (c *InitCmd) finish(env *initEnv, s *settings, dir string, cloud initCloud)
 	if s.backend == "s3" {
 		fmt.Fprintf(w, "  %s %s\n", sWarn("!"), kmsWarning)
 	}
-	if plan.staleResources > 0 {
+	if plan.staleLive != nil {
 		fmt.Fprintf(w, "  %s before make deploy, move the earlier state: %s\n", sWarn("!"), sCmd(migrateCmd(dir, s.profile)))
 	}
 	c.summary(env, s, wrote, false)

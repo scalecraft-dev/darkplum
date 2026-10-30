@@ -35,7 +35,7 @@ func TestInitS3ReRunReusesBucketFromBackendTF(t *testing.T) {
 	if !cloud.createdWith.BucketExists {
 		t.Error("CreateBackend must be told the bucket exists")
 	}
-	if !strings.Contains(out.String(), "S3 "+existing+" (reused)") || !strings.Contains(out.String(), "unrecoverable") {
+	if !strings.Contains(out.String(), "S3 "+existing+" (reused; same bucket, key and region)") || !strings.Contains(out.String(), "unrecoverable") {
 		t.Errorf("output lacks reuse note or KMS warning:\n%s", out)
 	}
 }

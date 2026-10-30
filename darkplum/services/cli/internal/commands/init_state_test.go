@@ -67,9 +67,41 @@ func TestInitStateReusesSingleBucket(t *testing.T) {
 	if !strings.Contains(out.String(), "S3 "+bucketN("ffffff")+" (reused)") {
 		t.Errorf("no reuse row:\n%s", out)
 	}
-	// The new install's key was checked before it was taken.
-	if strings.Join(cloud.reads, ",") != bucketN("ffffff")+"/darkplum/aws/darkplum/terraform.tfstate" {
-		t.Errorf("key not checked: %v", cloud.reads)
+	// Fresh checkout: the legacy and this cluster's keys were looked at for a
+	// live install, and the chosen key was checked before it was taken.
+	want := []string{bucketN("ffffff") + "/" + legacyStateKey, bucketN("ffffff") + "/darkplum/aws/darkplum/terraform.tfstate",
+		bucketN("ffffff") + "/darkplum/aws/darkplum/terraform.tfstate"}
+	if strings.Join(cloud.reads, ",") != strings.Join(want, ",") {
+		t.Errorf("reads = %v", cloud.reads)
+	}
+}
+
+func TestInitStateUntaggedBucketSaysSo(t *testing.T) {
+	cloud := newFakeCloud()
+	cloud.buckets = []stateBucket{{Name: bucketN("ffffff"), Untagged: true}}
+	cloud.state = backendState{KeyARN: fakeKMS, BucketExists: true}
+	env, out := testEnv(t, cloud, nil, "-")
+	if err := s3Cmd(t.TempDir(), nil).execute(env); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "S3 "+bucketN("ffffff")+" (reused; untagged, from an earlier release)") {
+		t.Errorf("no provenance note:\n%s", out)
+	}
+}
+
+func TestBucketCommandsTagNewBucketOnly(t *testing.T) {
+	joined := func(exists bool) string {
+		var s []string
+		for _, c := range bucketCommands("", testAccount, "b", "us-east-2", kmsARN, exists) {
+			s = append(s, formatAWS(c))
+		}
+		return strings.Join(s, "\n")
+	}
+	if got := joined(false); !strings.Contains(got, "put-bucket-tagging --bucket b --tagging '{\"TagSet\":[{\"Key\":\"darkplum:purpose\",\"Value\":\"terraform-state\"}]}' --expected-bucket-owner "+testAccount) {
+		t.Errorf("new bucket not tagged:\n%s", got)
+	}
+	if strings.Contains(joined(true), "put-bucket-tagging") {
+		t.Error("an existing bucket's tag set must not be replaced")
 	}
 }
 
@@ -156,7 +188,9 @@ func TestInitStateNewInstallKeyCarriesClusterName(t *testing.T) {
 	}
 }
 
-func TestInitStateExistingBackendKeptByteForByte(t *testing.T) {
+// An existing backend.tf keeps the same bucket, key and region (the whole file
+// comes out identical when the key ARN is unchanged).
+func TestInitStateExistingBackendKeepsBucketKeyRegion(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "backend.tf")
 	before := renderBackend(backendSpec{Bucket: bucketN("ffffff"), Key: legacyStateKey, Region: "us-east-2", KMSKeyARN: fakeKMS})
@@ -177,38 +211,112 @@ func TestInitStateExistingBackendKeptByteForByte(t *testing.T) {
 	if len(cloud.reads) != 0 {
 		t.Errorf("an existing install's key is not re-checked: %v", cloud.reads)
 	}
+	if !strings.Contains(out.String(), "(reused; same bucket, key and region)") {
+		t.Errorf("kept path not described:\n%s", out)
+	}
+}
+
+func TestInitStateKeptBucketVersioningOffWarns(t *testing.T) {
+	dir := t.TempDir()
+	writeBackendTF(t, dir, bucketN("ffffff"), "us-east-2")
+	cloud := newFakeCloud()
+	cloud.state = backendState{KeyARN: fakeKMS, BucketExists: true, Versioning: "Suspended"}
+	env, out := testEnv(t, cloud, nil, "-")
+	if err := s3Cmd(dir, nil).execute(env); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out.String(), "versioning is Suspended on "+bucketN("ffffff")) || !strings.Contains(out.String(), "turns it back on") {
+		t.Errorf("no versioning warning:\n%s", out)
+	}
+}
+
+// A fresh checkout (no backend.tf, no saved settings) must find a live install
+// in any reusable bucket, under the legacy key or this cluster's key, before it
+// picks a bucket, and print the backend.tf that manages it.
+func TestInitStateFreshCheckoutFindsLiveInstall(t *testing.T) {
+	cases := map[string]struct {
+		bucket, key string
+		sc          stateContents
+	}{
+		"cluster key, newest bucket skipped over": {bucketN("111111"), "darkplum/aws/darkplum/terraform.tfstate", stateContents{Resources: 42}},
+		"legacy key":   {bucketN("111111"), legacyStateKey, stateContents{Resources: 3}},
+		"outputs only": {bucketN("222222"), legacyStateKey, stateContents{Outputs: 2}},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			cloud := newFakeCloud()
+			cloud.buckets = []stateBucket{{Name: bucketN("222222")}, {Name: bucketN("111111")}}
+			cloud.state = backendState{KeyARN: fakeKMS, BucketExists: true}
+			cloud.objectsFull = map[string]stateContents{tc.bucket + "/" + tc.key: tc.sc}
+			env, out := testEnv(t, cloud, nil, "-")
+			err := s3Cmd(dir, nil).execute(env)
+			if err == nil || !strings.Contains(err.Error(), "an install already keeps state at s3://"+tc.bucket+"/"+tc.key) {
+				t.Fatalf("want refusal, got %v\n%s", err, out)
+			}
+			for _, want := range []string{`bucket       = "` + tc.bucket + `"`, `key          = "` + tc.key + `"`, `kms_key_id   = "` + fakeKMS + `"`, "save the following as backend.tf"} {
+				if !strings.Contains(out.String(), want) {
+					t.Errorf("restore instructions lack %q:\n%s", want, out)
+				}
+			}
+			if strings.Contains(out.String(), "using the newest") {
+				t.Error("picked a bucket before looking for the live install")
+			}
+			if entries, _ := os.ReadDir(dir); len(entries) != 0 || cloud.createCalls != 0 {
+				t.Errorf("wrote %v / created %d", entries, cloud.createCalls)
+			}
+		})
+	}
+	// Destroyed installs (empty states) do not block a reinstall.
+	cloud := newFakeCloud()
+	cloud.buckets = []stateBucket{{Name: bucketN("111111")}}
+	cloud.state = backendState{KeyARN: fakeKMS, BucketExists: true}
+	cloud.objects = map[string]int{bucketN("111111") + "/" + legacyStateKey: 0}
+	env, out := testEnv(t, cloud, nil, "-")
+	if err := s3Cmd(t.TempDir(), nil).execute(env); err != nil {
+		t.Fatalf("empty legacy state must not block: %v\n%s", err, out)
+	}
 }
 
 func TestInitStateKeyCollision(t *testing.T) {
-	taken := func() *fakeCloud {
+	ck := bucketN("ffffff") + "/darkplum/aws/darkplum/terraform.tfstate"
+	taken := func(n int) *fakeCloud {
 		c := newFakeCloud()
 		c.buckets = []stateBucket{{Name: bucketN("ffffff")}}
 		c.state = backendState{KeyARN: fakeKMS, BucketExists: true}
-		c.objects = map[string]int{bucketN("ffffff") + "/darkplum/aws/darkplum/terraform.tfstate": 42}
+		c.objects = map[string]int{ck: n}
 		return c
 	}
-	dir := t.TempDir()
-	cloud := taken()
-	env, out := testEnv(t, cloud, nil, "-")
-	err := s3Cmd(dir, nil).execute(env)
-	if err == nil || !strings.Contains(err.Error(), "another install named darkplum already keeps state here") {
-		t.Fatalf("want collision refusal, got %v\n%s", err, out)
+	// Not a fresh checkout: saved settings name some other, gone, state.
+	notFresh := func(t *testing.T) string {
+		dir := t.TempDir()
+		writeCache(t, dir, bucketN("000000"), legacyStateKey)
+		return dir
 	}
-	if entries, _ := os.ReadDir(dir); len(entries) != 0 || cloud.createCalls != 0 {
-		t.Errorf("wrote %v / created %d", entries, cloud.createCalls)
+	for _, n := range []int{42, 0} { // an existing object, even an empty one, is another install's
+		dir := notFresh(t)
+		cloud := taken(n)
+		env, out := testEnv(t, cloud, nil, "-")
+		err := s3Cmd(dir, nil).execute(env)
+		if err == nil || !strings.Contains(err.Error(), "another install named darkplum already keeps state here") {
+			t.Fatalf("%d resources: want collision refusal, got %v\n%s", n, err, out)
+		}
+		if _, err := os.Stat(filepath.Join(dir, "backend.tf")); err == nil || cloud.createCalls != 0 {
+			t.Errorf("%d resources: wrote backend.tf / created %d", n, cloud.createCalls)
+		}
 	}
 
-	// An emptied state (destroyed install of the same name) is reused.
-	cloud = taken()
-	cloud.objects[bucketN("ffffff")+"/darkplum/aws/darkplum/terraform.tfstate"] = 0
-	env, _ = testEnv(t, cloud, nil, "-")
-	if err := s3Cmd(t.TempDir(), nil).execute(env); err != nil {
-		t.Fatalf("empty state at the key must be reusable: %v", err)
+	// This checkout's own saved settings may claim the key.
+	dir := t.TempDir()
+	writeCache(t, dir, bucketN("ffffff"), "darkplum/aws/darkplum/terraform.tfstate")
+	env, out := testEnv(t, taken(0), nil, "-")
+	if err := s3Cmd(dir, nil).execute(env); err != nil {
+		t.Fatalf("own key refused: %v\n%s", err, out)
 	}
 
 	// Interactive: another name is asked for and lands in both files.
-	dir = t.TempDir()
-	env, out = testEnv(t, taken(), nil, "\ndarkplum-2\n\n")
+	dir = notFresh(t)
+	env, out = testEnv(t, taken(42), nil, "\ndarkplum-2\n\n")
 	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Region: "us-east-2", Mode: "bedrock", Backend: "s3", Profile: "acme", Domain: "acme.com"}
 	if err := c.execute(env); err != nil {
 		t.Fatalf("%v\n%s", err, out)
@@ -302,13 +410,26 @@ func TestInitStateFinalLineSaysConfigure(t *testing.T) {
 
 func TestAWSStateBucketsFiltersAndSorts(t *testing.T) {
 	good, newer, unversioned, otherKey := bucketN("aaaaaa"), bucketN("bbbbbb"), bucketN("cccccc"), bucketN("dddddd")
+	public, foreignTag := bucketN("eeeeee"), bucketN("ffffff")
+	listed := ""
+	for i, b := range []string{good, newer, unversioned, otherKey, public, foreignTag} {
+		if i > 0 {
+			listed += ","
+		}
+		listed += `{"Name":"` + b + `","Created":"2026-0` + string(rune('1'+i)) + `-01T00:00:00+00:00"}`
+	}
+	allBlocked := `{"BlockPublicAcls":true,"IgnorePublicAcls":true,"BlockPublicPolicy":true,"RestrictPublicBuckets":true}`
 	sr := &scriptRunner{rules: []rule{
 		{"sts get-caller-identity", `{"Account":"` + testAccount + `","Arn":"x"}`, nil},
-		{"s3api list-buckets", `[{"Name":"` + good + `","Created":"2026-01-01T00:00:00+00:00"},{"Name":"` + newer + `","Created":"2026-06-01T00:00:00+00:00"},` +
-			`{"Name":"` + unversioned + `","Created":"2026-07-01T00:00:00+00:00"},{"Name":"` + otherKey + `","Created":"2026-08-01T00:00:00+00:00"}]`, nil},
+		{"s3api list-buckets", "[" + listed + "]", nil},
 		{"--key-id alias/darkplum-tfstate", kmsARN, nil},
 		{"get-bucket-versioning --bucket " + unversioned, "Suspended", nil},
 		{"get-bucket-versioning", "Enabled", nil},
+		{"get-public-access-block --bucket " + public, `{"BlockPublicAcls":true,"IgnorePublicAcls":true,"BlockPublicPolicy":false,"RestrictPublicBuckets":true}`, nil},
+		{"get-public-access-block", allBlocked, nil},
+		{"get-bucket-tagging --bucket " + good, "", errors.New("An error occurred (NoSuchTagSet) when calling the GetBucketTagging operation")},
+		{"get-bucket-tagging --bucket " + foreignTag, `[{"Key":"darkplum:purpose","Value":"logs"}]`, nil},
+		{"get-bucket-tagging", `[{"Key":"darkplum:purpose","Value":"terraform-state"}]`, nil},
 		{"get-bucket-encryption --bucket " + otherKey, `{"SSEAlgorithm":"aws:kms","KMSMasterKeyID":"other"}`, nil},
 		{"get-bucket-encryption --bucket " + newer, `{"SSEAlgorithm":"aws:kms","KMSMasterKeyID":"k"}`, nil},
 		{"get-bucket-encryption", `{"SSEAlgorithm":"aws:kms","KMSMasterKeyID":"` + kmsARN + `"}`, nil},
@@ -321,7 +442,9 @@ func TestAWSStateBucketsFiltersAndSorts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(got) != 2 || got[0].Name != newer || got[1].Name != good {
+	// unversioned, wrong key, public access not fully blocked, tagged for
+	// something else: all left out. good is untagged (earlier release).
+	if len(got) != 2 || got[0].Name != newer || got[1].Name != good || got[0].Untagged || !got[1].Untagged {
 		t.Fatalf("got %+v", got)
 	}
 	for _, c := range sr.calls {
@@ -342,25 +465,29 @@ func TestAWSStateResources(t *testing.T) {
 	cases := []struct {
 		name      string
 		rules     []rule
-		n         int
+		want      stateContents
 		found, ok bool
 	}{
-		{"counts", []rule{{"head-bucket", "", nil}, {"s3 cp", `{"resources":[{},{},{}]}`, nil}}, 3, true, true},
-		{"empty", []rule{{"head-bucket", "", nil}, {"s3 cp", `{"version":4,"resources":[]}`, nil}}, 0, true, true},
-		{"no object", []rule{{"head-bucket", "", nil}, {"s3 cp", "", errors.New("exit 1: fatal error: An error occurred (404) when calling the HeadObject operation: Key does not exist")}}, 0, false, true},
-		{"no bucket", []rule{{"head-bucket", "", errors.New("An error occurred (404) when calling the HeadBucket operation: Not Found")}}, 0, false, true},
-		{"foreign bucket", []rule{{"head-bucket", "", errors.New("An error occurred (403) Forbidden")}}, 0, false, false},
-		{"denied", []rule{{"head-bucket", "", nil}, {"s3 cp", "", errors.New("AccessDenied")}}, 0, false, false},
-		{"garbage", []rule{{"head-bucket", "", nil}, {"s3 cp", "<html>", nil}}, 0, true, false},
+		{"counts", []rule{{"head-bucket", "", nil}, {"s3 cp", `{"resources":[{},{},{}]}`, nil}}, stateContents{Resources: 3}, true, true},
+		{"empty", []rule{{"head-bucket", "", nil}, {"s3 cp", `{"version":4,"resources":[],"outputs":{}}`, nil}}, stateContents{}, true, true},
+		{"outputs only", []rule{{"head-bucket", "", nil}, {"s3 cp", `{"version":4,"resources":[],"outputs":{"vpc_id":{"value":"vpc-1"}}}`, nil}}, stateContents{Outputs: 1}, true, true},
+		{"no object", []rule{{"head-bucket", "", nil}, {"s3 cp", "", errors.New("exit 1: fatal error: An error occurred (404) when calling the HeadObject operation: Key does not exist")}}, stateContents{}, false, true},
+		{"no bucket", []rule{{"head-bucket", "", errors.New("An error occurred (404) when calling the HeadBucket operation: Not Found")}}, stateContents{}, false, true},
+		{"foreign bucket", []rule{{"head-bucket", "", errors.New("An error occurred (403) Forbidden")}}, stateContents{}, false, false},
+		{"denied", []rule{{"head-bucket", "", nil}, {"s3 cp", "", errors.New("AccessDenied")}}, stateContents{}, false, false},
+		{"garbage", []rule{{"head-bucket", "", nil}, {"s3 cp", "<html>", nil}}, stateContents{}, true, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			sr := &scriptRunner{rules: append([]rule{id}, tc.rules...)}
 			a := newAWSCloud("p", sr.run)
 			a.Identity()
-			n, found, err := a.StateResources("b", "darkplum/aws/terraform.tfstate", "us-east-2")
-			if n != tc.n || found != tc.found || (err == nil) != tc.ok {
-				t.Fatalf("got %d %v %v", n, found, err)
+			sc, found, err := a.ReadState("b", "darkplum/aws/terraform.tfstate", "us-east-2")
+			if sc != tc.want || found != tc.found || (err == nil) != tc.ok {
+				t.Fatalf("got %+v %v %v", sc, found, err)
+			}
+			if tc.name == "outputs only" && sc.empty() {
+				t.Error("a state with outputs is not empty")
 			}
 			for _, c := range sr.calls {
 				if strings.Contains(c, "s3 cp") && !strings.Contains(c, "s3 cp s3://b/darkplum/aws/terraform.tfstate - ") {

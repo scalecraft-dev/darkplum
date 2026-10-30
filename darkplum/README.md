@@ -133,7 +133,10 @@ account fail at plan time. Preview everything with `darkplum init --dry-run`. Th
 in `backend.tf`; `make deploy` passes it to `terraform init`. If you run
 `terraform init` yourself, add `-backend-config=profile=<your-profile>` (or set
 `AWS_PROFILE`). Never delete the `alias/darkplum-tfstate` KMS key: it makes all
-state in the bucket unrecoverable.
+state in the bucket unrecoverable. Installs in the same account and region share
+the state bucket and KMS key (each under its own `darkplum/aws/<cluster>/` key),
+so they are one trust domain; installs that must not trust each other need
+separate AWS accounts.
 
 **Upgrading.** The default self-hosted model is unchanged (Mistral-7B-Instruct-v0.3,
 served as `mistral-7b`), so an existing install keeps its model and API name on
