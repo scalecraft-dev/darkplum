@@ -42,6 +42,8 @@ type fakeCloud struct {
 	// no object). objectErr makes a read fail.
 	buckets     []stateBucket
 	bucketsErr  error
+	prefixOnly  []string
+	prefixErr   error
 	objects     map[string]int
 	objectsFull map[string]stateContents // wins over objects (outputs, too)
 	objectErr   map[string]error
@@ -102,6 +104,19 @@ func (f *fakeCloud) Inspect(string, string) (backendState, error) {
 	return f.state, f.inspectErr
 }
 func (f *fakeCloud) StateBuckets(string) ([]stateBucket, error) { return f.buckets, f.bucketsErr }
+
+// PrefixBuckets: every prefixed bucket. Defaults to the reusable ones plus
+// prefixOnly (buckets that fail the reuse checks but exist).
+func (f *fakeCloud) PrefixBuckets(string) ([]string, error) {
+	if f.prefixErr != nil {
+		return nil, f.prefixErr
+	}
+	var names []string
+	for _, b := range f.buckets {
+		names = append(names, b.Name)
+	}
+	return append(names, f.prefixOnly...), nil
+}
 func (f *fakeCloud) ReadState(bucket, key, _ string) (stateContents, bool, error) {
 	k := bucket + "/" + key
 	f.reads = append(f.reads, k)

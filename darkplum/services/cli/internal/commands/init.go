@@ -61,6 +61,7 @@ type initCloud interface {
 	CheckRegion(region string) error
 	Inspect(bucket, region string) (backendState, error)
 	StateBuckets(region string) ([]stateBucket, error)
+	PrefixBuckets(region string) ([]string, error)
 	ReadState(bucket, key, region string) (sc stateContents, found bool, err error)
 	CreateBackend(bucket, region string, st backendState) (string, error)
 

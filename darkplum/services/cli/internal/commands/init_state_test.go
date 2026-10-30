@@ -82,6 +82,125 @@ func TestInitStateLiveInstallBeatsNameCollision(t *testing.T) {
 	}
 }
 
+// Live-install detection fails closed and looks at every prefixed bucket, not
+// only those a new install may reuse.
+func TestInitStateLiveInstallFailsClosed(t *testing.T) {
+	live := bucketN("bf3057")
+	base := func() *fakeCloud {
+		c := newFakeCloud()
+		c.state = backendState{KeyARN: fakeKMS, BucketExists: true}
+		return c
+	}
+	t.Run("bucket failing reuse checks is still searched", func(t *testing.T) {
+		cloud := base()
+		cloud.prefixOnly = []string{live} // e.g. tagging unreadable or versioning suspended: not reusable
+		cloud.objectsFull = map[string]stateContents{live + "/" + legacyStateKey: {Resources: 120, ClusterName: "darkplum"}}
+		env, out := testEnv(t, cloud, nil, "-")
+		err := s3Cmd(t.TempDir(), nil).execute(env)
+		if err == nil || !strings.Contains(err.Error(), "an install already keeps state at s3://"+live+"/"+legacyStateKey) {
+			t.Fatalf("live install missed: %v\n%s", err, out)
+		}
+	})
+	t.Run("listing fails on a fresh checkout", func(t *testing.T) {
+		for name, mut := range map[string]func(*fakeCloud){
+			"prefix listing": func(c *fakeCloud) { c.prefixErr = errors.New("AccessDenied: s3:ListAllMyBuckets") },
+			"reuse listing":  func(c *fakeCloud) { c.bucketsErr = errors.New("AccessDenied: s3:ListAllMyBuckets") },
+		} {
+			cloud := base()
+			mut(cloud)
+			dir := t.TempDir()
+			env, out := testEnv(t, cloud, nil, "-")
+			if err := s3Cmd(dir, nil).execute(env); err == nil {
+				t.Fatalf("%s: want refusal\n%s", name, out)
+			}
+			if !strings.Contains(out.String(), "s3:ListAllMyBuckets") || !strings.Contains(out.String(), "--backend local") {
+				t.Errorf("%s: no hint:\n%s", name, out)
+			}
+			if entries, _ := os.ReadDir(dir); len(entries) != 0 || cloud.createCalls != 0 {
+				t.Errorf("%s: wrote %v / created %d", name, entries, cloud.createCalls)
+			}
+		}
+	})
+	t.Run("listing fails with saved settings pinning the state: warn and go on", func(t *testing.T) {
+		cloud := base()
+		cloud.bucketsErr = errors.New("AccessDenied")
+		cloud.prefixErr = errors.New("AccessDenied")
+		dir := t.TempDir()
+		writeCache(t, dir, bucketN("a1b2c3"), "darkplum/aws/darkplum/terraform.tfstate")
+		env, out := testEnv(t, cloud, nil, "-")
+		if err := s3Cmd(dir, nil).execute(env); err != nil {
+			t.Fatalf("%v\n%s", err, out)
+		}
+	})
+	t.Run("state object unreadable", func(t *testing.T) {
+		cloud := base()
+		cloud.prefixOnly = []string{live}
+		cloud.objectErr = map[string]error{live + "/" + legacyStateKey: errors.New("An error occurred (403) when calling the HeadObject operation: Forbidden")}
+		dir := t.TempDir()
+		env, out := testEnv(t, cloud, nil, "-")
+		err := s3Cmd(dir, nil).execute(env)
+		if err == nil || !strings.Contains(err.Error(), "cannot read existing state") {
+			t.Fatalf("want refusal, got %v\n%s", err, out)
+		}
+		if !strings.Contains(out.String(), "s3:GetObject on arn:aws:s3:::"+live+"/"+legacyStateKey) || !strings.Contains(out.String(), "kms:Decrypt") {
+			t.Errorf("no permission hint:\n%s", out)
+		}
+		if entries, _ := os.ReadDir(dir); len(entries) != 0 || cloud.createCalls != 0 {
+			t.Errorf("wrote %v / created %d", entries, cloud.createCalls)
+		}
+	})
+	t.Run("rename re-checks the new name", func(t *testing.T) {
+		cloud := base()
+		cloud.buckets = []stateBucket{{Name: bucketN("ffffff")}}
+		cloud.prefixOnly = []string{live}
+		cloud.objects = map[string]int{bucketN("ffffff") + "/darkplum/aws/darkplum/terraform.tfstate": 0} // exists: forces a rename
+		cloud.objectsFull = map[string]stateContents{live + "/darkplum/aws/darkplum-2/terraform.tfstate": {Resources: 5}}
+		dir := t.TempDir()
+		env, out := testEnv(t, cloud, nil, "\ndarkplum-2\n\n")
+		c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Region: "us-east-2", Mode: "bedrock", Backend: "s3", Profile: "acme", Domain: "acme.com"}
+		err := c.execute(env)
+		if err == nil || !strings.Contains(err.Error(), "an install already keeps state at s3://"+live+"/darkplum/aws/darkplum-2/terraform.tfstate") {
+			t.Fatalf("renamed cluster's live install missed: %v\n%s", err, out)
+		}
+	})
+}
+
+func TestAWSPrefixBucketsIgnoresReuseChecks(t *testing.T) {
+	live, other := bucketN("bf3057"), bucketN("aaaaaa")
+	sr := &scriptRunner{rules: []rule{
+		{"sts get-caller-identity", `{"Account":"` + testAccount + `","Arn":"x"}`, nil},
+		{"s3api list-buckets", `["` + live + `","` + other + `","someone-else"]`, nil},
+		{"head-bucket", "", nil},
+		{"get-bucket-tagging", "", errors.New("AccessDenied")},
+		{"get-bucket-versioning", "Suspended", nil},
+	}}
+	a := newAWSCloud("p", sr.run)
+	a.Identity()
+	got, err := a.PrefixBuckets("us-east-2")
+	if err != nil || strings.Join(got, ",") != live+","+other {
+		t.Fatalf("%v %v", got, err)
+	}
+	for _, c := range sr.calls {
+		if strings.Contains(c, "get-bucket-") {
+			t.Errorf("reuse checks must not filter detection: %s", c)
+		}
+		if strings.Contains(c, "head-bucket") && !strings.Contains(c, "--expected-bucket-owner "+testAccount) {
+			t.Errorf("no owner assertion: %s", c)
+		}
+	}
+	// A bucket that cannot be confirmed is an error, not "none".
+	sr = &scriptRunner{rules: []rule{
+		{"sts get-caller-identity", `{"Account":"` + testAccount + `","Arn":"x"}`, nil},
+		{"s3api list-buckets", `["` + live + `"]`, nil},
+		{"head-bucket", "", errors.New("An error occurred (403) Forbidden")},
+	}}
+	a = newAWSCloud("p", sr.run)
+	a.Identity()
+	if _, err := a.PrefixBuckets("us-east-2"); err == nil {
+		t.Error("403 on head-bucket read as no bucket")
+	}
+}
+
 func TestParseStateClusterName(t *testing.T) {
 	eks := `{"version":4,"resources":[{"module":"module.eks.module.eks","mode":"managed","type":"aws_eks_cluster","name":"this",
 		"instances":[{"index_key":0,"attributes":{"name":"prod","arn":"x"}}]},{"type":"aws_vpc","instances":[{"attributes":{"id":"v"}}]}],

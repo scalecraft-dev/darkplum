@@ -40,34 +40,50 @@ func isFreshCheckout(dir string) bool {
 // preflightLiveInstall runs the live-install lookup for the requested cluster
 // name before the name-collision check, so a fresh checkout of a live install
 // is told to restore its backend.tf instead of being offered "<name>-2".
-// Read-only; a bucket listing that fails is left to planState to report.
+// Read-only.
 func (c *InitCmd) preflightLiveInstall(env *initEnv, s *settings, dir string, cloud initCloud) error {
 	if c.Backend == "local" || !isFreshCheckout(dir) {
 		return nil
 	}
-	fmt.Fprintf(env.out, "%s resolving Darkplum state buckets in %s…\n", sDim("…"), s.region)
-	buckets, err := cloud.StateBuckets(s.region)
-	if err != nil || len(buckets) == 0 {
-		return nil
-	}
-	return c.findLiveInstall(env, s, dir, cloud, buckets)
+	return c.checkLiveInstall(env, s, dir, cloud)
 }
 
-// findLiveInstall stops when any reusable bucket already keeps non-empty state
+// checkLiveInstall looks for this cluster's live install in every Darkplum
+// state bucket the account owns in the region. It fails closed: on a fresh
+// checkout nothing local says which state is this install's, so a bucket list
+// or a state object that cannot be read stops init rather than reading as
+// "no install".
+func (c *InitCmd) checkLiveInstall(env *initEnv, s *settings, dir string, cloud initCloud) error {
+	fmt.Fprintf(env.out, "%s resolving Darkplum state buckets in %s…\n", sDim("…"), s.region)
+	names, err := cloud.PrefixBuckets(s.region)
+	if err != nil {
+		return env.fail("existing install", "could not list state buckets: "+firstLine(err.Error()),
+			"with no backend.tf here, init must check this account for an existing install first: grant s3:ListAllMyBuckets (and s3:ListBucket on "+
+				stateBucketPrefix(s.account, s.region)+"*), or pass --backend local",
+			"cannot check for an existing install")
+	}
+	return c.findLiveInstall(env, s, dir, cloud, names)
+}
+
+// findLiveInstall stops when any of the buckets already keeps non-empty state
 // for this cluster (its own key, or the legacy key when the state there names
 // this cluster or no cluster at all), and prints the backend.tf that lets this
-// checkout manage that install.
-func (c *InitCmd) findLiveInstall(env *initEnv, s *settings, dir string, cloud initCloud, buckets []stateBucket) error {
+// checkout manage that install. Any bucket with the Darkplum prefix counts,
+// whatever its versioning, tags or public-access settings: those decide reuse
+// for a new install, not whether an install exists.
+func (c *InitCmd) findLiveInstall(env *initEnv, s *settings, dir string, cloud initCloud, buckets []string) error {
 	w := env.out
 	s.liveChecked = s.cluster
 	keys := []string{legacyStateKey, stateKeyFor(s.cluster)}
-	for _, b := range buckets {
+	for _, name := range buckets {
+		b := stateBucket{Name: name}
 		for _, k := range keys {
 			fmt.Fprintf(w, "%s resolving state at s3://%s/%s…\n", sDim("…"), b.Name, k)
 			sc, found, err := cloud.ReadState(b.Name, k, s.region)
 			if err != nil {
 				return env.fail("existing install", "could not read s3://"+b.Name+"/"+k+": "+firstLine(err.Error()),
-					"init must know whether an install already keeps state there; needs s3:GetObject on the bucket and kms:Decrypt on "+stateKeyAlias,
+					"init must know whether an install already keeps state there and will not assume none: grant s3:GetObject on arn:aws:s3:::"+b.Name+"/"+k+
+						" and kms:Decrypt on the bucket's KMS key ("+stateKeyAlias+"), then re-run",
 					"cannot read existing state")
 			}
 			if !found || sc.empty() {
@@ -203,19 +219,26 @@ func (c *InitCmd) planState(env *initEnv, s *settings, dir string, cloud initClo
 		p.bucket, p.key, p.kept, reused = eb, ek, true, true
 		note = "same bucket, key and region"
 	} else {
-		fmt.Fprintf(w, "%s resolving Darkplum state buckets in %s…\n", sDim("…"), s.region)
-		buckets, err := cloud.StateBuckets(s.region)
-		if err != nil {
-			record(checkResult{name: "state buckets", status: checkWarn, detail: "could not list: " + firstLine(err.Error()),
-				hint: "needs s3:ListAllMyBuckets to reuse an existing bucket; a new one will be created"})
-		}
 		// A checkout with no backend.tf and no saved settings may be a fresh
 		// clone of a live install: find its state before choosing anything, so
 		// a reinstall never quietly becomes a second install beside it.
 		if freshCheckout && s.liveChecked != s.cluster {
-			if err := c.findLiveInstall(env, s, dir, cloud, buckets); err != nil {
+			if err := c.checkLiveInstall(env, s, dir, cloud); err != nil {
 				return p, err
 			}
+		}
+		fmt.Fprintf(w, "%s resolving reusable state buckets in %s…\n", sDim("…"), s.region)
+		buckets, err := cloud.StateBuckets(s.region)
+		if err != nil {
+			if freshCheckout {
+				return p, env.fail("state buckets", "could not list: "+firstLine(err.Error()),
+					"with no backend.tf here, init must see this account's state buckets: grant s3:ListAllMyBuckets (and read access to "+
+						stateBucketPrefix(s.account, s.region)+"* and "+stateKeyAlias+"), or pass --backend local",
+					"cannot list state buckets")
+			}
+			// Saved settings pin where this checkout's state is; a new bucket is safe.
+			record(checkResult{name: "state buckets", status: checkWarn, detail: "could not list: " + firstLine(err.Error()),
+				hint: "needs s3:ListAllMyBuckets to reuse an existing bucket; a new one will be created"})
 		}
 		var chosen stateBucket
 		switch len(buckets) {
@@ -279,6 +302,12 @@ func (c *InitCmd) planState(env *initEnv, s *settings, dir string, cloud initClo
 			return p, err
 		}
 		p.key = stateKeyFor(s.cluster)
+		// The new name may itself be a live install's (legacy or cluster key).
+		if freshCheckout {
+			if err := c.checkLiveInstall(env, s, dir, cloud); err != nil {
+				return p, err
+			}
+		}
 	}
 
 	detail := "S3 " + p.bucket

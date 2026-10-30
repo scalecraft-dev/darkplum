@@ -426,6 +426,39 @@ func (a *awsCloud) StateBuckets(region string) ([]stateBucket, error) {
 	return found, nil
 }
 
+// PrefixBuckets lists every bucket with this account's Darkplum state prefix in
+// region, with ownership asserted by head-bucket, and nothing else checked: it
+// answers "where could an install keep state", not "which bucket may a new
+// install reuse". Read-only. Any failure is returned, never read as "none".
+func (a *awsCloud) PrefixBuckets(region string) ([]string, error) {
+	prefix := stateBucketPrefix(a.account, region)
+	out, err := a.aws("s3api", "list-buckets", "--query",
+		fmt.Sprintf("Buckets[?starts_with(Name, '%s')].Name", prefix), "--output", "json")
+	if err != nil {
+		return nil, err
+	}
+	var listed []string
+	if out != "" && out != "null" {
+		if err := json.Unmarshal([]byte(out), &listed); err != nil {
+			return nil, fmt.Errorf("unexpected list-buckets output")
+		}
+	}
+	var names []string
+	for _, n := range listed {
+		if !strings.HasPrefix(n, prefix) {
+			continue
+		}
+		if _, err := a.aws("s3api", "head-bucket", "--bucket", n, "--region", region, "--expected-bucket-owner", a.account); err != nil {
+			if isNotFound(err, "404", "Not Found", "NoSuchBucket") {
+				continue // deleted since the listing
+			}
+			return nil, fmt.Errorf("bucket %s: %w", n, err)
+		}
+		names = append(names, n)
+	}
+	return names, nil
+}
+
 // stateContents is what a Terraform state object holds.
 type stateContents struct {
 	Resources, Outputs int
