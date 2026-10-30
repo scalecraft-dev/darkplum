@@ -98,6 +98,10 @@ jobs:
       - uses: hashicorp/setup-terraform@v3
         with:
           terraform_version: "1.14.9"
+          # The default wrapper (a node shim that captures output) does not pass
+          # stdin through, so `terraform console` below waits forever. No step
+          # reads the wrapper's outputs.
+          terraform_wrapper: false
       - run: terraform fmt -check -recursive -diff
       - run: terraform init -backend=false -input=false
       - run: terraform validate
