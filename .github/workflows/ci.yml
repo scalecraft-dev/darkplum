@@ -12,6 +12,7 @@ jobs:
   go:
     name: Go (${{ matrix.service }})
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -61,6 +62,7 @@ jobs:
   web:
     name: Web
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: darkplum/services/web
@@ -87,6 +89,7 @@ jobs:
   terraform:
     name: Terraform
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: darkplum/terraform/aws
@@ -107,6 +110,7 @@ jobs:
           go-version-file: darkplum/services/cli/go.mod
           cache-dependency-path: darkplum/services/cli/go.sum
       - name: terraform validate (rendered init output)
+        timeout-minutes: 5
         run: |
           samples="$RUNNER_TEMP/samples"; mkdir -p "$samples"
           (cd ../../services/cli && DARKPLUM_RENDER_SAMPLES="$samples" go test ./internal/commands -run TestWriteRenderedSamples -count=1)
@@ -115,7 +119,11 @@ jobs:
           terraform validate
           rm backend.tf
           terraform init -backend=false -input=false -reconfigure
-          got=$(echo 'var.aws_profile' | terraform console -var-file="$samples/sample.tfvars")
+          # Read the value back with the variable declarations only: in the full
+          # config, `terraform console` configures the AWS provider, which waits on
+          # credential lookups (instance metadata) on a runner with no AWS access.
+          vars="$RUNNER_TEMP/vars-only"; mkdir -p "$vars"; cp variables.tf "$vars/"
+          got=$(cd "$vars" && echo 'var.aws_profile' | terraform console -var-file="$samples/sample.tfvars")
           want='"we\"ird\\${x}%{y}"'
           [ "$got" = "$want" ] || { echo "tfvars round trip changed the value: got $got want $want"; exit 1; }
       # The Go validators in the CLI and the validation blocks in variables.tf are
@@ -135,6 +143,7 @@ jobs:
   manifests:
     name: Kubernetes manifests and docs
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: darkplum
@@ -171,7 +180,7 @@ jobs:
           for target in deploy deploy-infra; do
             if out=$(make "$target" TF_DIR="$empty" 2>&1); then echo "make $target succeeded without tfvars"; exit 1; fi
             echo "$out" | grep -q 'Run ./bin/darkplum init first' || { echo "no init hint from make $target:"; echo "$out"; exit 1; }
-            echo "$out" | grep -qE 'Initializing Terraform|Building darkplum CLI' && { echo "make $target did work before the guard"; exit 1; }
+            if echo "$out" | grep -qE 'Initializing Terraform|Building darkplum CLI'; then echo "make $target did work before the guard"; exit 1; fi
           done
       - name: API reference is generated from the golden
         working-directory: darkplum/services/api
