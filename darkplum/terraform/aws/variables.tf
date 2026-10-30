@@ -4,6 +4,22 @@ variable "aws_region" {
   default     = "us-east-2"
 }
 
+variable "allowed_account_ids" {
+  description = <<-EOT
+    AWS account IDs this configuration may be applied to. The provider refuses
+    any other account, so credentials for the wrong account fail at plan time
+    instead of building a cluster there. `darkplum init` sets it to the account
+    you chose. Empty means no restriction.
+  EOT
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for a in var.allowed_account_ids : can(regex("^[0-9]{12}$", a))])
+    error_message = "Each allowed_account_ids entry must be a 12-digit AWS account ID."
+  }
+}
+
 variable "aws_profile" {
   description = "AWS CLI profile to authenticate with. Leave null to use the default credential chain (env vars, instance profile, SSO)."
   type        = string
@@ -69,9 +85,25 @@ variable "model_name" {
 }
 
 variable "model_revision" {
-  description = "Hugging Face revision (branch, tag, or preferably a full commit SHA) of model_name. Pin a SHA so a re-download cannot silently change the weights."
+  description = <<-EOT
+    Hugging Face revision of model_name: a full commit SHA (40 hex characters),
+    or the literal "main", accepted only for the default model so installs that
+    predate pinning keep working. Any other model_name must set a SHA, so a
+    re-download cannot silently change the weights. `darkplum init` always
+    writes model_name, served_model_name and a pinned SHA together.
+  EOT
   type        = string
   default     = "main"
+
+  validation {
+    condition     = var.model_revision == "main" || can(regex("^[0-9a-f]{40}$", var.model_revision))
+    error_message = "model_revision must be a full 40-character commit SHA (lowercase hex), or \"main\" for the default model only. Not a tag or other branch."
+  }
+
+  validation {
+    condition     = var.model_revision != "main" || var.model_name == "mistralai/Mistral-7B-Instruct-v0.3"
+    error_message = "A model_name other than the default needs an explicit model_revision (a 40-character commit SHA); \"main\" is a moving target. Run `darkplum init` to pin one."
+  }
 }
 
 variable "served_model_name" {
@@ -191,5 +223,73 @@ variable "bedrock_model_patterns" {
   validation {
     condition     = alltrue([for p in var.bedrock_model_patterns : can(regex("^[a-z0-9][a-z0-9.*:_-]*$", p))])
     error_message = "Each pattern must be a Bedrock model ID or glob such as \"anthropic.claude-*\" (lowercase letters, digits, . * : _ -). Do not pass ARNs."
+  }
+}
+
+# --- Private web address (modules/web-access) -------------------------------
+# Written by `darkplum init`. With web_domain empty (installs from before this
+# existed) nothing below is created and the web UI stays cluster-internal.
+
+variable "web_domain" {
+  description = "A domain you control, e.g. acme.com. The team reaches Darkplum at https://darkplum.<web_domain> (or web_hostname) from the allowed networks. Empty: no private address."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.web_domain == "" || (length(var.web_domain) <= 253 && can(regex("^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]$", var.web_domain)))
+    error_message = "web_domain must be a lowercase DNS name such as acme.com, without a trailing dot."
+  }
+}
+
+variable "web_hostname" {
+  description = "Name the team opens. Empty: darkplum.<web_domain>. Must be a subdomain of web_domain."
+  type        = string
+  default     = ""
+
+  validation {
+    condition = var.web_hostname == "" || (
+      var.web_domain != "" && length(var.web_hostname) <= 253 &&
+      can(regex("^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]$", var.web_hostname)) &&
+      endswith(var.web_hostname, ".${var.web_domain}")
+    )
+    error_message = "web_hostname needs web_domain and must be a lowercase name inside it (e.g. chat.acme.com for acme.com), not the domain itself."
+  }
+}
+
+variable "web_zone_id" {
+  description = "Existing public Route53 hosted zone that covers the web hostname (yours, or the one darkplum init created when your domain's DNS is elsewhere). Records are added to it; it is never managed or deleted. Empty: Terraform creates a zone for the hostname, delegated from web_domain's zone in this account."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.web_zone_id == "" || (var.web_domain != "" && can(regex("^Z[A-Z0-9]{1,31}$", var.web_zone_id)))
+    error_message = "web_zone_id needs web_domain and must be a Route53 hosted zone ID such as Z0123456789ABCDEFGHIJ."
+  }
+}
+
+variable "web_certificate_arn" {
+  description = "Existing ACM certificate (in aws_region) covering the web hostname. Never managed. Empty: Terraform issues one, validated through DNS."
+  type        = string
+  default     = ""
+
+  validation {
+    condition     = var.web_certificate_arn == "" || (var.web_domain != "" && can(regex(format("^arn:aws[a-z-]*:acm:%s:[0-9]{12}:certificate/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", var.aws_region), var.web_certificate_arn)))
+    error_message = "web_certificate_arn needs web_domain and must be an ACM certificate ARN in aws_region."
+  }
+}
+
+variable "web_allowed_cidrs" {
+  description = "Private (RFC 1918) IPv4 networks allowed to reach the web address on 443 (VPN, Direct Connect, office ranges). Empty: the VPC only."
+  type        = list(string)
+  default     = []
+
+  validation {
+    condition = length(var.web_allowed_cidrs) == 0 || (var.web_domain != "" && alltrue([
+      for c in var.web_allowed_cidrs : can(cidrnetmask(c)) && try(cidrsubnet(c, 0, 0) == c, false) && anytrue([
+        for b in ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"] :
+        try(tonumber(split("/", c)[1]) >= tonumber(split("/", b)[1]) && cidrsubnet("${cidrhost(c, 0)}/${split("/", b)[1]}", 0, 0) == b, false)
+      ])
+    ]))
+    error_message = "web_allowed_cidrs needs web_domain; each entry must be an IPv4 network in canonical form (10.8.0.0/16, not 10.8.1.0/16) inside 10.0.0.0/8, 172.16.0.0/12 or 192.168.0.0/16: the address is private."
   }
 }

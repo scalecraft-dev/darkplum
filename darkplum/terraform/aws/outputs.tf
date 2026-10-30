@@ -101,3 +101,30 @@ output "served_model_name" {
   description = "Short model name exposed on the OpenAI-compatible API."
   value       = var.served_model_name
 }
+
+# --- Private web address (empty when web_domain is not set) ---
+
+output "web_url" {
+  description = "The team's address for the web UI (reachable from web_allowed_cidrs)."
+  value       = var.web_domain != "" ? module.web_access[0].url : ""
+}
+
+output "web_hostname" {
+  description = "Host name of web_url."
+  value       = var.web_domain != "" ? module.web_access[0].hostname : ""
+}
+
+output "web_lb_private_ips" {
+  description = "The internal NLB's pinned private addresses. `darkplum configure` writes them into nginx's trusted-proxy list and the web-ingress NetworkPolicy."
+  value       = var.web_domain != "" ? module.web_access[0].lb_private_ips : []
+}
+
+output "web_name_servers" {
+  description = "Name servers of the hosted zone Terraform created for the web hostname (empty when the zone was supplied)."
+  value       = var.web_domain != "" ? module.web_access[0].name_servers : []
+}
+
+output "web_allowed_cidrs" {
+  description = "Networks allowed to reach web_url."
+  value       = var.web_domain != "" ? module.web_access[0].allowed_cidrs : []
+}

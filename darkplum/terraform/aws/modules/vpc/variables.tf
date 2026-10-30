@@ -19,3 +19,9 @@ variable "tags" {
   default     = {}
   description = "Additional tags for all resources"
 }
+
+variable "reserve_lb_ips" {
+  type        = bool
+  default     = false
+  description = "Reserve one address per private subnet for the web NLB (modules/web-access). Off: nothing is created."
+}

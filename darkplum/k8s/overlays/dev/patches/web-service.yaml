@@ -4,6 +4,8 @@ metadata:
   name: darkplum-web
   namespace: darkplum-system
 spec:
+  # kind publishes NodePort 30080 on the host (kind-config.yaml) for plain
+  # http on port 80; there is no load balancer and no PROXY protocol locally.
   type: NodePort
   ports:
     - name: http
@@ -11,3 +13,11 @@ spec:
       targetPort: 80
       nodePort: 30080
       protocol: TCP
+---
+# No load balancer locally, and 30080 is the dev http port above.
+$patch: delete
+apiVersion: v1
+kind: Service
+metadata:
+  name: darkplum-web-lb
+  namespace: darkplum-system
