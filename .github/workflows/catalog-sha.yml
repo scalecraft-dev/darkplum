@@ -1,0 +1,33 @@
+name: Model catalog check
+
+# `darkplum init` offers a catalog of reviewed self-hosted models, each pinned to
+# a Hugging Face commit SHA. This job re-checks them on a schedule (and whenever
+# the catalog changes): still public, still safetensors, pinned SHA still resolves.
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - darkplum/services/cli/internal/commands/init_catalog.go
+      - .github/workflows/catalog-sha.yml
+
+permissions:
+  contents: read
+
+jobs:
+  catalog:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: darkplum/services/cli
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: darkplum/services/cli/go.mod
+          cache-dependency-path: darkplum/services/cli/go.sum
+      - run: go test ./internal/commands -run TestCatalogResolvesOnHuggingFace -count=1 -v
+        env:
+          DARKPLUM_CHECK_CATALOG: "1"

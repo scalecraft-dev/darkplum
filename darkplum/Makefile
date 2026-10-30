@@ -42,15 +42,34 @@ TFVARS_AWS_PROFILE := $(shell sed -nE 's/^[[:space:]]*aws_profile[[:space:]]*=[[
 ifneq ($(TFVARS_AWS_PROFILE),)
 export AWS_PROFILE ?= $(TFVARS_AWS_PROFILE)
 endif
+# backend.tf (written by `darkplum init`) deliberately omits the AWS profile, so
+# pass it to terraform init here. Only when backend.tf exists: a local-state
+# install has no backend block to configure.
+TF_INIT_BACKEND := $(if $(and $(TFVARS_AWS_PROFILE),$(wildcard $(TF_DIR)/backend.tf)),'-backend-config=profile=$(TFVARS_AWS_PROFILE)')
+# The session must outlast the install: ~90 minutes with a GPU model, ~30 for a
+# Bedrock-only one (gpu_desired_size = 0). Override: make deploy MIN_SESSION=45
+TFVARS_GPU := $(shell sed -nE 's/^[[:space:]]*gpu_desired_size[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' $(TF_DIR)/terraform.tfvars 2>/dev/null | tail -1)
+MIN_SESSION ?= $(if $(filter 0,$(TFVARS_GPU)),30,90)
 CONTAINER_REGISTRY := $(shell cd $(TF_DIR) && terraform output -json 2>/dev/null | jq -r '.container_registry.value // empty')
 INFERENCE_REGION := $(shell cd $(TF_DIR) && terraform output -json 2>/dev/null | jq -r '.inference_region.value // empty')
 BEDROCK_MODEL_FILTER := $(shell cd $(TF_DIR) && terraform output -json 2>/dev/null | jq -r '.bedrock_model_filter.value // empty')
 endif
 
+# The tfvars and doctor guards belong to the AWS install path; another cloud
+# keeps its own (gcp has no root module yet).
+ifeq ($(CLOUD),aws)
+AWS_GUARDS := _require-tfvars
+AWS_DOCTOR := _doctor
+endif
+
+# Every deploy step assumes the one before it finished (and `make cli` writes a
+# shared binary), so never run prerequisites concurrently, even under make -j.
+.NOTPARALLEL:
+
 export DOCKER_CLI_HINTS = false
 export DOCKER_CLI_HOOKS = 0
 
-.PHONY: help check-prereqs _require-outputs _deploy-vllm deploy deploy-infra deploy-k8s deploy-platform build-images push-images configure-sso test status destroy \
+.PHONY: help check-prereqs _require-tfvars _doctor _require-outputs _deploy-vllm deploy deploy-infra deploy-k8s deploy-platform build-images push-images configure-sso test status destroy \
        deploy-model remove-model list-models verify-bedrock-iam expose-web unexpose-web set-hf-token set-anthropic-key set-openai-key remove-anthropic-key remove-openai-key set-anthropic-billing-key set-openai-billing-key remove-anthropic-billing-key remove-openai-billing-key deploy-semantic-router remove-semantic-router \
        dev-up dev-down dev-build-gateway dev-build-api dev-build-web dev-status dev-logs dev-test
 
@@ -70,14 +89,33 @@ check-prereqs: ## Validate required tools are installed
 	fi
 	@echo "All prerequisites satisfied."
 
+# deploy-infra and deploy refuse to run without the config `darkplum init` writes:
+# silently planning against defaults is how installs land in the wrong region or
+# account. GitOps users who manage tfvars themselves still need the file to exist.
+_require-tfvars:
+	@test -f $(TF_DIR)/terraform.tfvars || { echo "ERROR: $(TF_DIR)/terraform.tfvars not found. Run ./bin/darkplum init first (make cli builds it)."; exit 1; }
+
+# Time-sensitive checks, re-run right before an apply: the SSO session must
+# outlast the install (~90 min), the credentials must belong to the account init
+# pinned, and the GPU quota / instance offerings must still hold.
+# bin/darkplum is a file target (rebuilt only when CLI sources change) rather
+# than the phony `cli`, so repeated or concurrent invocations do not race on it.
+CLI_BIN := bin/darkplum
+CLI_SRC := $(shell find services/cli -type f \( -name '*.go' -o -name '*.txt' -o -name go.mod -o -name go.sum \) 2>/dev/null)
+$(CLI_BIN): $(CLI_SRC)
+	@$(MAKE) --no-print-directory cli
+
+_doctor: $(CLI_BIN)
+	@./bin/darkplum doctor check --cloud $(CLOUD) --tfvars $(TF_DIR)/terraform.tfvars --min-session $(MIN_SESSION)
+
 # Fail loudly if the normalized Terraform outputs aren't available yet (infra not
 # applied), instead of tagging/pushing images to an empty registry host.
 _require-outputs:
 	@test -n "$(CONTAINER_REGISTRY)" || { echo "ERROR: no container_registry output from $(TF_DIR). Run 'make deploy-infra' first."; exit 1; }
 
-deploy-infra: check-prereqs ## Provision cloud infrastructure with Terraform (CLOUD=aws|gcp)
+deploy-infra: $(AWS_GUARDS) check-prereqs ## Provision cloud infrastructure with Terraform (CLOUD=aws|gcp)
 	@echo "Initializing Terraform..."
-	@cd $(TF_DIR) && terraform init -input=false
+	@cd $(TF_DIR) && terraform init -input=false $(TF_INIT_BACKEND)
 	@# The EKS control-plane log group outlives `make destroy` on purpose (see
 	@# destroy). On a reinstall Terraform would try to create it and fail with
 	@# ResourceAlreadyExistsException, so adopt it into state first. A no-op when
@@ -153,7 +191,7 @@ _deploy-vllm:
 	@echo "Configuring model in deployment..."
 	@MODEL_NAME=$$(cd $(TF_DIR) && terraform output -raw model_name) && \
 		SERVED_NAME=$$(cd $(TF_DIR) && terraform output -raw served_model_name) && \
-		MODEL_REV=$$(cd $(TF_DIR) && terraform output -json | jq -r '.model_revision.value // "main"') && \
+		MODEL_REV=$$(cd $(TF_DIR) && terraform output -json | jq -r '.model_revision.value') && \
 		sed -e "s|PLACEHOLDER_MODEL_NAME|$$MODEL_NAME|g" \
 			-e "s|PLACEHOLDER_MODEL_REVISION|$$MODEL_REV|g" \
 			-e "s|PLACEHOLDER_SERVED_MODEL_NAME|$$SERVED_NAME|g" \
@@ -165,7 +203,11 @@ _deploy-vllm:
 	@echo "vLLM deployment created. Model download + loading takes 15-25 minutes."
 	@echo "Monitor progress: kubectl logs -f -n $(NAMESPACE) deploy/vllm-inference -c model-download"
 
-deploy: deploy-infra deploy-k8s deploy-platform ## Full deploy: infrastructure + workloads + platform
+deploy: $(AWS_GUARDS) $(AWS_DOCTOR) deploy-infra deploy-k8s ## Full deploy: infrastructure + workloads + platform
+	@# deploy-platform runs in a sub-make: the terraform outputs it needs
+	@# (CONTAINER_REGISTRY, PROVIDER_REGION, ...) are read when make starts, and
+	@# on a fresh install they only exist after deploy-infra has applied.
+	@$(MAKE) --no-print-directory deploy-platform
 	@echo ""
 	@echo "========================================="
 	@echo "  Darkplum deployment complete."
@@ -173,29 +215,17 @@ deploy: deploy-infra deploy-k8s deploy-platform ## Full deploy: infrastructure +
 	@echo ""
 	@GPUS=$$($(_GPU_COUNT)); \
 	if [ "$$GPUS" = "0" ]; then \
-		echo "Bedrock-only install (gpu_desired_size = 0). Next:"; \
-		echo "  make verify-bedrock-iam    prove the gateway role reaches only the configured Bedrock models"; \
-		echo "  make expose-web            publish the web UI (add CERT_ARN=<ACM cert> for HTTPS)"; \
-		echo "  then open the printed address, create the first admin, and enable a model under Admin > Models."; \
-		echo ""; \
-		echo "Add self-hosted open-source models later: set gpu_desired_size = 1 and run 'make deploy' again."; \
+		echo "Bedrock-only install. Add self-hosted open-source models later: re-run ./bin/darkplum init (Self-hosted GPU), then 'make deploy'."; \
 	else \
-		echo "Wait for vLLM to finish loading (15-25 minutes), then:"; \
-		echo "  make test                  chat once through the self-hosted model"; \
-		echo "  make verify-bedrock-iam    prove the gateway role reaches only the configured Bedrock models"; \
-		echo "  make expose-web            publish the web UI (add CERT_ARN=<ACM cert> for HTTPS)"; \
-		echo ""; \
-		echo "Monitor model loading:"; \
-		echo "  kubectl logs -f -n $(NAMESPACE) deploy/vllm-inference -c model-download"; \
-		echo "  kubectl logs -f -n $(NAMESPACE) deploy/vllm-inference -c vllm"; \
+		echo "The self-hosted model is loading (15-25 minutes); configure shows its progress."; \
 	fi
 	@echo ""
-	@echo "Check readiness:  make status"
+	@echo "Next: ./bin/darkplum configure  (~2 min, longer while the model loads)"
 
 cli: ## Build the darkplum operator CLI (bin/darkplum)
 	@echo "Building darkplum CLI..."
 	@cd services/cli && go build -o ../../bin/darkplum ./cmd
-	@echo "Built bin/darkplum — operator commands: doctor / admin / sso / status"
+	@echo "Built bin/darkplum — operator commands: init / doctor / admin / sso / status"
 
 build-images: _require-outputs ## Build Docker images for gateway, api, and web
 	@echo "Building gateway image ($(IMAGE_PLATFORM))..."
@@ -633,7 +663,7 @@ unexpose-web: ## Revert the web UI to cluster-internal (port-forward only)
 
 MAX_LEN ?= 8192
 # Number of GPU nodes the current Terraform state asked for ("" before apply).
-_GPU_COUNT = cd $(TF_DIR) && terraform output -json 2>/dev/null | jq -r '.gpu_desired_size.value // empty'
+_GPU_COUNT = cd $(TF_DIR) && terraform output -json 2>/dev/null | jq -r '.gpu_desired_size.value // 1'
 # Hugging Face revision for deploy-model. Pin a commit SHA for anything that matters.
 REVISION ?= main
 _GW_UPSTREAMS = kubectl get deploy darkplum-gateway -n darkplum-system \
@@ -650,7 +680,7 @@ deploy-model: ## Add a self-hosted model: make deploy-model NAME=qwen MODEL=Qwen
 	EXISTS=$$(kubectl get deploy vllm-$(NAME) -n $(NAMESPACE) -o name 2>/dev/null); \
 	if [ -z "$$EXISTS" ] && [ $$((TOTAL - USED)) -lt 1 ]; then \
 		echo "WARNING: no free GPU ($$USED of $$TOTAL allocated). vllm-$(NAME) will stay Pending until the GPU"; \
-		echo "         node group grows: raise gpu_desired_size in $(TF_DIR)/terraform.tfvars and run 'make deploy-infra'."; \
+		echo "         node group grows: re-run ./bin/darkplum init (GPU mode), then 'make deploy-infra'."; \
 	fi; \
 	[ "$(REVISION)" != "main" ] || echo "NOTE: REVISION=main is a moving target. Pin a commit SHA (REVISION=<sha>) so weights cannot change under you."; \
 	echo "Deploying vllm-$(NAME): $(MODEL)@$(REVISION) served as '$$SERVED'..."; \

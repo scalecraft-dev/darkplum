@@ -10,6 +10,13 @@ crash.*.log
 *.tfvars
 !*.tfvars.example
 
+# Written per install by `darkplum init` (names the customer's own state bucket).
+terraform/aws/backend.tf
+terraform/aws/backend.tf.bak
+terraform/aws/*.tfvars.bak
+# Private kubeconfig every darkplum kube command regenerates and validates.
+terraform/*/.darkplum/
+
 # Build output
 /bin/
 
