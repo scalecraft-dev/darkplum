@@ -26,7 +26,7 @@ func TestParsesWhatTheWorkflowWrites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m.Channel != Release || m.Version != "1.2.3" || m.RunID != "42" || m.Images["api"].Digest != "sha256:"+strings.Repeat("2", 64) {
+	if m.Channel != Release || m.Version != "1.2.3" || m.RunID != "42" || m.Images["api"].Digest != "sha256:"+strings.Repeat("2", 64) || m.Images["api"].RunAttempt != "2" {
 		t.Errorf("manifest = %+v", m)
 	}
 	if got := m.Images["gateway"].Ref(); got != "ghcr.io/scalecraft-dev/darkplum-gateway@sha256:"+strings.Repeat("1", 64) {
@@ -40,7 +40,7 @@ func TestParsesWhatTheWorkflowWrites(t *testing.T) {
 
 func TestIdentityIsExactAndSeparatesReleaseFromRC(t *testing.T) {
 	m, _ := Parse(golden(t, "release.golden.json"))
-	id, err := m.Identity()
+	id, err := m.Identity("gateway")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -59,7 +59,15 @@ func TestIdentityIsExactAndSeparatesReleaseFromRC(t *testing.T) {
 		t.Errorf("identity = %+v\nwant       %+v", id, want)
 	}
 	rcm, _ := Parse(golden(t, "rc.golden.json"))
-	rid, _ := rcm.Identity()
+	rid, _ := rcm.Identity("gateway")
+	// each image is matched against the attempt of the job that signed it
+	apiID, _ := m.Identity("api")
+	if apiID.RunInvocationURI != gh+"/actions/runs/42/attempts/2" || id.RunInvocationURI != gh+"/actions/runs/42/attempts/1" {
+		t.Errorf("per-image attempts: gateway %s, api %s", id.RunInvocationURI, apiID.RunInvocationURI)
+	}
+	if _, err := m.Identity("nope"); err == nil {
+		t.Error("an unknown service produced an identity")
+	}
 	if rid.BuildConfigURI != gh+"/.github/workflows/prerelease.yml@refs/heads/prerelease/makefile-removal" || rid.BuildConfigURI == id.BuildConfigURI {
 		t.Errorf("rc caller identity = %s", rid.BuildConfigURI)
 	}
@@ -78,7 +86,7 @@ func TestDevBuildHasNoIdentity(t *testing.T) {
 	if err != nil || m.Channel != Dev {
 		t.Fatalf("Current = %+v, %v", m, err)
 	}
-	if _, err := m.Identity(); err == nil {
+	if _, err := m.Identity("api"); err == nil {
 		t.Error("a dev build produced an identity")
 	}
 	// A dev manifest cannot be forged by passing one to Parse.
@@ -129,6 +137,12 @@ func TestParseRefusals(t *testing.T) {
 		"short commit":                  func(m map[string]any) { m["commit"] = "abc" },
 		"non numeric run":               func(m map[string]any) { m["run_id"] = "4x" },
 		"other owner":                   func(m map[string]any) { m["repository"] = "evil/darkplum" },
+		"a fork of the right owner":     func(m map[string]any) { m["repository"] = "scalecraft-dev/darkplum-fork" },
+		"different case":                func(m map[string]any) { m["repository"] = "Scalecraft-Dev/darkplum" },
+		"top-level run attempt":         func(m map[string]any) { m["run_attempt"] = "1" },
+		"missing image attempt":         func(m map[string]any) { delete(img(m, "api"), "run_attempt") },
+		"zero image attempt":            func(m map[string]any) { img(m, "api")["run_attempt"] = "0" },
+		"non numeric image attempt":     func(m map[string]any) { img(m, "api")["run_attempt"] = "1x" },
 		"missing image":                 func(m map[string]any) { delete(m["images"].(map[string]any), "web") },
 		"extra image":                   func(m map[string]any) { m["images"].(map[string]any)["x"] = img(m, "web") },
 		"tag instead of digest":         func(m map[string]any) { img(m, "api")["digest"] = "latest" },
@@ -169,5 +183,37 @@ func TestRCRefusesReleaseShapes(t *testing.T) {
 		if _, err := Parse([]byte(bad)); err == nil {
 			t.Errorf("%s accepted", name)
 		}
+	}
+}
+
+// The trusted repository is baked in: a manifest from another repository is
+// refused even if everything else about it is valid, and the override exists only
+// as a link-time variable.
+func TestTrustedRepository(t *testing.T) {
+	if TrustedRepository() != "scalecraft-dev/darkplum" || NonDefaultTrust() {
+		t.Fatalf("default trust = %q", TrustedRepository())
+	}
+	golden := string(golden(t, "release.golden.json"))
+	scratch := strings.ReplaceAll(golden, "ghcr.io/scalecraft-dev/", "ghcr.io/scratch-org/")
+	scratch = strings.Replace(scratch, `"repository":"scalecraft-dev/darkplum"`, `"repository":"scratch-org/darkplum-release"`, 1)
+	if _, err := Parse([]byte(scratch)); err == nil || !strings.Contains(err.Error(), "only trusts") {
+		t.Fatalf("a manifest from another repository: %v", err)
+	}
+	old := trustedRepository
+	defer func() { trustedRepository = old }()
+	trustedRepository = "scratch-org/darkplum-release"
+	if !NonDefaultTrust() {
+		t.Error("NonDefaultTrust is false for an overridden trust")
+	}
+	m, err := Parse([]byte(scratch))
+	if err != nil {
+		t.Fatalf("scratch build trusting its own repository: %v", err)
+	}
+	if m.Images["api"].Repository != "ghcr.io/scratch-org/darkplum-api" {
+		t.Errorf("repository = %s", m.Images["api"].Repository)
+	}
+	// and now the product's own manifest is the one that is refused
+	if _, err := Parse([]byte(golden)); err == nil {
+		t.Error("a binary trusting the scratch repository accepted the product's manifest")
 	}
 }

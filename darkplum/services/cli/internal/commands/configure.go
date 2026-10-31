@@ -29,7 +29,6 @@ type ConfigureCmd struct {
 	Yes         bool          `help:"Take every default: enables every ready model for everyone who can sign in, and waits for a loading self-hosted model when nothing else is ready. Still asks for the admin email and password; a password is never read from a flag, the environment or a pipe."`
 	Wait        bool          `help:"Wait for the self-hosted model to finish loading, then enable it and chat with it once."`
 	WaitTimeout time.Duration `name:"wait-timeout" help:"How long to wait for the self-hosted model." default:"40m"`
-	Tfvars      string        `help:"Install settings written by darkplum init (default: terraform/aws/terraform.tfvars)." default:""`
 }
 
 // configureEnv is everything configure touches outside its flags, so tests
@@ -69,9 +68,10 @@ func (c *ConfigureCmd) Run(g *Globals) error {
 	if !term.IsTerminal(fd) {
 		return errors.New("configure asks for the admin password, so it needs a terminal (stdin is not one)")
 	}
-	path := c.Tfvars
-	if path == "" {
-		path = defaultTFVars
+	in, rec, err := openInstall(g.Install)
+	if err != nil {
+		printCheckTo(os.Stdout, noInstallRow(err))
+		return reportedError{"no install to configure"}
 	}
 	var (
 		mu  sync.Mutex
@@ -83,7 +83,7 @@ func (c *ConfigureCmd) Run(g *Globals) error {
 		interactive: !c.Yes,
 		namespace:   g.Namespace,
 		resolve: func() (clusterTarget, checkResult, error) {
-			return installCluster(path, runWithStderr)
+			return installCluster(in, runWithStderr)
 		},
 		newKube: func(t clusterTarget, ns string) *kube.Client { return t.kube(ns) },
 		newFwd: func(t clusterTarget) Forwarder {
@@ -98,9 +98,9 @@ func (c *ConfigureCmd) Run(g *Globals) error {
 		hold:  true,
 		probe: probeHTTPS,
 	}
-	if tf, err := readTFVars(path); err == nil {
+	if tf, err := readTFVars(in.TFVars()); err == nil {
 		env.web = webAddressFrom(tf)
-		env.tfOutputs = func() (map[string]json.RawMessage, error) { return terraformOutputs(path, tf.Profile) }
+		env.tfOutputs = func() (map[string]json.RawMessage, error) { return terraformOutputs(in, rec) }
 	}
 
 	// Ctrl-C (or closing the terminal: SIGHUP) cancels the run, which closes the tunnel on its way out. A
@@ -136,7 +136,7 @@ func (c *ConfigureCmd) Run(g *Globals) error {
 			os.Exit(130)
 		}
 	}()
-	err := c.execute(ctx, env)
+	err = c.execute(ctx, env)
 	close(finished)
 	return err
 }

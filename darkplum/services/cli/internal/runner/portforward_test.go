@@ -12,8 +12,6 @@ import (
 	"time"
 )
 
-const testKubeconfigPath = "/work/darkplum/.darkplum/kubeconfig"
-
 // testHandle is a handle that passed the real Validate against a fake aws,
 // pinned to a private kubeconfig path.
 func testHandle(t *testing.T, profile string) ValidatedCluster {
@@ -22,7 +20,11 @@ func testHandle(t *testing.T, profile string) ValidatedCluster {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return v.WithKubeconfig(testKubeconfigPath)
+	h, err := v.WriteKubeconfig(filepath.Join(t.TempDir(), "kubeconfig"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return h
 }
 
 func fakeAWS(caller string) AWSFunc {
@@ -52,12 +54,13 @@ func TestForwardingLineParse(t *testing.T) {
 	if fmt.Sprint(got) != "[54321]" {
 		t.Errorf("parsed ports %v", got)
 	}
-	f := testHandle(t, "acme").PortForward("darkplum-system", "svc/darkplum-web")
+	h := testHandle(t, "acme")
+	f := h.PortForward("darkplum-system", "svc/darkplum-web")
 	if a := f.args(); strings.Join(a, " ") !=
-		"--kubeconfig "+testKubeconfigPath+" --context "+Context+" -n darkplum-system port-forward --address 127.0.0.1 svc/darkplum-web :80" {
+		"--kubeconfig "+h.Kubeconfig()+" --context "+Context+" -n darkplum-system port-forward --address 127.0.0.1 svc/darkplum-web :80" {
 		t.Errorf("port-forward args = %q", a)
 	}
-	if strings.Join(f.env, " ") != "AWS_PROFILE=acme KUBECONFIG="+testKubeconfigPath {
+	if strings.Join(f.env, " ") != "AWS_PROFILE=acme KUBECONFIG="+h.Kubeconfig() {
 		t.Errorf("port-forward env = %q", f.env)
 	}
 }

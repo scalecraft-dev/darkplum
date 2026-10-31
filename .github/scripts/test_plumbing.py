@@ -23,12 +23,13 @@ pin = load("check_pinned", "check-pinned-actions.py")
 lock = load("check_lock", "check-lock-platforms.py")
 
 SHA = "a" * 40
-D = {s: "sha256:" + c * 64 for s, c in zip(("gateway", "api", "web"), "123")}
+# one image per service, each with the run attempt of the job that signed it
+D = {s: {"digest": "sha256:" + c * 64, "run_attempt": a} for s, c, a in zip(("gateway", "api", "web"), "123", ("1", "2", "1"))}
 
 
 def good_release(**over):
-    kw = dict(channel="release", version="1.2.3", commit=SHA, run_id="42", run_attempt="1",
-              repo="scalecraft-dev/darkplum", ref="refs/tags/v1.2.3", digests=dict(D))
+    kw = dict(channel="release", version="1.2.3", commit=SHA, run_id="42",
+              repo="scalecraft-dev/darkplum", ref="refs/tags/v1.2.3", images_in=dict(D))
     kw.update(over)
     return kw
 
@@ -38,12 +39,23 @@ class ReleaseJSON(unittest.TestCase):
         doc = rj.build(**good_release())
         self.assertEqual(doc["workflow"], ".github/workflows/release.yml")
         self.assertEqual(doc["images"]["gateway"]["repository"], "ghcr.io/scalecraft-dev/darkplum-gateway")
-        self.assertEqual(doc["images"]["web"]["digest"], D["web"])
+        self.assertEqual(doc["images"]["web"]["digest"], D["web"]["digest"])
+        # the attempt is per image: a re-run of one failed job does not change the others
+        self.assertEqual({k: v["run_attempt"] for k, v in doc["images"].items()}, {"gateway": "1", "api": "2", "web": "1"})
+        self.assertNotIn("run_attempt", doc)
 
     def test_rc_manifest_uses_rc_repositories_and_prerelease_workflow(self):
         doc = rj.build(**good_release(channel="rc", version="0.0.0-rc.7+abcdef0", ref="refs/heads/prerelease/makefile-removal"))
         self.assertEqual(doc["workflow"], ".github/workflows/prerelease.yml")
         self.assertEqual(doc["images"]["api"]["repository"], "ghcr.io/scalecraft-dev/darkplum-rc-api")
+
+    def test_images_live_under_the_building_repositorys_owner(self):
+        # A release cut from a scratch organisation names that organisation's images;
+        # whether the CLI TRUSTS that repository is decided in the CLI (its baked
+        # trusted repository), never here.
+        doc = rj.build(**good_release(repo="Scratch-Org/darkplum-release"))
+        self.assertEqual(doc["repository"], "Scratch-Org/darkplum-release")
+        self.assertEqual(doc["images"]["api"]["repository"], "ghcr.io/scratch-org/darkplum-api")
 
     def test_refuses_mismatched_inputs(self):
         cases = {
@@ -54,12 +66,17 @@ class ReleaseJSON(unittest.TestCase):
             "rc from main": dict(channel="rc", version="0.0.0-rc.1+abcdef0", ref="refs/heads/main"),
             "rc version on release channel": dict(version="0.0.0-rc.1+abcdef0"),
             "short commit": dict(commit="abc123"),
-            "foreign owner": dict(repo="evil/darkplum"),
+            "repository that is not owner/name": dict(repo="darkplum"),
             "non-numeric run id": dict(run_id="4x"),
-            "tag digest": dict(digests={**D, "api": "latest"}),
-            "short digest": dict(digests={**D, "api": "sha256:abc"}),
-            "missing service": dict(digests={k: v for k, v in D.items() if k != "web"}),
-            "extra service": dict(digests={**D, "extra": D["web"]}),
+            "tag digest": dict(images_in={**D, "api": {**D["api"], "digest": "latest"}}),
+            "short digest": dict(images_in={**D, "api": {**D["api"], "digest": "sha256:abc"}}),
+            "missing service": dict(images_in={k: v for k, v in D.items() if k != "web"}),
+            "extra service": dict(images_in={**D, "extra": D["web"]}),
+            "missing attempt": dict(images_in={**D, "api": {"digest": D["api"]["digest"]}}),
+            "zero attempt": dict(images_in={**D, "api": {**D["api"], "run_attempt": "0"}}),
+            "non-numeric attempt": dict(images_in={**D, "api": {**D["api"], "run_attempt": "1x"}}),
+            "extra image field": dict(images_in={**D, "api": {**D["api"], "extra": "x"}}),
+            "string instead of image": dict(images_in={**D, "api": "sha256:" + "2" * 64}),
         }
         for label, over in cases.items():
             with self.subTest(label):
@@ -70,7 +87,7 @@ class ReleaseJSON(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             p = Path(d, "digests.json")
             p.write_text(json.dumps(D))
-            argv = ["--channel", "release", "--version", "1.2.3", "--commit", SHA, "--run-id", "42", "--run-attempt", "1",
+            argv = ["--channel", "release", "--version", "1.2.3", "--commit", SHA, "--run-id", "42",
                     "--repository", "scalecraft-dev/darkplum", "--ref", "refs/tags/v1.2.3", "--digests", str(p)]
             import contextlib
             import io
@@ -85,10 +102,9 @@ class ReleaseJSON(unittest.TestCase):
         # services/cli/internal/release parses these same files; if either side's
         # rules or field names drift, one of the two tests breaks.
         golden = HERE / "testdata"
-        D = {s: "sha256:" + c * 64 for s, c in zip(("gateway", "api", "web"), "123")}
-        rel = rj.build("release", "1.2.3", "a" * 40, "42", "1", "scalecraft-dev/darkplum", "refs/tags/v1.2.3", D)
+        rel = rj.build("release", "1.2.3", "a" * 40, "42", "scalecraft-dev/darkplum", "refs/tags/v1.2.3", D)
         self.assertEqual((golden / "release.golden.json").read_text().strip(), rj.canonical(rel))
-        rc = rj.build("rc", "0.0.0-rc.7+abcdef0", "b" * 40, "43", "2", "scalecraft-dev/darkplum",
+        rc = rj.build("rc", "0.0.0-rc.7+abcdef0", "b" * 40, "43", "scalecraft-dev/darkplum",
                       "refs/heads/prerelease/makefile-removal", D)
         self.assertEqual((golden / "rc.golden.json").read_text().strip(), rj.canonical(rc))
 
@@ -101,7 +117,7 @@ class ReleaseJSON(unittest.TestCase):
 
     def test_missing_digest_file_fails_closed(self):
         self.assertEqual(rj.main(["--channel", "release", "--version", "1.2.3", "--commit", SHA, "--run-id", "1",
-                                  "--run-attempt", "1", "--repository", "scalecraft-dev/darkplum",
+                                  "--repository", "scalecraft-dev/darkplum",
                                   "--ref", "refs/tags/v1.2.3", "--digests", "/nonexistent"]), 1)
 
 
@@ -116,10 +132,10 @@ class PinnedActions(unittest.TestCase):
         self.assertEqual(pin.main([]), 0)
 
     def test_every_pinned_action_carries_a_version_comment(self):
-        for f in pin.PLUMBING:
-            for n, line in enumerate((HERE.parent / "workflows" / f).read_text().splitlines(), 1):
+        for path in sorted((HERE.parent / "workflows").glob("*.yml")):
+            for n, line in enumerate(path.read_text().splitlines(), 1):
                 if re.search(r"uses:\s*\S+@[0-9a-f]{40}", line):
-                    self.assertRegex(line, r"#\s*v\d", f"{f}:{n} pinned action needs a '# vX.Y.Z' comment")
+                    self.assertRegex(line, r"#\s*v\d", f"{path.name}:{n} pinned action needs a '# vX.Y.Z' comment")
 
 
 class LockPlatforms(unittest.TestCase):

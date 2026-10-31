@@ -28,6 +28,24 @@ import (
 // encoded is set by the linker; see the package comment.
 var encoded string
 
+// trustedRepository is the one repository whose workflows this binary believes.
+// A manifest naming any other repository is refused, so a binary built from
+// someone's fork, or a manifest edited to point elsewhere, deploys nothing.
+// release.yml and prerelease.yml never set it. The only override is a build-time
+// -X flag on a binary an engineer builds by hand for the scratch-organisation
+// exercise (docs/RELEASING.md); `darkplum version` says loudly when it is not the
+// default, and nothing at run time can change it.
+var trustedRepository = defaultTrustedRepository
+
+const defaultTrustedRepository = "scalecraft-dev/darkplum"
+
+// TrustedRepository is the repository this binary trusts.
+func TrustedRepository() string { return trustedRepository }
+
+// NonDefaultTrust reports a binary that trusts a repository other than the
+// product's own: fine for a scratch exercise, never for a customer.
+func NonDefaultTrust() bool { return trustedRepository != defaultTrustedRepository }
+
 const (
 	// Channels. A binary and the images it verifies are on the same channel.
 	Release = "release"
@@ -39,16 +57,19 @@ const (
 
 	buildSignWorkflow = ".github/workflows/_build-sign.yml"
 	registry          = "ghcr.io"
-	owner             = "scalecraft-dev"
 )
 
 // Services are the first-party images, in display order.
 var Services = []string{"gateway", "api", "web"}
 
-// Image is one released image.
+// Image is one released image. RunAttempt is the attempt number of the job that
+// signed THIS image: each image is built and signed in its own job, and re-running
+// one failed job raises only its attempt, so the signing certificate of each image
+// is matched against its own attempt.
 type Image struct {
 	Repository string `json:"repository"`
 	Digest     string `json:"digest"`
+	RunAttempt string `json:"run_attempt"`
 }
 
 // Ref is repository@digest, the only way the CLI ever names an image.
@@ -64,7 +85,6 @@ type Manifest struct {
 	Ref        string           `json:"ref"`
 	Workflow   string           `json:"workflow"`
 	RunID      string           `json:"run_id"`
-	RunAttempt string           `json:"run_attempt"`
 	Images     map[string]Image `json:"images"`
 }
 
@@ -72,6 +92,7 @@ var (
 	digestRe  = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 	commitRe  = regexp.MustCompile(`^[0-9a-f]{40}$`)
 	numRe     = regexp.MustCompile(`^[0-9]+$`)
+	attemptRe = regexp.MustCompile(`^[1-9][0-9]*$`)
 	repoRe    = regexp.MustCompile(`^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$`)
 	releaseRe = regexp.MustCompile(`^refs/tags/v([0-9]+\.[0-9]+\.[0-9]+)$`)
 	rcRefRe   = regexp.MustCompile(`^refs/heads/prerelease/[A-Za-z0-9._/-]+$`)
@@ -135,12 +156,16 @@ func (m Manifest) Validate() error {
 	if !commitRe.MatchString(m.Commit) {
 		return fmt.Errorf("release manifest: commit %q is not a 40-hex sha", m.Commit)
 	}
-	if !numRe.MatchString(m.RunID) || !numRe.MatchString(m.RunAttempt) {
-		return errors.New("release manifest: run id and attempt must be numeric")
+	if !numRe.MatchString(m.RunID) {
+		return errors.New("release manifest: run id must be numeric")
 	}
-	if !repoRe.MatchString(m.Repository) || !strings.HasPrefix(m.Repository, owner+"/") {
-		return fmt.Errorf("release manifest: repository %q is not in %s", m.Repository, owner)
+	if !repoRe.MatchString(m.Repository) {
+		return fmt.Errorf("release manifest: repository %q is not owner/name", m.Repository)
 	}
+	if m.Repository != trustedRepository {
+		return fmt.Errorf("release manifest: built by %q, but this darkplum only trusts %q", m.Repository, trustedRepository)
+	}
+	owner := strings.ToLower(strings.SplitN(m.Repository, "/", 2)[0])
 	var have []string
 	for k := range m.Images {
 		have = append(have, k)
@@ -153,6 +178,9 @@ func (m Manifest) Validate() error {
 		img := m.Images[svc]
 		if !digestRe.MatchString(img.Digest) {
 			return fmt.Errorf("release manifest: digest for %s is not sha256:<64 hex>", svc)
+		}
+		if !attemptRe.MatchString(img.RunAttempt) {
+			return fmt.Errorf("release manifest: run attempt for %s is not a positive number", svc)
 		}
 		if img.Repository != registry+"/"+owner+"/"+prefix+"-"+svc {
 			return fmt.Errorf("release manifest: repository %q for %s is not %s/%s/%s-%s", img.Repository, svc, registry, owner, prefix, svc)
@@ -175,17 +203,23 @@ type Identity struct {
 	SourceRepositoryRef string
 	Trigger             string
 	// Commit is both the workflow SHA (BuildConfigDigest) and the source digest.
-	Commit           string
+	Commit string
+	// RunInvocationURI names the run and the attempt of the job that signed this image.
 	RunInvocationURI string
 }
 
-// Identity returns the signing identity this release must have been signed with.
-func (m Manifest) Identity() (Identity, error) {
+// Identity returns the signing identity the named image (gateway, api or web)
+// must have been signed with.
+func (m Manifest) Identity(service string) (Identity, error) {
 	if m.Channel == Dev {
 		return Identity{}, errors.New("this is a development build; it has no release identity and verifies nothing")
 	}
 	if err := m.Validate(); err != nil {
 		return Identity{}, err
+	}
+	img, ok := m.Images[service]
+	if !ok {
+		return Identity{}, fmt.Errorf("release manifest has no image %q", service)
 	}
 	gh := "https://github.com/" + m.Repository
 	return Identity{
@@ -196,7 +230,7 @@ func (m Manifest) Identity() (Identity, error) {
 		SourceRepositoryRef: m.Ref,
 		Trigger:             "push",
 		Commit:              m.Commit,
-		RunInvocationURI:    gh + "/actions/runs/" + m.RunID + "/attempts/" + m.RunAttempt,
+		RunInvocationURI:    gh + "/actions/runs/" + m.RunID + "/attempts/" + img.RunAttempt,
 	}, nil
 }
 

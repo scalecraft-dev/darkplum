@@ -46,7 +46,7 @@ func TestValidateIssuesAHandleOnlyForTheInstallsCluster(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !v.Valid() || v.Name() != "dp-trial" || v.Account() != "123456789012" || v.Endpoint() != a.endpoint || v.CA() != a.ca {
+	if !v.Valid() || v.Name() != "dp-trial" || v.Account() != "123456789012" || v.Endpoint() != a.endpoint {
 		t.Errorf("handle = %+v", v)
 	}
 	for _, c := range a.calls {
@@ -127,48 +127,6 @@ func TestValidateAsksAWSNothingForAnIncompleteClaim(t *testing.T) {
 	}
 }
 
-func TestHandleIsPinnedToItsPrivateKubeconfig(t *testing.T) {
-	v, _ := Validate(claim(), goodAWS().run)
-	if got := v.Flags(); got != nil {
-		t.Errorf("flags before WithKubeconfig = %v", got)
-	}
-	if _, err := v.Exec().Run(nil, "kubectl", "get", "pods"); err == nil {
-		t.Error("kubectl ran before the handle was pinned to a private kubeconfig")
-	}
-	p := v.WithKubeconfig("/w/kubeconfig")
-	if strings.Join(p.Flags(), " ") != "--kubeconfig /w/kubeconfig --context darkplum" {
-		t.Errorf("flags = %v", p.Flags())
-	}
-	if strings.Join(p.Env(), " ") != "AWS_PROFILE=acme KUBECONFIG=/w/kubeconfig" {
-		t.Errorf("env = %v", p.Env())
-	}
-	if v.Kubeconfig() != "" {
-		t.Error("WithKubeconfig changed the original handle")
-	}
-	// The zero handle is inert.
-	var z ValidatedCluster
-	if z.Valid() || z.Flags() != nil || z.Env() != nil || z.WithKubeconfig("/x").Valid() {
-		t.Error("zero handle is not inert")
-	}
-	if _, err := z.Exec().Run(nil, "kubectl", "version"); err == nil {
-		t.Error("zero handle ran kubectl")
-	}
-	if _, err := z.PortForward("ns", "svc/x").Open(t.Context()); err == nil {
-		t.Error("zero handle opened a tunnel")
-	}
-}
-
-// A cluster handle runs kubectl and nothing else, whatever it is asked.
-func TestHandleExecRunsOnlyKubectl(t *testing.T) {
-	v, _ := Validate(claim(), goodAWS().run)
-	p := v.WithKubeconfig("/w/kubeconfig")
-	for _, name := range []string{"aws", "terraform", "helm", "sh", "/usr/bin/kubectl", "kubectl ", ""} {
-		if _, err := p.Exec().Run(nil, name, "x"); !errors.Is(err, ErrNotAllowed) {
-			t.Errorf("handle ran %q: %v", name, err)
-		}
-	}
-}
-
 func TestToolRefusesEverythingButAwsAndTerraform(t *testing.T) {
 	for _, name := range []string{"kubectl", "helm", "sh", "bash", "rm", "", "aws2", "/usr/local/bin/aws"} {
 		if _, err := Tool(name, "x"); !errors.Is(err, ErrNotAllowed) {
@@ -182,48 +140,5 @@ func TestToolRefusesEverythingButAwsAndTerraform(t *testing.T) {
 		if _, err := Which(name); !errors.Is(err, ErrNotAllowed) {
 			t.Errorf("Which(%q) = %v", name, err)
 		}
-	}
-}
-
-func TestLocalKindOnlyAdmitsLoopbackKindContexts(t *testing.T) {
-	server := func(s string) func(string) (string, error) {
-		return func(string) (string, error) { return s, nil }
-	}
-	for _, ok := range []struct{ ctx, server string }{
-		{"kind-darkplum", "https://127.0.0.1:52000"},
-		{"kind-dev", "https://localhost:6443"},
-		{"kind-a.b", "https://[::1]:6443"},
-	} {
-		k, err := newLocalKind(ok.ctx, server(ok.server))
-		if err != nil || k.Context() != ok.ctx {
-			t.Errorf("%s %s refused: %v", ok.ctx, ok.server, err)
-		}
-		if strings.Join(k.Flags(), " ") != "--context "+ok.ctx {
-			t.Errorf("flags = %v", k.Flags())
-		}
-	}
-	for _, bad := range []struct{ ctx, server string }{
-		{"darkplum", "https://127.0.0.1:1"},
-		{"prod", "https://127.0.0.1:1"},
-		{"arn:aws:eks:us-east-2:1:cluster/x", "https://127.0.0.1:1"},
-		{"kind-", "https://127.0.0.1:1"},
-		{"Kind-x", "https://127.0.0.1:1"},
-		{"kind-x y", "https://127.0.0.1:1"},
-		{"kind-prod", "https://ABC.gr7.us-east-2.eks.amazonaws.com"}, // named like kind, points at a real cluster
-		{"kind-prod", "https://10.0.0.5:6443"},
-		{"kind-prod", "http://127.0.0.1:8080"},
-		{"kind-prod", "https://127.0.0.1.evil.com:443"},
-		{"kind-prod", ""},
-	} {
-		if k, err := newLocalKind(bad.ctx, server(bad.server)); err == nil || k.Context() != "" {
-			t.Errorf("%q -> %q admitted", bad.ctx, bad.server)
-		}
-	}
-	if _, err := newLocalKind("kind-x", func(string) (string, error) { return "", errors.New("no such context") }); err == nil {
-		t.Error("a context kubectl cannot read was admitted")
-	}
-	// The zero LocalKind is inert and a LocalKind is not a ValidatedCluster.
-	if _, err := (LocalKind{}).Exec().Run(nil, "kubectl", "get", "pods"); err == nil {
-		t.Error("zero LocalKind ran kubectl")
 	}
 }

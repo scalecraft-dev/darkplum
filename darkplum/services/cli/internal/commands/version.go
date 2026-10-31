@@ -70,13 +70,16 @@ func (c *VersionCmd) render(w io.Writer, m release.Manifest, b *bundle.Bundle) e
 	case release.RC:
 		fmt.Fprintln(w, sWarn("RELEASE CANDIDATE")+" for testing; it deploys darkplum-rc-* images and refuses release images.")
 	}
+	if release.NonDefaultTrust() {
+		fmt.Fprintln(w, sWarn("NON-DEFAULT TRUST")+" this binary trusts "+release.TrustedRepository()+" instead of the product's own repository. Scratch exercises only.")
+	}
 	if m.Channel != release.Dev {
 		fmt.Fprintf(w, "  commit      %s\n", m.Commit)
-		fmt.Fprintf(w, "  built by    %s %s (run %s, attempt %s)\n", m.Repository, m.Workflow, m.RunID, m.RunAttempt)
+		fmt.Fprintf(w, "  built by    %s %s (run %s)\n", m.Repository, m.Workflow, m.RunID)
 		fmt.Fprintf(w, "  ref         %s\n", m.Ref)
 		fmt.Fprintln(w, "  images")
 		for _, svc := range release.Services {
-			fmt.Fprintf(w, "    %-8s  %s\n", svc, m.Images[svc].Ref())
+			fmt.Fprintf(w, "    %-8s  %s  (signed in attempt %s)\n", svc, m.Images[svc].Ref(), m.Images[svc].RunAttempt)
 		}
 	}
 	fmt.Fprintf(w, "  bundle      %s (%d files)\n", b.Hash()[:12], len(b.Entries()))

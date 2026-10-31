@@ -69,7 +69,7 @@ func TestExtractVerifyAndIdempotence(t *testing.T) {
 	if err := b.Extract(dest); err != nil {
 		t.Fatal(err)
 	}
-	if err := Verify(dest, b.Hash()); err != nil {
+	if _, err := Verify(dest, b.Hash()); err != nil {
 		t.Fatalf("fresh extraction does not verify: %v", err)
 	}
 	for _, gone := range []string{"terraform/aws/backend.tf", "terraform/aws/terraform.tfvars", "terraform/aws/modules/eks/tests"} {
@@ -130,7 +130,7 @@ func TestVerifyRefusesAnyTampering(t *testing.T) {
 			dest := filepath.Join(t.TempDir(), "b")
 			must(t, b.Extract(dest))
 			tamper(t, dest)
-			if err := Verify(dest, b.Hash()); err == nil {
+			if _, err := Verify(dest, b.Hash()); err == nil {
 				t.Error("tampered bundle verified")
 			}
 			// and extraction over a tampered dir refuses instead of trusting it
@@ -148,7 +148,7 @@ func TestVerifyRefusesAnotherBundle(t *testing.T) {
 	b, _ := New(other)
 	dest := filepath.Join(t.TempDir(), "b")
 	must(t, a.Extract(dest))
-	if err := Verify(dest, b.Hash()); err == nil {
+	if _, err := Verify(dest, b.Hash()); err == nil {
 		t.Error("a different release's hash verified this tree")
 	}
 }
@@ -164,7 +164,9 @@ func TestEmbeddedBundleRoundTrip(t *testing.T) {
 	}
 	dest := filepath.Join(t.TempDir(), "bundle")
 	must(t, b.Extract(dest))
-	must(t, Verify(dest, b.Hash()))
+	if v, err := Verify(dest, b.Hash()); err != nil || !v.Valid() || v.Short() != b.Hash()[:12] {
+		t.Fatalf("verify: %v %+v", err, v)
+	}
 	// extracted tree has no test files and nothing local
 	err = filepath.WalkDir(dest, func(p string, d fs.DirEntry, err error) error {
 		rel, _ := filepath.Rel(dest, p)

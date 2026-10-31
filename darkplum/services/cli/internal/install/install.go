@@ -150,32 +150,22 @@ func (i Install) Dir() string        { return filepath.Join(i.home.installs(), i
 func (i Install) RecordPath() string { return filepath.Join(i.Dir(), recordFile) }
 func (i Install) TFVars() string     { return filepath.Join(i.Dir(), "terraform.tfvars") }
 func (i Install) BackendHCL() string { return filepath.Join(i.Dir(), "backend.hcl") }
-func (i Install) TFData() string     { return filepath.Join(i.Dir(), "tfdata") }
+
 func (i Install) Kubeconfig() string { return filepath.Join(i.Dir(), "kubeconfig") }
 func (i Install) LogsDir() string    { return filepath.Join(i.Dir(), "logs") }
 func (i Install) PluginCache() string {
 	return i.home.PluginCache()
 }
 
-// BundleDir is where one version of the shipped tree is extracted.
-func (i Install) BundleDir(version string) string {
-	return filepath.Join(i.Dir(), "bundle", sanitize(version))
-}
+// BundleDir is where one build of the shipped tree is extracted. key is
+// bundle.Key(version, hash): the release version and the content hash, so two
+// builds never share a directory.
+func (i Install) BundleDir(key string) string { return filepath.Join(i.Dir(), "bundle", key) }
 
-// TerraformDir is the Terraform root inside an extracted bundle.
-func (i Install) TerraformDir(version string) string {
-	return filepath.Join(i.BundleDir(version), "terraform", "aws")
-}
-
-func sanitize(v string) string {
-	return strings.Map(func(r rune) rune {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '-':
-			return r
-		}
-		return '_'
-	}, v)
-}
+// TFData is Terraform's data directory (TF_DATA_DIR) for one bundle key. It lives
+// beside the bundle, never inside it: terraform init writes there, and the
+// bundle is verified read-only.
+func (i Install) TFData(key string) string { return filepath.Join(i.Dir(), "tfdata", key) }
 
 const recordFile = "install.json"
 
@@ -292,30 +282,40 @@ func (i Install) WriteFile(name string, data []byte) error {
 	return writeAtomic(filepath.Join(i.Dir(), name), data, 0o600)
 }
 
-// PrepareBundle extracts b as the given version (a no-op when already there and
-// intact) and returns the Terraform root. It never reuses a directory that does
-// not verify.
-func (i Install) PrepareBundle(b *bundle.Bundle, version string) (string, error) {
+// UseBundle returns b extracted for version and verified, ready to hand to
+// runner.Terraform. A directory that is missing is extracted. One that exists but
+// does not verify (edited, truncated, something dropped into it) is moved aside to
+// <key>.rejected-<time>, never trusted and never deleted, and the bundle is
+// extracted afresh; note says so, for the operator.
+func (i Install) UseBundle(b *bundle.Bundle, version string, now func() time.Time) (v bundle.Verified, note string, err error) {
 	if version == "" {
-		return "", errors.New("bundle version is empty")
+		return bundle.Verified{}, "", errors.New("bundle version is empty")
 	}
 	if err := os.MkdirAll(i.Dir(), 0o700); err != nil {
-		return "", err
+		return bundle.Verified{}, "", err
 	}
-	if err := b.Extract(i.BundleDir(version)); err != nil {
-		return "", err
+	key := bundle.Key(version, b.Hash())
+	dir := i.BundleDir(key)
+	if _, statErr := os.Lstat(dir); statErr == nil {
+		if v, err := bundle.Verify(dir, b.Hash()); err == nil {
+			return v, "", nil
+		}
+		rejected := dir + ".rejected-" + now().UTC().Format("20060102T150405Z")
+		if err := os.Rename(dir, rejected); err != nil {
+			return bundle.Verified{}, "", fmt.Errorf("the extracted bundle %s does not match this binary and cannot be moved aside: %w", dir, err)
+		}
+		note = "the extracted bundle did not match this binary; moved it to " + rejected + " and extracted a fresh copy"
 	}
-	return i.TerraformDir(version), nil
+	if err := b.Extract(dir); err != nil {
+		return bundle.Verified{}, note, err
+	}
+	v, err = bundle.Verify(dir, b.Hash())
+	return v, note, err
 }
 
-// VerifyBundle re-checks an extracted version against the bundle shipped in this binary.
-func (i Install) VerifyBundle(b *bundle.Bundle, version string) error {
-	return bundle.Verify(i.BundleDir(version), b.Hash())
-}
-
-// PruneBundles removes every extracted bundle except those named. Callers keep
-// the current and the previous version, so a rollback needs no re-extraction.
-func (i Install) PruneBundles(keep ...string) error {
+// PruneBundles removes every extracted bundle except those whose key is named
+// (callers keep the current and the previous), leaving rejected copies alone.
+func (i Install) PruneBundles(keepKeys ...string) error {
 	root := filepath.Join(i.Dir(), "bundle")
 	entries, err := os.ReadDir(root)
 	if errors.Is(err, fs.ErrNotExist) {
@@ -325,11 +325,11 @@ func (i Install) PruneBundles(keep ...string) error {
 		return err
 	}
 	want := map[string]bool{}
-	for _, k := range keep {
-		want[sanitize(k)] = true
+	for _, k := range keepKeys {
+		want[k] = true
 	}
 	for _, e := range entries {
-		if want[e.Name()] {
+		if want[e.Name()] || strings.Contains(e.Name(), ".rejected-") {
 			continue
 		}
 		p := filepath.Join(root, e.Name())

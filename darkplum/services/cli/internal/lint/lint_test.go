@@ -48,11 +48,29 @@ func check(fset *token.FileSet, f *ast.File, rel string) []string {
 					out = append(out, pos(x)+fmt.Sprintf(": string literal %q outside internal/runner (use runner.Kubectl and a cluster handle)", s))
 				}
 			}
+		case *ast.SelectorExpr:
+			// kube.ForTest takes a fake runner; in production code it would let a
+			// client skip the handle.
+			if id, ok := x.X.(*ast.Ident); ok && id.Name == "kube" && x.Sel.Name == "ForTest" {
+				out = append(out, pos(x)+": kube.ForTest is for _test.go files only")
+			}
+		case *ast.AssignStmt:
+			// Swapping a client's runner after construction retargets it.
+			for _, lhs := range x.Lhs {
+				if sel, ok := lhs.(*ast.SelectorExpr); ok && sel.Sel.Name == "Runner" {
+					out = append(out, pos(x)+": assignment to a .Runner field: clients are built by kube.ForCluster or kube.ForLocalKind and never retargeted")
+				}
+			}
 		case *ast.CompositeLit:
 			// A kube.Client built by hand skips ForCluster/ForLocalKind, so skips the handle.
 			if sel, ok := x.Type.(*ast.SelectorExpr); ok {
 				if id, ok := sel.X.(*ast.Ident); ok && id.Name == "kube" && sel.Sel.Name == "Client" && !strings.HasPrefix(rel, "internal/kube/") {
 					out = append(out, pos(x)+": kube.Client built by hand: use kube.ForCluster or kube.ForLocalKind")
+				}
+				// A handle written as a literal is the zero value, which is inert, but
+				// it is never what code means: handles come from Validate / NewLocalKind.
+				if id, ok := sel.X.(*ast.Ident); ok && id.Name == "runner" && (sel.Sel.Name == "ValidatedCluster" || sel.Sel.Name == "LocalKind") {
+					out = append(out, pos(x)+": runner."+sel.Sel.Name+" built by hand: handles come from runner.Validate or runner.NewLocalKind")
 				}
 			}
 		}
@@ -137,9 +155,12 @@ func TestCheckerCatchesViolations(t *testing.T) {
 		"helm literal":    {"internal/commands/x.go", "package commands\nfunc f(r interface{ Run(...string) }) { r.Run(\"helm\", \"ls\") }\n", 1},
 		"hand-built kube.Client": {"internal/commands/x.go",
 			"package commands\nimport \"x/kube\"\nvar _ = &kube.Client{Namespace: \"n\"}\n", 1},
-		"exec and kubectl both":  {"cmd/x.go", "package main\nimport \"os/exec\"\nvar _ = exec.Command(\"kubectl\")\n", 2},
-		"clean file":             {"internal/commands/x.go", "package commands\nimport \"fmt\"\nvar _ = fmt.Sprint(\"aws\", \"terraform\")\n", 0},
-		"runner may do anything": {"internal/runner/x.go", "package runner\nimport \"os/exec\"\nvar _ = exec.Command(\"kubectl\")\n", 0},
+		"exec and kubectl both":      {"cmd/x.go", "package main\nimport \"os/exec\"\nvar _ = exec.Command(\"kubectl\")\n", 2},
+		"kube.ForTest in production": {"internal/commands/x.go", "package commands\nimport \"x/kube\"\nvar _ = kube.ForTest\n", 1},
+		"runner swap by assignment":  {"internal/commands/x.go", "package commands\nfunc f(c *struct{ Runner int }) { c.Runner = 1 }\n", 1},
+		"hand built handle":          {"internal/commands/x.go", "package commands\nimport \"x/runner\"\nvar _ = runner.LocalKind{}\nvar _ = runner.ValidatedCluster{}\n", 2},
+		"clean file":                 {"internal/commands/x.go", "package commands\nimport \"fmt\"\nvar _ = fmt.Sprint(\"aws\", \"terraform\")\n", 0},
+		"runner may do anything":     {"internal/runner/x.go", "package runner\nimport \"os/exec\"\nvar _ = exec.Command(\"kubectl\")\n", 0},
 		"kube package may build its own client": {"internal/kube/x.go",
 			"package kube\nvar _ = &Client{}\n", 0},
 	}

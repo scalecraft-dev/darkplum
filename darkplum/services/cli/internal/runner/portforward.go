@@ -23,6 +23,7 @@ type PortForward struct {
 	flags              []string // --kubeconfig <private> --context darkplum
 	namespace, service string
 	env                []string
+	check              func() error
 	openTimeout        time.Duration
 
 	mu   sync.Mutex
@@ -34,8 +35,12 @@ type PortForward struct {
 // 80) in namespace on this cluster. Nothing is started until Open. A handle with
 // no pinned kubeconfig opens nothing.
 func (v ValidatedCluster) PortForward(namespace, service string) *PortForward {
-	return &PortForward{flags: v.Flags(), namespace: namespace, service: service,
+	pf := &PortForward{flags: v.Flags(), namespace: namespace, service: service,
 		env: v.Env(), openTimeout: 30 * time.Second}
+	if k, ok := v.Exec().(kubectlExec); ok {
+		pf.check = k.check
+	}
+	return pf
 }
 
 func (f *PortForward) args() []string {
@@ -47,6 +52,11 @@ func (f *PortForward) args() []string {
 func (f *PortForward) Open(ctx context.Context) (string, error) {
 	if len(f.flags) == 0 {
 		return "", errors.New("runner: no validated cluster to forward to")
+	}
+	if f.check != nil {
+		if err := f.check(); err != nil {
+			return "", err
+		}
 	}
 	f.Close()
 	// Not tied to ctx: a Ctrl-C must leave the tunnel up long enough for

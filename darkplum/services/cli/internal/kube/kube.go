@@ -3,7 +3,10 @@
 //
 // A Client that really runs kubectl can only be built from a runner handle: a
 // ValidatedCluster (an install's cluster, checked against AWS) or a LocalKind (a
-// kind cluster on this machine). This package never starts a process itself.
+// kind cluster on this machine). The handle's Exec puts the pinned --kubeconfig
+// and --context in front of every call itself and refuses callers' arguments that
+// would select anything else. This package never starts a process, and its
+// fields are unexported so no other package can build or retarget a Client.
 package kube
 
 import (
@@ -16,51 +19,43 @@ type Runner = runner.Exec
 
 // Client runs kubectl against a fixed namespace.
 type Client struct {
-	Runner    Runner
-	Namespace string
-	// Kubeconfig, when set, is passed as --kubeconfig on every invocation (and
-	// exported as KUBECONFIG, so plugins and helm agree): the client then
-	// never reads the operator's own kubeconfig.
-	Kubeconfig string
-	// Context, when set, is passed as --context on every invocation, so the
-	// client acts on that cluster whatever the kubeconfig's current context is.
-	Context string
-	// Env is what the runner adds to the environment; kept here so other
-	// kubectl processes (port-forward) run with the same credentials.
-	Env []string
+	r  Runner
+	ns string
+	// flags are added to the arguments before the runner sees them. Real clients
+	// leave this empty (the handle's Exec adds the selectors); ForTest sets it so a
+	// fake observes the same argv a real call produces.
+	flags []string
 }
 
 // ForCluster returns a client that only ever talks to the install's validated
 // cluster, through the install's private kubeconfig.
 func ForCluster(namespace string, v runner.ValidatedCluster) *Client {
-	return &Client{Runner: v.Exec(), Namespace: namespace, Kubeconfig: v.Kubeconfig(), Context: runner.Context, Env: v.Env()}
+	return &Client{r: v.Exec(), ns: namespace}
 }
 
 // ForLocalKind returns a client that only ever talks to one local kind context
-// of the operator's own kubeconfig (the explicit --context escape).
+// (the explicit --context escape).
 func ForLocalKind(namespace string, k runner.LocalKind) *Client {
-	return &Client{Runner: k.Exec(), Namespace: namespace, Context: k.Context()}
+	return &Client{r: k.Exec(), ns: namespace}
 }
 
-// Flags are the selectors every kubectl invocation by this client carries.
-func (c *Client) Flags() []string {
-	var f []string
-	if c.Kubeconfig != "" {
-		f = append(f, "--kubeconfig", c.Kubeconfig)
-	}
-	if c.Context != "" {
-		f = append(f, "--context", c.Context)
-	}
-	return f
+// ForTest builds a client around a fake Runner. flags stand in for the selectors a
+// real handle would prepend, so assertions on the argv match production. It is for
+// _test.go files only; internal/lint fails the build on any other use.
+func ForTest(r Runner, namespace string, flags ...string) *Client {
+	return &Client{r: r, ns: namespace, flags: flags}
 }
+
+// Namespace is the namespace NS targets.
+func (c *Client) Namespace() string { return c.ns }
 
 // Run invokes kubectl with the given args verbatim (no implicit namespace).
 func (c *Client) Run(stdin []byte, args ...string) (string, error) {
-	out, err := c.Runner.Run(stdin, runner.Kubectl, append(c.Flags(), args...)...)
+	out, err := c.r.Run(stdin, runner.Kubectl, append(append([]string{}, c.flags...), args...)...)
 	return string(out), err
 }
 
 // NS invokes kubectl with -n <namespace> prepended.
 func (c *Client) NS(stdin []byte, args ...string) (string, error) {
-	return c.Run(stdin, append([]string{"-n", c.Namespace}, args...)...)
+	return c.Run(stdin, append([]string{"-n", c.ns}, args...)...)
 }

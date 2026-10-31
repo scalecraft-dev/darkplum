@@ -107,7 +107,7 @@ func (c *InitCmd) adopt(w io.Writer, home install.Home, now func() time.Time) er
 	if cn := first(tf.Raw, "cluster_name"); cn != "" {
 		rec.ClusterName = cn
 	}
-	rec.Name = c.Install
+	rec.Name = c.installName
 	if rec.Name == "" {
 		rec.Name = rec.ClusterName
 	}

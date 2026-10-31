@@ -116,7 +116,7 @@ const hashFile = ".bundle-sha256"
 // later run would trust.
 func (b *Bundle) Extract(dest string) error {
 	if _, err := os.Stat(dest); err == nil {
-		if err := Verify(dest, b.hash); err != nil {
+		if _, err := Verify(dest, b.hash); err != nil {
 			return fmt.Errorf("%s exists and is not this bundle: %w", dest, err)
 		}
 		return nil
@@ -156,7 +156,7 @@ func (b *Bundle) Extract(dest string) error {
 	}
 	if err := os.Rename(tmp, dest); err != nil {
 		// Another process won the race with the same bundle: fine, verify it.
-		if verr := Verify(dest, b.hash); verr == nil {
+		if _, verr := Verify(dest, b.hash); verr == nil {
 			return nil
 		}
 		return err
@@ -164,11 +164,51 @@ func (b *Bundle) Extract(dest string) error {
 	return nil
 }
 
+// Verified is proof that a directory held exactly the shipped bundle when it was
+// last checked. It can only be obtained from Verify, and it is what runner.Terraform
+// takes: Terraform never runs from a tree that was not just verified.
+type Verified struct {
+	dir, hash string
+}
+
+// Valid reports whether this came from Verify (the zero value did not).
+func (v Verified) Valid() bool { return v.dir != "" }
+
+// Dir is the extracted bundle's root.
+func (v Verified) Dir() string { return v.dir }
+
+// TerraformDir is the Terraform root inside it.
+func (v Verified) TerraformDir() string { return filepath.Join(v.dir, "terraform", "aws") }
+
+// K8sDir is the Kubernetes tree inside it.
+func (v Verified) K8sDir() string { return filepath.Join(v.dir, "k8s") }
+
+// Hash is the full content hash that was verified.
+func (v Verified) Hash() string { return v.hash }
+
+// Short is the first 12 characters of the hash, for directory names.
+func (v Verified) Short() string { return short(v.hash) }
+
+// Key names a bundle on disk: the release version and the content hash. Two
+// builds of the same version with different content (a dev build, a rebuilt
+// release) never share a directory or Terraform's data directory.
+func Key(version, hash string) string { return sanitize(version) + "-" + short(hash) }
+
+func sanitize(v string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '-':
+			return r
+		}
+		return '_'
+	}, v)
+}
+
 // Verify re-hashes dir and compares it with want. Any difference is an error: a
 // changed file, a missing file, and also an extra one (a stray .terraform, a
 // backend.tf, a tfvars someone dropped in). Terraform and kubectl never run from
 // a tree that does not verify.
-func Verify(dir, want string) error {
+func Verify(dir, want string) (Verified, error) {
 	var entries []Entry
 	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
@@ -197,20 +237,24 @@ func Verify(dir, want string) error {
 		return nil
 	})
 	if err != nil {
-		return err
+		return Verified{}, err
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
 	if got := treeHash(entries); got != want {
-		return fmt.Errorf("bundle on disk does not match the one shipped in this binary (hash %s, expected %s)", short(got), short(want))
+		return Verified{}, fmt.Errorf("bundle on disk does not match the one shipped in this binary (hash %s, expected %s)", short(got), short(want))
 	}
 	stored, err := os.ReadFile(filepath.Join(dir, hashFile))
 	if err != nil {
-		return fmt.Errorf("bundle marker missing: %w", err)
+		return Verified{}, fmt.Errorf("bundle marker missing: %w", err)
 	}
 	if !bytes.Equal(bytes.TrimSpace(stored), []byte(want)) {
-		return errors.New("bundle marker does not match the shipped bundle")
+		return Verified{}, errors.New("bundle marker does not match the shipped bundle")
 	}
-	return nil
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return Verified{}, err
+	}
+	return Verified{dir: abs, hash: want}, nil
 }
 
 func short(h string) string {

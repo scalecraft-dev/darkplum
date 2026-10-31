@@ -23,9 +23,16 @@ jobs:
   gate:
     name: Gate
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Waiting for CI can take a while; the job holds nothing but a runner.
+    timeout-minutes: 90
+    # The reviewer approves BEFORE anything is built or any identity token for the
+    # release workflow is issued. A rejection or a failure here costs nothing: no
+    # image exists yet, so the version is not burned; "Re-run failed jobs" retries
+    # the gate alone.
+    environment: release
     permissions:
       contents: read
+      actions: read
       checks: read
     outputs:
       version: ${{ steps.v.outputs.version }}
@@ -45,9 +52,12 @@ jobs:
           echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
           git fetch --no-tags origin main
           git merge-base --is-ancestor "$SHA" origin/main || { echo "$SHA is not on main: releases are cut from main only"; exit 1; }
+      # Waits (up to an hour) for the CI run of this exact commit, then requires it
+      # green. Tag after CI is green, but a tag pushed a little early just waits.
       - name: CI is green on this commit
         env:
           GH_TOKEN: ${{ github.token }}
+          CI_WAIT_SECONDS: "3600"
         run: bash .github/scripts/require-ci-green.sh "$GITHUB_REPOSITORY" "$GITHUB_SHA"
       - name: Plumbing tests
         run: |
@@ -100,7 +110,7 @@ jobs:
           printf '%s' "$DIGESTS" > "$RUNNER_TEMP/digests.json"
           enc="$(python3 -I .github/scripts/release-json.py --base64 \
             --channel release --version "$VERSION" --commit "$GITHUB_SHA" \
-            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --run-id "$GITHUB_RUN_ID" \
             --repository "$GITHUB_REPOSITORY" --ref "$GITHUB_REF" \
             --digests "$RUNNER_TEMP/digests.json")"
           mkdir -p dist/stage
@@ -116,14 +126,35 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  draft:
-    name: Draft release
-    needs: [gate, images, cli]
+  # Anonymous: no login, no token, no permissions. The binary just built (the one
+  # customers will run) verifies the images CI just signed, with the identity it has
+  # baked in. Needs the GHCR packages to be public (docs/RELEASING.md): an image only
+  # the CI can read is not something a customer can verify.
+  verify:
+    name: Verify the signed images
+    needs: [gate, cli]
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # Protected environment with a required reviewer: a person approves before a
-    # draft carrying signed artifacts exists.
-    environment: release
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cli-linux-amd64
+          path: dist
+      - name: darkplum verify-release
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          tar -xzf "dist/darkplum_${VERSION}_linux_amd64.tar.gz" -C dist darkplum
+          ./dist/darkplum version
+          ./dist/darkplum verify-release
+
+  draft:
+    name: Draft release
+    needs: [gate, images, cli, verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
       contents: write
       id-token: write
@@ -147,7 +178,7 @@ jobs:
           printf '%s' "$DIGESTS" > "$RUNNER_TEMP/digests.json"
           python3 -I .github/scripts/release-json.py \
             --channel release --version "$VERSION" --commit "$GITHUB_SHA" \
-            --run-id "$GITHUB_RUN_ID" --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --run-id "$GITHUB_RUN_ID" \
             --repository "$GITHUB_REPOSITORY" --ref "$GITHUB_REF" \
             --digests "$RUNNER_TEMP/digests.json" > dist/release.json
           cat dist/checksums.txt

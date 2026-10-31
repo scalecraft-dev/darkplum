@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"github.com/scalecraft-dev/darkplum/cli/internal/kube"
+
+	"github.com/scalecraft-dev/darkplum/cli/internal/runner"
 )
 
 const (
@@ -333,7 +335,7 @@ func (h *configureHarness) run(c *ConfigureCmd, answers string, secrets ...strin
 		namespace:   "darkplum-system",
 		resolve:     resolve,
 		newKube: func(t clusterTarget, ns string) *kube.Client {
-			return &kube.Client{Runner: h.kube, Namespace: ns, Kubeconfig: t.Kubeconfig, Context: t.Context}
+			return kube.ForTest(h.kube, ns, "--kubeconfig", t.Kubeconfig, "--context", t.Context)
 		},
 		newFwd: func(clusterTarget) Forwarder { return h.fwd },
 		httpc:  &http.Client{Timeout: 5 * time.Second},
@@ -602,7 +604,7 @@ func TestConfigureHoldOpenGivesUpAfterSecondDrop(t *testing.T) {
 	api := newFakeAPI()
 	h := newHarness(t, api, 2)
 	out := &bytes.Buffer{}
-	r := &configureRun{configureEnv: &configureEnv{out: out}, fwd: h.fwd, kc: &kube.Client{Runner: h.kube}}
+	r := &configureRun{configureEnv: &configureEnv{out: out}, fwd: h.fwd, kc: kube.ForTest(h.kube, "")}
 	base, _ := h.fwd.Open(context.Background())
 	r.api = &apiClient{fwd: h.fwd, base: base}
 	go func() {
@@ -863,16 +865,15 @@ func loggingKubectl(t *testing.T) (logPath string) {
 
 func TestWriteCommandsFailClosed(t *testing.T) {
 	g := &Globals{Namespace: "darkplum-system"}
-	t.Run("sso with install settings that do not resolve refuses", func(t *testing.T) {
+	t.Run("sso with an install that does not resolve refuses", func(t *testing.T) {
 		log := loggingKubectl(t)
-		dir := t.TempDir()
-		if err := os.MkdirAll(filepath.Join(dir, "terraform", "aws"), 0o755); err != nil {
+		testInstall(t, nil)
+		// an aws that cannot answer: the install cannot be validated
+		bin := t.TempDir()
+		if err := os.WriteFile(filepath.Join(bin, "aws"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(dir, defaultTFVars), []byte("aws_region = \"us-east-2\"\nallowed_account_ids = [\"123456789012\"]\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		t.Chdir(dir)
+		t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 		err := (&SSOConfigureCmd{Issuer: "https://idp", ClientID: "c", RedirectURL: "https://x/cb", SecretStdin: true}).Run(g)
 		if err == nil || !IsReported(err) {
 			t.Fatalf("want a reported refusal, got %v", err)
@@ -899,15 +900,13 @@ func TestWriteCommandsFailClosed(t *testing.T) {
 	})
 	t.Run("--context pins every call", func(t *testing.T) {
 		t.Chdir(t.TempDir())
-		kc, err := installKube(io.Discard, "darkplum-system", "kind-darkplum-dev")
-		if err != nil {
-			t.Fatal(err)
+		old := newLocalKind
+		defer func() { newLocalKind = old }()
+		newLocalKind = func(ctx string) (runner.LocalKind, error) {
+			return runner.LocalKind{}, errors.New("stub: pretend kind")
 		}
-		rec := &fakeKube{}
-		kc.Runner = rec
-		_, _ = kc.NS(nil, "get", "svc", "darkplum-web")
-		if got := strings.Join(rec.calls[0], " "); got != "--context kind-darkplum-dev -n darkplum-system get svc darkplum-web" {
-			t.Errorf("args = %q", got)
+		if _, err := installKube(io.Discard, "darkplum-system", "kind-darkplum-dev", ""); err == nil {
+			t.Fatal("the stub refused; installKube must surface it")
 		}
 	})
 }

@@ -85,27 +85,29 @@ func Which(name string) (string, error) {
 	return "", fmt.Errorf("%w: %q", ErrNotAllowed, name)
 }
 
-// Terraform runs terraform in dir with env added to the environment and returns
-// stdout and stderr separately. A non-zero exit is the error.
-func Terraform(dir string, env []string, args ...string) (stdout []byte, stderr string, err error) {
-	cmd := exec.Command("terraform", append([]string{"-chdir=" + dir}, args...)...)
-	cmd.Env = append(os.Environ(), env...)
-	var out, errb bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &out, &errb
-	err = cmd.Run()
-	return out.Bytes(), errb.String(), err
+// kubectlExec shells out to kubectl and nothing else. prefix is the pinned
+// selectors (--kubeconfig <file> --context <ctx>), put in front of the caller's
+// arguments here and nowhere else; env is added to the inherited environment (the
+// AWS_PROFILE a kubeconfig's exec credential plugin needs, and KUBECONFIG). check,
+// when set, runs before every call.
+type kubectlExec struct {
+	prefix, env []string
+	check       func() error
 }
 
-// kubectlExec shells out to kubectl and nothing else. env is added to the
-// inherited environment (the AWS_PROFILE a kubeconfig's exec credential plugin
-// needs, and KUBECONFIG so plugins agree).
-type kubectlExec struct{ env []string }
-
 func (k kubectlExec) Run(stdin []byte, name string, args ...string) ([]byte, error) {
-	if name != "kubectl" {
+	if name != Kubectl {
 		return nil, fmt.Errorf("%w: %q through a cluster handle", ErrNotAllowed, name)
 	}
-	c := exec.Command(name, args...)
+	if k.check != nil {
+		if err := k.check(); err != nil {
+			return nil, err
+		}
+	}
+	if err := screenArgs(args); err != nil {
+		return nil, err
+	}
+	c := exec.Command(name, append(append([]string{}, k.prefix...), args...)...)
 	if len(k.env) > 0 {
 		c.Env = append(os.Environ(), k.env...)
 	}
@@ -123,6 +125,36 @@ func (k kubectlExec) Run(stdin []byte, name string, args ...string) ([]byte, err
 		return out.Bytes(), fmt.Errorf("%s: %s", name, msg)
 	}
 	return out.Bytes(), nil
+}
+
+// selectorFlags are the kubectl flags that choose which cluster, credentials or
+// identity a call uses. A handle fixes all of them, so a caller may not pass any.
+var selectorFlags = []string{
+	"--kubeconfig", "--context", "--cluster", "--server", "--user", "--token", "--as", "--as-group", "--as-uid",
+	"--certificate-authority", "--client-certificate", "--client-key", "--insecure-skip-tls-verify", "--tls-server-name",
+	"--username", "--password",
+}
+
+// screenArgs refuses an argument that is, or starts with, a selector flag (in
+// "--flag", "--flag=value" or, for the one short form kubectl has, "-s<server>"
+// shape). Scanning stops at the first "--": what follows belongs to the command a
+// subcommand runs (kubectl exec POD -- sh -c ...), not to kubectl, and cannot
+// change where kubectl connects.
+func screenArgs(args []string) error {
+	for _, a := range args {
+		if a == "--" {
+			return nil
+		}
+		for _, f := range selectorFlags {
+			if a == f || strings.HasPrefix(a, f+"=") {
+				return fmt.Errorf("runner: kubectl argument %q selects a cluster or identity; a handle fixes those", a)
+			}
+		}
+		if strings.HasPrefix(a, "-s") && !strings.HasPrefix(a, "--") {
+			return fmt.Errorf("runner: kubectl argument %q (-s is --server) selects a cluster; a handle fixes that", a)
+		}
+	}
+	return nil
 }
 
 // noCluster is what the zero handle executes: nothing.

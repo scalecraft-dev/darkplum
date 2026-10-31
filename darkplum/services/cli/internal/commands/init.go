@@ -39,8 +39,10 @@ type InitCmd struct {
 	DryRun        bool   `help:"Run the checks and print what would be written and created, without writing or creating anything." name:"dry-run" aliases:"stdout"`
 	Force         bool   `help:"Overwrite an existing terraform.tfvars without asking (a .bak copy is kept)."`
 	Dir           string `help:"Terraform root to write into. Defaults to terraform/<cloud> under the current directory." default:""`
-	Adopt         bool   `help:"Take over an install the Makefile flow created (terraform/aws, state in S3): record it in ~/.darkplum/installs/<name>, leave its state where it is, and rename its backend.tf and terraform.tfvars to *.adopted. Use --dir for another Terraform root."`
-	Install       string `help:"Name of the install workspace to create with --adopt. Defaults to the cluster name." default:""`
+	Adopt         bool   `help:"Take over an install the Makefile flow created (terraform/aws, state in S3): record it in ~/.darkplum/installs/<name>, leave its state where it is, and rename its backend.tf and terraform.tfvars to *.adopted. Use --dir for another Terraform root and the global --install to name the workspace (default: the cluster name)."`
+
+	// installName is the workspace --adopt creates: the global --install, else the cluster name.
+	installName string
 
 	Domain         string `help:"A domain you control. The team reaches Darkplum privately at https://darkplum.<domain> (the name is public, its address is not). Required with --yes." default:""`
 	Hostname       string `help:"Name the team opens instead of darkplum.<domain>; must be inside --domain." default:""`
@@ -118,8 +120,9 @@ func randomSuffix() string {
 const baseUSDPerDay = 10
 
 // Run executes `darkplum init`.
-func (c *InitCmd) Run(_ *Globals) error {
+func (c *InitCmd) Run(g *Globals) error {
 	if c.Adopt {
+		c.installName = g.Install
 		return c.runAdopt(os.Stdout)
 	}
 	tty := term.IsTerminal(int(os.Stdin.Fd()))

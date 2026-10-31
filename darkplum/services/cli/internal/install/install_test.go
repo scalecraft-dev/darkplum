@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"testing/fstest"
+	"time"
 
 	"github.com/scalecraft-dev/darkplum/cli/internal/bundle"
 )
@@ -121,7 +122,7 @@ func TestInstallsAreIsolated(t *testing.T) {
 	if _, err := os.Stat(b.TFVars()); err == nil {
 		t.Error("beta sees alpha's settings")
 	}
-	for _, p := range []string{a.TFVars(), a.Kubeconfig(), a.TFData(), a.LogsDir(), a.BundleDir("1.0.0"), a.RecordPath(), a.BackendHCL()} {
+	for _, p := range []string{a.TFVars(), a.Kubeconfig(), a.TFData("k"), a.LogsDir(), a.BundleDir("1.0.0-abc"), a.RecordPath(), a.BackendHCL()} {
 		if !strings.HasPrefix(p, a.Dir()+string(filepath.Separator)) {
 			t.Errorf("%s escapes alpha's workspace %s", p, a.Dir())
 		}
@@ -198,37 +199,125 @@ func TestLoadRefusesBadRecords(t *testing.T) {
 	}
 }
 
-func TestBundlePrepareVerifyAndPrune(t *testing.T) {
-	h := Home(t.TempDir())
-	mk(t, h, "alpha")
-	a, _ := Open(h, "alpha")
+func fixedNow() time.Time { return time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC) }
+
+func sampleBundle(t *testing.T, mainTF string) *bundle.Bundle {
+	t.Helper()
 	b, err := bundle.New(fstest.MapFS{
-		"terraform/aws/main.tf":       {Data: []byte("# main")},
+		"terraform/aws/main.tf":       {Data: []byte(mainTF)},
 		"k8s/base/kustomization.yaml": {Data: []byte("kind: Kustomization")},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
+	return b
+}
+
+func TestUseBundleExtractsAndVerifies(t *testing.T) {
+	h := Home(t.TempDir())
+	mk(t, h, "alpha")
+	a, _ := Open(h, "alpha")
+	b := sampleBundle(t, "# main")
+	v, note, err := a.UseBundle(b, "1.2.3", fixedNow)
+	if err != nil || note != "" || !v.Valid() {
+		t.Fatalf("UseBundle = %+v %q %v", v, note, err)
+	}
+	key := bundle.Key("1.2.3", b.Hash())
+	if v.Dir() != a.BundleDir(key) || v.TerraformDir() != filepath.Join(a.BundleDir(key), "terraform", "aws") {
+		t.Errorf("dir = %s", v.Dir())
+	}
+	if !strings.Contains(key, b.Hash()[:12]) || !strings.HasPrefix(key, "1.2.3-") {
+		t.Errorf("key %q must carry the version and the content hash", key)
+	}
+	// terraform's data directory is keyed the same way and is outside the bundle
+	if td := a.TFData(key); strings.HasPrefix(td, v.Dir()) || !strings.HasPrefix(td, a.Dir()+string(filepath.Separator)) {
+		t.Errorf("tfdata %s must be in the workspace, outside the bundle %s", td, v.Dir())
+	}
+	// a second use is a no-op that still verifies
+	if _, note, err := a.UseBundle(b, "1.2.3", fixedNow); err != nil || note != "" {
+		t.Errorf("second use: %q %v", note, err)
+	}
+}
+
+// The same version with different content (a dev rebuild, a re-cut release) never
+// shares a directory with the earlier one.
+func TestSameVersionDifferentContentGetsItsOwnDirectory(t *testing.T) {
+	h := Home(t.TempDir())
+	mk(t, h, "alpha")
+	a, _ := Open(h, "alpha")
+	v1, _, err1 := a.UseBundle(sampleBundle(t, "# one"), "dev", fixedNow)
+	v2, _, err2 := a.UseBundle(sampleBundle(t, "# two"), "dev", fixedNow)
+	if err1 != nil || err2 != nil || v1.Dir() == v2.Dir() {
+		t.Fatalf("dirs %s %s (%v %v)", v1.Dir(), v2.Dir(), err1, err2)
+	}
+}
+
+// A tampered extraction is never trusted: it is moved aside, kept for inspection,
+// and a fresh copy is used.
+func TestUseBundleMovesATamperedExtractionAside(t *testing.T) {
+	h := Home(t.TempDir())
+	mk(t, h, "alpha")
+	a, _ := Open(h, "alpha")
+	b := sampleBundle(t, "# main")
+	v, _, err := a.UseBundle(b, "1.2.3", fixedNow)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, tamper := range map[string]func(){
+		"edited file": func() {
+			p := filepath.Join(v.TerraformDir(), "main.tf")
+			_ = os.Chmod(p, 0o600)
+			_ = os.WriteFile(p, []byte("# main\nresource \"x\" \"y\" {}"), 0o600)
+		},
+		"terraform init inside the bundle": func() {
+			_ = os.MkdirAll(filepath.Join(v.TerraformDir(), ".terraform"), 0o700)
+			_ = os.WriteFile(filepath.Join(v.TerraformDir(), ".terraform", "x"), []byte("x"), 0o600)
+		},
+		"dropped backend.tf": func() {
+			_ = os.WriteFile(filepath.Join(v.TerraformDir(), "backend.tf"), []byte("x"), 0o600)
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			tamper()
+			v2, note, err := a.UseBundle(b, "1.2.3", fixedNow)
+			if err != nil || !v2.Valid() || !strings.Contains(note, ".rejected-20261031T120000Z") {
+				t.Fatalf("UseBundle = %+v %q %v", v2, note, err)
+			}
+			if _, err := bundle.Verify(v2.Dir(), b.Hash()); err != nil {
+				t.Errorf("the fresh copy does not verify: %v", err)
+			}
+			rejected, _ := filepath.Glob(v.Dir() + ".rejected-*")
+			if len(rejected) != 1 {
+				t.Fatalf("rejected copies: %v", rejected)
+			}
+			// the evidence is kept; clear it for the next case
+			_ = filepath.WalkDir(rejected[0], func(p string, d os.DirEntry, err error) error {
+				if err == nil && d.IsDir() {
+					_ = os.Chmod(p, 0o700)
+				}
+				return nil
+			})
+			_ = os.RemoveAll(rejected[0])
+		})
+	}
+}
+
+func TestPruneKeepsNamedKeysAndRejectedCopies(t *testing.T) {
+	h := Home(t.TempDir())
+	mk(t, h, "alpha")
+	a, _ := Open(h, "alpha")
+	var keys []string
 	for _, v := range []string{"1.0.0", "1.1.0", "1.2.0"} {
-		dir, err := a.PrepareBundle(b, v)
-		if err != nil {
+		b := sampleBundle(t, "# "+v)
+		if _, _, err := a.UseBundle(b, v, fixedNow); err != nil {
 			t.Fatal(err)
 		}
-		if dir != filepath.Join(a.BundleDir(v), "terraform", "aws") {
-			t.Errorf("terraform dir = %s", dir)
-		}
-		if err := a.VerifyBundle(b, v); err != nil {
-			t.Errorf("fresh bundle %s does not verify: %v", v, err)
-		}
+		keys = append(keys, bundle.Key(v, b.Hash()))
 	}
-	// a terraform init inside the version dir is caught
-	if err := os.MkdirAll(filepath.Join(a.TerraformDir("1.2.0"), ".terraform"), 0o700); err == nil {
-		_ = os.WriteFile(filepath.Join(a.TerraformDir("1.2.0"), ".terraform", "x"), []byte("x"), 0o600)
+	if err := os.MkdirAll(filepath.Join(a.Dir(), "bundle", keys[0]+".rejected-X"), 0o700); err != nil {
+		t.Fatal(err)
 	}
-	if err := a.VerifyBundle(b, "1.2.0"); err == nil {
-		t.Error("a bundle with a .terraform inside verified")
-	}
-	if err := a.PruneBundles("1.2.0", "1.1.0"); err != nil {
+	if err := a.PruneBundles(keys[1], keys[2]); err != nil {
 		t.Fatal(err)
 	}
 	left, _ := os.ReadDir(filepath.Join(a.Dir(), "bundle"))
@@ -236,18 +325,19 @@ func TestBundlePrepareVerifyAndPrune(t *testing.T) {
 	for _, e := range left {
 		names = append(names, e.Name())
 	}
-	if strings.Join(names, ",") != "1.1.0,1.2.0" {
-		t.Errorf("after prune: %v", names)
+	want := []string{keys[0] + ".rejected-X", keys[1], keys[2]}
+	if strings.Join(names, ",") != strings.Join(want, ",") {
+		t.Errorf("after prune: %v, want %v", names, want)
 	}
-	if _, err := a.PrepareBundle(b, ""); err == nil {
+	if _, _, err := a.UseBundle(sampleBundle(t, "x"), "", fixedNow); err == nil {
 		t.Error("empty version accepted")
 	}
 	// a hostile version string cannot leave the workspace
-	dir, err := a.PrepareBundle(b, "../../../evil")
+	v, _, err := a.UseBundle(sampleBundle(t, "# evil"), "../../../evil", fixedNow)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.HasPrefix(dir, a.Dir()+string(filepath.Separator)) {
-		t.Errorf("version string escaped the workspace: %s", dir)
+	if !strings.HasPrefix(v.Dir(), a.Dir()+string(filepath.Separator)) {
+		t.Errorf("version string escaped the workspace: %s", v.Dir())
 	}
 }

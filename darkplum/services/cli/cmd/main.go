@@ -16,7 +16,7 @@ func main() {
 		kong.Help(commands.HelpPrinter),
 		kong.UsageOnError(),
 	)
-	err := kctx.Run(&commands.Globals{Namespace: cli.Namespace})
+	err := kctx.Run(&commands.Globals{Namespace: cli.Namespace, Install: cli.Install})
 	if commands.IsReported(err) { // already shown as a ✗ row with a hint
 		os.Exit(1)
 	}

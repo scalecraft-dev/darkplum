@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/scalecraft-dev/darkplum/cli/internal/install"
 	"github.com/scalecraft-dev/darkplum/cli/internal/runner"
 )
 
@@ -32,6 +33,31 @@ func installDir(t *testing.T, tfvars string) string {
 		t.Fatal(err)
 	}
 	return p
+}
+
+// testInstall creates a workspace in a private DARKPLUM_HOME for the install the
+// tests below use (dp-trial, profile acme, account 123456789012). mut edits the
+// record before it is saved.
+func testInstall(t *testing.T, mut func(*install.Record)) install.Install {
+	t.Helper()
+	t.Setenv("DARKPLUM_HOME", t.TempDir())
+	home, err := install.DefaultHome()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := install.Record{Name: "dp-trial", ClusterName: "dp-trial", Region: "us-east-2", Profile: "acme", AccountIDs: []string{"123456789012"},
+		Backend: install.Backend{Type: "s3", Bucket: "darkplum-tfstate-123456789012-us-east-2-a1b2c3", Key: "darkplum/aws/dp-trial/terraform.tfstate", Region: "us-east-2", Encrypt: true, UseLockfile: true}}
+	if mut != nil {
+		mut(&rec)
+	}
+	in, err := install.Open(home, "dp-trial")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := in.Save(rec); err != nil {
+		t.Fatal(err)
+	}
+	return in
 }
 
 const pinnedTFVars = "aws_profile = \"acme\"\naws_region = \"us-east-2\"\ncluster_name = \"dp-trial\"\nallowed_account_ids = [\"123456789012\"]\n"
@@ -77,13 +103,13 @@ func TestInstallClusterWritesPrivateKubeconfig(t *testing.T) {
 	}
 	t.Setenv("KUBECONFIG", envCfg)
 
-	tfvars := installDir(t, pinnedTFVars)
+	in := testInstall(t, nil)
 	aws := &fakeAWS{arn: testARN, caller: "123456789012"}
-	tg, row, err := installCluster(tfvars, aws.run)
+	tg, row, err := installCluster(in, aws.run)
 	if err != nil {
 		t.Fatalf("%v %+v", err, row)
 	}
-	want := filepath.Join(filepath.Dir(tfvars), ".darkplum", "kubeconfig")
+	want := in.Kubeconfig()
 	if tg.Kubeconfig != want || tg.Context != "darkplum" || tg.Account != "123456789012" {
 		t.Errorf("target = %+v", tg)
 	}
@@ -161,32 +187,35 @@ func TestInstallClusterWritesPrivateKubeconfig(t *testing.T) {
 
 func TestInstallClusterRefusals(t *testing.T) {
 	cases := []struct {
-		name, tfvars string
-		aws          *fakeAWS
-		detail       string
-		notFound     bool
+		name     string
+		mut      func(*install.Record)
+		aws      *fakeAWS
+		detail   string
+		notFound bool
 	}{
-		{"cluster in an account the install does not pin", pinnedTFVars,
+		{"cluster in an account the install does not pin", nil,
 			&fakeAWS{arn: "arn:aws:eks:us-east-2:999999999999:cluster/dp-trial", caller: "999999999999"}, "not the install's account", false},
-		{"credentials for another account", pinnedTFVars,
+		{"credentials for another account", nil,
 			&fakeAWS{arn: testARN, caller: "999999999999"}, "credentials are for account 999999999999", false},
-		{"cluster missing", pinnedTFVars,
-			&fakeAWS{describeErr: errors.New("exit status 254: An error occurred (ResourceNotFoundException) when calling the DescribeCluster operation")},
+		{"cluster missing", nil,
+			&fakeAWS{caller: "123456789012", describeErr: errors.New("exit status 254: An error occurred (ResourceNotFoundException) when calling the DescribeCluster operation")},
 			"does not exist in us-east-2", true},
-		{"ARN for another cluster", pinnedTFVars,
+		// wrong-account credentials must not learn whether the cluster exists
+		{"cluster missing but credentials for another account", nil,
+			&fakeAWS{caller: "999999999999", describeErr: errors.New("ResourceNotFoundException")},
+			"credentials are for account 999999999999", false},
+		{"ARN for another cluster", nil,
 			&fakeAWS{arn: "arn:aws:eks:us-east-2:123456789012:cluster/other", caller: "123456789012"}, "does not match dp-trial", false},
-		{"expired session", pinnedTFVars,
-			&fakeAWS{describeErr: errors.New("ExpiredToken")}, "cannot read cluster", false},
-		{"no pinned account", "aws_region = \"us-east-2\"\n",
-			&fakeAWS{arn: testARN, caller: "123456789012"}, "pin no AWS account", false},
+		{"expired session", nil,
+			&fakeAWS{caller: "123456789012", describeErr: errors.New("ExpiredToken")}, "cannot read cluster", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			tfvars := installDir(t, tc.tfvars)
-			stale := filepath.Join(filepath.Dir(tfvars), ".darkplum", "kubeconfig")
+			in := testInstall(t, tc.mut)
+			stale := in.Kubeconfig()
 			_ = os.MkdirAll(filepath.Dir(stale), 0o700)
 			_ = os.WriteFile(stale, []byte("stale"), 0o600)
-			_, row, err := installCluster(tfvars, tc.aws.run)
+			_, row, err := installCluster(in, tc.aws.run)
 			if err == nil || row.status != checkFail || !strings.Contains(row.detail, tc.detail) {
 				t.Fatalf("want refusal %q, got %v %+v", tc.detail, err, row)
 			}
@@ -198,16 +227,47 @@ func TestInstallClusterRefusals(t *testing.T) {
 			}
 		})
 	}
-	t.Run("no install settings", func(t *testing.T) {
-		_, row, err := installCluster(filepath.Join(t.TempDir(), "terraform.tfvars"), (&fakeAWS{}).run)
-		if !errors.Is(err, errNoSettings) || strings.Contains(row.detail+row.hint, "tfvars") {
-			t.Fatalf("want errNoSettings without file names, got %v %+v", err, row)
+	t.Run("a record that does not validate", func(t *testing.T) {
+		in := testInstall(t, nil)
+		if err := os.WriteFile(in.RecordPath(), []byte(`{"schema":1,"name":"dp-trial","cluster_name":"dp-trial","region":"us-east-2","account_ids":[]}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		_, row, err := installCluster(in, (&fakeAWS{arn: testARN, caller: "123456789012"}).run)
+		if err == nil || row.status != checkFail || !strings.Contains(row.detail, "install record unreadable") {
+			t.Fatalf("got %v %+v", err, row)
+		}
+	})
+	t.Run("no install", func(t *testing.T) {
+		t.Setenv("DARKPLUM_HOME", t.TempDir())
+		home, _ := install.DefaultHome()
+		ghost, _ := install.Open(home, "ghost")
+		t.Chdir(t.TempDir())
+		_, row, err := installCluster(ghost, (&fakeAWS{}).run)
+		if !errors.Is(err, errNoSettings) || strings.Contains(row.detail+row.hint, "tfvars") || !strings.Contains(row.hint, "darkplum init") {
+			t.Fatalf("want errNoSettings pointing at init, without file names, got %v %+v", err, row)
+		}
+	})
+	t.Run("a Makefile-era root here points at adopt", func(t *testing.T) {
+		t.Setenv("DARKPLUM_HOME", t.TempDir())
+		home, _ := install.DefaultHome()
+		ghost, _ := install.Open(home, "ghost")
+		cwd := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(cwd, "terraform", "aws"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(cwd, "terraform", "aws", "backend.tf"), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Chdir(cwd)
+		_, row, err := installCluster(ghost, (&fakeAWS{}).run)
+		if !errors.Is(err, errNoSettings) || !strings.Contains(row.hint, "darkplum init --adopt") {
+			t.Fatalf("got %v %+v", err, row)
 		}
 	})
 }
 
 func TestKubeconfigCommandPrintsExport(t *testing.T) {
-	tfvars := installDir(t, pinnedTFVars)
+	in := testInstall(t, nil)
 	dir := t.TempDir()
 	script := `#!/bin/sh
 case "$*" in
@@ -231,12 +291,12 @@ esac
 		b, _ := io.ReadAll(r)
 		return string(b), err
 	}
-	out, err := capture(&KubeconfigCmd{Tfvars: tfvars})
-	want := "export KUBECONFIG='" + filepath.Join(filepath.Dir(tfvars), ".darkplum", "kubeconfig") + "'\n"
+	out, err := capture(&KubeconfigCmd{})
+	want := "export KUBECONFIG='" + in.Kubeconfig() + "'\n"
 	if err != nil || out != want {
 		t.Errorf("stdout = %q, %v; want %q", out, err, want)
 	}
-	if out, err := capture(&KubeconfigCmd{Tfvars: tfvars, Write: true}); err != nil || out != "" {
+	if out, err := capture(&KubeconfigCmd{Write: true}); err != nil || out != "" {
 		t.Errorf("--write must be silent: %q %v", out, err)
 	}
 }
@@ -244,21 +304,24 @@ esac
 // The target carries a validated handle only on success; kubectl is reachable
 // through nothing else.
 func TestInstallClusterHandsOutAValidatedHandleOnlyOnSuccess(t *testing.T) {
-	tfvars := installDir(t, pinnedTFVars)
-	tg, _, err := installCluster(tfvars, (&fakeAWS{arn: testARN, caller: "123456789012"}).run)
+	in := testInstall(t, nil)
+	tg, _, err := installCluster(in, (&fakeAWS{arn: testARN, caller: "123456789012"}).run)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !tg.h.Valid() || tg.h.Kubeconfig() != tg.Kubeconfig || tg.h.Account() != "123456789012" {
 		t.Errorf("handle = %+v for target %+v", tg.h, tg)
 	}
-	k := tg.kube("darkplum-system")
-	if len(k.Flags()) != 4 || k.Flags()[1] != tg.Kubeconfig || k.Flags()[3] != installContext {
-		t.Errorf("client flags = %v", k.Flags())
+	// a kubeconfig someone edited after it was written is never used
+	if err := os.WriteFile(tg.Kubeconfig, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tg.kube("darkplum-system").NS(nil, "get", "pods"); err == nil || !strings.Contains(err.Error(), "changed") {
+		t.Errorf("kubectl ran against an edited kubeconfig: %v", err)
 	}
 
 	// credentials for another account: no target, no handle, no private kubeconfig
-	bad, _, err := installCluster(tfvars, (&fakeAWS{arn: testARN, caller: "999999999999"}).run)
+	bad, _, err := installCluster(in, (&fakeAWS{arn: testARN, caller: "999999999999"}).run)
 	if err == nil || bad.h.Valid() {
 		t.Fatalf("credentials for another account produced a handle: %+v %v", bad, err)
 	}
@@ -283,7 +346,7 @@ func TestContextEscapeIsRestrictedToLocalKind(t *testing.T) {
 				}
 			}
 			var buf bytes.Buffer
-			k, err := installKube(&buf, "darkplum-system", ctx)
+			k, err := installKube(&buf, "darkplum-system", ctx, "")
 			if err == nil || k != nil {
 				t.Fatalf("--context %q was accepted: %v", ctx, err)
 			}

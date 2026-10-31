@@ -9,10 +9,13 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"path/filepath"
+	"os"
 	"strings"
 	"time"
 
+	"github.com/scalecraft-dev/darkplum/cli/internal/bundle"
+	"github.com/scalecraft-dev/darkplum/cli/internal/install"
+	"github.com/scalecraft-dev/darkplum/cli/internal/release"
 	"github.com/scalecraft-dev/darkplum/cli/internal/runner"
 )
 
@@ -61,14 +64,41 @@ func webAddressFrom(tf tfvarsInfo) webAddress {
 	return a
 }
 
-// terraformOutputs runs `terraform output -json` in the install's Terraform
-// root, under the install's AWS profile. It reads state; it changes nothing.
-func terraformOutputs(tfvarsPath, profile string) (map[string]json.RawMessage, error) {
-	var env []string
-	if profile != "" {
-		env = append(env, "AWS_PROFILE="+profile)
+// terraformOutputs runs `terraform output -json` for the install, from its
+// verified bundle: the extraction is checked against the hash shipped in this
+// binary first (a tampered one is moved aside and replaced), Terraform's data
+// directory lives in the workspace, and the backend comes from the install's
+// backend.hcl. It reads state; it changes nothing.
+func terraformOutputs(in install.Install, rec install.Record) (map[string]json.RawMessage, error) {
+	b, err := bundle.Embedded()
+	if err != nil {
+		return nil, err
 	}
-	out, stderr, err := runner.Terraform(filepath.Dir(tfvarsPath), env, "output", "-json")
+	m, err := release.Current()
+	if err != nil {
+		return nil, err
+	}
+	v, note, err := in.UseBundle(b, m.Version, time.Now)
+	if err != nil {
+		return nil, err
+	}
+	if note != "" {
+		fmt.Fprintln(os.Stderr, sWarn("! "+note))
+	}
+	key := bundle.Key(m.Version, b.Hash())
+	dirs := runner.TerraformDirs{Workspace: in.Dir(), Data: in.TFData(key), PluginCache: in.PluginCache(),
+		BackendHCL: in.BackendHCL(), TFVars: in.TFVars()}
+	var env []string
+	if rec.Profile != "" {
+		env = append(env, "AWS_PROFILE="+rec.Profile)
+	}
+	if stderr, err := runner.TerraformInit(v, dirs, rec.Profile, env); err != nil {
+		if s := strings.TrimSpace(stderr); s != "" {
+			return nil, errors.New(firstLine(s))
+		}
+		return nil, err
+	}
+	out, stderr, err := runner.Terraform(v, dirs, env, "output", "-json")
 	if err != nil {
 		if s := strings.TrimSpace(stderr); s != "" {
 			return nil, errors.New(firstLine(s))

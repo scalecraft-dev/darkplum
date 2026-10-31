@@ -20,7 +20,6 @@ import sys
 
 SERVICES = ("gateway", "api", "web")
 REGISTRY = "ghcr.io"
-OWNER = "scalecraft-dev"
 
 # channel -> (workflow file, image prefix, ref pattern, version pattern)
 CHANNELS = {
@@ -47,7 +46,11 @@ class Invalid(Exception):
     pass
 
 
-def build(channel, version, commit, run_id, run_attempt, repo, ref, digests):
+def build(channel, version, commit, run_id, repo, ref, images_in):
+    """images_in: {service: {"digest": "sha256:...", "run_attempt": "N"}}. Each image
+    leg of _build-sign.yml signs in its own job, and a re-run of a failed job gets a
+    new attempt number while its siblings keep theirs, so the attempt is recorded
+    per image and the CLI matches each image's certificate against its own."""
     if channel not in CHANNELS:
         raise Invalid(f"channel {channel!r} is not one of {sorted(CHANNELS)}")
     workflow, prefix, ref_re, ver_re = CHANNELS[channel]
@@ -60,17 +63,24 @@ def build(channel, version, commit, run_id, run_attempt, repo, ref, digests):
         raise Invalid(f"tag {ref!r} does not match version {version!r}")
     if not COMMIT.fullmatch(commit):
         raise Invalid(f"commit {commit!r} is not a 40-hex sha")
-    if not (re.fullmatch("[0-9]+", run_id) and re.fullmatch("[0-9]+", run_attempt)):
-        raise Invalid("run id and attempt must be numeric")
-    if not REPO.fullmatch(repo) or repo.split("/")[0] != OWNER:
-        raise Invalid(f"repository {repo!r} is not owned by {OWNER}")
-    if sorted(digests) != sorted(SERVICES):
-        raise Invalid(f"digests must be exactly {sorted(SERVICES)}, got {sorted(digests)}")
+    if not re.fullmatch("[0-9]+", run_id):
+        raise Invalid("run id must be numeric")
+    if not REPO.fullmatch(repo):
+        raise Invalid(f"repository {repo!r} is not owner/name")
+    owner = repo.split("/")[0].lower()
+    if not isinstance(images_in, dict) or sorted(images_in) != sorted(SERVICES):
+        raise Invalid(f"images must be exactly {sorted(SERVICES)}, got {sorted(images_in) if isinstance(images_in, dict) else images_in!r}")
     images = {}
     for svc in SERVICES:
-        if not DIGEST.fullmatch(digests[svc]):
-            raise Invalid(f"digest for {svc} is not sha256:<64 hex>: {digests[svc]!r}")
-        images[svc] = {"repository": f"{REGISTRY}/{OWNER}/{prefix}-{svc}", "digest": digests[svc]}
+        img = images_in[svc]
+        if not isinstance(img, dict) or sorted(img) != ["digest", "run_attempt"]:
+            raise Invalid(f"{svc} must have exactly digest and run_attempt")
+        if not isinstance(img["digest"], str) or not DIGEST.fullmatch(img["digest"]):
+            raise Invalid(f"digest for {svc} is not sha256:<64 hex>: {img['digest']!r}")
+        if not isinstance(img["run_attempt"], str) or not re.fullmatch("[1-9][0-9]*", img["run_attempt"]):
+            raise Invalid(f"run attempt for {svc} is not a positive number: {img['run_attempt']!r}")
+        images[svc] = {"repository": f"{REGISTRY}/{owner}/{prefix}-{svc}", "digest": img["digest"],
+                       "run_attempt": img["run_attempt"]}
     return {
         "schema": 1,
         "channel": channel,
@@ -80,7 +90,6 @@ def build(channel, version, commit, run_id, run_attempt, repo, ref, digests):
         "ref": ref,
         "workflow": f".github/workflows/{workflow}",
         "run_id": run_id,
-        "run_attempt": run_attempt,
         "images": images,
     }
 
@@ -95,16 +104,15 @@ def main(argv=None):
     p.add_argument("--version", required=True)
     p.add_argument("--commit", required=True)
     p.add_argument("--run-id", required=True)
-    p.add_argument("--run-attempt", required=True)
     p.add_argument("--repository", required=True)
     p.add_argument("--ref", required=True)
-    p.add_argument("--digests", required=True, help='path to {"gateway":"sha256:...","api":...,"web":...}')
+    p.add_argument("--digests", required=True, help='path to {"gateway":{"digest":"sha256:...","run_attempt":"1"},"api":...,"web":...}')
     p.add_argument("--base64", action="store_true", help="emit the single-line base64 form for the linker")
     a = p.parse_args(argv)
     try:
         with open(a.digests, encoding="utf-8") as f:
             digests = json.load(f)
-        doc = build(a.channel, a.version, a.commit, a.run_id, a.run_attempt, a.repository, a.ref, digests)
+        doc = build(a.channel, a.version, a.commit, a.run_id, a.repository, a.ref, digests)
     except (Invalid, OSError, ValueError) as e:
         print(f"release-json: {e}", file=sys.stderr)
         return 1

@@ -33,8 +33,8 @@ jobs:
       run:
         working-directory: darkplum/services/${{ matrix.service }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: darkplum/services/${{ matrix.service }}/go.mod
           cache-dependency-path: darkplum/services/${{ matrix.service }}/go.sum
@@ -76,8 +76,8 @@ jobs:
       run:
         working-directory: darkplum
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: darkplum/go.mod
           cache: false
@@ -97,11 +97,11 @@ jobs:
       run:
         working-directory: darkplum/services/web
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 9
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: pnpm
@@ -124,8 +124,8 @@ jobs:
       run:
         working-directory: darkplum/terraform/aws
     steps:
-      - uses: actions/checkout@v4
-      - uses: hashicorp/setup-terraform@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
         with:
           terraform_version: "1.14.9"
           # The default wrapper (a node shim that captures output) does not pass
@@ -141,7 +141,7 @@ jobs:
       # check Terraform parses and formats backend.hcl as written (attribute-only
       # HCL, so it is checked under a .tfvars name), then check Terraform reads
       # the hostile value back unchanged.
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: darkplum/services/cli/go.mod
           cache-dependency-path: darkplum/services/cli/go.sum
@@ -188,7 +188,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # The release workflows sign what customers deploy: every action in them is
       # pinned to a commit, the manifest writer refuses channel/ref/prefix
       # mix-ups, and the workflow files must at least parse.
@@ -210,12 +210,12 @@ jobs:
       run:
         working-directory: darkplum
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: darkplum/services/api/go.mod
           cache-dependency-path: darkplum/services/api/go.sum
-      - uses: azure/setup-kubectl@v4
+      - uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede # v4
       - name: kustomize builds
         run: |
           for overlay in dev dev-aws; do

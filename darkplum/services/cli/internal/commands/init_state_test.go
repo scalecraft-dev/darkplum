@@ -113,7 +113,7 @@ func TestInitStateLiveInstallFailsClosed(t *testing.T) {
 			if err := s3Cmd(dir, nil).execute(env); err == nil {
 				t.Fatalf("%s: want refusal\n%s", name, out)
 			}
-			if !strings.Contains(out.String(), "s3:ListAllMyBuckets")  {
+			if !strings.Contains(out.String(), "s3:ListAllMyBuckets") {
 				t.Errorf("%s: no hint:\n%s", name, out)
 			}
 			if entries, _ := os.ReadDir(dir); len(entries) != 0 || cloud.createCalls != 0 {

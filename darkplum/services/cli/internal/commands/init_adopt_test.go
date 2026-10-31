@@ -169,7 +169,7 @@ func TestAdoptRefusals(t *testing.T) {
 			home := install.Home(t.TempDir())
 			snap := snapshot(t, dir)
 			c := adoptCmd(dir)
-			c.Install = tc.install
+			c.installName = tc.install
 			out, err := runAdoptT(t, c, home)
 			if err == nil {
 				t.Fatalf("adopted:\n%s", out)

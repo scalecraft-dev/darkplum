@@ -9,14 +9,14 @@ import (
 
 // StatusCmd is `darkplum status`.
 type StatusCmd struct {
-	Context string `name:"context" help:"Local kind context (kind-*) to read, for a cluster Darkplum did not install. An install is found from its settings." default:""`
+	Context string `name:"context" help:"Local kind context (kind-*) to read, for a cluster Darkplum did not install. An install is found from its settings. A loopback address can still be an ssh tunnel to a remote cluster: the flag cannot tell, so do not point it at one. A loopback address can still be an ssh tunnel to a remote cluster: the flag cannot tell, so do not point it at one." default:""`
 }
 
 // Run executes `darkplum status`. Like every kube command it establishes and
 // validates the install's cluster first, and refuses rather than read
 // whatever cluster the current context points at.
 func (s *StatusCmd) Run(g *Globals) error {
-	c, err := installKube(os.Stdout, g.Namespace, s.Context)
+	c, err := installKube(os.Stdout, g.Namespace, s.Context, g.Install)
 	if err != nil {
 		return err
 	}
