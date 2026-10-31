@@ -3,8 +3,11 @@ package commands
 import (
 	"encoding/base64"
 	"fmt"
+	"io"
 	"os"
 	"strings"
+
+	"github.com/scalecraft-dev/darkplum/cli/internal/kube"
 )
 
 // StatusCmd is `darkplum status`.
@@ -20,29 +23,56 @@ func (s *StatusCmd) Run(g *Globals) error {
 	if err != nil {
 		return err
 	}
+	e := &statusEnv{out: os.Stdout, kc: c, ns: g.Namespace}
+	// The install's own settings tell which sections apply (web address, GPU). A
+	// cluster reached with --context has none; those sections are read live.
+	if s.Context == "" {
+		if in, _, err := openInstall(g.Install); err == nil {
+			if tf, err := readTFVars(in.TFVars()); err == nil {
+				e.tf = &tf
+			}
+		}
+	}
+	return e.run()
+}
 
-	// OIDC on/off is read from the auth secret (no DB access needed). make
-	// deploy writes the placeholder "unconfigured" when SSO is not set up; the
-	// api treats that as off (auth/config.go), so status must too.
+// statusEnv is what status reads, so tests can replace the cluster.
+type statusEnv struct {
+	out io.Writer
+	kc  *kube.Client
+	ns  string
+	tf  *tfvarsInfo // nil when there is no install record (--context)
+}
+
+func (e *statusEnv) run() error {
+	c := e.kc
+	failed := e.release()
+
+	// OIDC on/off is read from the auth secret (no DB access needed). deploy
+	// writes the placeholder "unconfigured" when SSO is not set up; the api
+	// treats that as off (auth/config.go), so status must too.
 	issuer, _ := c.NS(nil, "get", "secret", "darkplum-auth",
 		"-o", "jsonpath={.data.OIDC_ISSUER}")
 	if oidcConfigured(issuer) {
-		fmt.Printf("%s     %s\n", sDim("auth"), sInfo("local + OIDC"))
+		fmt.Fprintf(e.out, "%s     %s\n", sDim("auth"), sInfo("local + OIDC"))
 	} else {
-		fmt.Printf("%s     %s\n", sDim("auth"), sInfo("local only"))
+		fmt.Fprintf(e.out, "%s     %s\n", sDim("auth"), sInfo("local only"))
+	}
+	if e.imageTrust() {
+		failed = true
 	}
 
 	anyNotReady := false
-	for _, ns := range []string{g.Namespace, "darkplum-inference"} {
-		fmt.Printf("\n%s\n", sHeader("▸ "+ns))
+	for _, ns := range []string{e.ns, inferenceNamespace} {
+		fmt.Fprintf(e.out, "\n%s\n", sHeader("▸ "+ns))
 		out, err := c.Run(nil, "-n", ns, "get", "pods", "--no-headers")
 		if err != nil {
-			fmt.Printf("  (unavailable: %v)\n", err)
+			fmt.Fprintf(e.out, "  (unavailable: %v)\n", err)
 			continue
 		}
 		out = strings.TrimSpace(out)
 		if out == "" {
-			fmt.Println("  (no pods)")
+			fmt.Fprintln(e.out, "  (no pods)")
 			continue
 		}
 		for _, line := range strings.Split(out, "\n") {
@@ -60,23 +90,29 @@ func (s *StatusCmd) Run(g *Globals) error {
 				mark = sFail("✗ not ready")
 				anyNotReady = true
 			}
-			fmt.Printf("  %s %-40s %s %s\n", mark, pod, sDim(fmt.Sprintf("%-7s", ready)), sDim(phase))
+			fmt.Fprintf(e.out, "  %s %-40s %s %s\n", mark, pod, sDim(fmt.Sprintf("%-7s", ready)), sDim(phase))
 			if !ok {
 				logs, _ := c.Run(nil, "-n", ns, "logs", pod, "--tail=3", "--all-containers")
 				for _, l := range strings.Split(strings.TrimSpace(logs), "\n") {
 					if l != "" {
-						fmt.Printf("      %s\n", sDim("│ "+l))
+						fmt.Fprintf(e.out, "      %s\n", sDim("│ "+l))
 					}
 				}
 			}
 		}
 	}
 
-	fmt.Println()
-	if anyNotReady {
+	e.webUI()
+	e.models()
+
+	fmt.Fprintln(e.out)
+	switch {
+	case anyNotReady:
 		return fmt.Errorf("one or more pods are not ready")
+	case failed:
+		return reportedError{"the images this install runs were not verified"}
 	}
-	fmt.Println(sSuccess("✓ all pods ready"))
+	fmt.Fprintln(e.out, sSuccess("✓ all pods ready"))
 	return nil
 }
 
