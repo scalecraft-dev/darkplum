@@ -240,3 +240,27 @@ func parseOutputs(raw []byte) (deployOutputs, error) {
 	}
 	return o, nil
 }
+
+// changeCount is the number of resources a plan would create, update, delete or
+// replace; 0 means Terraform found nothing to do.
+func changeCount(planJSON []byte) (int, error) {
+	var p struct {
+		ResourceChanges []struct {
+			Change struct {
+				Actions []string `json:"actions"`
+			} `json:"change"`
+		} `json:"resource_changes"`
+	}
+	if err := json.Unmarshal(planJSON, &p); err != nil {
+		return 0, errors.New("terraform printed a plan this darkplum cannot read")
+	}
+	n := 0
+	for _, rc := range p.ResourceChanges {
+		a := rc.Change.Actions
+		if len(a) == 1 && (a[0] == "no-op" || a[0] == "read") {
+			continue
+		}
+		n++
+	}
+	return n, nil
+}

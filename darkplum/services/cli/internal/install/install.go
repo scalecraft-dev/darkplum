@@ -207,6 +207,10 @@ type Record struct {
 	// Bundle is the version of the shipped tree the install was last applied
 	// with (empty until the first deploy).
 	Bundle string `json:"bundle,omitempty"`
+	// CreatedZoneID is the Route 53 hosted zone `darkplum init` itself created
+	// (the domain's DNS is elsewhere). Only a zone recorded here is reported by
+	// destroy as Darkplum's to mention; a zone the customer supplied is theirs.
+	CreatedZoneID string `json:"created_zone_id,omitempty"`
 }
 
 // Backend is where Terraform keeps this install's state.

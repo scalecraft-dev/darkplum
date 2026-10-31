@@ -41,7 +41,12 @@ import (
 //     namespaces, through the install's own validated cluster, never the current
 //     kubectl context), then the credentials are checked again, then
 //     `terraform destroy`.
-//  6. A report of what is deliberately left behind, from what exists.
+//  6. A report of what is deliberately left behind, from what exists, and a
+//     non-zero exit if anything tagged for the cluster (load balancer, network
+//     interface, security group) is still in the account.
+//
+// Load balancers and volume claims in namespaces other than the Darkplum ones are
+// never deleted: they stop the run before anything is changed.
 type DestroyCmd struct {
 	Confirm           string `name:"confirm" help:"The cluster name, for scripts. Interactively you are asked to type it."`
 	ConfirmNoSnapshot string `name:"confirm-no-snapshot" help:"The cluster name again, to delete the database WITHOUT a final snapshot when the install is configured to take none. --confirm does not cover this."`
@@ -73,7 +78,7 @@ func (c *DestroyCmd) Run(g *Globals) error {
 		interactive: term.IsTerminal(int(os.Stdin.Fd())),
 		prompt:      promptLine,
 	}
-	e.sessionOK = func(min int) checkResult { return checkAWSSession(rec.Profile, min) }
+	e.sessionOK = func(min int) checkResult { return strictSession(rec.Profile, min) }
 	e.openTF = func() (tfRunner, string, error) { return openTF(in, rec) }
 	e.cluster = func() (clusterTarget, checkResult, error) { return installCluster(in, e.aws) }
 	e.kube = func(t clusterTarget) *kube.Client { return t.kube(platformNS) }
@@ -195,8 +200,7 @@ func (e *destroyEnv) run(ctx context.Context) (err error) {
 	managed := managedCount(state)
 	if managed == 0 {
 		e.row(checkResult{name: "terraform state", status: checkPass, detail: "empty: nothing to destroy"})
-		e.report(tf)
-		return nil
+		return e.report(tf)
 	}
 	if _, err := checkStateOwnership(tf, rec, state, true); err != nil {
 		return e.stop(checkResult{name: "terraform state", status: checkFail, detail: firstLine(err.Error()),
@@ -287,8 +291,10 @@ func (e *destroyEnv) run(ctx context.Context) (err error) {
 			return err
 		}
 	}
-	if r := e.sessionOK(15); r.status == checkFail {
-		return e.stop(r, "the AWS session expired before the destroy")
+	// The destroy takes 10-15 minutes and cannot be resumed mid-resource: the same margin
+	// as at the start.
+	if r := e.sessionOK(30); r.status == checkFail {
+		return e.stop(r, "the AWS session is too short to start the destroy")
 	}
 	if c, cerr := e.aws("aws", runner.ProfileArgs(rec.Profile, "sts", "get-caller-identity", "--region", rec.Region, "--query", "Account", "--output", "text")...); cerr != nil || strings.TrimSpace(c) != caller {
 		return e.stop(checkResult{name: "aws credentials", status: checkFail, detail: "the session no longer belongs to account " + caller,
@@ -306,8 +312,7 @@ func (e *destroyEnv) run(ctx context.Context) (err error) {
 	}
 	e.protectionOff = false
 	e.row(checkResult{name: "infrastructure", status: checkPass, detail: "destroyed"})
-	e.report(tf)
-	return nil
+	return e.report(tf)
 }
 
 func accountRe12(s string) bool {
@@ -531,6 +536,16 @@ func (e *destroyEnv) kubePhase(ctx context.Context, kc *kube.Client) error {
 			return e.stop(checkResult{name: "service " + o.String(), status: checkFail, detail: firstLine(err.Error())}, "cannot delete a load balancer service")
 		}
 	}
+	if len(s.Claims) > 0 {
+		// A claim stays Terminating for as long as a pod uses it. Stop the Darkplum
+		// workloads (their namespaces only; the load balancers are already going) so
+		// the claims, and the volumes behind them, can actually be released.
+		for ns := range darkplumNamespaces {
+			if _, err := kc.Run(nil, "-n", ns, "delete", "deployments,statefulsets,daemonsets,jobs", "--all", "--wait=false", "--ignore-not-found"); err != nil {
+				return e.stop(checkResult{name: "workloads in " + ns, status: checkFail, detail: firstLine(err.Error())}, "cannot stop the workloads that use volumes")
+			}
+		}
+	}
 	for _, o := range s.Claims {
 		if _, err := kc.Run(nil, "-n", o.NS, "delete", "pvc", o.Name, "--wait=false", "--ignore-not-found"); err != nil {
 			return e.stop(checkResult{name: "volume claim " + o.String(), status: checkFail, detail: firstLine(err.Error())}, "cannot delete a volume claim")
@@ -565,7 +580,7 @@ func (e *destroyEnv) kubePhase(ctx context.Context, kc *kube.Client) error {
 
 // report lists, from what exists now, what a destroy deliberately leaves, with
 // the command that deletes each. It deletes nothing.
-func (e *destroyEnv) report(tf tfRunner) {
+func (e *destroyEnv) report(tf tfRunner) error {
 	rec := e.rec
 	e.phase("Left behind on purpose (Darkplum deletes none of these)")
 	any := false
@@ -616,17 +631,29 @@ func (e *destroyEnv) report(tf tfRunner) {
 			prof("kms", "schedule-key-deletion", "--region", b.Region, "--key-id", b.KMSKeyID, "--pending-window-in-days", "30"))
 	}
 	// Hosted zone from the install's settings.
-	if z := tfStrings(e.tfv.Raw["web_zone_id"]); len(z) > 0 {
-		item("Route 53 hosted zone "+z[0], "(web_zone_id; `darkplum init` may have created it for you; it is not in Terraform)",
-			prof("route53", "delete-hosted-zone", "--id", z[0]))
+	// Only a zone `darkplum init` created is Darkplum's to mention; one the customer
+	// supplied (web_zone_id in the settings) is theirs and is not listed.
+	if z := rec.CreatedZoneID; z != "" {
+		item("Route 53 hosted zone "+z, "(created by `darkplum init` for your web address; it is not in Terraform)",
+			prof("route53", "delete-hosted-zone", "--id", z))
 	}
-	// Unprefixed repositories from the previous generation.
+	// ECR: the per-cluster repositories must be gone with the stack (looked up, not
+	// assumed); the unprefixed ones of the Makefile-era install are left alone.
+	var names []string
 	for _, svc := range []string{"gateway", "api", "web"} {
-		name := "darkplum-" + svc
+		names = append(names, rec.ClusterName+"/darkplum-"+svc)
+	}
+	for _, svc := range []string{"gateway", "api", "web"} {
+		names = append(names, "darkplum-"+svc)
+	}
+	for _, name := range names {
 		_, err := e.aws("aws", runner.ProfileArgs(rec.Profile, "ecr", "describe-repositories", "--region", rec.Region, "--repository-names", name)...)
 		switch {
+		case err == nil && strings.Contains(name, "/"):
+			item("ECR repository "+name, "(this install's own repository should have been deleted with the stack, but exists)",
+				prof("ecr", "delete-repository", "--region", rec.Region, "--repository-name", name, "--force"))
 		case err == nil:
-			item("ECR repository "+name, "(from the Makefile-era install; the new ones are per-cluster and were deleted)",
+			item("ECR repository "+name, "(from the Makefile-era install; never deleted by Darkplum)",
 				prof("ecr", "delete-repository", "--region", rec.Region, "--repository-name", name, "--force"))
 		case strings.Contains(err.Error(), "RepositoryNotFoundException"):
 		default:
@@ -636,5 +663,70 @@ func (e *destroyEnv) report(tf tfRunner) {
 	if !any {
 		e.printf("  nothing found\n")
 	}
-	e.printf("\n%s\n", sSuccess("✓ Done."))
+
+	// Things that must NOT be left: anything the cluster's controllers made in the
+	// account, found by the cluster tag (a load balancer, a network interface or a
+	// security group keeps a VPC, and the bill, alive).
+	if orphans := e.orphans(); len(orphans) > 0 {
+		e.phase("Still exists and should not")
+		for _, o := range orphans {
+			e.printf("  %s %s\n", sFail("✗"), o)
+		}
+		e.printf("\n  %s\n", sDim("These carry this cluster's tag. Delete them (or find what holds them) before the VPC can go; re-run `darkplum destroy` after."))
+		return reportedError{fmt.Sprintf("%d resource(s) tagged for the cluster still exist", len(orphans))}
+	}
+	e.printf("\n%s\n", sSuccess("✓ Done. Nothing tagged for the cluster is left in the account."))
+	return nil
+}
+
+// orphans finds load balancers, network interfaces and security groups tagged for
+// this cluster. A lookup that fails is printed and is not an orphan.
+func (e *destroyEnv) orphans() []string {
+	rec := e.rec
+	c := rec.ClusterName
+	prof := func(args ...string) []string {
+		return runner.ProfileArgs(rec.Profile, append(args, "--region", rec.Region)...)
+	}
+	var found []string
+	list := func(kind string, out string, err error) {
+		if err != nil {
+			e.printf("  ? %s %s\n", kind, sDim("could not be checked: "+firstLine(err.Error())))
+			return
+		}
+		var ids []string
+		_ = json.Unmarshal([]byte(out), &ids)
+		for _, id := range ids {
+			found = append(found, kind+" "+id)
+		}
+	}
+	for _, f := range []string{"Name=tag-key,Values=kubernetes.io/cluster/" + c, "Name=tag:cluster.k8s.amazonaws.com/name,Values=" + c, "Name=tag:aws:eks:cluster-name,Values=" + c} {
+		out, err := e.aws("aws", prof("ec2", "describe-network-interfaces", "--filters", f, "--query", "NetworkInterfaces[].NetworkInterfaceId", "--output", "json")...)
+		list("network interface", out, err)
+		out, err = e.aws("aws", prof("ec2", "describe-security-groups", "--filters", f, "--query", "SecurityGroups[].GroupId", "--output", "json")...)
+		list("security group", out, err)
+	}
+	// Load balancers carry the tag on the balancer, so list them and ask for tags.
+	out, err := e.aws("aws", prof("elbv2", "describe-load-balancers", "--query", "LoadBalancers[].LoadBalancerArn", "--output", "json")...)
+	if err != nil {
+		e.printf("  ? load balancer %s\n", sDim("could not be checked: "+firstLine(err.Error())))
+	} else {
+		var arns []string
+		_ = json.Unmarshal([]byte(out), &arns)
+		for i := 0; i < len(arns); i += 20 {
+			end := min(i+20, len(arns))
+			args := []string{"elbv2", "describe-tags", "--resource-arns"}
+			args = append(args, arns[i:end]...)
+			args = append(args, "--query", "TagDescriptions[?Tags[?(Key=='kubernetes.io/cluster/"+c+"' || (Key=='elbv2.k8s.aws/cluster' && Value=='"+c+"'))]].ResourceArn", "--output", "json")
+			tags, err := e.aws("aws", prof(args...)...)
+			list("load balancer", tags, err)
+		}
+	}
+	sort.Strings(found)
+	var uniq []string
+	for i, f := range found {
+		if i == 0 || f != found[i-1] {
+			uniq = append(uniq, f)
+		}
+	}
+	return uniq
 }

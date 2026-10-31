@@ -187,14 +187,28 @@ func TestUserHMACRules(t *testing.T) {
 			t.Errorf("calls = %d", len(k.calls))
 		}
 	})
-	t.Run("existing key is never replaced", func(t *testing.T) {
+	t.Run("a key without its id is refused, not repaired", func(t *testing.T) {
 		k := newScriptKube(t).on("get secret darkplum-user-hmac", secretJSON(map[string]string{"user-hmac-key": "live"}), nil).on("patch secret", "", nil)
-		if _, err := ensureUserHMAC(k.client("darkplum-system"), "darkplum-system"); err != nil {
-			t.Fatal(err)
+		if _, err := ensureUserHMAC(k.client("darkplum-system"), "darkplum-system"); err == nil {
+			t.Fatal("guessed the id of a live key")
 		}
-		sd := stringData(t, k.matching("patch secret")[0])
-		if _, has := sd["user-hmac-key"]; has || sd["user-hmac-key-id"] != "k1" {
-			t.Errorf("patch = %v: must add only the missing key id", sd)
+		if len(k.matching("patch")) != 0 {
+			t.Error("patched a half-present pair")
+		}
+	})
+	t.Run("an id without its key is refused", func(t *testing.T) {
+		k := newScriptKube(t).on("get secret darkplum-user-hmac", secretJSON(map[string]string{"user-hmac-key-id": "k7"}), nil)
+		if _, err := ensureUserHMAC(k.client("darkplum-system"), "darkplum-system"); err == nil {
+			t.Fatal("generated a new key under an existing id")
+		}
+		if len(k.calls) != 1 {
+			t.Errorf("calls = %d, want just the read", len(k.calls))
+		}
+	})
+	t.Run("a complete pair is left alone", func(t *testing.T) {
+		k := newScriptKube(t).on("get secret darkplum-user-hmac", secretJSON(map[string]string{"user-hmac-key": "live", "user-hmac-key-id": "k3"}), nil)
+		if _, err := ensureUserHMAC(k.client("darkplum-system"), "darkplum-system"); err != nil || len(k.calls) != 1 {
+			t.Fatalf("err=%v calls=%d", err, len(k.calls))
 		}
 	})
 }

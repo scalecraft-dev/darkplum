@@ -951,7 +951,10 @@ func (c *InitCmd) saveRecord(dir string, s *settings, spec backendSpec, now time
 		Backend: install.Backend{Type: "s3", Bucket: spec.Bucket, Key: spec.Key, Region: spec.Region, KMSKeyID: spec.KMSKeyARN, Encrypt: true, UseLockfile: true},
 	}
 	if old, err := in.Load(); err == nil {
-		rec.Created, rec.Bundle, rec.AdoptedFrom = old.Created, old.Bundle, old.AdoptedFrom
+		rec.Created, rec.Bundle, rec.AdoptedFrom, rec.CreatedZoneID = old.Created, old.Bundle, old.AdoptedFrom, old.CreatedZoneID
+	}
+	if s.web.createZone {
+		rec.CreatedZoneID = s.web.zoneID
 	}
 	return in.Save(rec)
 }

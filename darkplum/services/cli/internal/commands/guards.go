@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/scalecraft-dev/darkplum/cli/internal/install"
 )
@@ -133,4 +134,25 @@ func unreachable(err error) bool {
 		}
 	}
 	return false
+}
+
+// strictSession is checkAWSSession for the re-checks made mid-run: when the
+// expiry cannot be read it fails, where the preflight only warns. A re-check
+// exists to catch a session about to lapse; "unknown" must not pass it.
+func strictSession(profile string, minMinutes int) checkResult {
+	return strictSessionWith(awsSessionExpiry, profile, minMinutes, time.Now())
+}
+
+func strictSessionWith(expiry func(string) (time.Time, error), profile string, minMinutes int, now time.Time) checkResult {
+	r := sessionResult(expiry, profile, minMinutes, now)
+	if r.status == checkWarn {
+		r.status = checkFail
+		r.detail = "cannot tell when the AWS session expires"
+		login := "aws sso login"
+		if profile != "" {
+			login += " --profile " + profile
+		}
+		r.hint = "run `" + login + "` and re-run"
+	}
+	return r
 }

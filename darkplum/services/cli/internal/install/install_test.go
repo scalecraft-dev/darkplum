@@ -341,3 +341,19 @@ func TestPruneKeepsNamedKeysAndRejectedCopies(t *testing.T) {
 		t.Errorf("version string escaped the workspace: %s", v.Dir())
 	}
 }
+
+func TestRecordKeepsTheZoneInitCreated(t *testing.T) {
+	in, err := OpenDir(t.TempDir(), "dp-trial")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := Record{Name: "dp-trial", ClusterName: "dp-trial", Region: "us-east-2", AccountIDs: []string{"123456789012"},
+		Backend: Backend{Type: "s3", Bucket: "b", Key: "k", Region: "us-east-2"}, CreatedZoneID: "Z0123456789ABCDEFGHIJ"}
+	if err := in.Save(rec); err != nil {
+		t.Fatal(err)
+	}
+	got, err := in.Load()
+	if err != nil || got.CreatedZoneID != "Z0123456789ABCDEFGHIJ" {
+		t.Fatalf("%+v %v", got, err)
+	}
+}

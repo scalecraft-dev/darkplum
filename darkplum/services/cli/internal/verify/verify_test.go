@@ -345,3 +345,18 @@ func TestUnverifiedIsForTheDevChannelOnly(t *testing.T) {
 		t.Error("a verified release must not report unsigned")
 	}
 }
+
+func TestUnverifiedRefusesOnAReleaseOrCandidateBinary(t *testing.T) {
+	old := binaryChannel
+	defer func() { binaryChannel = old }()
+	for _, ch := range []string{release.Release, release.RC, ""} {
+		binaryChannel = func() string { return ch }
+		if _, err := Unverified(release.Manifest{Channel: release.Dev}); err == nil {
+			t.Errorf("a %q binary accepted a hand-built dev manifest", ch)
+		}
+	}
+	binaryChannel = func() string { return release.Dev }
+	if _, err := Unverified(release.Manifest{Channel: release.Dev}); err != nil {
+		t.Error(err)
+	}
+}

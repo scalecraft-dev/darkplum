@@ -8,10 +8,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	"github.com/scalecraft-dev/darkplum/cli/internal/iamcheck"
 	"github.com/scalecraft-dev/darkplum/cli/internal/release"
 )
@@ -1098,5 +1101,270 @@ func TestDeployAuthorizationFailureAtPreflightIsStillAHardStop(t *testing.T) {
 	}}}, h.k.handlers...)
 	if !IsReported(h.run()) || h.tl.count("terraform") != 0 {
 		t.Fatal("an ACTIVE cluster that answers 401 must stop the run")
+	}
+}
+
+func TestStrictSessionFailsWhereThePreflightOnlyWarns(t *testing.T) {
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	unreadable := func(string) (time.Time, error) { return time.Time{}, errors.New("no export-credentials") }
+	if r := sessionResult(unreadable, "acme", 30, now); r.status != checkWarn {
+		t.Fatalf("the preflight is expected to warn: %+v", r)
+	}
+	if r := strictSessionWith(unreadable, "acme", 30, now); r.status != checkFail || !strings.Contains(r.hint, "--profile acme") {
+		t.Errorf("a re-check that cannot read the expiry must fail: %+v", r)
+	}
+	soon := func(string) (time.Time, error) { return now.Add(10 * time.Minute), nil }
+	if r := strictSessionWith(soon, "", 30, now); r.status != checkFail {
+		t.Errorf("10 minutes left against a 30 minute bar: %+v", r)
+	}
+	long := func(string) (time.Time, error) { return now.Add(3 * time.Hour), nil }
+	if r := strictSessionWith(long, "", 30, now); r.status != checkPass {
+		t.Errorf("%+v", r)
+	}
+	if r := strictSessionWith(func(string) (time.Time, error) { return time.Time{}, nil }, "", 30, now); r.status != checkPass {
+		t.Errorf("long-lived credentials never expire: %+v", r)
+	}
+}
+
+func TestDeployCancelDuringTheGPUWaitIsNotADegradedDeploy(t *testing.T) {
+	h := newDeployHarness(t, 1)
+	h.gpuNode = func() bool { return false }
+	ctx, cancel := context.WithCancel(context.Background())
+	h.env.sleep = func(c context.Context, d time.Duration) error { cancel(); return c.Err() }
+	h.passChecks()
+	err := h.env.run(ctx)
+	if _, ok := ExitCode(err); ok || !IsReported(err) {
+		t.Fatalf("err = %v: an interrupt must not be reported as exit 3 (deployed, no GPU)", err)
+	}
+	h.mustContain("interrupted while waiting for a GPU")
+	if strings.Contains(h.out.String(), "Darkplum is deployed") {
+		t.Error("claimed to be deployed")
+	}
+}
+
+func TestDeployNonGPUErrorInTheModelStepIsItsOwnFailure(t *testing.T) {
+	h := newDeployHarness(t, 1)
+	h.k.handlers = append([]skHandler{{"apply -f -", func(args []string, in []byte) ([]byte, error) {
+		if strings.Contains(string(in), `"name":"vllm-inference"`) {
+			return nil, errors.New(`kubectl: Error from server (Forbidden): deployments.apps is forbidden`)
+		}
+		return nil, nil
+	}}}, h.k.handlers...)
+	err := h.run()
+	if code, ok := ExitCode(err); ok {
+		t.Fatalf("a forbidden apply was reported as exit %d (no GPU)", code)
+	}
+	if !IsReported(err) {
+		t.Fatalf("err = %v", err)
+	}
+	h.mustContain("not a GPU shortage", "Forbidden")
+}
+
+func TestDeployNoGPUPrintsWhatTheCLISees(t *testing.T) {
+	h := newDeployHarness(t, 1)
+	h.gpuNode = func() bool { return false }
+	h.env.flags.GPUWait = time.Minute
+	h.k.on("kube-system get pods", "nvidia-device-plugin-ds-x   0/1   Pending", nil)
+	_ = h.run()
+	if h.tl.first("name=nvidia-device-plugin-ds") < 0 {
+		t.Error("the device plugin's pods were not looked at")
+	}
+	if h.tl.first("autoscaling describe-scaling-activities") < 0 && h.tl.first("autoscaling describe-auto-scaling-groups") < 0 {
+		t.Error("the node groups' scaling activities were not looked at")
+	}
+	if strings.Contains(h.out.String(), "kubectl get nodes") {
+		t.Error("told the operator to run kubectl instead of showing it")
+	}
+}
+
+func TestDeployNodeWaitTimeoutShowsClusterAndScalingActivities(t *testing.T) {
+	h := newDeployHarness(t, 0)
+	h.k.handlers = append([]skHandler{{"get nodes -o json", func([]string, []byte) ([]byte, error) { return []byte(h.nodesJSON("amd64", false)), nil }}}, h.k.handlers...)
+	_ = h.run()
+	if h.tl.first("cluster.status") < 0 || h.tl.first("autoscaling describe-auto-scaling-groups") < 0 {
+		t.Errorf("no diagnostics gathered:\n%s", h.tl)
+	}
+	h.mustContain("node group scaling activities")
+}
+
+func TestDeployApplyFailureNamesTheResourceAndTheLastLines(t *testing.T) {
+	h := newDeployHarness(t, 0)
+	h.tf.streamText["apply"] = strings.Repeat("noise\n", 50) + "╷\n│ Error: creating EKS Cluster: LimitExceeded\n│\n│   with module.eks.module.eks.aws_eks_cluster.this[0],\n│   on main.tf line 1:\n╵"
+	h.tf.streamErr["apply"] = errors.New("exit status 1")
+	if !IsReported(h.run()) {
+		t.Fatal("a failed apply passed")
+	}
+	h.mustContain("failing resource(s): module.eks.module.eks.aws_eks_cluster.this[0]", "last lines of terraform's output", "LimitExceeded")
+	// The summary is the tail, not the whole scroll.
+	if n := strings.Count(h.out.String(), "│ noise"); n > 30 {
+		t.Errorf("%d noise lines in the summary", n)
+	}
+}
+
+func TestDeployMirrorFailureShowsTheRegistryStatus(t *testing.T) {
+	for code, want := range map[int]string{403: "ecr:PutImage", 404: "does not exist", 503: "having trouble"} {
+		h := newDeployHarness(t, 0)
+		h.mirrorErr = fmt.Errorf("api: cannot write: %w", &transport.Error{StatusCode: code})
+		if !IsReported(h.run()) {
+			t.Fatal("passed")
+		}
+		h.mustContain(fmt.Sprintf("HTTP %d", code), want)
+	}
+}
+
+func TestDeployRolloutFailureShowsEventsAndStateOfThatDeploymentsPods(t *testing.T) {
+	h := newDeployHarness(t, 0)
+	h.k.handlers = append([]skHandler{{"rollout status deployment/darkplum-api", func([]string, []byte) ([]byte, error) {
+		return nil, errors.New("kubectl: error: timed out waiting for the condition")
+	}}}, h.k.handlers...)
+	h.k.on("get events", "0s Warning FailedMount pod/p-new", nil)
+	h.k.on("describe pod p-new", "Name: p-new\nState: Waiting (ImagePullBackOff)", nil)
+	if !IsReported(h.run()) {
+		t.Fatal("passed")
+	}
+	if h.tl.first("involvedObject.name=p-new") < 0 || h.tl.first("describe pod p-new") < 0 {
+		t.Errorf("the pod's own events and state were not gathered:\n%s", h.tl)
+	}
+	if h.tl.first("get events --field-selector type=Warning") >= 0 {
+		t.Error("namespace-wide events are not scoped to the deployment")
+	}
+	h.mustContain("ImagePullBackOff", "FailedMount")
+}
+
+func TestSessionExpiredMatchesOnlySessionMessages(t *testing.T) {
+	for _, m := range []string{"An error occurred (ExpiredToken) when calling", "The SSO session associated with this profile has expired",
+		"Error loading SSO Token: Token for x does not exist", "The security token included in the request is expired", "RequestExpired: Request has expired"} {
+		if !sessionExpired(m) && !strings.Contains(strings.ToLower(m), "sso token") {
+			t.Errorf("%q not recognised", m)
+		}
+	}
+	for _, m := range []string{"AccessDenied: not authorized to perform ecr:PutImage", "error: You must be logged in to the server (Unauthorized)",
+		"Unable to locate credentials", "invalid credentials in the kubeconfig", "certificate has expired"} {
+		if sessionExpired(m) {
+			t.Errorf("%q is not an expired session; telling the operator to log in would hide the real problem", m)
+		}
+	}
+}
+
+func TestDeployPlanFileIsOwnerOnlySweptAndNoOpIsSaid(t *testing.T) {
+	h := newDeployHarness(t, 0)
+	h.tf.planFile = true
+	stale := filepath.Join(h.in.Dir(), "plan-20200101T000000Z.tfplan")
+	staleD := filepath.Join(h.in.Dir(), "destroy-20200101T000000Z.tfplan")
+	for _, f := range []string{stale, staleD} {
+		if err := os.WriteFile(f, []byte("old secrets"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := h.run(); err != nil {
+		t.Fatal(err)
+	}
+	if h.tf.planMode != 0o600 {
+		t.Errorf("the saved plan was mode %v when terraform read it, want 0600", h.tf.planMode)
+	}
+	for _, f := range []string{stale, staleD} {
+		if _, err := os.Stat(f); err == nil {
+			t.Errorf("%s was not swept", f)
+		}
+	}
+
+	h2 := newDeployHarness(t, 0)
+	h2.tf.planJSON = `{"resource_changes":[{"address":"module.vpc.aws_vpc.this","change":{"actions":["no-op"]}}]}`
+	h2.tf.applied = true // an install with nothing to change already has its outputs
+	h2.awsf.base.describeErr = nil
+	if err := h2.run(); err != nil {
+		t.Fatal(err)
+	}
+	h2.mustContain("no infrastructure changes")
+	if h2.tf.ran("apply") {
+		t.Error("applied a plan with nothing in it")
+	}
+	if h2.tl.first("terraform output") < 0 {
+		t.Error("the rest of the deploy must still run on a no-op plan")
+	}
+}
+
+func TestDeployUnsignedImagesMustBeInTheInstallsRegistryAndAreReadWithItsLogin(t *testing.T) {
+	h := newDeployHarness(t, 0)
+	h.unsigned = true
+	h.unsignedHost = "registry.example.com"
+	h.env.manifest.Channel = release.Dev
+	h.env.flags.UnsignedImages = "x"
+	if !IsReported(h.run()) {
+		t.Fatal("mirrored an unsigned image from a stranger's registry")
+	}
+	if h.tl.count("mirror") != 0 || h.writes() != 0 {
+		t.Errorf("went on:\n%s", h.tl)
+	}
+	h.mustContain("registry.example.com", "must already be in the install's registry")
+
+	ok := newDeployHarness(t, 0)
+	ok.unsigned = true
+	ok.env.manifest.Channel = release.Dev
+	ok.env.flags.UnsignedImages = "x"
+	if err := ok.run(); err != nil {
+		t.Fatalf("%v\n%s", err, ok.out.String())
+	}
+	if ok.env.srcAuth == nil {
+		t.Error("the unsigned images' source was not read with the install's ECR login")
+	}
+	// A signed release reads its public source anonymously.
+	signed := newDeployHarness(t, 0)
+	if err := signed.run(); err != nil {
+		t.Fatal(err)
+	}
+	if signed.env.srcAuth != nil {
+		t.Error("a signed release's source was read with credentials")
+	}
+}
+
+func TestDeployImageIDWithoutARegistryDigestWarnsInsteadOfFailing(t *testing.T) {
+	h := newDeployHarness(t, 0)
+	h.imageID["darkplum-web"] = "sha256:" + strings.Repeat("e", 64) // a runtime that reports the config id
+	if err := h.run(); err != nil {
+		t.Fatalf("%v\n%s", err, h.out.String())
+	}
+	h.mustContain("carries no registry digest")
+	// ... but a DIFFERENT digest is still a failure (covered by the per-service test).
+}
+
+func TestDeployStepNumbersOnlyGoUp(t *testing.T) {
+	h := newDeployHarness(t, 1)
+	if err := h.run(); err != nil {
+		t.Fatal(err)
+	}
+	prev := 0
+	for _, m := range regexp.MustCompile(`(?m)^\[(\d+)/(\d+)\]`).FindAllStringSubmatch(h.out.String(), -1) {
+		n, _ := strconv.Atoi(m[1])
+		if m[2] != strconv.Itoa(deploySteps) || n <= prev {
+			t.Errorf("step %s/%s after %d", m[1], m[2], prev)
+		}
+		prev = n
+	}
+	if prev != deploySteps {
+		t.Errorf("last step %d of %d", prev, deploySteps)
+	}
+}
+
+func TestDeploySessionRecheckedBeforeTheModelAndBeforeLayer1(t *testing.T) {
+	for _, failAt := range []int{3, 4} { // mirror(1), platform(2), model(3), layer 1(4)
+		h := newDeployHarness(t, 1)
+		calls := 0
+		h.env.sessionOK = func(int) checkResult {
+			calls++
+			if calls == failAt {
+				return checkResult{name: "session lifetime", status: checkFail, detail: "unreadable"}
+			}
+			return checkResult{name: "session lifetime", status: checkPass}
+		}
+		if !IsReported(h.run()) {
+			t.Fatalf("failAt=%d: passed", failAt)
+		}
+		if failAt == 3 && h.tl.first("nvidia") >= 0 {
+			t.Error("the model step ran with a session about to lapse")
+		}
+		if failAt == 4 && h.tl.count("iam simulate") != 0 {
+			t.Error("the self-test ran with a session about to lapse")
+		}
 	}
 }

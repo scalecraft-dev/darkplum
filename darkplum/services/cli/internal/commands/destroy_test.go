@@ -88,6 +88,7 @@ func newDestroyHarness(t *testing.T) *destroyHarness {
 	h.aws = &destroyAWS{base: &fakeAWS{arn: testARN, caller: dpAccount}, tl: h.tl, extra: map[string]string{}, extraErr: map[string]error{}}
 	h.k = newScriptKube(t)
 	h.k.tl = h.tl
+	h.k.on("delete deployments", "", nil)
 	h.k.onFn("get svc -A", func([]string, []byte) ([]byte, error) {
 		return h.listJSON("LoadBalancer", append(append([]objRef{}, h.svcs...), h.foreign...)), nil
 	})
@@ -586,7 +587,7 @@ func TestDestroyOnlyTouchesDarkplumNamespaces(t *testing.T) {
 		if !strings.Contains(j, "-n "+platformNS) && !strings.Contains(j, "-n "+inferenceNS) {
 			t.Errorf("a delete without a Darkplum namespace: %s", j)
 		}
-		if strings.Contains(j, "namespace ") || strings.Contains(j, "-A") || strings.Contains(j, "--all") {
+		if strings.Contains(j, "namespace ") || strings.Contains(j, "-A") {
 			t.Errorf("a broad delete: %s", j)
 		}
 	}
@@ -636,11 +637,11 @@ func TestDestroyReportFindsEverythingLeftBehind(t *testing.T) {
 	h := newDestroyHarness(t)
 	h.tf.stateErr = &tfFailure{Cmd: "state", Stderr: "No state file was found!", Err: errors.New("x")}
 	h.env.rec.Backend.KMSKeyID = "arn:aws:kms:us-east-2:123456789012:key/abc"
-	_ = h.env.in.WriteFile("terraform.tfvars", []byte(pinnedTFVars+"web_zone_id = \"Z0123456789ABCDEFGHIJ\"\n"))
-	h.env.tfv, _ = readTFVars(h.env.in.TFVars())
+	h.env.rec.CreatedZoneID = "Z0123456789ABCDEFGHIJ"
 	h.aws.extra["rds describe-db-snapshots"] = `["dp-trial-db-final-ab12"]`
 	h.aws.extra["logs describe-log-groups"] = "1"
 	h.aws.extra["--repository-names darkplum-api"] = "{}"
+	h.aws.extra["--repository-names dp-trial/darkplum-web"] = "{}" // should have gone with the stack
 	if err := h.run(); err != nil {
 		t.Fatal(err)
 	}
@@ -649,6 +650,7 @@ func TestDestroyReportFindsEverythingLeftBehind(t *testing.T) {
 	if strings.Contains(h.out.String(), "ECR repository darkplum-web") {
 		t.Error("reported a repository that does not exist")
 	}
+	h.contains("ECR repository dp-trial/darkplum-web", "should have been deleted with the stack")
 	h.contains("Done")
 }
 
@@ -776,5 +778,86 @@ func TestDestroyDowngradeGuard(t *testing.T) {
 	h2.aws.extra["logs describe-log-groups"] = "0"
 	if err := h2.run(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestDestroyOnlyReportsAZoneInitCreated(t *testing.T) {
+	// A zone the customer supplied (web_zone_id in the settings) is theirs.
+	h := newDestroyHarness(t)
+	h.tf.stateErr = &tfFailure{Cmd: "state", Stderr: "No state file was found!", Err: errors.New("x")}
+	_ = h.env.in.WriteFile("terraform.tfvars", []byte(pinnedTFVars+"web_zone_id = \"Z0SUPPLIEDBYCUSTOMER\"\n"))
+	h.env.tfv, _ = readTFVars(h.env.in.TFVars())
+	h.aws.extra["logs describe-log-groups"] = "0"
+	h.aws.extra["rds describe-db-snapshots"] = `[]`
+	if err := h.run(); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(h.out.String(), "Z0SUPPLIEDBYCUSTOMER") || strings.Contains(h.out.String(), "delete-hosted-zone") {
+		t.Errorf("listed a zone Darkplum did not create:\n%s", h.out.String())
+	}
+}
+
+func TestDestroyFailsWhenSomethingTaggedForTheClusterIsLeft(t *testing.T) {
+	for name, tc := range map[string]struct{ key, out, want string }{
+		"network interface": {"ec2 describe-network-interfaces", `["eni-0abc"]`, "network interface eni-0abc"},
+		"security group":    {"ec2 describe-security-groups", `["sg-0abc"]`, "security group sg-0abc"},
+		"load balancer":     {"elbv2 describe-tags", `["arn:aws:elasticloadbalancing:us-east-2:123456789012:loadbalancer/net/k8s-abc/1"]`, "load balancer arn:aws:elasticloadbalancing"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newDestroyHarness(t)
+			h.aws.extra["rds describe-db-snapshots"] = `[]`
+			h.aws.extra["logs describe-log-groups"] = "0"
+			h.aws.extra["elbv2 describe-load-balancers"] = `["arn:aws:elasticloadbalancing:us-east-2:123456789012:loadbalancer/net/k8s-abc/1"]`
+			h.aws.extra[tc.key] = tc.out
+			err := h.run()
+			if !IsReported(err) {
+				t.Fatalf("a leftover %s did not fail the destroy: %v", name, err)
+			}
+			h.contains(tc.want, "Still exists and should not")
+			if !h.tf.ran("destroy") {
+				t.Error("the infrastructure destroy itself should have run")
+			}
+		})
+	}
+	// Every lookup filters by this cluster's tag, never account-wide.
+	h := newDestroyHarness(t)
+	h.aws.extra["rds describe-db-snapshots"] = `[]`
+	h.aws.extra["logs describe-log-groups"] = "0"
+	_ = h.run()
+	for _, ev := range h.tl.ev {
+		if strings.Contains(ev, "describe-network-interfaces") && !strings.Contains(ev, "dp-trial") {
+			t.Errorf("an unfiltered lookup: %s", ev)
+		}
+	}
+}
+
+func TestDestroyStopsWorkloadsBeforeDeletingVolumeClaims(t *testing.T) {
+	h := newDestroyHarness(t)
+	h.svcs = []objRef{{platformNS, "darkplum-web-lb"}}
+	h.pvcs = []objRef{{inferenceNS, "model-cache"}}
+	h.aws.extra["rds describe-db-snapshots"] = `[]`
+	h.aws.extra["logs describe-log-groups"] = "0"
+	if err := h.run(); err != nil {
+		t.Fatal(err)
+	}
+	svc, work, pvc := h.tl.first("delete svc"), h.tl.first("delete deployments,statefulsets"), h.tl.first("delete pvc")
+	if !(svc >= 0 && svc < work && work < pvc) {
+		t.Errorf("order must be load balancers, workloads, claims (%d %d %d):\n%s", svc, work, pvc, h.tl)
+	}
+	for _, c := range h.k.matching("delete deployments") {
+		j := c.joined()
+		if !strings.Contains(j, "-n "+platformNS) && !strings.Contains(j, "-n "+inferenceNS) {
+			t.Errorf("workloads deleted outside the Darkplum namespaces: %s", j)
+		}
+	}
+	// With no volume claims, workloads are left to the cluster's own deletion.
+	h2 := newDestroyHarness(t)
+	h2.aws.extra["rds describe-db-snapshots"] = `[]`
+	h2.aws.extra["logs describe-log-groups"] = "0"
+	if err := h2.run(); err != nil {
+		t.Fatal(err)
+	}
+	if h2.tl.count("delete deployments") != 0 {
+		t.Error("deleted workloads although there were no claims to release")
 	}
 }

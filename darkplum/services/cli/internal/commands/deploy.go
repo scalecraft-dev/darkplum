@@ -14,6 +14,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/go-containerregistry/pkg/authn"
+	"github.com/google/go-containerregistry/pkg/v1/remote"
+	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	"golang.org/x/term"
 
 	"github.com/scalecraft-dev/darkplum/cli/internal/bundle"
@@ -165,6 +168,9 @@ type deployEnv struct {
 	// inspected is true once the existing cluster has been checked for conflicts
 	// (or there was none to check).
 	inspected bool
+	// srcAuth reads the image source when the images are unsigned (nil: anonymous).
+	srcAuth authn.Authenticator
+	ecrAuth func(region string) (authn.Authenticator, error)
 	// force is closed by a second Ctrl-C and kills a running Terraform.
 	force <-chan struct{}
 
@@ -186,20 +192,23 @@ type deployEnv struct {
 // useRealSeams wires the production implementations of everything a test replaces.
 func (e *deployEnv) useRealSeams() {
 	e.checks = e.realChecks
-	e.sessionOK = func(min int) checkResult { return checkAWSSession(e.rec.Profile, min) }
+	e.sessionOK = func(min int) checkResult { return strictSession(e.rec.Profile, min) }
 	e.openTF = func() (tfRunner, string, error) { return openTF(e.in, e.rec) }
 	e.cluster = func() (clusterTarget, checkResult, error) { return installCluster(e.in, e.aws) }
 	e.kube = func(t clusterTarget) *kube.Client { return t.kube(platformNS) }
 	e.resolve = e.realResolve
+	e.ecrAuth = func(region string) (authn.Authenticator, error) {
+		return mirror.ECRAuth(func(args ...string) (string, error) { return e.aws("aws", args...) }, e.rec.Profile, region)
+	}
 	e.platforms = func(ctx context.Context, img release.Image) ([]string, error) {
-		return mirror.Platforms(ctx, img, mirror.Options{})
+		return mirror.Platforms(ctx, img, mirror.Options{Source: e.srcOpts()})
 	}
 	e.mirror = func(ctx context.Context, v verify.Verified, repos map[string]string, region string) ([]mirror.Mirrored, error) {
-		auth, err := mirror.ECRAuth(func(args ...string) (string, error) { return e.aws("aws", args...) }, e.rec.Profile, region)
+		auth, err := e.ecrAuth(region)
 		if err != nil {
 			return nil, err
 		}
-		return mirror.Release(ctx, v, repos, auth, mirror.Options{})
+		return mirror.Release(ctx, v, repos, auth, mirror.Options{Source: e.srcOpts()})
 	}
 	e.iam = func(ctx context.Context, o iamcheck.Outputs) (iamcheck.Report, error) {
 		return iamcheck.Run(ctx, func(args ...string) (string, error) {
@@ -366,6 +375,11 @@ func (e *deployEnv) run(ctx context.Context) (err error) {
 			hint:   "the state backend does not belong to this install; check backend.hcl"}, "state and install disagree")
 	}
 	e.row(checkResult{name: "outputs", status: checkPass, detail: fmt.Sprintf("cluster %s · %d GPU node(s)", out.ClusterName, out.GPUDesired)})
+	if imgs.Unsigned() {
+		if err := e.unsignedSources(imgs, out); err != nil {
+			return err
+		}
+	}
 
 	// ---- 6. cluster ----------------------------------------------------------------
 	e.step(6, "Connect to the cluster")
@@ -387,8 +401,9 @@ func (e *deployEnv) run(ctx context.Context) (err error) {
 	}
 	nodes, err := e.waitNodes(ctx, kc)
 	if err != nil {
+		e.nodeDiagnostics(kc)
 		return e.stop(checkResult{name: "nodes", status: checkFail, detail: firstLine(err.Error()),
-			hint: "no node became Ready; check the node group in the EKS console (instance quota, subnets), then re-run"}, "no Ready node")
+			hint: "no node became Ready; the cluster's status and the node groups' scaling activities are above (an instance quota or capacity problem shows there). Fix it and re-run"}, "no Ready node")
 	}
 	e.row(checkResult{name: "nodes", status: checkPass, detail: fmt.Sprintf("%d Ready (%s)", len(nodes), strings.Join(archSet(nodes), ", "))})
 	if err := e.checkArch(ctx, imgs, nodes); err != nil {
@@ -402,8 +417,21 @@ func (e *deployEnv) run(ctx context.Context) (err error) {
 	}
 	mirrored, err := e.mirror(ctx, imgs, out.Repos, out.Region)
 	if err != nil {
-		return e.stop(checkResult{name: "mirror", status: checkFail, detail: firstLine(err.Error()),
-			hint: e.loginHint(err.Error()) + " (copies already made are kept)"}, "cannot mirror the images")
+		detail, hint := firstLine(err.Error()), e.loginHint(err.Error())
+		var te *transport.Error
+		if errors.As(err, &te) {
+			detail = fmt.Sprintf("the registry answered HTTP %d: %s", te.StatusCode, detail)
+			switch te.StatusCode {
+			case 401, 403:
+				hint = "the registry refused the request: your AWS identity needs ecr:BatchCheckLayerAvailability, ecr:InitiateLayerUpload, ecr:UploadLayerPart, ecr:CompleteLayerUpload and ecr:PutImage on the install's repositories (or the login lapsed: " + e.loginHint("ExpiredToken") + ")"
+			case 404:
+				hint = "a repository does not exist: the infrastructure may have been destroyed or not applied; run `darkplum deploy` again"
+			case 429, 500, 502, 503, 504:
+				hint = "the registry is having trouble; wait a minute and re-run"
+			}
+		}
+		return e.stop(checkResult{name: "mirror", status: checkFail, detail: detail,
+			hint: hint + " (copies already made are kept)"}, "cannot mirror the images")
 	}
 	images := map[string]string{}
 	for _, mi := range mirrored {
@@ -451,10 +479,30 @@ func (e *deployEnv) run(ctx context.Context) (err error) {
 	degraded := false
 	if out.GPUDesired == 0 {
 		e.row(checkResult{name: "self-hosted model", status: checkPass, detail: "gpu_desired_size = 0: Bedrock models only (raise it in `darkplum init`, then deploy)"})
-	} else if err := e.deployGPU(ctx, kc, fsys, out); err != nil {
-		degraded = true
-		e.row(checkResult{name: "self-hosted model", status: checkWarn, detail: firstLine(err.Error()),
-			hint: "the platform is healthy and Bedrock models work; fix the GPU and run `darkplum deploy` again"})
+	} else {
+		if r := e.sessionOK(15); r.status == checkFail {
+			return e.stop(r, "the AWS session is about to expire; the platform is deployed, run `darkplum deploy` again to finish")
+		}
+		if err := e.deployGPU(ctx, kc, fsys, out); err != nil {
+			var ng *noGPUError
+			switch {
+			case ctx.Err() != nil:
+				// An interrupt is not "deployed with a warning".
+				return e.stop(checkResult{name: "self-hosted model", status: checkFail, detail: "interrupted while waiting for a GPU",
+					hint: "the platform is deployed; run `darkplum deploy` again to finish the model"}, "interrupted")
+			case errors.As(err, &ng):
+				degraded = true
+				e.row(checkResult{name: "self-hosted model", status: checkWarn, detail: firstLine(err.Error()),
+					hint: "the platform is healthy and Bedrock models work; fix the GPU and run `darkplum deploy` again"})
+				e.gpuDiagnostics(kc)
+			default:
+				return e.stop(checkResult{name: "self-hosted model", status: checkFail, detail: "could not be deployed: " + firstLine(err.Error()),
+					hint: "this is not a GPU shortage; the platform is healthy and Bedrock models work. Fix the error and run `darkplum deploy` again"}, "the self-hosted model could not be deployed")
+			}
+		}
+	}
+	if r := e.sessionOK(5); r.status == checkFail {
+		return e.stop(r, "the AWS session expired before the Layer 1 self-test; run `darkplum deploy` again")
 	}
 	iamFailed := e.layer1(ctx, out)
 	if iamFailed {
@@ -478,15 +526,28 @@ func (e *deployEnv) run(ctx context.Context) (err error) {
 
 // loginHint is the remedy for an expired session when the failure looks like one.
 func (e *deployEnv) loginHint(msg string) string {
-	l := strings.ToLower(msg)
-	if strings.Contains(l, "expired") || strings.Contains(l, "sso") || strings.Contains(l, "unauthorized") || strings.Contains(l, "credentials") {
-		login := "aws sso login"
-		if e.rec.Profile != "" {
-			login += " --profile " + e.rec.Profile
-		}
-		return "your AWS session may have expired: run `" + login + "`, then re-run"
+	if !sessionExpired(msg) {
+		return "fix the above and re-run"
 	}
-	return "fix the above and re-run"
+	login := "aws sso login"
+	if e.rec.Profile != "" {
+		login += " --profile " + e.rec.Profile
+	}
+	return "your AWS session expired: run `" + login + "`, then re-run"
+}
+
+// sessionExpired recognises the messages AWS and its tools give for an expired or
+// lapsed session, and only those: "credentials" or "unauthorized" in a message
+// also describe a missing permission, where logging in again changes nothing.
+func sessionExpired(msg string) bool {
+	l := strings.ToLower(msg)
+	for _, s := range []string{"expiredtoken", "requestexpired", "the sso session", "sso token", "token included in the request is expired",
+		"security token included in the request is expired", "token has expired", "refresh token has expired"} {
+		if strings.Contains(l, s) {
+			return true
+		}
+	}
+	return false
 }
 
 func trustWord(v verify.Verified) string {
@@ -727,6 +788,37 @@ func webExposure(svcJSON string) string {
 	return d
 }
 
+// unsignedSources limits hand-given images to the install's own registry: with no
+// signature to check, the only thing standing between a typo and a stranger's image
+// is that the image must already be in the customer's account, and is read with
+// the customer's own login.
+func (e *deployEnv) unsignedSources(v verify.Verified, out deployOutputs) error {
+	host := func(repo string) string { h, _, _ := strings.Cut(repo, "/"); return h }
+	for _, svc := range release.Services {
+		src, dst := v.Manifest().Images[svc].Repository, out.Repos[svc]
+		if host(src) != host(dst) {
+			return e.stop(checkResult{name: "images", status: checkFail,
+				detail: fmt.Sprintf("--unsigned-images %s is on %s; unsigned images must already be in the install's registry (%s)", svc, host(src), host(dst)),
+				hint:   "push the image to " + dst + " first (or deploy a signed release). Nothing was applied to the cluster"}, "unsigned image from another registry")
+		}
+	}
+	auth, err := e.ecrAuth(out.Region)
+	if err != nil {
+		return e.stop(checkResult{name: "images", status: checkFail, detail: firstLine(err.Error()), hint: e.loginHint(err.Error())}, "cannot log in to the registry")
+	}
+	e.srcAuth = auth
+	return nil
+}
+
+// srcOpts is how the source registry is read: anonymously for a signed release
+// (public), with the customer's login for unsigned images.
+func (e *deployEnv) srcOpts() []remote.Option {
+	if e.srcAuth == nil {
+		return nil
+	}
+	return []remote.Option{remote.WithAuth(e.srcAuth)}
+}
+
 // ---- terraform ---------------------------------------------------------------------
 
 const logGroupAddr = "module.eks.module.eks.aws_cloudwatch_log_group.this[0]"
@@ -782,6 +874,7 @@ func (t *tail) Write(p []byte) (int, error) {
 func (t *tail) String() string { t.mu.Lock(); defer t.mu.Unlock(); return string(t.buf) }
 
 func (e *deployEnv) planAndApply(ctx context.Context, tf tfRunner) error {
+	sweepStalePlans(e.in.Dir())
 	planPath := filepath.Join(e.in.Dir(), "plan-"+e.now().UTC().Format("20060102T150405Z")+".tfplan")
 	defer os.Remove(planPath)
 	vf := "-var-file=" + tf.VarFile()
@@ -790,9 +883,22 @@ func (e *deployEnv) planAndApply(ctx context.Context, tf tfRunner) error {
 	if err := e.streamTF(ctx, tf, 4, "plan", "plan", "-input=false", "-out="+planPath, vf); err != nil {
 		return err
 	}
+	// A saved plan can hold secrets (the database password): owner-only, always.
+	if err := os.Chmod(planPath, 0o600); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return e.stop(checkResult{name: "plan file", status: checkFail, detail: firstLine(err.Error())}, "cannot protect the plan file")
+	}
 	js, err := tf.Capture("show", "-json", planPath)
 	if err != nil {
 		return e.stop(checkResult{name: "terraform show", status: checkFail, detail: firstLine(err.Error())}, "cannot read the plan")
+	}
+	if n, err := changeCount(js); err == nil && n == 0 {
+		e.row(checkResult{name: "infrastructure", status: checkPass, detail: "no infrastructure changes"})
+		rec := e.rec
+		rec.Bundle = e.manifest.Version
+		if err := e.in.Save(rec); err != nil {
+			e.row(checkResult{name: "install record", status: checkWarn, detail: firstLine(err.Error())})
+		}
+		return nil
 	}
 	dangerous, err := destructiveChanges(js)
 	if err != nil {
@@ -893,7 +999,48 @@ func (e *deployEnv) streamTF(ctx context.Context, tf tfRunner, stepNo int, label
 			hint = h
 		}
 	}
+	e.tfFailureSummary(tl.String())
 	return e.stop(checkResult{name: "terraform " + label, status: checkFail, detail: firstLine(err.Error()), hint: hint}, "terraform "+label+" failed")
+}
+
+// tfWithRe finds the resource a Terraform error block names ("with aws_x.y,").
+var tfWithRe = regexp.MustCompile(`(?m)^[\s│]*with\s+([^\s,]+),?\s*$`)
+
+// tfFailureSummary repeats, at the end of a long scroll, which resource failed
+// and the last lines Terraform printed.
+func (e *deployEnv) tfFailureSummary(output string) {
+	if m := tfWithRe.FindAllStringSubmatch(output, -1); len(m) > 0 {
+		seen := map[string]bool{}
+		var rs []string
+		for _, x := range m {
+			if !seen[x[1]] {
+				seen[x[1]] = true
+				rs = append(rs, x[1])
+			}
+		}
+		e.printf("      %s\n", sDim("failing resource(s): "+strings.Join(rs, ", ")))
+	}
+	lines := strings.Split(strings.TrimRight(output, "\n"), "\n")
+	if len(lines) > 30 {
+		lines = lines[len(lines)-30:]
+	}
+	e.printf("      %s\n", sDim("┌ last lines of terraform's output"))
+	for _, l := range lines {
+		if strings.TrimSpace(l) != "" {
+			e.printf("      %s\n", sDim("│ "+l))
+		}
+	}
+}
+
+// sweepStalePlans removes saved plans an earlier run left behind (a crash, a
+// kill): they can hold secrets and are never reusable.
+func sweepStalePlans(dir string) {
+	for _, pat := range []string{"plan-*.tfplan", "destroy-*.tfplan"} {
+		old, _ := filepath.Glob(filepath.Join(dir, pat))
+		for _, f := range old {
+			_ = os.Remove(f)
+		}
+	}
 }
 
 // ---- cluster -------------------------------------------------------------------------
@@ -1096,7 +1243,12 @@ func (e *deployEnv) rollout(ctx context.Context, kc *kube.Client, deployment str
 			hint: "the pods did not become ready; their state and logs are above. Nothing else was applied"}, deployment+" did not roll out")
 	}
 	svc := strings.TrimPrefix(deployment, "darkplum-")
-	if err := e.checkRunningImage(kc, deployment, images[svc]); err != nil {
+	warn, err := e.checkRunningImage(kc, deployment, images[svc])
+	if warn != "" {
+		e.row(checkResult{name: deployment, status: checkWarn, detail: warn,
+			hint: "the container runtime reports no registry digest for this image, so what is running cannot be compared with the mirrored one; the rollout itself succeeded"})
+	}
+	if err != nil {
 		return e.stop(checkResult{name: deployment, status: checkFail, detail: firstLine(err.Error()),
 			hint: "the running pods are not on the image that was mirrored"}, deployment+" runs the wrong image")
 	}
@@ -1121,11 +1273,11 @@ func jsonMarshal(v any) ([]byte, error)   { return json.Marshal(v) }
 
 // checkRunningImage requires every pod of the Deployment that is not terminating
 // to run want's digest, as the container runtime reports it.
-func (e *deployEnv) checkRunningImage(kc *kube.Client, deployment, want string) error {
+func (e *deployEnv) checkRunningImage(kc *kube.Client, deployment, want string) (warn string, err error) {
 	digest := want[strings.Index(want, "@")+1:]
 	out, err := kc.Run(nil, "-n", platformNS, "get", "pods", "-l", "app.kubernetes.io/name="+deployment, "-o", "json")
 	if err != nil {
-		return err
+		return "", err
 	}
 	var l struct {
 		Items []struct {
@@ -1145,7 +1297,7 @@ func (e *deployEnv) checkRunningImage(kc *kube.Client, deployment, want string) 
 		} `json:"items"`
 	}
 	if err := jsonUnmarshal(out, &l); err != nil {
-		return errors.New("unexpected answer listing pods")
+		return "", errors.New("unexpected answer listing pods")
 	}
 	seen := 0
 	for _, p := range l.Items {
@@ -1163,38 +1315,46 @@ func (e *deployEnv) checkRunningImage(kc *kube.Client, deployment, want string) 
 					got = s.ImageID
 				}
 			}
-			if !strings.Contains(got, digest) {
-				return fmt.Errorf("pod %s runs image id %q, not %s", p.Metadata.Name, got, digest)
+			switch {
+			case strings.Contains(got, digest):
+			case !strings.Contains(got, "@sha256:"):
+				// A runtime that reports only the image's config id (or nothing): no
+				// digest to compare. Warn; the rollout succeeded.
+				warn = fmt.Sprintf("pod %s reports image id %q, which carries no registry digest", p.Metadata.Name, got)
+			default:
+				return "", fmt.Errorf("pod %s runs image id %q, not %s", p.Metadata.Name, got, digest)
 			}
 		}
 	}
 	if seen == 0 {
-		return fmt.Errorf("no running pod of %s uses %s", deployment, want)
+		return "", fmt.Errorf("no running pod of %s uses %s", deployment, want)
 	}
-	return nil
+	return warn, nil
 }
 
-// diagnose prints what a failed rollout looks like from the inside: the pods and
-// their events, and the previous container's last log lines. Best effort.
+// diagnose prints what a failed rollout looks like from the inside, scoped to the
+// Deployment's own pods: each pod's state and events (what `kubectl describe`
+// would show), and the last log lines of its current and previous container.
+// Best effort.
 func (e *deployEnv) diagnose(kc *kube.Client, deployment string) {
 	sel := "app.kubernetes.io/name=" + deployment
-	for _, q := range [][]string{
-		{"-n", platformNS, "get", "pods", "-l", sel, "-o", "wide"},
-		{"-n", platformNS, "get", "events", "--field-selector", "type=Warning", "--sort-by=.lastTimestamp"},
-		{"-n", platformNS, "logs", "deployment/" + deployment, "--tail=30", "--all-containers", "--previous"},
-		{"-n", platformNS, "logs", "deployment/" + deployment, "--tail=30", "--all-containers"},
-	} {
-		out, err := kc.Run(nil, q...)
-		if err != nil {
-			e.printf("%s\n", sDim("  ("+firstLine(err.Error())+")"))
-			continue
+	e.diag("pods", kc, "-n", platformNS, "get", "pods", "-l", sel, "-o", "wide")
+	out, err := kc.Run(nil, "-n", platformNS, "get", "pods", "-l", sel, "-o", "json")
+	if err == nil {
+		var l struct {
+			Items []struct {
+				Metadata struct{ Name string } `json:"metadata"`
+			} `json:"items"`
 		}
-		for _, l := range strings.Split(strings.TrimSpace(out), "\n") {
-			if l != "" {
-				e.printf("      %s\n", sDim("│ "+l))
+		if jsonUnmarshal(out, &l) == nil {
+			for _, p := range l.Items {
+				e.diag("events of "+p.Metadata.Name, kc, "-n", platformNS, "get", "events", "--field-selector", "involvedObject.name="+p.Metadata.Name, "--sort-by=.lastTimestamp")
+				e.diag("state of "+p.Metadata.Name, kc, "-n", platformNS, "describe", "pod", p.Metadata.Name)
 			}
 		}
 	}
+	e.diag("log (previous container)", kc, "-n", platformNS, "logs", "deployment/"+deployment, "--tail=30", "--all-containers", "--previous")
+	e.diag("log", kc, "-n", platformNS, "logs", "deployment/"+deployment, "--tail=30", "--all-containers")
 }
 
 // recordInstall writes the darkplum-install ConfigMap: which release, which
@@ -1272,7 +1432,7 @@ func (e *deployEnv) deployGPU(ctx context.Context, kc *kube.Client, fsys fs.FS, 
 			break
 		}
 		if e.now().After(deadline) {
-			return fmt.Errorf("no GPU became allocatable within %s (check the GPU node joined: kubectl get nodes -l darkplum.ai/node-type=gpu-inference, and the device plugin pod on it)", e.flags.GPUWait)
+			return &noGPUError{fmt.Errorf("no GPU became allocatable within %s", e.flags.GPUWait)}
 		}
 		e.printf("%s\n", sDim("  waiting for a GPU node to register and report nvidia.com/gpu ..."))
 		if err := e.sleep(ctx, e.poll); err != nil {
@@ -1304,6 +1464,85 @@ func (e *deployEnv) deployGPU(ctx context.Context, kc *kube.Client, fsys fs.FS, 
 	}
 	e.row(checkResult{name: "vllm-inference", status: checkPass, detail: out.ModelName + " as " + out.ServedModel + " (loading; not waited for)"})
 	return nil
+}
+
+// noGPUError is the one failure of the GPU step that means "the platform is fine,
+// there is simply no GPU": it makes the deploy exit 3. Anything else is an error.
+type noGPUError struct{ error }
+
+func (n *noGPUError) Unwrap() error { return n.error }
+
+// nodeDiagnostics prints what the CLI can see about a cluster with no Ready node.
+func (e *deployEnv) nodeDiagnostics(kc *kube.Client) {
+	st, err := e.aws("aws", runner.ProfileArgs(e.rec.Profile, "eks", "describe-cluster", "--name", e.rec.ClusterName, "--region", e.rec.Region,
+		"--query", "cluster.status", "--output", "text")...)
+	e.printf("      %s\n", sDim("┌ cluster"))
+	if err != nil {
+		e.printf("      %s\n", sDim("│ (unavailable: "+firstLine(err.Error())+")"))
+	} else {
+		e.printf("      %s\n", sDim("│ status "+strings.TrimSpace(st)))
+	}
+	e.diag("nodes", kc, "get", "nodes", "-o", "wide")
+	e.asgActivities()
+}
+
+// gpuDiagnostics prints what the CLI can see about why no GPU appeared: the GPU
+// nodes, the device plugin's pods, and the scaling activities of the node groups.
+func (e *deployEnv) gpuDiagnostics(kc *kube.Client) {
+	e.diag("GPU nodes", kc, "get", "nodes", "-l", "darkplum.ai/node-type=gpu-inference", "-o", "wide")
+	e.diag("device plugin", kc, "-n", "kube-system", "get", "pods", "-l", "name=nvidia-device-plugin-ds", "-o", "wide")
+	e.asgActivities()
+}
+
+// diag runs one read-only kubectl query and prints its output indented and dim.
+func (e *deployEnv) diag(title string, kc *kube.Client, args ...string) {
+	out, err := kc.Run(nil, args...)
+	e.printf("      %s\n", sDim("┌ "+title))
+	if err != nil {
+		e.printf("      %s\n", sDim("│ (unavailable: "+firstLine(err.Error())+")"))
+		return
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) > 30 {
+		lines = lines[len(lines)-30:] // the end: events and recent log lines are there
+	}
+	n := 0
+	for _, l := range lines {
+		if l != "" {
+			e.printf("      %s\n", sDim("│ "+l))
+			n++
+		}
+	}
+	if n == 0 {
+		e.printf("      %s\n", sDim("│ (nothing)"))
+	}
+}
+
+// asgActivities prints the recent scaling activities of the cluster's node
+// groups: an instance that cannot launch (quota, capacity, a missing subnet) says
+// so there, and nowhere in Kubernetes.
+func (e *deployEnv) asgActivities() {
+	prof := func(args ...string) []string { return runner.ProfileArgs(e.rec.Profile, args...) }
+	names, err := e.aws("aws", prof("autoscaling", "describe-auto-scaling-groups", "--region", e.rec.Region, "--query",
+		"AutoScalingGroups[?Tags[?Key=='eks:cluster-name' && Value=='"+e.rec.ClusterName+"']].AutoScalingGroupName", "--output", "text")...)
+	e.printf("      %s\n", sDim("┌ node group scaling activities"))
+	if err != nil {
+		e.printf("      %s\n", sDim("│ (unavailable: "+firstLine(err.Error())+")"))
+		return
+	}
+	for _, name := range strings.Fields(names) {
+		out, err := e.aws("aws", prof("autoscaling", "describe-scaling-activities", "--region", e.rec.Region, "--auto-scaling-group-name", name,
+			"--max-items", "5", "--query", "Activities[].[StatusCode,StatusMessage]", "--output", "text")...)
+		if err != nil {
+			e.printf("      %s\n", sDim("│ "+name+": (unavailable: "+firstLine(err.Error())+")"))
+			continue
+		}
+		for _, l := range strings.Split(strings.TrimSpace(out), "\n") {
+			if l != "" {
+				e.printf("      %s\n", sDim("│ "+name+": "+l))
+			}
+		}
+	}
 }
 
 // gpuAllocatable reports whether any GPU node advertises at least one nvidia.com/gpu.

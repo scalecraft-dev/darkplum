@@ -85,7 +85,11 @@ func kubeNotFound(err error, resource, name string) bool {
 }
 
 // ensureSecret makes sure the named Secret in ns holds keys, by the rules above.
-func ensureSecret(kc *kube.Client, ns, name string, keys []secretKey) (secretOutcome, error) {
+//
+// pair says the keys belong together (a key and the id that names it): a Secret
+// holding some of them and not the others is refused, not repaired, because the
+// missing half cannot be invented without changing what the survivor means.
+func ensureSecret(kc *kube.Client, ns, name string, keys []secretKey, pair bool) (secretOutcome, error) {
 	var res secretOutcome
 	out, err := kc.Run(nil, "-n", ns, "get", "secret", name, "-o", "json")
 	switch {
@@ -117,6 +121,20 @@ func ensureSecret(kc *kube.Client, ns, name string, keys []secretKey) (secretOut
 	have, err := secretKeysPresent(out)
 	if err != nil {
 		return res, fmt.Errorf("secret %s: %w", name, err)
+	}
+	if pair {
+		var have2, missing []string
+		for _, k := range keys {
+			if have[k.name] {
+				have2 = append(have2, k.name)
+			} else {
+				missing = append(missing, k.name)
+			}
+		}
+		if len(have2) > 0 && len(missing) > 0 {
+			return res, fmt.Errorf("secret %s has %s but not %s; refusing to guess the other half (regenerating the key would change every pseudonym a vendor has seen). Nothing was changed",
+				name, strings.Join(have2, ", "), strings.Join(missing, ", "))
+		}
 	}
 	// A Secret written by an older flow with client-side apply carries its own
 	// values, in clear text, in the last-applied-configuration annotation.
@@ -220,7 +238,7 @@ func ensureAuthSecret(kc *kube.Client, ns string, oidc map[string]string) (secre
 	keys = append(keys,
 		secretKey{name: keySessionSigning, value: randomKey},
 		secretKey{name: keyServiceKey, value: randomKey})
-	return ensureSecret(kc, ns, authSecretName, keys)
+	return ensureSecret(kc, ns, authSecretName, keys, false)
 }
 
 // ensureUserHMAC makes darkplum-user-hmac hold the per-install key the gateway
@@ -230,7 +248,7 @@ func ensureUserHMAC(kc *kube.Client, ns string) (secretOutcome, error) {
 	return ensureSecret(kc, ns, userHMACSecretName, []secretKey{
 		{name: keyUserHMAC, value: randomKey},
 		{name: keyUserHMACID, value: fixed("k1")},
-	})
+	}, true)
 }
 
 // applyPostgresSecret writes the database URL from Terraform's output. Unlike the

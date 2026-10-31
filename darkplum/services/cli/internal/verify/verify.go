@@ -236,11 +236,23 @@ type Verified struct {
 // as image-trust: unsigned.
 func (v Verified) Unsigned() bool { return v.unsigned }
 
+// binaryChannel is the channel of this executable, from the manifest linked into it.
+// A variable so a test can stand in for a release binary.
+var binaryChannel = func() string {
+	m, err := release.Current()
+	if err != nil {
+		return ""
+	}
+	return m.Channel
+}
+
 // Unverified wraps images a development build was handed by hand. It exists only
 // for the dev channel's escape hatch: it refuses any manifest that is a release or
 // a release candidate, so a customer's binary has no way to skip verification.
 func Unverified(m release.Manifest) (Verified, error) {
-	if m.Channel != release.Dev {
+	// The binary's own channel decides, not the manifest the caller built: a
+	// release or candidate binary can never skip verification.
+	if m.Channel != release.Dev || binaryChannel() != release.Dev {
 		return Verified{}, errors.New("verify: only a development build may deploy unverified images")
 	}
 	return Verified{manifest: m, Results: map[string]Result{}, ok: true, unsigned: true}, nil

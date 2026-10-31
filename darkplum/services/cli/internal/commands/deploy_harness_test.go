@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/go-containerregistry/pkg/authn"
 	darkplum "github.com/scalecraft-dev/darkplum"
 	"github.com/scalecraft-dev/darkplum/cli/internal/iamcheck"
 	"github.com/scalecraft-dev/darkplum/cli/internal/install"
@@ -48,6 +49,8 @@ type fakeTF struct {
 	applied     bool
 	onApply     func()
 	cmds        [][]string
+	planMode    os.FileMode // mode of the saved plan when `show` read it
+	planFile    bool        // plan files are created by `plan`
 }
 
 func (f *fakeTF) record(args ...string) {
@@ -73,6 +76,9 @@ func (f *fakeTF) Capture(args ...string) ([]byte, error) {
 		}
 		return []byte(f.stateOut), nil
 	case "show":
+		if st, err := os.Stat(args[len(args)-1]); err == nil {
+			f.planMode = st.Mode().Perm()
+		}
 		if f.showErr != nil {
 			return nil, f.showErr
 		}
@@ -100,6 +106,13 @@ func (f *fakeTF) Capture(args ...string) ([]byte, error) {
 
 func (f *fakeTF) Stream(ctx context.Context, w io.Writer, _ runner.StreamOptions, args ...string) error {
 	f.record(args...)
+	if args[0] == "plan" && f.planFile {
+		for _, a := range args {
+			if strings.HasPrefix(a, "-out=") {
+				_ = os.WriteFile(strings.TrimPrefix(a, "-out="), []byte("plan"), 0o644)
+			}
+		}
+	}
 	if txt := f.streamText[args[0]]; txt != "" {
 		fmt.Fprintln(w, txt)
 	}
@@ -217,17 +230,18 @@ type deployHarness struct {
 	manifest release.Manifest
 	images   map[string]string // service -> mirrored ref
 	// imageID reported by the container runtime per deployment; defaults to the mirrored digest.
-	imageID    map[string]string
-	nodeArch   string
-	iamRep     iamcheck.Report
-	iamErr     error
-	checks     []checkResult
-	session    checkResult
-	mirrorErr  error
-	platforms  []string
-	resolveErr error
-	unsigned   bool
-	gpuNode    func() bool
+	imageID      map[string]string
+	nodeArch     string
+	iamRep       iamcheck.Report
+	iamErr       error
+	checks       []checkResult
+	session      checkResult
+	mirrorErr    error
+	platforms    []string
+	resolveErr   error
+	unsigned     bool
+	gpuNode      func() bool
+	unsignedHost string
 }
 
 func releaseManifest() release.Manifest {
@@ -290,11 +304,16 @@ func newDeployHarness(t *testing.T, gpu int) *deployHarness {
 			if h.unsigned {
 				m := h.manifest
 				m.Channel = release.Dev
+				m.Images = map[string]release.Image{}
+				for i, svc := range release.Services {
+					m.Images[svc] = release.Image{Repository: h.unsignedRepo(svc), Digest: digestFor(i), RunAttempt: "1"}
+				}
 				v, _ := verify.Unverified(m)
 				return v, nil
 			}
 			return verify.ForTest(h.manifest), nil
 		},
+		ecrAuth:   func(string) (authn.Authenticator, error) { return authn.Anonymous, nil },
 		platforms: func(context.Context, release.Image) ([]string, error) { return h.platforms, nil },
 		mirror: func(_ context.Context, v verify.Verified, repos map[string]string, region string) ([]mirror.Mirrored, error) {
 			h.tl.add("mirror images " + region)
@@ -456,4 +475,12 @@ func writeLogFile(t *testing.T, in install.Install) (*os.File, string) {
 	}
 	t.Cleanup(func() { f.Close() })
 	return f, p
+}
+
+func (h *deployHarness) unsignedRepo(svc string) string {
+	host := dpRegistry
+	if h.unsignedHost != "" {
+		host = h.unsignedHost
+	}
+	return host + "/dp-trial/darkplum-" + svc
 }
