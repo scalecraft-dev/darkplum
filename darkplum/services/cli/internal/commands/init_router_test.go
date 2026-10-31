@@ -118,3 +118,13 @@ func TestInitExistingInstallShowsTheRouterAndChangesIt(t *testing.T) {
 		t.Errorf("%v\n%s", err, out)
 	}
 }
+
+// The question states what the router can see and where its pod can connect, so the
+// answer is informed.
+func TestRouterQuestionStatesPromptAccessAndEgress(t *testing.T) {
+	for _, want := range []string{"text of the prompts", "port 443", "Hugging Face"} {
+		if !strings.Contains(routerPitch, want) {
+			t.Errorf("the router question does not say %q:\n%s", want, routerPitch)
+		}
+	}
+}

@@ -6,7 +6,7 @@ import (
 	"github.com/scalecraft-dev/darkplum/cli/internal/install"
 )
 
-const routerPitch = "Install the semantic router? An optional classifier that runs in your cluster (one pod, about 2 GiB of memory, a 1-2 GB model download from Hugging Face on first start) so routed aliases can send each request to the model that suits its topic. Aliases that do not use it are unaffected"
+const routerPitch = "Install the semantic router? An optional classifier that runs in your cluster (one pod, about 2 GiB of memory, a 1-2 GB model download from Hugging Face on first start) so routed aliases can send each request to the model that suits its topic. Aliases that do not use it are unaffected. It reads the text of the prompts routed through it, and its pod may reach any public address on port 443 (needed for the Hugging Face download at startup; private ranges stay blocked)"
 
 // chooseRouter takes the semantic router setting from --semantic-router, or asks.
 // The default is off: the router was always opt-in, and a run that does not ask
