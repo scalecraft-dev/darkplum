@@ -11,12 +11,19 @@
 // semantic-router/rendered.yaml, so no helm binary and no network chart download
 // is needed on the operator's machine. A build that does not carry the rendered
 // file reports ErrNotRendered rather than guessing.
+//
+// Applying the objects overwrites what the bundle sets: a field someone changed
+// on a live router object with kubectl edit is put back to the shipped value the
+// next time Apply runs. Customise the router by changing the install, not the
+// object.
 package semrouter
 
 import (
 	"bytes"
 	"compress/gzip"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -117,7 +124,10 @@ func DefaultValues(k8s fs.FS) ([]byte, error) { return fs.ReadFile(k8s, valuesPa
 
 // Apply installs the router: objects, wait for ready, point the gateway at it.
 // It is idempotent. progress receives the human-readable steps.
-func Apply(kc *kube.Client, objs []manifests.Object, progress io.Writer) error {
+func Apply(kc *kube.Client, tok Takeover, objs []manifests.Object, progress io.Writer) error {
+	if !tok.checked {
+		return errors.New("semrouter: Apply needs the result of CheckTakeover: a helm-installed router must be checked before it is overwritten")
+	}
 	body, err := manifests.JSONList(objs)
 	if err != nil {
 		return err
@@ -187,62 +197,93 @@ func notFound(err error) bool {
 // HelmRelease is a helm 3 release of the router found in the cluster.
 type HelmRelease struct {
 	Found bool
-	// Secrets are the release's revision Secrets (sh.helm.release.v1.<name>.vN).
-	Secrets []string
-	// Values are the values the operator installed it with (helm's "config"),
-	// from the latest revision.
+	// Secrets and ConfigMaps are the release's revision objects (helm's "secret"
+	// and "configmap" storage drivers), sh.helm.release.v1.<name>.vN.
+	Secrets    []string
+	ConfigMaps []string
+	// Revision and Status are those of the revision Values came from: the latest
+	// one helm marks deployed, or the highest when none is.
+	Revision int
+	Status   string
+	// Values are the values the operator installed it with (helm's "config").
 	Values map[string]any
 }
 
-// DetectHelm looks for a helm release of the router by its release Secrets
-// (owner=helm, name=semantic-router). It never runs helm.
+type helmItem struct {
+	Metadata struct {
+		Name   string            `json:"name"`
+		Labels map[string]string `json:"labels"`
+	} `json:"metadata"`
+	Data map[string]string `json:"data"`
+}
+
+// DetectHelm looks for a helm release of the router by its release objects
+// (owner=helm, name=semantic-router), in both of helm's storage drivers. It never
+// runs helm. The values come from the revision helm marks deployed, not merely the
+// highest number: a failed upgrade leaves a higher revision that never ran.
 func DetectHelm(kc *kube.Client) (HelmRelease, error) {
-	out, err := kc.NS(nil, "get", "secret", "-l", "owner=helm,name="+ReleaseName, "-o", "json")
-	if err != nil {
-		return HelmRelease{}, fmt.Errorf("look for a helm release of the semantic router: %w", err)
-	}
-	var list struct {
-		Items []struct {
-			Metadata struct {
-				Name   string            `json:"name"`
-				Labels map[string]string `json:"labels"`
-			} `json:"metadata"`
-			Data map[string]string `json:"data"`
-		} `json:"items"`
-	}
-	if err := json.Unmarshal([]byte(out), &list); err != nil {
-		return HelmRelease{}, err
-	}
 	var rel HelmRelease
-	best := -1
-	for _, it := range list.Items {
-		rel.Found = true
-		rel.Secrets = append(rel.Secrets, it.Metadata.Name)
-		var v int
-		fmt.Sscanf(it.Metadata.Labels["version"], "%d", &v)
-		if v > best {
-			vals, err := decodeRelease(it.Data["release"])
-			if err != nil {
-				return HelmRelease{}, fmt.Errorf("helm release secret %s: %w", it.Metadata.Name, err)
+	bestDeployed, bestAny := -1, -1
+	var deployedVals, anyVals map[string]any
+	var anyStatus string
+	for _, kind := range []string{"secret", "configmap"} {
+		out, err := kc.NS(nil, "get", kind, "-l", "owner=helm,name="+ReleaseName, "-o", "json")
+		if err != nil {
+			return HelmRelease{}, fmt.Errorf("look for a helm release of the semantic router (%s driver): %w", kind, err)
+		}
+		var list struct {
+			Items []helmItem `json:"items"`
+		}
+		if err := json.Unmarshal([]byte(out), &list); err != nil {
+			return HelmRelease{}, err
+		}
+		for _, it := range list.Items {
+			rel.Found = true
+			if kind == "secret" {
+				rel.Secrets = append(rel.Secrets, it.Metadata.Name)
+			} else {
+				rel.ConfigMaps = append(rel.ConfigMaps, it.Metadata.Name)
 			}
-			best, rel.Values = v, vals
+			var v int
+			fmt.Sscanf(it.Metadata.Labels["version"], "%d", &v)
+			deployed := it.Metadata.Labels["status"] == "deployed"
+			vals, err := decodeRelease(it.Data["release"], kind == "secret")
+			if err != nil {
+				return HelmRelease{}, fmt.Errorf("helm release %s %s: %w", kind, it.Metadata.Name, err)
+			}
+			if v > bestAny {
+				bestAny, anyVals, anyStatus = v, vals, it.Metadata.Labels["status"]
+			}
+			if deployed && v > bestDeployed {
+				bestDeployed, deployedVals = v, vals
+			}
 		}
 	}
 	sort.Strings(rel.Secrets)
+	sort.Strings(rel.ConfigMaps)
+	switch {
+	case bestDeployed >= 0:
+		rel.Revision, rel.Status, rel.Values = bestDeployed, "deployed", deployedVals
+	case bestAny >= 0:
+		rel.Revision, rel.Status, rel.Values = bestAny, anyStatus, anyVals
+	}
 	return rel, nil
 }
 
-// decodeRelease reads the user-supplied values out of a helm release Secret's
-// data.release: Kubernetes base64, then helm's base64 of gzip of JSON.
-func decodeRelease(k8sB64 string) (map[string]any, error) {
-	inner, err := base64.StdEncoding.DecodeString(k8sB64)
-	if err != nil {
-		return nil, fmt.Errorf("not base64: %w", err)
+// decodeRelease reads the user-supplied values out of a helm release object's
+// data.release: helm's base64 of gzip of JSON. A Secret's data adds Kubernetes'
+// own base64 layer on top (secret true); a ConfigMap's does not.
+func decodeRelease(stored string, secret bool) (map[string]any, error) {
+	inner := []byte(stored)
+	if secret {
+		var err error
+		if inner, err = base64.StdEncoding.DecodeString(stored); err != nil {
+			return nil, fmt.Errorf("not base64: %w", err)
+		}
 	}
 	zipped, err := base64.StdEncoding.DecodeString(string(inner))
 	if err != nil {
-		// Some helm versions store the gzip stream without a second base64 layer.
-		zipped = inner
+		return nil, fmt.Errorf("not a helm release: %w", err)
 	}
 	zr, err := gzip.NewReader(bytes.NewReader(zipped))
 	if err != nil {
@@ -264,13 +305,37 @@ func decodeRelease(k8sB64 string) (map[string]any, error) {
 	return rel.Config, nil
 }
 
+// shippedValues are the canonical hashes (sha256 of the values parsed and
+// re-marshalled as JSON, so comments and layout do not matter) of every
+// values.yaml this repository has shipped for the router, taken from its git
+// history (k8s/semantic-router/values.yaml at 8907e6d, bd10508, 18f4974). A
+// router installed from any of them is the default router, not a customised one.
+var shippedValues = map[string]string{
+	"c4bd55fe454af82b019e7f5b535ea2419b9394b09c587c5ec85ebd550c5d96d3": "8907e6d",
+	"d7a4b3ee150662c6ae7d2b2427a9336a90285ed5a7cb9a4c58e66e0b1088a892": "bd10508",
+	"6f758286453167a97ce106ad7110f3102cf43b0e7f8c1b2a776eab7cc82c93c2": "18f4974",
+}
+
+func canonicalHash(v map[string]any) string {
+	b, _ := json.Marshal(v)
+	h := sha256.Sum256(b)
+	return hex.EncodeToString(h[:])
+}
+
 // Differences lists the value paths where the release's values differ from the
-// shipped defaults, both normalised through JSON. Empty means equal: the
-// release can be taken over without losing anything.
+// shipped defaults, both normalised through JSON. Empty means the release is
+// the default router: its values equal the values.yaml this build ships, or any
+// values.yaml an earlier release of this repository shipped.
 func Differences(rel HelmRelease, defaults []byte) ([]string, error) {
 	var want map[string]any
 	if err := yaml.Unmarshal(defaults, &want); err != nil {
 		return nil, fmt.Errorf("the shipped values: %w", err)
+	}
+	// Round-trip so numbers compare the way helm stored them.
+	raw, _ := json.Marshal(want)
+	_ = json.Unmarshal(raw, &want)
+	if _, ok := shippedValues[canonicalHash(rel.Values)]; ok || canonicalHash(rel.Values) == canonicalHash(want) {
+		return nil, nil
 	}
 	var diffs []string
 	diffMaps("", rel.Values, want, &diffs)
@@ -310,32 +375,53 @@ func join(p, k string) string {
 type ErrCustomised struct{ Keys []string }
 
 func (e *ErrCustomised) Error() string {
-	return "the helm-installed semantic router has values that differ from the shipped defaults (" + strings.Join(e.Keys, ", ") +
+	return "the helm-installed semantic router has values that differ from every values file this project shipped (" + strings.Join(e.Keys, ", ") +
 		"); taking it over would replace them with the default decisions"
 }
 
-// CheckTakeover refuses to convert a customised release unless convert is set.
-func CheckTakeover(rel HelmRelease, defaults []byte, convert bool) error {
-	if !rel.Found {
-		return nil
-	}
-	diffs, err := Differences(rel, defaults)
-	if err != nil {
-		return err
-	}
-	if len(diffs) > 0 && !convert {
-		return &ErrCustomised{Keys: diffs}
-	}
-	return nil
+// Takeover is the proof that a helm-installed router (if there is one) was
+// checked. Only CheckTakeover makes a usable one; Apply and FinishTakeover refuse
+// the zero value, so no caller can overwrite a customised helm router by
+// forgetting to look.
+type Takeover struct {
+	checked bool
+	rel     HelmRelease
 }
 
-// FinishTakeover deletes the helm release Secrets, once Apply has put the
-// router's objects in place, so a later `helm upgrade` cannot fight the CLI. The
-// workload objects are not touched.
-func FinishTakeover(kc *kube.Client, rel HelmRelease) error {
-	for _, s := range rel.Secrets {
-		if _, err := kc.NS(nil, "delete", "secret", s, "--ignore-not-found"); err != nil {
-			return fmt.Errorf("delete helm release secret %s: %w", s, err)
+// Found reports whether there is a helm release to take over.
+func (t Takeover) Found() bool { return t.rel.Found }
+
+// CheckTakeover decides whether a helm release can be taken over: no release is
+// fine, a default one is fine, a customised one is refused unless convert says the
+// operator accepts losing the customisation.
+func CheckTakeover(rel HelmRelease, defaults []byte, convert bool) (Takeover, error) {
+	if rel.Found {
+		diffs, err := Differences(rel, defaults)
+		if err != nil {
+			return Takeover{}, err
+		}
+		if len(diffs) > 0 && !convert {
+			return Takeover{}, &ErrCustomised{Keys: diffs}
+		}
+	}
+	return Takeover{checked: true, rel: rel}, nil
+}
+
+// FinishTakeover deletes the helm release objects (both storage drivers), once
+// Apply has put the router's objects in place, so a later `helm upgrade` cannot
+// fight the CLI. The workload objects are not touched.
+func FinishTakeover(kc *kube.Client, tok Takeover) error {
+	if !tok.checked {
+		return errors.New("semrouter: FinishTakeover needs the result of CheckTakeover")
+	}
+	for _, n := range tok.rel.Secrets {
+		if _, err := kc.NS(nil, "delete", "secret", n, "--ignore-not-found"); err != nil {
+			return fmt.Errorf("delete helm release secret %s: %w", n, err)
+		}
+	}
+	for _, n := range tok.rel.ConfigMaps {
+		if _, err := kc.NS(nil, "delete", "configmap", n, "--ignore-not-found"); err != nil {
+			return fmt.Errorf("delete helm release configmap %s: %w", n, err)
 		}
 	}
 	return nil

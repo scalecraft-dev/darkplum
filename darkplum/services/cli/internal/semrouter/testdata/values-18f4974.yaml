@@ -1,0 +1,82 @@
+# Helm values for the vLLM Semantic Router (Apache-2.0), used ONLY as the
+# in-cluster intent classifier behind routed aliases with classifier
+# "semantic_router". It never sits in the data path: the gateway calls its
+# classification API (POST /api/v1/classify/intent) and routes the request
+# itself, so policy, residency and audit stay in the gateway.
+#
+# Installed by `make deploy-semantic-router` with:
+#   helm upgrade --install semantic-router oci://ghcr.io/vllm-project/charts/semantic-router \
+#     --version 0.3.0 -n darkplum-system -f k8s/semantic-router/values.yaml
+#
+# The `decisions` below are what the classifier returns as `category`; a routed
+# alias maps that name onto a route of the SAME name (case-insensitive, spaces
+# become dashes). Edit the decisions to match your routes; the built-in domain
+# signals are the MMLU categories the bundled classifier was trained on:
+# business, law, psychology, biology, chemistry, history, other, health,
+# economics, math, physics, computer science, philosophy, engineering.
+# Classifier models are downloaded from Hugging Face at start-up (~1-2 GB, a
+# minute or two); the pod needs outbound HTTPS for that and nothing else.
+# Pinned by digest. The chart renders image as "<repository>:<tag>", so a tag of
+# "<version>@sha256:<digest>" yields a reference that the registry resolves by
+# digest. The tag half is only informational once a digest is present.
+image:
+  tag: "v0.3.0@sha256:5c5a6421f7a1fc0596fc7e9053b35952fef4bc12564c01a3f7315c51e3602ae6"
+resources:
+  requests: { cpu: 500m, memory: 2Gi }
+  limits: { cpu: "2", memory: 4Gi }
+# No PersistentVolumeClaim: the chart's default StorageClass ("standard") does
+# not exist on the EKS cluster this Terraform builds (no EBS CSI driver is
+# installed), so a PVC would stay Pending and the pod would never schedule.
+# Classifier weights (~1-2 GB) live in the pod's ephemeral storage and are
+# re-downloaded from Hugging Face on every pod start (one to three minutes).
+persistence:
+  enabled: false
+service:
+  type: ClusterIP
+  metrics: { enabled: false }
+# Sizing: the default CPU node group is 2 x m5.large (2 vCPU / 8 GiB each) and
+# already hosts web, api, gateway and Postgres. Before enabling the classifier
+# in production, add a node (cpu_desired_size) or move to m5.xlarge; otherwise
+# expect memory pressure.
+podLabels:
+  app.kubernetes.io/part-of: darkplum
+config:
+  version: v0.3
+  listeners:
+    - { name: grpc-50051, address: 0.0.0.0, port: 50051, timeout: 300s }
+    - { name: http-8080, address: 0.0.0.0, port: 8080, timeout: 300s }
+  # The router insists on at least one provider/model even though Darkplum
+  # never sends inference through it; this placeholder is never called.
+  providers:
+    defaults:
+      default_model: placeholder
+    models:
+      - name: placeholder
+        provider_model_id: placeholder
+        backend_refs:
+          - { name: primary, endpoint: "placeholder.invalid:8000", protocol: http, weight: 100 }
+  routing:
+    modelCards:
+      - name: placeholder
+    signals:
+      domains:
+        - { name: legal,   description: "Law, contracts, compliance",  mmlu_categories: ["law"] }
+        - { name: code,    description: "Programming and engineering", mmlu_categories: ["computer science", "engineering"] }
+        - { name: general, description: "Everything else",
+            mmlu_categories: ["other", "business", "psychology", "biology", "chemistry", "history", "health", "economics", "math", "physics", "philosophy"] }
+    decisions:
+      - name: legal
+        description: Legal and compliance intents
+        priority: 20
+        rules: { operator: OR, conditions: [ { type: domain, name: legal } ] }
+        modelRefs: [ { model: placeholder, use_reasoning: false } ]
+      - name: code
+        description: Programming intents
+        priority: 20
+        rules: { operator: OR, conditions: [ { type: domain, name: code } ] }
+        modelRefs: [ { model: placeholder, use_reasoning: false } ]
+      - name: general
+        description: Default
+        priority: 10
+        rules: { operator: OR, conditions: [ { type: domain, name: general } ] }
+        modelRefs: [ { model: placeholder, use_reasoning: false } ]
