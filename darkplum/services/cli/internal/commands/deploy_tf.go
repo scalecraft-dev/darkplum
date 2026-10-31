@@ -220,6 +220,14 @@ func parseOutputs(raw []byte) (deployOutputs, error) {
 	get("cluster_service_cidr", &o.ServiceCIDR)
 	get("database_url", &o.DatabaseURL)
 	get("inference_region", &o.InferenceRegion)
+	// Terraform sets this on every apply (bedrock_region, else aws_region), even
+	// with no Bedrock model allowed, so empty means state from before the output
+	// existed or a broken apply. The Makefile fell back to the base manifest's
+	// us-east-1 here, which sends a cluster elsewhere to the wrong region; refuse
+	// instead.
+	if o.InferenceRegion == "" && len(errs) == 0 {
+		errs = append(errs, errors.New(`terraform output "inference_region" is empty; run darkplum deploy again so the apply sets it`))
+	}
 	get("bedrock_model_filter", &o.BedrockModelFilter) // the key must exist; "" is a valid value
 	get("gpu_desired_size", &o.GPUDesired)
 	get("image_repositories", &o.Repos)

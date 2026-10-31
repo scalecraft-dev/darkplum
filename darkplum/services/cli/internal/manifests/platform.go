@@ -49,7 +49,7 @@ func (in Inputs) validate() error {
 		errs = append(errs, fmt.Errorf("the VPC CIDR %q is not an IPv4 CIDR", in.VPCCIDR))
 	}
 	if in.BedrockRegion == "" {
-		errs = append(errs, errors.New("no Bedrock region (the inference_region output)"))
+		errs = append(errs, errors.New("no Bedrock region (the inference_region output; terraform always sets it, so deploy again)"))
 	}
 	return errors.Join(errs...)
 }

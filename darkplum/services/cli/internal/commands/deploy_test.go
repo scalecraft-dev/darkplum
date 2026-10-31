@@ -372,6 +372,10 @@ func TestParseOutputsRequiresEveryKey(t *testing.T) {
 	if o, err := parseOutputs([]byte(outputsJSON(0, func(v map[string]any) { v["bedrock_model_filter"] = "" }))); err != nil || o.BedrockModelFilter != "" {
 		t.Errorf("empty filter: %v", err)
 	}
+	// The region is different: it is set on every apply, so "" is a fault.
+	if _, err := parseOutputs([]byte(outputsJSON(0, func(v map[string]any) { v["inference_region"] = "" }))); err == nil || !strings.Contains(err.Error(), "inference_region") {
+		t.Errorf("an empty inference_region was accepted: %v", err)
+	}
 	if _, err := parseOutputs([]byte(`{}`)); err == nil {
 		t.Error("{} accepted")
 	}
