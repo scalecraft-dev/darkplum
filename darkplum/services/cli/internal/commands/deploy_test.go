@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -954,5 +955,148 @@ func TestStateListDistinguishesEmptyFromFailure(t *testing.T) {
 	tf.stateErr = errors.New("plain error")
 	if _, err := stateList(tf); err == nil {
 		t.Error("an unexplained failure must be an error")
+	}
+}
+
+func TestVersionGuard(t *testing.T) {
+	rc := func(n int) string { return fmt.Sprintf("0.0.0-rc.%d+abcdef0", n) }
+	cases := []struct {
+		recorded, current string
+		allow, refused    bool
+	}{
+		{"", "1.0.0", false, false}, // never deployed
+		{"1.2.3", "1.2.3", false, false},
+		{"1.2.3", "1.2.4", false, false},
+		{"1.2.3", "1.10.0", false, false}, // numeric, not lexical
+		{"1.10.0", "1.9.9", false, true},
+		{"2.0.0", "1.99.99", false, true},
+		{"2.0.0", "1.0.0", true, false},
+		{rc(7), rc(8), false, false},
+		{rc(8), rc(7), false, true},
+		{"1.2.3", rc(9), false, true}, // no order between a release and a candidate
+		{rc(9), "1.2.3", false, true}, // ... in either direction
+		{"1.2.3", "dev", false, true},
+		{"dev", "1.2.3", false, true},
+		{"dev", "dev", false, false},
+		{"garbage", "1.2.3", false, true},
+		{"garbage", "1.2.3", true, false},
+	}
+	for _, c := range cases {
+		err := versionGuard(c.recorded, c.current, c.allow)
+		if (err != nil) != c.refused {
+			t.Errorf("versionGuard(%q, %q, allow=%v) = %v, refused should be %v", c.recorded, c.current, c.allow, err, c.refused)
+		}
+	}
+}
+
+func TestDeployDowngradeIsRefusedBeforeTerraform(t *testing.T) {
+	h := newDeployHarness(t, 0)
+	h.env.rec.Bundle = "1.4.0"
+	if !IsReported(h.run()) {
+		t.Fatal("deployed an older release over a newer one")
+	}
+	if h.tl.count("terraform") != 0 || h.writes() != 0 {
+		t.Errorf("went on:\n%s", h.tl)
+	}
+	h.mustContain("--allow-downgrade")
+	h2 := newDeployHarness(t, 0)
+	h2.env.rec.Bundle = "1.4.0"
+	h2.env.flags.AllowDowngrade = true
+	if err := h2.run(); err != nil {
+		t.Fatalf("%v\n%s", err, h2.out.String())
+	}
+}
+
+func TestDeployRefusesAStateThatIsNotThisInstalls(t *testing.T) {
+	h := newDeployHarness(t, 0)
+	h.tf.stateOut = "module.vpc.aws_vpc.this\n"
+	h.tf.outputs = outputsJSON(0, func(v map[string]any) { v["cluster_name"] = "prod-eks" })
+	h.tf.applied = true // the state already has outputs (they are the other cluster's)
+	if !IsReported(h.run()) {
+		t.Fatal("planned against someone else's state")
+	}
+	if h.tf.ran("plan") || h.tf.ran("apply") {
+		t.Error("went on")
+	}
+	h.mustContain("does not belong to this install")
+}
+
+func TestDeployResumesAnUnfinishedFirstApply(t *testing.T) {
+	// Resources in the state, no outputs yet: what an interrupted first apply leaves.
+	h := newDeployHarness(t, 0)
+	h.tf.stateOut = "module.vpc.aws_vpc.this\n"
+	if err := h.run(); err != nil {
+		t.Fatalf("%v\n%s", err, h.out.String())
+	}
+	h.mustContain("unfinished earlier apply")
+	// ... but not when the backend key does not name this cluster.
+	h2 := newDeployHarness(t, 0)
+	h2.tf.stateOut = "module.vpc.aws_vpc.this\n"
+	h2.env.rec.Backend.Key = "darkplum/aws/someone-else/terraform.tfstate"
+	if !IsReported(h2.run()) || h2.tf.ran("plan") {
+		t.Fatal("resumed a state whose key names another cluster")
+	}
+}
+
+// The resume trap: "Re-run darkplum deploy" must work when the previous run was
+// interrupted while the cluster was still being created.
+func TestDeployResumesWhileTheClusterIsStillBeingCreated(t *testing.T) {
+	h := newDeployHarness(t, 0)
+	h.awsf.base.describeErr = nil
+	h.awsf.base.status, h.awsf.base.noEndpoint = "CREATING", true
+	h.tf.onApply = func() { h.awsf.base.status, h.awsf.base.noEndpoint = "ACTIVE", false }
+	if err := h.run(); err != nil {
+		t.Fatalf("a cluster that is CREATING stopped the resume:\n%v\n%s", err, h.out.String())
+	}
+	if !h.tf.ran("apply") {
+		t.Error("terraform never got to finish the cluster")
+	}
+	h.mustContain("still being created")
+}
+
+func TestDeployStillStopsOnAWrongAccountClusterThatIsCreating(t *testing.T) {
+	h := newDeployHarness(t, 0)
+	h.awsf.base.describeErr = nil
+	h.awsf.base.status, h.awsf.base.noEndpoint = "CREATING", true
+	h.awsf.base.arn = "arn:aws:eks:us-east-2:999999999999:cluster/dp-trial"
+	h.awsf.base.caller = "999999999999"
+	if !IsReported(h.run()) || h.tl.count("terraform") != 0 {
+		t.Fatal("a cluster in another account must stop the run")
+	}
+}
+
+func TestDeployRechecksExposureWhenTheClusterWasNotReadableAtPreflight(t *testing.T) {
+	// Unreachable API at preflight: carry on, but the internet-facing check must still
+	// happen before anything is applied to Kubernetes.
+	h := newDeployHarness(t, 0)
+	h.awsf.base.describeErr = nil
+	calls := 0
+	h.k.handlers = append([]skHandler{{"get svc darkplum-web", func([]string, []byte) ([]byte, error) {
+		calls++
+		if calls == 1 {
+			return nil, errors.New("kubectl: Unable to connect to the server: dial tcp 10.0.0.1:443: i/o timeout")
+		}
+		return []byte(webSvc("LoadBalancer", "internet-facing", "abc.elb.amazonaws.com")), nil
+	}}}, h.k.handlers...)
+	if !IsReported(h.run()) {
+		t.Fatal("applied over an internet-facing web service")
+	}
+	if !h.tf.ran("apply") {
+		t.Error("the unreachable cluster should not have stopped terraform")
+	}
+	if h.writes() != 0 {
+		t.Errorf("Kubernetes was written to after the exposure was found:\n%s", h.tl)
+	}
+	h.mustContain("abc.elb.amazonaws.com")
+}
+
+func TestDeployAuthorizationFailureAtPreflightIsStillAHardStop(t *testing.T) {
+	h := newDeployHarness(t, 0)
+	h.awsf.base.describeErr = nil
+	h.k.handlers = append([]skHandler{{"get svc darkplum-web", func([]string, []byte) ([]byte, error) {
+		return nil, errors.New("kubectl: error: You must be logged in to the server (Unauthorized)")
+	}}}, h.k.handlers...)
+	if !IsReported(h.run()) || h.tl.count("terraform") != 0 {
+		t.Fatal("an ACTIVE cluster that answers 401 must stop the run")
 	}
 }

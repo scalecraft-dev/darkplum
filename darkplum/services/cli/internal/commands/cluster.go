@@ -45,6 +45,8 @@ var (
 	// errClusterNotFound means the install names a cluster that does not exist
 	// (never created, or already destroyed).
 	errClusterNotFound = runner.ErrClusterNotFound
+	// errClusterNotReady means the cluster exists but is still being created.
+	errClusterNotReady = runner.ErrClusterNotReady
 )
 
 // legacyRootHere reports a Makefile-era Terraform root near the working

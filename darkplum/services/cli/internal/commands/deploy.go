@@ -42,8 +42,9 @@ import (
 // Nothing is written anywhere until the images verify, so a bad release costs
 // seconds. Policies are applied before any workload starts.
 type DeployCmd struct {
-	MinSession  int  `name:"min-session" help:"Stop unless the AWS session outlasts this many minutes. Default: 90 with a self-hosted GPU model, 30 without." default:"0"`
-	ConfirmPlan bool `name:"confirm-plan" help:"Approve a Terraform plan that deletes or replaces resources. Without it deploy shows the list and asks; it never approves a delete on its own, and there is no --yes that would."`
+	MinSession     int  `name:"min-session" help:"Stop unless the AWS session outlasts this many minutes. Default: 90 with a self-hosted GPU model, 30 without." default:"0"`
+	AllowDowngrade bool `name:"allow-downgrade" help:"Apply even though this darkplum is older than (or cannot be ordered against) the release that last applied the install."`
+	ConfirmPlan    bool `name:"confirm-plan" help:"Approve a Terraform plan that deletes or replaces resources. Without it deploy shows the list and asks; it never approves a delete on its own, and there is no --yes that would."`
 
 	GPUWait time.Duration `name:"gpu-wait" hidden:"" help:"How long to wait for a GPU to become allocatable before reporting the platform healthy without it." default:"15m"`
 
@@ -161,6 +162,9 @@ type deployEnv struct {
 	// mutated is set when the run first changes anything, so a failure before then
 	// can say nothing was touched.
 	mutated bool
+	// inspected is true once the existing cluster has been checked for conflicts
+	// (or there was none to check).
+	inspected bool
 	// force is closed by a second Ctrl-C and kills a running Terraform.
 	force <-chan struct{}
 
@@ -293,6 +297,9 @@ func (e *deployEnv) run(ctx context.Context) (err error) {
 	if failed > 0 {
 		return reportedError{fmt.Sprintf("%d preflight check(s) failed; nothing was changed", failed)}
 	}
+	if err := versionGuard(e.rec.Bundle, e.manifest.Version, e.flags.AllowDowngrade); err != nil {
+		return e.stop(checkResult{name: "release", status: checkFail, detail: firstLine(err.Error())}, "refusing to downgrade")
+	}
 	if err := e.inspectLive(); err != nil {
 		return err
 	}
@@ -318,7 +325,20 @@ func (e *deployEnv) run(ctx context.Context) (err error) {
 		return e.stop(checkResult{name: "terraform init", status: checkFail, detail: firstLine(err.Error()),
 			hint: e.loginHint(err.Error())}, "terraform init failed")
 	}
-	if err := e.adoptLogGroup(tf); err != nil {
+	state, err := stateList(tf)
+	if err != nil {
+		return e.stop(checkResult{name: "terraform state", status: checkFail, detail: firstLine(err.Error()),
+			hint: e.loginHint(err.Error()) + ". Nothing was applied"}, "cannot read the state")
+	}
+	warn, err := checkStateOwnership(tf, e.rec, state, false)
+	if err != nil {
+		return e.stop(checkResult{name: "terraform state", status: checkFail, detail: firstLine(err.Error()),
+			hint: "check backend.hcl; nothing was applied"}, "the state is not this install's")
+	}
+	if warn != "" {
+		e.row(checkResult{name: "terraform state", status: checkWarn, detail: warn})
+	}
+	if err := e.adoptLogGroup(tf, state); err != nil {
 		return e.stop(checkResult{name: "audit log group", status: checkFail, detail: firstLine(err.Error()),
 			hint: "nothing was applied; fix the above and re-run"}, "cannot check the audit log group")
 	}
@@ -355,6 +375,16 @@ func (e *deployEnv) run(ctx context.Context) (err error) {
 	}
 	e.row(row)
 	kc := e.kube(t)
+	if !e.inspected {
+		// The cluster could not be read at preflight (it was still being created, or
+		// unreachable). It is up now; nothing has been applied to it yet.
+		if reachable, err := e.checkConflicts(kc); err != nil {
+			return err
+		} else if !reachable {
+			return e.stop(checkResult{name: "cluster", status: checkFail, detail: "the cluster's API is not reachable from here",
+				hint: "nothing was applied to Kubernetes; check your network (the API endpoint) and re-run"}, "cluster unreachable")
+		}
+	}
 	nodes, err := e.waitNodes(ctx, kc)
 	if err != nil {
 		return e.stop(checkResult{name: "nodes", status: checkFail, detail: firstLine(err.Error()),
@@ -588,45 +618,73 @@ const lbSchemeAnnotation = "service.beta.kubernetes.io/aws-load-balancer-scheme"
 //   - a semantic router installed by helm, which this release does not manage.
 func (e *deployEnv) inspectLive() error {
 	t, row, err := e.cluster()
-	if errors.Is(err, errClusterNotFound) {
+	switch {
+	case errors.Is(err, errClusterNotFound):
 		e.row(checkResult{name: "cluster", status: checkPass, detail: "none yet: a first install"})
+		e.inspected = true
 		return nil
-	}
-	if err != nil {
+	case errors.Is(err, errClusterNotReady):
+		// An interrupted first deploy leaves exactly this. It must be resumable: stopping
+		// here would make "re-run darkplum deploy" a lie. The checks below are repeated
+		// once the cluster is up, before anything is applied to it.
+		e.row(checkResult{name: "cluster", status: checkWarn, detail: row.detail,
+			hint: "still being created (an earlier deploy was interrupted); continuing so Terraform can finish it"})
+		return nil
+	case err != nil:
 		return e.stop(row, "cannot inspect the existing cluster; nothing was changed")
 	}
 	e.row(row)
-	kc := e.kube(t)
+	reachable, err := e.checkConflicts(e.kube(t))
+	if err != nil {
+		return err
+	}
+	if !reachable {
+		e.row(checkResult{name: "cluster", status: checkWarn, detail: "its API is not reachable from here yet",
+			hint: "continuing; the web exposure and router checks are repeated before anything is applied to Kubernetes"})
+		return nil
+	}
+	e.inspected = true
+	return nil
+}
 
+// checkConflicts is the part of the inspection that needs the cluster's API.
+// reachable is false (with no error) when it cannot be reached, so the caller can
+// try again later; anything else that stops it is an error.
+func (e *deployEnv) checkConflicts(kc *kube.Client) (reachable bool, err error) {
 	svc, err := kc.Run(nil, "-n", platformNS, "get", "svc", "darkplum-web", "-o", "json")
 	switch {
 	case err == nil:
 		if ex := webExposure(svc); ex != "" {
-			return e.stop(checkResult{name: "web exposure", status: checkFail, detail: ex,
+			return true, e.stop(checkResult{name: "web exposure", status: checkFail, detail: ex,
 				hint: "this release serves the web UI on a private load balancer and keeps the darkplum-web Service cluster-internal. " +
 					"Deploying would remove the address above without warning. Nothing was changed. To move to private: " +
 					"`eval \"$(darkplum kubeconfig)\"`, then `kubectl -n darkplum-system patch svc darkplum-web --type=merge -p '{\"spec\":{\"type\":\"ClusterIP\"}}'` " +
 					"and re-run deploy. To keep the public address, stay on the release that created it."}, "internet-facing web service")
 		}
 	case kubeNotFound(err, "services", "darkplum-web"):
+	case unreachable(err):
+		return false, nil
 	default:
-		return e.stop(checkResult{name: "web exposure", status: checkFail, detail: firstLine(err.Error()),
+		return true, e.stop(checkResult{name: "web exposure", status: checkFail, detail: firstLine(err.Error()),
 			hint: "cannot tell how the web UI is exposed; nothing was changed"}, "cannot inspect the web service")
 	}
 
 	sec, err := kc.Run(nil, "-n", platformNS, "get", "secret", "-l", "owner=helm,name=semantic-router", "-o", "name")
 	if err != nil {
-		return e.stop(checkResult{name: "semantic router", status: checkFail, detail: firstLine(err.Error()),
+		if unreachable(err) {
+			return false, nil
+		}
+		return true, e.stop(checkResult{name: "semantic router", status: checkFail, detail: firstLine(err.Error()),
 			hint: "cannot tell whether a helm-installed router exists; nothing was changed"}, "cannot inspect helm releases")
 	}
 	if strings.TrimSpace(sec) != "" {
-		return e.stop(checkResult{name: "semantic router", status: checkFail,
+		return true, e.stop(checkResult{name: "semantic router", status: checkFail,
 			detail: "installed by helm (release semantic-router)",
 			hint: "this release does not manage the router: it has no helm, and no way yet to take the release over without losing any edits you made to its values. " +
 				"Nothing was changed. Stay on the release that installed it, or remove it first (`helm uninstall semantic-router -n darkplum-system` with your own cluster access); routed aliases then fall back to their default route."},
 			"helm-installed semantic router")
 	}
-	return nil
+	return true, nil
 }
 
 // webExposure describes a darkplum-web Service that is published outside the
@@ -677,11 +735,7 @@ const logGroupAddr = "module.eks.module.eks.aws_cloudwatch_log_group.this[0]"
 // exists but is not managed: destroy keeps it on purpose (it holds the Kubernetes
 // API audit logs), and a reinstall would otherwise fail creating it. Every status
 // is checked; a failing read is an error, never "not there".
-func (e *deployEnv) adoptLogGroup(tf tfRunner) error {
-	state, err := stateList(tf)
-	if err != nil {
-		return err
-	}
+func (e *deployEnv) adoptLogGroup(tf tfRunner, state map[string]bool) error {
 	lg := "/aws/eks/" + e.rec.ClusterName + "/cluster"
 	if state[logGroupAddr] {
 		e.row(checkResult{name: "audit log group", status: checkPass, detail: lg + " (in the state)"})

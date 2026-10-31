@@ -65,6 +65,8 @@ const pinnedTFVars = "aws_profile = \"acme\"\naws_region = \"us-east-2\"\ncluste
 // fakeAWS answers describe-cluster and get-caller-identity, recording argv.
 type fakeAWS struct {
 	arn, caller string
+	status      string
+	noEndpoint  bool
 	describeErr error
 	calls       [][]string
 }
@@ -77,7 +79,11 @@ func (f *fakeAWS) run(_ string, args ...string) (string, error) {
 		if f.describeErr != nil {
 			return "", f.describeErr
 		}
-		b, _ := json.Marshal(map[string]string{"endpoint": testEndpoint, "ca": testCA, "arn": f.arn})
+		ep, ca := testEndpoint, testCA
+		if f.noEndpoint {
+			ep, ca = "", ""
+		}
+		b, _ := json.Marshal(map[string]string{"endpoint": ep, "ca": ca, "arn": f.arn, "status": f.status})
 		return string(b), nil
 	case strings.Contains(joined, "sts get-caller-identity"):
 		return f.caller + "\n", nil

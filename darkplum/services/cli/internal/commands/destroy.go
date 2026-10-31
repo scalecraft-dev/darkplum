@@ -16,6 +16,7 @@ import (
 
 	"github.com/scalecraft-dev/darkplum/cli/internal/install"
 	"github.com/scalecraft-dev/darkplum/cli/internal/kube"
+	"github.com/scalecraft-dev/darkplum/cli/internal/release"
 	"github.com/scalecraft-dev/darkplum/cli/internal/runner"
 )
 
@@ -44,6 +45,7 @@ import (
 type DestroyCmd struct {
 	Confirm           string `name:"confirm" help:"The cluster name, for scripts. Interactively you are asked to type it."`
 	ConfirmNoSnapshot string `name:"confirm-no-snapshot" help:"The cluster name again, to delete the database WITHOUT a final snapshot when the install is configured to take none. --confirm does not cover this."`
+	AllowDowngrade    bool   `name:"allow-downgrade" help:"Destroy even though this darkplum is older than (or cannot be ordered against) the release that last applied the install."`
 	MinSession        int    `name:"min-session" help:"Stop unless the AWS session outlasts this many minutes." default:"30"`
 }
 
@@ -60,7 +62,11 @@ func (c *DestroyCmd) Run(g *Globals) error {
 	}
 	defer logf.Close()
 	tfv, _ := readTFVars(in.TFVars())
-	e := &destroyEnv{
+	m, err := release.Current()
+	if err != nil {
+		return err
+	}
+	e := &destroyEnv{version: m.Version,
 		out: newLockedWriter(io.MultiWriter(os.Stdout, logf)), logPath: logPath, in: in, rec: rec, tfv: tfv, flags: *c,
 		now: time.Now, sleep: sleepCtx, heartbeat: 30 * time.Second, poll: 10 * time.Second,
 		aws:         runWithStderr,
@@ -87,6 +93,8 @@ type destroyEnv struct {
 	rec     install.Record
 	tfv     tfvarsInfo
 	flags   DestroyCmd
+	// version is this binary's release version, for the downgrade guard.
+	version string
 
 	now       func() time.Time
 	sleep     func(ctx context.Context, d time.Duration) error
@@ -163,6 +171,10 @@ func (e *destroyEnv) run(ctx context.Context) (err error) {
 		return e.stop(r, "the AWS session is too short for a teardown")
 	}
 
+	if err := versionGuard(rec.Bundle, e.version, e.flags.AllowDowngrade); err != nil {
+		return e.stop(checkResult{name: "release", status: checkFail, detail: firstLine(err.Error())}, "refusing to act with an older darkplum")
+	}
+
 	// ---- 2. read-only: state, cluster, what would block the teardown ------------
 	e.phase("[2/5] What exists (nothing is changed)")
 	tf, note, err := e.openTF()
@@ -180,18 +192,17 @@ func (e *destroyEnv) run(ctx context.Context) (err error) {
 		return e.stop(checkResult{name: "terraform state", status: checkFail, detail: firstLine(err.Error()),
 			hint: "the state could not be read, so what exists is unknown (an expired session looks like this). If it is the session: `" + login + "`. Nothing was deleted"}, "cannot read the state")
 	}
-	managed := 0
-	for a := range state {
-		if !strings.HasPrefix(a, "data.") {
-			managed++
-		}
-	}
+	managed := managedCount(state)
 	if managed == 0 {
 		e.row(checkResult{name: "terraform state", status: checkPass, detail: "empty: nothing to destroy"})
 		e.report(tf)
 		return nil
 	}
-	e.row(checkResult{name: "terraform state", status: checkPass, detail: fmt.Sprintf("%d resources", managed)})
+	if _, err := checkStateOwnership(tf, rec, state, true); err != nil {
+		return e.stop(checkResult{name: "terraform state", status: checkFail, detail: firstLine(err.Error()),
+			hint: "check backend.hcl: destroy will not delete resources it cannot show belong to " + rec.ClusterName + ". Nothing was deleted"}, "the state is not this install's")
+	}
+	e.row(checkResult{name: "terraform state", status: checkPass, detail: fmt.Sprintf("%d resources, belonging to %s", managed, rec.ClusterName)})
 
 	var kc *kube.Client
 	var survey kubeSurvey
@@ -227,6 +238,11 @@ func (e *destroyEnv) run(ctx context.Context) (err error) {
 	// ---- 4. terraform-side preparation, before any Kubernetes deletion ----------
 	e.phase("[4/5] Prepare the infrastructure for deletion")
 	vf := "-var-file=" + tf.VarFile()
+	// First, while nothing has been changed: can the teardown be planned, and does it
+	// delete only what the state holds? If not, the database is still protected.
+	if err := e.sanityPlan(ctx, tf, vf, state); err != nil {
+		return err
+	}
 	const rdsAddr = "module.rds.aws_db_instance.this"
 	if state[rdsAddr] {
 		snap, err := e.finalSnapshot(tf)
@@ -261,9 +277,6 @@ func (e *destroyEnv) run(ctx context.Context) (err error) {
 		}
 		e.row(checkResult{name: "audit log group", status: checkPass, detail: "removed from the state so the destroy keeps it"})
 		delete(state, logGroupAddr)
-	}
-	if err := e.sanityPlan(ctx, tf, vf, state); err != nil {
-		return err
 	}
 
 	// ---- 5. kubernetes, credentials again, terraform destroy ---------------------

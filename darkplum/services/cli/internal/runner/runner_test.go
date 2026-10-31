@@ -14,9 +14,9 @@ func claim() Claim {
 
 // aws answers describe-cluster with the given ARN/endpoint/CA and the caller.
 type aws struct {
-	arn, endpoint, ca, caller string
-	describeErr, callerErr    error
-	calls                     [][]string
+	arn, endpoint, ca, caller, status string
+	describeErr, callerErr            error
+	calls                             [][]string
 }
 
 func goodAWS() *aws {
@@ -32,7 +32,7 @@ func (a *aws) run(args ...string) (string, error) {
 		if a.describeErr != nil {
 			return "", a.describeErr
 		}
-		b, _ := json.Marshal(map[string]string{"endpoint": a.endpoint, "ca": a.ca, "arn": a.arn})
+		b, _ := json.Marshal(map[string]string{"endpoint": a.endpoint, "ca": a.ca, "arn": a.arn, "status": a.status})
 		return string(b), nil
 	case strings.Contains(j, "sts get-caller-identity"):
 		return a.caller + "\n", a.callerErr
@@ -139,6 +139,39 @@ func TestToolRefusesEverythingButAwsAndTerraform(t *testing.T) {
 	for _, name := range []string{"helm", "sh", ""} {
 		if _, err := Which(name); !errors.Is(err, ErrNotAllowed) {
 			t.Errorf("Which(%q) = %v", name, err)
+		}
+	}
+}
+
+// A cluster that is still being created is "not ready", which a resumed deploy
+// must be able to continue past; the same cluster in ANOTHER account is a refusal.
+func TestValidateNotReadyIsDistinctFromARefusal(t *testing.T) {
+	for name, mut := range map[string]func(*aws){
+		"CREATING":    func(a *aws) { a.status = "CREATING"; a.endpoint = "" },
+		"no endpoint": func(a *aws) { a.endpoint = "" },
+		"PENDING":     func(a *aws) { a.status = "PENDING" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			a := goodAWS()
+			mut(a)
+			v, err := Validate(claim(), a.run)
+			if v.Valid() || !errors.Is(err, ErrClusterNotReady) {
+				t.Fatalf("handle=%v err=%v, want ErrClusterNotReady and no handle", v.Valid(), err)
+			}
+		})
+	}
+	a := goodAWS()
+	a.status, a.endpoint = "CREATING", ""
+	a.arn = "arn:aws:eks:us-east-2:999999999999:cluster/dp-trial"
+	a.caller = "999999999999"
+	if _, err := Validate(claim(), a.run); err == nil || errors.Is(err, ErrClusterNotReady) {
+		t.Errorf("a cluster in an unpinned account is a refusal, got %v", err)
+	}
+	for _, st := range []string{"ACTIVE", "UPDATING"} {
+		a := goodAWS()
+		a.status = st
+		if v, err := Validate(claim(), a.run); err != nil || !v.Valid() {
+			t.Errorf("%s: %v", st, err)
 		}
 	}
 }

@@ -203,11 +203,11 @@ func TestDestroyFullRunOrder(t *testing.T) {
 		"sts get-caller-identity",
 		"terraform init",
 		"terraform state list",
+		"terraform output -json", // the state is shown to be this install's
 		"eks describe-cluster",
-		"terraform output -json",
+		"terraform plan -destroy", // the sanity plan, while the database is still protected
 		"terraform apply -auto-approve -input=false -var-file=/ws/terraform.tfvars -var db_deletion_protection=false -target=module.rds.aws_db_instance.this",
 		"terraform state rm " + logGroupAddr,
-		"terraform plan -destroy",
 		"delete svc darkplum-web-lb",
 		"delete pvc model-cache",
 		"terraform destroy",
@@ -226,7 +226,7 @@ func TestDestroyFullRunOrder(t *testing.T) {
 	}
 	// Every terraform-side preparation precedes the first kubectl delete.
 	firstDelete := h.tl.first("delete svc")
-	for _, s := range []string{"db_deletion_protection=false", "state rm", "plan -destroy"} {
+	for _, s := range []string{"plan -destroy", "db_deletion_protection=false", "state rm"} {
 		if h.tl.first(s) > firstDelete {
 			t.Errorf("%q came after Kubernetes deletion began", s)
 		}
@@ -388,7 +388,7 @@ func TestDestroyConfirmation(t *testing.T) {
 		h.prompts = []string{""}
 		_ = h.run()
 		h.assertNothingDeleted()
-		if h.tf.ran("output") {
+		if h.tf.ran("plan") || h.tf.ran("apply") {
 			t.Error("preparation started before the confirmation")
 		}
 	})
@@ -466,7 +466,7 @@ func TestDestroyOnlyFlipsProtectionWhenTheDatabaseIsInTheState(t *testing.T) {
 			t.Errorf("a targeted apply would plan to CREATE a database that is not there: %v", c)
 		}
 	}
-	if h.tf.ran("output") {
+	if h.tl.count("terraform output") != 1 { // the ownership check only
 		t.Error("asked about a snapshot of a database that is not in the state")
 	}
 }
@@ -536,7 +536,7 @@ func TestDestroyForeignLoadBalancersAndVolumesAbortBeforeAnything(t *testing.T) 
 	}
 	h.assertNothingDeleted()
 	h.contains("team-a/grafana", "Nothing was deleted")
-	if h.tf.ran("output") {
+	if h.tf.ran("plan") {
 		t.Error("preparation started")
 	}
 }
@@ -721,5 +721,60 @@ func TestDestroyNoInstallRunsNothing(t *testing.T) {
 	}
 	if _, err := os.Stat(marker); err == nil {
 		t.Error("started a program with no install")
+	}
+}
+
+func TestDestroyRefusesAStateThatIsNotThisInstalls(t *testing.T) {
+	cases := map[string]string{
+		"another cluster":      outputsJSON(0, func(v map[string]any) { v["cluster_name"] = "prod-eks" }),
+		"another region":       outputsJSON(0, func(v map[string]any) { v["provider_region"] = "eu-west-1" }),
+		"resources, no output": "{}",
+	}
+	for name, out := range cases {
+		t.Run(name, func(t *testing.T) {
+			h := newDestroyHarness(t)
+			h.tf.outputs = out
+			if !IsReported(h.run()) {
+				t.Fatal("destroyed a state that is not this install's")
+			}
+			h.assertNothingDeleted()
+			if h.tf.ran("plan") || h.tl.count("kubectl") != 0 {
+				t.Error("went on")
+			}
+		})
+	}
+}
+
+func TestDestroySanityPlanComesBeforeAnythingIsChanged(t *testing.T) {
+	h := newDestroyHarness(t)
+	h.tf.streamErr["plan"] = errors.New("exit status 1")
+	if !IsReported(h.run()) {
+		t.Fatal("went on")
+	}
+	// The regression: a failing plan used to be found only after the database's
+	// deletion protection was off and the log group had left the state.
+	h.assertNothingDeleted()
+	if h.env.protectionOff {
+		t.Error("protection was turned off before the plan was known good")
+	}
+}
+
+func TestDestroyDowngradeGuard(t *testing.T) {
+	h := newDestroyHarness(t)
+	h.env.rec.Bundle, h.env.version = "1.4.0", "1.3.0"
+	if !IsReported(h.run()) {
+		t.Fatal("an older darkplum destroyed the install")
+	}
+	h.assertNothingDeleted()
+	if h.tl.count("terraform") != 0 {
+		t.Error("terraform started")
+	}
+	h2 := newDestroyHarness(t)
+	h2.env.rec.Bundle, h2.env.version = "1.4.0", "1.3.0"
+	h2.env.flags.AllowDowngrade = true
+	h2.aws.extra["rds describe-db-snapshots"] = `[]`
+	h2.aws.extra["logs describe-log-groups"] = "0"
+	if err := h2.run(); err != nil {
+		t.Fatal(err)
 	}
 }

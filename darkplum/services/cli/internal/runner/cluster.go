@@ -21,6 +21,12 @@ const Context = "darkplum"
 // created, or already destroyed).
 var ErrClusterNotFound = errors.New("cluster not found")
 
+// ErrClusterNotReady means the cluster exists but cannot be used yet: it is still
+// being created or updated into existence (no endpoint or certificate, or a status
+// other than ACTIVE or UPDATING). It is not a refusal to be obeyed: a deploy that
+// was interrupted is exactly in this state and must be able to continue.
+var ErrClusterNotReady = errors.New("cluster not ready")
+
 // Claim is what the install says its cluster is. Nothing in it is trusted until
 // Validate has checked it against AWS.
 type Claim struct {
@@ -272,7 +278,7 @@ func Validate(cl Claim, aws AWSFunc) (ValidatedCluster, error) {
 
 	// 2. Only now look at the cluster.
 	out, err := aws(ProfileArgs(cl.Profile, "eks", "describe-cluster", "--name", cl.Name, "--region", cl.Region,
-		"--query", "cluster.{endpoint:endpoint,ca:certificateAuthority.data,arn:arn}", "--output", "json")...)
+		"--query", "cluster.{endpoint:endpoint,ca:certificateAuthority.data,arn:arn,status:status}", "--output", "json")...)
 	if err != nil {
 		if strings.Contains(err.Error(), "ResourceNotFoundException") {
 			return refuse("cluster "+cl.Name+" does not exist in "+cl.Region, "deploy the install first",
@@ -285,14 +291,12 @@ func Validate(cl Claim, aws AWSFunc) (ValidatedCluster, error) {
 		Endpoint string `json:"endpoint"`
 		CA       string `json:"ca"`
 		ARN      string `json:"arn"`
+		Status   string `json:"status"`
 	}
 	if json.Unmarshal([]byte(out), &dc) != nil {
 		return refuse("unexpected answer describing cluster "+cl.Name, "check your AWS CLI version (2.x)", nil)
 	}
 	ca, cerr := base64.StdEncoding.DecodeString(dc.CA)
-	if !strings.HasPrefix(dc.Endpoint, "https://") || cerr != nil || len(ca) == 0 {
-		return refuse("cluster "+cl.Name+" has no usable endpoint or certificate yet", "wait for the deploy to finish, then re-run", nil)
-	}
 	arnAccount, ok := clusterARNAccount(dc.ARN, cl.Region, cl.Name)
 	if !ok {
 		return refuse("cluster ARN "+dc.ARN+" does not match "+cl.Name+" in "+cl.Region, "re-run ./bin/darkplum init", nil)
@@ -300,6 +304,18 @@ func Validate(cl Claim, aws AWSFunc) (ValidatedCluster, error) {
 	if arnAccount != caller {
 		return refuse(fmt.Sprintf("credentials are for account %s, the cluster is in %s", caller, arnAccount),
 			"use the profile for the install's account (re-run ./bin/darkplum init to change it)", nil)
+	}
+	// Only after the account is established: a cluster that is still being created
+	// in ANOTHER account is a refusal, not "not ready".
+	notReady := func(why string) (ValidatedCluster, error) {
+		return refuse("cluster "+cl.Name+" "+why, "wait for the deploy to finish, then re-run",
+			fmt.Errorf("%w: %s %s", ErrClusterNotReady, cl.Name, why))
+	}
+	if dc.Status != "" && dc.Status != "ACTIVE" && dc.Status != "UPDATING" {
+		return notReady("is " + dc.Status)
+	}
+	if !strings.HasPrefix(dc.Endpoint, "https://") || cerr != nil || len(ca) == 0 {
+		return notReady("has no usable endpoint or certificate yet")
 	}
 	return ValidatedCluster{&cluster{name: cl.Name, region: cl.Region, profile: cl.Profile, account: arnAccount,
 		endpoint: dc.Endpoint, ca: dc.CA}}, nil
