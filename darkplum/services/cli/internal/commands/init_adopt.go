@@ -225,8 +225,11 @@ func renameAside(stamp string, files ...string) ([][2]string, error) {
 // renderBackendHCL is the -backend-config file for `terraform init`: partial
 // configuration, so the bundle's Terraform carries no bucket names.
 func renderBackendHCL(b install.Backend) string {
+	return "# Written by `darkplum init --adopt`. Passed to terraform init as -backend-config.\n" + backendHCLBody(b)
+}
+
+func backendHCLBody(b install.Backend) string {
 	var buf bytes.Buffer
-	buf.WriteString("# Written by `darkplum init --adopt`. Passed to terraform init as -backend-config.\n")
 	fmt.Fprintf(&buf, "bucket       = %s\n", hclString(b.Bucket))
 	fmt.Fprintf(&buf, "key          = %s\n", hclString(b.Key))
 	fmt.Fprintf(&buf, "region       = %s\n", hclString(b.Region))

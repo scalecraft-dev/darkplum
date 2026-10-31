@@ -20,7 +20,7 @@ import (
 
 // InitCmd is `darkplum init`: prompt for the few choices that shape an install,
 // check them against the operator's own cloud account, and write
-// terraform.tfvars (and an S3 backend.tf). It deploys nothing — `make deploy`
+// terraform.tfvars (and the S3 backend settings in backend.hcl). It deploys nothing — `make deploy`
 // does that — and holds no credential: every cloud call is the operator's own
 // `aws` CLI.
 type InitCmd struct {
@@ -34,7 +34,6 @@ type InitCmd struct {
 	GPUCount      int    `help:"Number of GPU nodes (gpu mode); each self-hosted model takes one." name:"gpu-count" default:"1"`
 	ClusterName   string `help:"EKS cluster name; prefix of related resources." name:"cluster-name" default:"darkplum"`
 	Throwaway     bool   `help:"Test install: one-day backups, no deletion protection, no final snapshot. Never for real data."`
-	Backend       string `help:"Where Terraform keeps state: s3 (a versioned, KMS-encrypted bucket in your account; default) or local (plain-text file; not for synced folders)." enum:"s3,local," default:""`
 	Offline       bool   `help:"Make no Hugging Face call. A model outside the catalog then needs --model-revision."`
 	Yes           bool   `help:"Take every default and ask nothing (for scripts). Refuses to overwrite or accept a gated model."`
 	DryRun        bool   `help:"Run the checks and print what would be written and created, without writing or creating anything." name:"dry-run" aliases:"stdout"`
@@ -156,9 +155,6 @@ func (c *InitCmd) missingFlagsError() error {
 	if c.Mode == "" && c.Model == "" {
 		missing = append(missing, "--mode bedrock|gpu")
 	}
-	if c.Backend == "" {
-		missing = append(missing, "--backend s3|local")
-	}
 	if c.Domain == "" {
 		missing = append(missing, "--domain <a domain you control>")
 	}
@@ -176,7 +172,6 @@ type settings struct {
 	gpuCount                          int
 	geo, bedrockRegion                string
 	throwaway                         bool
-	backend                           string // "s3" | "local"
 	liveChecked                       string // cluster name the live-install lookup already ran for
 	web                               webSettings
 	checks                            []checkResult
@@ -248,6 +243,13 @@ func (c *InitCmd) execute(env *initEnv) error {
 	}
 	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
 		return env.fail("terraform root", dir, "run from the darkplum/ directory or pass --dir", "no Terraform root at "+dir)
+	}
+
+	// A backend.tf here is a Makefile-era install: its state is already somewhere,
+	// and init no longer writes Terraform code into the checkout. Adopt it first.
+	if _, err := os.Stat(filepath.Join(dir, "backend.tf")); err == nil {
+		return env.fail("existing install", filepath.Join(dir, "backend.tf")+" is from the Makefile flow",
+			"run `darkplum init --adopt` to take this install over (its state stays where it is)", "this directory holds an install from the Makefile flow; run darkplum init --adopt")
 	}
 
 	// An install from before the private address: offer to add just that.
@@ -463,27 +465,6 @@ func (c *InitCmd) execute(env *initEnv) error {
 	}
 	s.cluster = cluster
 
-	// Backend.
-	backend := c.Backend
-	if backend == "" {
-		backend = "s3"
-		if env.interactive {
-			i, err := env.prompt.Select("Where should Terraform keep its state?", []Option{
-				{"S3 bucket in your account", "versioned, KMS-encrypted, private; recommended"},
-				{"Local file", "plain text on this machine; holds the database password"},
-			}, 0)
-			if err != nil {
-				return err
-			}
-			backend = []string{"s3", "local"}[i]
-		}
-	}
-	s.backend = backend
-	if backend == "local" {
-		record(checkResult{name: "terraform state", status: checkWarn, detail: "local file",
-			hint: "terraform.tfstate holds the RDS password in plain text: keep it out of Dropbox/iCloud/git and back it up"})
-	}
-
 	return c.finish(env, s, dir, cloud)
 }
 
@@ -692,7 +673,7 @@ func (s *settings) tfvars() []tfvarsKV {
 	return kv
 }
 
-// existingBackend reads the bucket, key and region named in an existing backend.tf.
+// existingBackend reads the bucket, key and region named in an existing backend.hcl.
 func existingBackend(path string) (bucket, key, region string, ok bool) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -732,16 +713,13 @@ func localStateResources(dir string) int {
 func (c *InitCmd) finish(env *initEnv, s *settings, dir string, cloud initCloud) error {
 	w := env.out
 	tfvarsPath := filepath.Join(dir, "terraform.tfvars")
-	backendPath := filepath.Join(dir, "backend.tf")
+	backendPath := filepath.Join(dir, backendFileName)
 
 	// Where state lives: kept from backend.tf, an existing Darkplum bucket, or a
 	// new one (init_state.go). May rename the cluster, so tfvars renders after.
-	var plan statePlan
-	if s.backend == "s3" {
-		var err error
-		if plan, err = c.planState(env, s, dir, cloud); err != nil {
-			return err
-		}
+	plan, err := c.planState(env, s, dir, cloud)
+	if err != nil {
+		return err
 	}
 	bucket, reused, st := plan.bucket, plan.kept, plan.st
 	tfvarsText := renderTFVars(s.tfvars(), env.now())
@@ -749,33 +727,24 @@ func (c *InitCmd) finish(env *initEnv, s *settings, dir string, cloud initCloud)
 	if spec.KMSKeyARN == "" {
 		spec.KMSKeyARN = kmsKeyPlaceholder
 	}
-	localResources := 0
-	if s.backend == "s3" {
-		localResources = localStateResources(dir)
-	}
+	localResources := localStateResources(dir)
 	_, backendExists := os.Stat(backendPath)
-	switchingToLocal := s.backend == "local" && backendExists == nil
 
 	fmt.Fprintln(w)
 	if c.DryRun {
 		fmt.Fprintf(w, "%s\n%s\n", sHeader("terraform.tfvars (dry run — not written)"), tfvarsText)
-		if s.backend == "s3" {
-			fmt.Fprintf(w, "%s\n%s\n", sHeader("backend.tf (dry run — not written)"), renderBackend(spec))
-			fmt.Fprintf(w, "%s\n", sHeader("read-only pre-checks that ran"))
-			for _, ch := range st.Checks {
-				fmt.Fprintf(w, "  %s\n", sDim(ch))
-			}
-			fmt.Fprintf(w, "\n%s\n", sHeader("would run in account "+s.account+" (dry run — nothing run)"))
-			for _, cmd := range plannedBackendCommands(s.profile, s.account, bucket, s.region, st) {
-				fmt.Fprintf(w, "  %s\n", sDim(formatAWS(cmd)))
-			}
-			fmt.Fprintf(w, "\n  %s %s\n\n", sWarn("!"), kmsWarning)
+		fmt.Fprintf(w, "%s\n%s\n", sHeader(backendFileName+" (dry run — not written)"), renderBackend(spec))
+		fmt.Fprintf(w, "%s\n", sHeader("read-only pre-checks that ran"))
+		for _, ch := range st.Checks {
+			fmt.Fprintf(w, "  %s\n", sDim(ch))
 		}
+		fmt.Fprintf(w, "\n%s\n", sHeader("would run in account "+s.account+" (dry run — nothing run)"))
+		for _, cmd := range plannedBackendCommands(s.profile, s.account, bucket, s.region, st) {
+			fmt.Fprintf(w, "  %s\n", sDim(formatAWS(cmd)))
+		}
+		fmt.Fprintf(w, "\n  %s %s\n\n", sWarn("!"), kmsWarning)
 		if s.web.createZone {
 			fmt.Fprintf(w, "  %s would create the public hosted zone %s, show its 4 NS records to add at your DNS provider, and wait until they resolve\n\n", sWarn("!"), s.web.hostname)
-		}
-		if switchingToLocal {
-			fmt.Fprintf(w, "  %s would rename %s to backend.tf.bak (state stays in S3; see terraform init -migrate-state)\n\n", sWarn("!"), backendPath)
 		}
 		if localResources > 0 {
 			fmt.Fprintf(w, "  %s %d resources in local state would NOT move to S3 automatically; after writing, run: cd %s && terraform init -migrate-state\n\n", sWarn("!"), localResources, dir)
@@ -790,14 +759,14 @@ func (c *InitCmd) finish(env *initEnv, s *settings, dir string, cloud initCloud)
 		return nil
 	}
 
-	// Overwrite guard (a reused backend.tf names the same bucket, so it is not
+	// Overwrite guard (a reused backend.hcl names the same bucket, so it is not
 	// an overwrite worth asking about).
 	var existing []string
 	if _, err := os.Stat(tfvarsPath); err == nil {
 		existing = append(existing, "terraform.tfvars")
 	}
-	if s.backend == "s3" && backendExists == nil && !reused {
-		existing = append(existing, "backend.tf")
+	if backendExists == nil && !reused {
+		existing = append(existing, backendFileName)
 	}
 	if len(existing) > 0 && !c.Force {
 		if !env.interactive {
@@ -813,7 +782,7 @@ func (c *InitCmd) finish(env *initEnv, s *settings, dir string, cloud initCloud)
 	}
 
 	// Existing local state does not follow to S3: migrating is a manual step, so
-	// make the operator acknowledge it BEFORE backend.tf is written.
+	// make the operator acknowledge it BEFORE backend.hcl is written.
 	if localResources > 0 {
 		cmd := "cd " + dir + " && terraform init -migrate-state"
 		printCheckTo(w, checkResult{name: "local state", status: checkWarn, detail: fmt.Sprintf("%d resources in %s", localResources, filepath.Join(dir, "terraform.tfstate")),
@@ -838,7 +807,7 @@ func (c *InitCmd) finish(env *initEnv, s *settings, dir string, cloud initCloud)
 	}
 	if env.interactive {
 		what := "Save these settings?"
-		if s.backend == "s3" && !st.BucketExists {
+		if !st.BucketExists {
 			what = fmt.Sprintf("Save these settings? This creates a private, encrypted bucket in account %s to hold the install's state", s.account)
 		}
 		if s.web.createZone {
@@ -854,32 +823,22 @@ func (c *InitCmd) finish(env *initEnv, s *settings, dir string, cloud initCloud)
 	}
 
 	var wrote []string
-	if switchingToLocal {
-		if err := os.Rename(backendPath, backendPath+".bak"); err != nil {
-			return reportedErr("could not move %s aside: %v", backendPath, err)
-		}
-		_ = os.Chmod(backendPath+".bak", 0o600)
-		printCheckTo(w, checkResult{name: "backend.tf", status: checkWarn, detail: "moved to backend.tf.bak",
-			hint: "terraform now uses local state; existing S3 state stays in the bucket. To bring it local run: cd " + dir + " && terraform init -migrate-state"})
+	fmt.Fprintf(w, "%s preparing state bucket %s…\n", sDim("…"), bucket)
+	arn, err := cloud.CreateBackend(bucket, s.region, st)
+	if err != nil {
+		return env.fail("state bucket", firstLine(err.Error()), "needs s3:CreateBucket/PutBucket* and kms:CreateKey/CreateAlias in "+s.region+"; re-run init (it reuses what was created)", "could not create the state backend")
 	}
-	if s.backend == "s3" {
-		fmt.Fprintf(w, "%s preparing state bucket %s…\n", sDim("…"), bucket)
-		arn, err := cloud.CreateBackend(bucket, s.region, st)
-		if err != nil {
-			return env.fail("state bucket", firstLine(err.Error()), "needs s3:CreateBucket/PutBucket* and kms:CreateKey/CreateAlias in "+s.region+"; re-run init (it reuses what was created), or use --backend local", "could not create the state backend")
+	spec.KMSKeyARN = arn
+	if plan.staleEmpty {
+		if err := setAsideBackendCache(dir, env.now()); err != nil {
+			return reportedErr("could not set aside Terraform's saved backend settings in %s: %v", filepath.Join(dir, ".terraform"), err)
 		}
-		spec.KMSKeyARN = arn
-		if plan.staleEmpty {
-			if err := setAsideBackendCache(dir, env.now()); err != nil {
-				return reportedErr("could not set aside Terraform's saved backend settings in %s: %v", filepath.Join(dir, ".terraform"), err)
-			}
-			fmt.Fprintf(w, "  %s\n", sDim("set aside Terraform's saved settings for the earlier, empty state at "+plan.cache.url()))
-		}
-		if err := writeFileAtomic(backendPath, []byte(renderBackend(spec))); err != nil {
-			return err
-		}
-		wrote = append(wrote, backendPath)
+		fmt.Fprintf(w, "  %s\n", sDim("set aside Terraform's saved settings for the earlier, empty state at "+plan.cache.url()))
 	}
+	if err := writeFileAtomic(backendPath, []byte(renderBackend(spec))); err != nil {
+		return err
+	}
+	wrote = append(wrote, backendPath)
 	if s.web.createZone {
 		if err := c.createAndDelegate(env, s, cloud); err != nil {
 			return err
@@ -891,9 +850,7 @@ func (c *InitCmd) finish(env *initEnv, s *settings, dir string, cloud initCloud)
 	}
 	wrote = append(wrote, tfvarsPath)
 	fmt.Fprintln(w)
-	if s.backend == "s3" {
-		fmt.Fprintf(w, "  %s %s\n", sWarn("!"), kmsWarning)
-	}
+	fmt.Fprintf(w, "  %s %s\n", sWarn("!"), kmsWarning)
 	if plan.staleLive != nil {
 		fmt.Fprintf(w, "  %s before make deploy, move the earlier state: %s\n", sWarn("!"), sCmd(migrateCmd(dir, s.profile)))
 	}

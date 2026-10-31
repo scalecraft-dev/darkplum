@@ -14,7 +14,7 @@ import (
 // anything is written.
 type statePlan struct {
 	bucket, key string
-	kept        bool // bucket and key come from an existing backend.tf
+	kept        bool // bucket and key come from an existing backend.hcl
 	st          backendState
 
 	// Terraform's saved backend settings (.terraform/terraform.tfstate) naming
@@ -30,19 +30,19 @@ func cacheExists(dir string) bool {
 	return err == nil
 }
 
-// isFreshCheckout: no backend.tf and no saved backend settings, so nothing
+// isFreshCheckout: no backend.hcl and no saved backend settings, so nothing
 // local says which state this checkout manages.
 func isFreshCheckout(dir string) bool {
-	_, err := os.Stat(filepath.Join(dir, "backend.tf"))
+	_, err := os.Stat(filepath.Join(dir, backendFileName))
 	return err != nil && !cacheExists(dir)
 }
 
 // preflightLiveInstall runs the live-install lookup for the requested cluster
 // name before the name-collision check, so a fresh checkout of a live install
-// is told to restore its backend.tf instead of being offered "<name>-2".
+// is told to restore its backend.hcl instead of being offered "<name>-2".
 // Read-only.
 func (c *InitCmd) preflightLiveInstall(env *initEnv, s *settings, dir string, cloud initCloud) error {
-	if c.Backend == "local" || !isFreshCheckout(dir) {
+	if !isFreshCheckout(dir) {
 		return nil
 	}
 	return c.checkLiveInstall(env, s, dir, cloud)
@@ -58,8 +58,8 @@ func (c *InitCmd) checkLiveInstall(env *initEnv, s *settings, dir string, cloud 
 	names, err := cloud.PrefixBuckets(s.region)
 	if err != nil {
 		return env.fail("existing install", "could not list state buckets: "+firstLine(err.Error()),
-			"with no backend.tf here, init must check this account for an existing install first: grant s3:ListAllMyBuckets (and s3:ListBucket on "+
-				stateBucketPrefix(s.account, s.region)+"*), or pass --backend local",
+			"with no backend.hcl here, init must check this account for an existing install first: grant s3:ListAllMyBuckets (and s3:ListBucket on "+
+				stateBucketPrefix(s.account, s.region)+"*), or run `darkplum init --dry-run` to see what it needs",
 			"cannot check for an existing install")
 	}
 	return c.findLiveInstall(env, s, dir, cloud, names)
@@ -67,7 +67,7 @@ func (c *InitCmd) checkLiveInstall(env *initEnv, s *settings, dir string, cloud 
 
 // findLiveInstall stops when any of the buckets already keeps non-empty state
 // for this cluster (its own key, or the legacy key when the state there names
-// this cluster or no cluster at all), and prints the backend.tf that lets this
+// this cluster or no cluster at all), and prints the backend.hcl that lets this
 // checkout manage that install. Any bucket with the Darkplum prefix counts,
 // whatever its versioning, tags or public-access settings: those decide reuse
 // for a new install, not whether an install exists.
@@ -105,7 +105,7 @@ func (c *InitCmd) findLiveInstall(env *initEnv, s *settings, dir string, cloud i
 			if sc.ClusterName == "" && k == legacyStateKey {
 				who = "an install whose cluster name cannot be read (it may be " + s.cluster + ")"
 			}
-			hint := who + " already exists and keeps its state there: this is that install, not a name clash. To manage it from this checkout, save the following as backend.tf in " + dir +
+			hint := who + " already exists and keeps its state there: this is that install, not a name clash. To manage it from this checkout, save the following as backend.hcl in " + dir +
 				" and re-run init (it keeps an existing backend's bucket, key and region)"
 			if k != legacyStateKey {
 				hint += "; to install beside it instead, pass another --cluster-name"
@@ -184,7 +184,7 @@ func migrateCmd(dir, profile string) string {
 // backend settings. Read-only: it may ask questions, but creates, moves and
 // writes nothing.
 //
-//   - An existing backend.tf for this account and region is kept exactly, bucket
+//   - An existing backend.hcl for this account and region is kept exactly, bucket
 //     and key: re-running init never moves an install's state.
 //   - Otherwise a Darkplum state bucket already in the account and region is
 //     reused (one: silently; several: the one the saved settings name, else
@@ -209,7 +209,7 @@ func (c *InitCmd) planState(env *initEnv, s *settings, dir string, cloud initClo
 		cache = nil // local state is handled by the local-state check
 	}
 
-	backendPath := filepath.Join(dir, "backend.tf")
+	backendPath := filepath.Join(dir, backendFileName)
 	_, statErr := os.Stat(backendPath)
 	hasBackendTF := statErr == nil
 	freshCheckout := !hasBackendTF && cache == nil && !cacheExists(dir)
@@ -219,7 +219,7 @@ func (c *InitCmd) planState(env *initEnv, s *settings, dir string, cloud initClo
 		p.bucket, p.key, p.kept, reused = eb, ek, true, true
 		note = "same bucket, key and region"
 	} else {
-		// A checkout with no backend.tf and no saved settings may be a fresh
+		// A checkout with no backend.hcl and no saved settings may be a fresh
 		// clone of a live install: find its state before choosing anything, so
 		// a reinstall never quietly becomes a second install beside it.
 		if freshCheckout && s.liveChecked != s.cluster {
@@ -232,8 +232,8 @@ func (c *InitCmd) planState(env *initEnv, s *settings, dir string, cloud initClo
 		if err != nil {
 			if freshCheckout {
 				return p, env.fail("state buckets", "could not list: "+firstLine(err.Error()),
-					"with no backend.tf here, init must see this account's state buckets: grant s3:ListAllMyBuckets (and read access to "+
-						stateBucketPrefix(s.account, s.region)+"* and "+stateKeyAlias+"), or pass --backend local",
+					"with no backend.hcl here, init must see this account's state buckets: grant s3:ListAllMyBuckets (and read access to "+
+						stateBucketPrefix(s.account, s.region)+"* and "+stateKeyAlias+"), or run `darkplum init --dry-run` to see what it needs",
 					"cannot list state buckets")
 			}
 			// Saved settings pin where this checkout's state is; a new bucket is safe.
@@ -264,7 +264,7 @@ func (c *InitCmd) planState(env *initEnv, s *settings, dir string, cloud initClo
 	fmt.Fprintf(w, "%s checking state bucket %s and key %s…\n", sDim("…"), p.bucket, stateKeyAlias)
 	st, err := cloud.Inspect(p.bucket, s.region)
 	if err != nil {
-		return p, env.fail("state bucket", firstLine(err.Error()), "fix the above, pick --backend local, or remove the bucket named in backend.tf", "cannot use the state backend")
+		return p, env.fail("state bucket", firstLine(err.Error()), "fix the above, or remove the bucket named in backend.hcl", "cannot use the state backend")
 	}
 	p.st = st
 	if p.kept && st.BucketExists && st.Versioning != "" && st.Versioning != "Enabled" {

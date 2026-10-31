@@ -126,13 +126,15 @@ type: it keeps a `.bak` copy of the previous file, then run `make deploy` again.
 first (session lifetime, account match, GPU quota).
 
 `init` keeps Terraform state in a versioned, KMS-encrypted, private S3 bucket in
-your own account (`--backend local` opts out; local state holds the database
-password in plain text, so keep it out of synced folders). It also pins the AWS
+your own account. It also pins the AWS
 provider to your account (`allowed_account_ids`), so credentials for another
-account fail at plan time. Preview everything with `darkplum init --dry-run`. The profile is not stored
-in `backend.tf`; `make deploy` passes it to `terraform init`. If you run
-`terraform init` yourself, add `-backend-config=profile=<your-profile>` (or set
-`AWS_PROFILE`). Never delete the `alias/darkplum-tfstate` KMS key: it makes all
+account fail at plan time. Preview everything with `darkplum init --dry-run`. The
+bucket, key and region are written to `backend.hcl` and handed to Terraform as
+partial backend configuration: the Terraform code only declares `backend "s3" {}`.
+`make deploy` passes `-backend-config=backend.hcl` and the profile to `terraform init`. If you run
+`terraform init` yourself (or from a GitOps pipeline), use
+`terraform init -backend-config=backend.hcl -backend-config=profile=<your-profile>`
+(or set `AWS_PROFILE`). Never delete the `alias/darkplum-tfstate` KMS key: it makes all
 state in the bucket unrecoverable. Installs in the same account and region share
 the state bucket and KMS key (each under its own `darkplum/aws/<cluster>/` key),
 so they are one trust domain; installs that must not trust each other need

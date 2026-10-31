@@ -42,10 +42,10 @@ TFVARS_AWS_PROFILE := $(shell sed -nE 's/^[[:space:]]*aws_profile[[:space:]]*=[[
 ifneq ($(TFVARS_AWS_PROFILE),)
 export AWS_PROFILE ?= $(TFVARS_AWS_PROFILE)
 endif
-# backend.tf (written by `darkplum init`) deliberately omits the AWS profile, so
-# pass it to terraform init here. Only when backend.tf exists: a local-state
-# install has no backend block to configure.
-TF_INIT_BACKEND := $(if $(and $(TFVARS_AWS_PROFILE),$(wildcard $(TF_DIR)/backend.tf)),'-backend-config=profile=$(TFVARS_AWS_PROFILE)')
+# backend.hcl (written by `darkplum init`) supplies the S3 state bucket, key and
+# region to the `backend "s3" {}` block in versions.tf; it deliberately omits the
+# AWS profile, so pass that to terraform init here too.
+TF_INIT_BACKEND := -backend-config=backend.hcl $(if $(TFVARS_AWS_PROFILE),'-backend-config=profile=$(TFVARS_AWS_PROFILE)')
 # The session must outlast the install: ~90 minutes with a GPU model, ~30 for a
 # Bedrock-only one (gpu_desired_size = 0). Override: make deploy MIN_SESSION=45
 TFVARS_GPU := $(shell sed -nE 's/^[[:space:]]*gpu_desired_size[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' $(TF_DIR)/terraform.tfvars 2>/dev/null | tail -1)

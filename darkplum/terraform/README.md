@@ -16,13 +16,17 @@ terraform/
 
 ```bash
 # AWS
-./bin/darkplum init         # writes terraform/aws/terraform.tfvars (and backend.tf)
+./bin/darkplum init         # writes terraform/aws/terraform.tfvars and backend.hcl (the S3 state settings)
 make deploy                 # init, apply and the platform deploy
 ```
 
 `terraform.tfvars` is written by `darkplum init`; `terraform.tfvars.example` is
 an advanced reference for teams that manage tfvars from their own pipeline.
-Driving `terraform` by hand is fine once `init` has written the files.
+Driving `terraform` by hand is fine once `init` has written the files. The
+state backend is declared as `backend "s3" {}` in `aws/versions.tf` with no settings;
+always initialise with `terraform init -backend-config=backend.hcl` (add
+`-backend-config=profile=<profile>` when you use a named profile). Without it
+Terraform stops and asks for a bucket.
 
 The `Makefile` in `darkplum/` drives the full install and selects the cloud
 via `CLOUD` (defaults to `aws`):

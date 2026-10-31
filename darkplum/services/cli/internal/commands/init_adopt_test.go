@@ -20,7 +20,7 @@ const (
 )
 
 func legacyBackend() string {
-	return renderBackend(backendSpec{Bucket: adoptBucket, Key: adoptKey, Region: "us-east-2", KMSKeyARN: adoptKMS})
+	return legacyBackendTF(backendSpec{Bucket: adoptBucket, Key: adoptKey, Region: "us-east-2", KMSKeyARN: adoptKMS})
 }
 
 // legacyRoot is a Makefile-era Terraform root: backend.tf + terraform.tfvars,
@@ -142,12 +142,12 @@ func TestAdoptRefusals(t *testing.T) {
 		"settings name no region": {backend: legacyBackend(), detail: "no region",
 			tfvars: "cluster_name = \"dp-trial\"\nallowed_account_ids = [\"123456789012\"]\n"},
 		"state bucket in another region": {tfvars: pinnedTFVars, detail: "the state bucket is in eu-west-1",
-			backend: renderBackend(backendSpec{Bucket: adoptBucket, Key: adoptKey, Region: "eu-west-1", KMSKeyARN: adoptKMS})},
+			backend: legacyBackendTF(backendSpec{Bucket: adoptBucket, Key: adoptKey, Region: "eu-west-1", KMSKeyARN: adoptKMS})},
 		// someone else's state: the bucket belongs to another account than the install pins
 		"state bucket from another account": {tfvars: pinnedTFVars, detail: "belongs to account 999999999999",
-			backend: renderBackend(backendSpec{Bucket: "darkplum-tfstate-999999999999-us-east-2-a1b2c3", Key: adoptKey, Region: "us-east-2", KMSKeyARN: adoptKMS})},
+			backend: legacyBackendTF(backendSpec{Bucket: "darkplum-tfstate-999999999999-us-east-2-a1b2c3", Key: adoptKey, Region: "us-east-2", KMSKeyARN: adoptKMS})},
 		"state bucket from another region by name": {tfvars: pinnedTFVars, detail: "belongs to account 123456789012 in eu-west-1",
-			backend: renderBackend(backendSpec{Bucket: "darkplum-tfstate-123456789012-eu-west-1-a1b2c3", Key: adoptKey, Region: "us-east-2", KMSKeyARN: adoptKMS})},
+			backend: legacyBackendTF(backendSpec{Bucket: "darkplum-tfstate-123456789012-eu-west-1-a1b2c3", Key: adoptKey, Region: "us-east-2", KMSKeyARN: adoptKMS})},
 		"terraform last used a different state": {tfvars: pinnedTFVars, backend: legacyBackend(), detail: "half-way between two states",
 			mutate: func(t *testing.T, dir string) {
 				cache := `{"version":3,"backend":{"type":"s3","config":{"bucket":"darkplum-tfstate-123456789012-us-east-2-ffffff","key":"darkplum/aws/dp-trial/terraform.tfstate","region":"us-east-2"}}}`
@@ -333,4 +333,19 @@ func TestBackendHCLQuotesHostileValues(t *testing.T) {
 	if strings.Contains(got, "kms_key_id") {
 		t.Error("kms_key_id written when there is none")
 	}
+}
+
+// legacyBackendTF is the backend.tf the Makefile-era init wrote: the same settings
+// inside a terraform { backend "s3" { ... } } block.
+func legacyBackendTF(s backendSpec) string {
+	var b strings.Builder
+	b.WriteString("terraform {\n  backend \"s3\" {\n")
+	for _, l := range strings.Split(strings.TrimSpace(renderBackend(s)), "\n") {
+		if strings.HasPrefix(l, "#") {
+			continue
+		}
+		b.WriteString("    " + l + "\n")
+	}
+	b.WriteString("  }\n}\n")
+	return b.String()
 }

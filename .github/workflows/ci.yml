@@ -136,9 +136,11 @@ jobs:
       - run: terraform init -backend=false -input=false
       - run: terraform validate
       # What `darkplum init` writes must be valid Terraform. Render a sample
-      # tfvars (hostile profile name included) and backend.tf from the Go code,
-      # validate the config with that backend.tf, then check Terraform reads the
-      # hostile value back unchanged.
+      # tfvars (hostile profile name included) and backend.hcl from the Go code,
+      # validate the config (which declares backend "s3" {} and nothing else),
+      # check Terraform parses and formats backend.hcl as written (attribute-only
+      # HCL, so it is checked under a .tfvars name), then check Terraform reads
+      # the hostile value back unchanged.
       - uses: actions/setup-go@v5
         with:
           go-version-file: darkplum/services/cli/go.mod
@@ -148,10 +150,10 @@ jobs:
         run: |
           samples="$RUNNER_TEMP/samples"; mkdir -p "$samples"
           (cd ../../services/cli && DARKPLUM_RENDER_SAMPLES="$samples" go test ./internal/commands -run TestWriteRenderedSamples -count=1)
-          cp "$samples/backend.tf" backend.tf
           terraform init -backend=false -input=false -reconfigure
           terraform validate
-          rm backend.tf
+          cp "$samples/backend.hcl" "$samples/backend-check.tfvars"
+          terraform fmt -check -diff "$samples/backend-check.tfvars"
           terraform init -backend=false -input=false -reconfigure
           # Read the value back with the variable declarations only: in the full
           # config, `terraform console` configures the AWS provider, which waits on

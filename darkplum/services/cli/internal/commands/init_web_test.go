@@ -276,7 +276,7 @@ func TestInitReRunKeepsTheWebAddress(t *testing.T) {
 					// Domain (Enter keeps it), networks (Enter keeps them), save.
 					env, o := testEnv(t, cloud, nil, "\n\n\n")
 					env.now = time.Now
-					c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Profile: "acme", Region: "us-east-2", Mode: "bedrock", Backend: "local", Force: true}
+					c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Profile: "acme", Region: "us-east-2", Mode: "bedrock", Force: true}
 					err = c.execute(env)
 					out = o.String()
 				}

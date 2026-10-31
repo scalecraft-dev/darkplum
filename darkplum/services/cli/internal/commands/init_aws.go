@@ -191,7 +191,7 @@ func firstLine(s string) string {
 }
 
 // stateBucketName: the random suffix keeps the globally unique S3 namespace from
-// being squatted or colliding; a re-run reuses the name recorded in backend.tf,
+// being squatted or colliding; a re-run reuses the name recorded in backend.hcl,
 // and a new install reuses an existing Darkplum bucket (StateBuckets).
 func stateBucketName(account, region, suffix string) string {
 	return stateBucketPrefix(account, region) + suffix
@@ -210,7 +210,7 @@ func stateKeyFor(cluster string) string {
 const (
 	stateKeyAlias = "alias/darkplum-tfstate"
 	// legacyStateKey is the key every install used before the cluster name was
-	// part of it. An existing backend.tf keeps whatever key it names.
+	// part of it. An existing backend.hcl keeps whatever key it names.
 	legacyStateKey    = "darkplum/aws/terraform.tfstate"
 	kmsKeyPlaceholder = "<kms-key-arn>"
 	kmsWarning        = "Deleting the KMS key alias/darkplum-tfstate makes every state file in the bucket unrecoverable."
@@ -599,7 +599,7 @@ func formatAWS(args []string) string {
 }
 
 // CreateBackend creates what Inspect found missing and returns the KMS key ARN
-// for backend.tf. The alias is created immediately after the key and the key is
+// for backend.hcl. The alias is created immediately after the key and the key is
 // scheduled for deletion if that fails, so a re-run can never accumulate keys.
 func (a *awsCloud) CreateBackend(bucket, region string, st backendState) (string, error) {
 	arn := st.KeyARN

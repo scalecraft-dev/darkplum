@@ -43,6 +43,10 @@ run "lifecycle_keeps_tagged_images_and_expires_only_untagged" {
     condition     = jsondecode(aws_ecr_lifecycle_policy.this["api"].policy).rules[1].selection.countNumber == 20
     error_message = "Default retention is the last 20 tagged images."
   }
+  assert {
+    condition     = join(",", jsondecode(aws_ecr_lifecycle_policy.this["api"].policy).rules[1].selection.tagPatternList) == "*.*.*,rc-*"
+    error_message = "Count-based expiry must only ever match version tags (X.Y.Z and rc-N-sha), never an arbitrary tag."
+  }
 }
 
 run "retention_below_two_is_rejected" {

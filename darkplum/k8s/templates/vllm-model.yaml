@@ -54,7 +54,7 @@ spec:
         - name: model-download
           # The pinned vLLM image already ships huggingface_hub, so the download
           # needs no `pip install` at start-up and no second third-party image. Its
-          # entrypoint is the API server, hence the explicit command. Runs as an
+          # entrypoint is the API server, hence the explicit command. The init container runs as an
           # unprivileged user: nothing here needs root, and /model (an emptyDir) is
           # writable by anyone.
           image: vllm/vllm-openai:v0.6.6@sha256:6956052a3491118df885b37e240abebaf839b62495c3d54e617cb8401c54717b
@@ -63,6 +63,7 @@ spec:
             runAsNonRoot: true
             runAsUser: 65532
             runAsGroup: 65532
+            readOnlyRootFilesystem: true
             capabilities:
               drop: ["ALL"]
           command:

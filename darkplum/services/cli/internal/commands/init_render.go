@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/scalecraft-dev/darkplum/cli/internal/install"
 )
 
 // tfvarsKV is one rendered variable. Value is a Go string, int, bool or []string.
@@ -87,23 +89,24 @@ func renderTFVars(kvs []tfvarsKV, now time.Time) string {
 	return b.String()
 }
 
-// backendSpec is the S3 backend written to backend.tf.
+// backendFileName is the partial backend configuration init writes next to
+// terraform.tfvars. The Terraform code declares `backend "s3" {}` and nothing
+// else; this file supplies the bucket, key and region (terraform init
+// -backend-config=backend.hcl), so the code that ships in the binary never
+// names a customer's bucket and nothing is ever written into it.
+const backendFileName = "backend.hcl"
+
+// backendSpec is the S3 backend written to backend.hcl.
 type backendSpec struct {
 	Bucket, Key, Region, KMSKeyARN string
 }
 
 func renderBackend(s backendSpec) string {
-	var b strings.Builder
-	b.WriteString("# Written by `darkplum init`: Terraform state lives in a versioned, KMS-encrypted,\n# private S3 bucket in your own account. Native S3 locking needs Terraform >= 1.10.\n# The AWS profile is not stored here: make deploy passes it with -backend-config=profile=...\n# WARNING: deleting the KMS key alias/darkplum-tfstate makes this state unrecoverable.\n")
-	b.WriteString("terraform {\n  backend \"s3\" {\n")
-	fmt.Fprintf(&b, "    bucket       = %s\n", hclString(s.Bucket))
-	fmt.Fprintf(&b, "    key          = %s\n", hclString(s.Key))
-	fmt.Fprintf(&b, "    region       = %s\n", hclString(s.Region))
-	b.WriteString("    encrypt      = true\n")
-	fmt.Fprintf(&b, "    kms_key_id   = %s\n", hclString(s.KMSKeyARN))
-	b.WriteString("    use_lockfile = true\n")
-	b.WriteString("  }\n}\n")
-	return b.String()
+	return "# Written by `darkplum init`: Terraform state lives in a versioned, KMS-encrypted,\n" +
+		"# private S3 bucket in your own account. Native S3 locking needs Terraform >= 1.10.\n" +
+		"# Passed to terraform init as -backend-config=backend.hcl (the AWS profile is added separately).\n" +
+		"# WARNING: deleting the KMS key alias/darkplum-tfstate makes this state unrecoverable.\n" +
+		backendHCLBody(install.Backend{Bucket: s.Bucket, Key: s.Key, Region: s.Region, KMSKeyID: s.KMSKeyARN, Encrypt: true, UseLockfile: true})
 }
 
 // writeFileAtomic writes data to path with mode 0600 via temp file + rename, so

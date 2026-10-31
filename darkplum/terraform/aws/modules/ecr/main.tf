@@ -47,10 +47,13 @@ resource "aws_ecr_lifecycle_policy" "this" {
       },
       {
         rulePriority = 2
-        description  = "Keep the last ${var.keep_tagged_images} tagged images"
+        description  = "Keep the last ${var.keep_tagged_images} version-tagged images"
         selection = {
-          tagStatus      = "tagged"
-          tagPatternList = ["*"]
+          tagStatus = "tagged"
+          # Only version tags: the mirror pushes X.Y.Z (releases) and rc-N-sha
+          # (release candidates) and never tags anything else, so nothing else is
+          # ever pruned by count. ECR patterns only know "*".
+          tagPatternList = ["*.*.*", "rc-*"]
           countType      = "imageCountMoreThan"
           countNumber    = var.keep_tagged_images
         }
