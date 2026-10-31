@@ -93,7 +93,7 @@ The rc build uses the prerelease identity, so it does not prove the release path
 
 ## After merge: smoke gate before anyone is told
 
-The first real tag is cut and left as a **draft**. Until this checklist passes, nothing is published, README install instructions are not switched to the new flow, nothing is announced, and the brew tap is not bumped:
+The first real tag is cut and left as a **draft**. Until this checklist passes, nothing is published, the install instructions in the READMEs (which already describe `brew install scalecraft-dev/tap/darkplum` and the manual download) are not linked or announced, and the brew tap is not bumped. Until the first release exists those instructions describe a flow no one can follow yet, so do not publish the docs ahead of the release:
 
 - [ ] Download the draft's artifacts with a clean `HOME` (no `~/.darkplum`, no `~/.terraform.d`, no `~/.kube`).
 - [ ] `darkplum version` shows channel `release`, the tag, and three digests.
@@ -101,11 +101,11 @@ The first real tag is cut and left as a **draft**. Until this checklist passes, 
 - [ ] Mirror to a throwaway ECR; deploy Bedrock-only through the verification step.
 - [ ] `checksums.txt` verifies (see "Verifying a release by hand").
 
-Then publish the draft, and only then open the follow-up that switches the install docs.
+Then publish the draft, bump the tap, and only then announce the install instructions.
 
 ## Revert point
 
-The merge commit of the Makefile-removal change is the revert point: `git revert -m 1 <merge-commit>` restores the Makefile flow in one step.
+The merge commit of the Makefile-removal change is the revert point: `git revert -m 1 <merge-commit>` restores the make-based flow in one step.
 
 What reverting does and does not undo:
 

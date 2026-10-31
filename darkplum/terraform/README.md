@@ -16,35 +16,39 @@ terraform/
 
 ```bash
 # AWS
-./bin/darkplum init         # writes terraform/aws/terraform.tfvars and backend.hcl (the S3 state settings)
-make deploy                 # init, apply and the platform deploy
+darkplum init               # records the install's settings and S3 state backend
+darkplum deploy             # Terraform init, plan and apply, then the platform
 ```
 
-`terraform.tfvars` is written by `darkplum init`; `terraform.tfvars.example` is
-an advanced reference for teams that manage tfvars from their own pipeline.
-Driving `terraform` by hand is fine once `init` has written the files. The
-state backend is declared as `backend "s3" {}` in `aws/versions.tf` with no settings;
-always initialise with `terraform init -backend-config=backend.hcl` (add
-`-backend-config=profile=<profile>` when you use a named profile). Without it
-Terraform stops and asks for a bucket.
+`darkplum deploy` is what drives Terraform. The `darkplum` binary embeds this
+directory, so the Terraform it runs is exactly the version it was released
+with; there is no checkout to keep in step. Each install has its own workspace
+under `~/.darkplum/installs/<name>`, which holds the settings `darkplum init`
+wrote, the state backend settings and a private kubeconfig.
+`aws/terraform.tfvars.example` is an advanced reference for teams that manage
+settings from their own pipeline.
 
-The `Makefile` in `darkplum/` drives the full install and selects the cloud
-via `CLOUD` (defaults to `aws`):
+Driving `terraform` by hand after `init` is supported for inspection and for
+pipelines. The state backend is declared as `backend "s3" {}` in
+`aws/versions.tf` with no settings, so a manual run must supply them
+(`terraform init -backend-config=<the install's backend settings>`, plus
+`-backend-config=profile=<profile>` for a named profile); otherwise Terraform
+stops and asks for a bucket. Prefer `darkplum deploy`: it also applies the
+platform in the right order and verifies the images.
 
-```bash
-make deploy            # CLOUD=aws by default
-make deploy CLOUD=gcp  # once the gcp root exists
-```
+A checkout of this repository is only needed to work on darkplum itself
+(see CONTRIBUTING.md); a build from a checkout is a development build and
+deploys images only through `--release-images` or `--unsigned-images`.
 
 ## Database durability (AWS)
 
 The RDS instance holds everything the platform has: conversations, library items, policies, settings. Its defaults are set so that losing it takes a deliberate act:
 
 - `db_backup_retention_days = 7` — automated backups with point-in-time recovery over the window (AWS allows 1–35).
-- `db_deletion_protection = true` — the instance refuses deletion from Terraform, the console and the API until the flag is applied as `false`. `make destroy` does that itself right before `terraform destroy`.
+- `db_deletion_protection = true` — the instance refuses deletion from Terraform, the console and the API until the flag is applied as `false`. `darkplum destroy` does that itself right before `terraform destroy`.
 - `db_skip_final_snapshot = false` — a teardown leaves a snapshot named `<cluster_name>-db-final-<id>`. It costs snapshot storage until you delete it; do that only once you are sure.
 
-`make destroy` is the deliberate act: it turns protection off itself, warns and pauses when no snapshot will be kept, and prints the snapshot name when it is done. The protection stops a stray `terraform destroy`, a console click and an API call; it does not stop `make destroy`, by design.
+`darkplum destroy` is the deliberate act: you type the cluster name, it turns protection off itself, requires a second typed confirmation when no snapshot will be kept, and prints the snapshot name when it is done. The protection stops a stray `terraform destroy`, a console click and an API call; it does not stop `darkplum destroy`, by design.
 
 Upgrading an existing install: all three apply in place without a restart (`terraform apply`; the module sets `apply_immediately` so the longer retention takes effect at once rather than at the next maintenance window). Backups and snapshots stay in the instance's region and are encrypted like the storage, with the AWS-managed `aws/rds` key; a customer-managed KMS key is a follow-up.
 
@@ -63,7 +67,6 @@ nothing branches yet; the key exists so the seam is ready when `vertex` lands.
 | `cluster_name` | Kubernetes cluster name |
 | `cluster_endpoint` | API server endpoint |
 | `provider_region` | Region infra runs in |
-| `kube_config_command` | Deprecated (goes away with the Makefile flow): wires the operator's own `~/.kube/config`. The CLI keeps a private kubeconfig per install instead |
 | `container_registry` | Registry host the first-party image repositories live on |
 | `image_repositories` | Service (`gateway`, `api`, `web`) -> repository URL, `<cluster_name>/darkplum-<service>`, IMMUTABLE tags, owned by Terraform (destroyed with the install) |
 | `cluster_service_cidr` | The cluster's Kubernetes service CIDR (scopes the gateway-egress-services NetworkPolicy) |

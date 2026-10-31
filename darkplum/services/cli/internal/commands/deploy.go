@@ -466,7 +466,7 @@ func (e *deployEnv) run(ctx context.Context) (err error) {
 	upstreams, err := carriedUpstreams(kc)
 	if err != nil {
 		return e.stop(checkResult{name: "gateway models", status: checkFail, detail: firstLine(err.Error()),
-			hint: "the live gateway's model list could not be read; applying without it would drop the models added with `darkplum models`"}, "cannot read the live gateway")
+			hint: "the live gateway's model list could not be read; applying without it would drop the models added with `darkplum models add`"}, "cannot read the live gateway")
 	}
 	phases, err := manifests.Platform(fsys, manifests.Inputs{
 		Images: images, BedrockRegion: out.InferenceRegion, BedrockModelFilter: out.BedrockModelFilter,
