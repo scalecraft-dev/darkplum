@@ -1,0 +1,141 @@
+name: Build and sign images
+
+# Reusable. Builds the three Darkplum images, pushes them to GHCR and attaches a
+# sigstore bundle (DSSE, the image digest as the in-toto subject) to each as an
+# OCI referrer. The darkplum CLI verifies exactly this bundle, with an exact
+# match on THIS file (as the certificate's workflow, because it is the reusable
+# workflow that runs the attest step) and on the CALLER (release.yml for a release,
+# prerelease.yml for a release candidate). Nothing here may be called from any
+# other workflow: the guard below refuses a channel/ref/prefix mix-up.
+
+on:
+  workflow_call:
+    inputs:
+      channel:
+        description: "release or rc"
+        type: string
+        required: true
+      image-tag:
+        description: "Tag for the pushed images (no '+')"
+        type: string
+        required: true
+    outputs:
+      digests:
+        description: 'JSON {"gateway":{"digest":"sha256:...","run_attempt":"1"},"api":{...},"web":{...}}'
+        value: ${{ jobs.collect.outputs.digests }}
+
+permissions: {}
+
+jobs:
+  image:
+    name: Image (${{ matrix.service }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: true
+      matrix:
+        service: [gateway, api, web]
+    steps:
+      # Release images only from a vX.Y.Z tag; rc images only from prerelease/**.
+      # The CLI enforces the same pairing when it verifies, this stops the bad
+      # combination from being produced at all.
+      - name: Guard channel, ref and tag
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          REF: ${{ github.ref }}
+          TAG: ${{ inputs.image-tag }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          [ "$EVENT" = push ] || { echo "images are only built from push events (got $EVENT)"; exit 1; }
+          case "$CHANNEL" in
+            release)
+              [[ "$REF" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "release images need a vX.Y.Z tag, got $REF"; exit 1; }
+              [ "$TAG" = "${REF#refs/tags/v}" ] || { echo "image tag $TAG does not match $REF"; exit 1; }
+              echo "PREFIX=darkplum" >> "$GITHUB_ENV" ;;
+            rc)
+              [[ "$REF" =~ ^refs/heads/prerelease/ ]] || { echo "rc images need a prerelease/** branch, got $REF"; exit 1; }
+              [[ "$TAG" =~ ^rc-[0-9]+-[0-9a-f]{7}$ ]] || { echo "rc image tag must look like rc-<run>-<sha7>, got $TAG"; exit 1; }
+              echo "PREFIX=darkplum-rc" >> "$GITHUB_ENV" ;;
+            *) echo "unknown channel $CHANNEL"; exit 1 ;;
+          esac
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: darkplum/services/${{ matrix.service }}
+          platforms: linux/amd64
+          push: true
+          tags: ghcr.io/${{ github.repository_owner }}/${{ env.PREFIX }}-${{ matrix.service }}:${{ inputs.image-tag }}
+          # One plain manifest per image: its digest is the thing that is signed,
+          # pinned in release.json and mirrored byte for byte.
+          provenance: false
+          sbom: false
+      # The bundle goes to the registry as a referrer of the image digest. GHCR has
+      # no Referrers API, so it lands under the fallback tag sha256-<digest>, which
+      # is where the CLI looks.
+      - name: Attest (sigstore bundle, pushed to the registry)
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ghcr.io/${{ github.repository_owner }}/${{ env.PREFIX }}-${{ matrix.service }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+      # The digest and the attempt of THIS job. The signing certificate names the run
+      # and the attempt of the job that signed, and "re-run failed jobs" gives only
+      # the re-run job a new attempt, so each image records its own and the CLI
+      # matches each image against its own.
+      - name: Record digest and attempt
+        env:
+          SERVICE: ${{ matrix.service }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+          ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "unexpected digest: $DIGEST"; exit 1; }
+          [[ "$ATTEMPT" =~ ^[1-9][0-9]*$ ]] || { echo "unexpected attempt: $ATTEMPT"; exit 1; }
+          mkdir -p digest
+          printf '{"digest":"%s","run_attempt":"%s"}' "$DIGEST" "$ATTEMPT" > "digest/$SERVICE"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ matrix.service }}
+          path: digest/${{ matrix.service }}
+          if-no-files-found: error
+          retention-days: 7
+
+  collect:
+    name: Collect digests
+    needs: image
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      digests: ${{ steps.json.outputs.digests }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: digest-*
+          path: digests
+      - id: json
+        run: |
+          set -euo pipefail
+          out='{'
+          for svc in gateway api web; do
+            out="$out\"$svc\":$(cat "digests/digest-$svc/$svc"),"
+          done
+          out="${out%,}}"
+          python3 -I -c 'import json, sys; d = json.loads(sys.argv[1]); assert sorted(d) == ["api", "gateway", "web"], d' "$out"
+          echo "digests=$out" >> "$GITHUB_OUTPUT"

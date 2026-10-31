@@ -4,7 +4,9 @@
 # classification API (POST /api/v1/classify/intent) and routes the request
 # itself, so policy, residency and audit stay in the gateway.
 #
-# Installed by `make deploy-semantic-router` with:
+# Rendered into rendered.yaml by .github/scripts/render-semantic-router.sh
+# (helm template, run in CI) and applied by `darkplum deploy` when the install
+# has the router on. The rendering is what this chart would install with:
 #   helm upgrade --install semantic-router oci://ghcr.io/vllm-project/charts/semantic-router \
 #     --version 0.3.0 -n darkplum-system -f k8s/semantic-router/values.yaml
 #
@@ -16,6 +18,11 @@
 # economics, math, physics, computer science, philosophy, engineering.
 # Classifier models are downloaded from Hugging Face at start-up (~1-2 GB, a
 # minute or two); the pod needs outbound HTTPS for that and nothing else.
+# Pinned by digest. The chart renders image as "<repository>:<tag>", so a tag of
+# "<version>@sha256:<digest>" yields a reference that the registry resolves by
+# digest. The tag half is only informational once a digest is present.
+image:
+  tag: "v0.3.0@sha256:5c5a6421f7a1fc0596fc7e9053b35952fef4bc12564c01a3f7315c51e3602ae6"
 resources:
   requests: { cpu: 500m, memory: 2Gi }
   limits: { cpu: "2", memory: 4Gi }

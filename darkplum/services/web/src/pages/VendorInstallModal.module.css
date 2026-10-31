@@ -262,6 +262,11 @@
   color: var(--fg-default);
 }
 
+.noticeText code {
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
 /* Escape with a key in the field. Asked in place rather than as a second
    dialog: a modal on top of a modal is two focus traps and one decision. */
 .discard {

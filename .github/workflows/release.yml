@@ -1,0 +1,280 @@
+name: Release
+
+# A vX.Y.Z tag on a commit that is already on main and green becomes a DRAFT
+# release: signed images in GHCR, the darkplum CLI for four platforms with the
+# release manifest (image digests, repository, this workflow's identity) baked
+# in, and a checksums file with its own attestation.
+#
+# Nothing is published from here. The draft is smoke-tested by a human (see
+# darkplum/docs/RELEASING.md) and only then published; docs and any
+# announcement wait for that. The Homebrew tap is bumped by the last job, which
+# waits for a reviewer on the release-publish environment and refuses to run
+# until the release is public.
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    name: Gate
+    runs-on: ubuntu-latest
+    # Waiting for CI can take a while; the job holds nothing but a runner.
+    timeout-minutes: 90
+    # The reviewer approves BEFORE anything is built or any identity token for the
+    # release workflow is issued. A rejection or a failure here costs nothing: no
+    # image exists yet, so the version is not burned; "Re-run failed jobs" retries
+    # the gate alone.
+    environment: release
+    permissions:
+      contents: read
+      actions: read
+      checks: read
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Tag is a plain vX.Y.Z on a commit that is on main
+        id: v
+        env:
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$REF" =~ ^refs/tags/v([0-9]+\.[0-9]+\.[0-9]+)$ ]] || { echo "not a vX.Y.Z tag: $REF"; exit 1; }
+          echo "version=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+          git fetch --no-tags origin main
+          git merge-base --is-ancestor "$SHA" origin/main || { echo "$SHA is not on main: releases are cut from main only"; exit 1; }
+      # Waits (up to an hour) for the CI run of this exact commit, then requires it
+      # green. Tag after CI is green, but a tag pushed a little early just waits.
+      - name: CI is green on this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CI_WAIT_SECONDS: "3600"
+        run: bash .github/scripts/require-ci-green.sh "$GITHUB_REPOSITORY" "$GITHUB_SHA"
+      - name: Plumbing tests
+        run: |
+          python3 -I -m unittest discover -s .github/scripts -p 'test_*.py'
+
+  images:
+    name: Images
+    needs: gate
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/_build-sign.yml
+    with:
+      channel: release
+      image-tag: ${{ needs.gate.outputs.version }}
+
+  cli:
+    name: CLI (${{ matrix.goos }}/${{ matrix.goarch }})
+    needs: [gate, images]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - {goos: darwin, goarch: arm64}
+          - {goos: darwin, goarch: amd64}
+          - {goos: linux, goarch: arm64}
+          - {goos: linux, goarch: amd64}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: darkplum/services/cli/go.mod
+          cache-dependency-path: darkplum/services/cli/go.sum
+      # The router's Kubernetes objects are rendered from its chart in CI, never on
+      # the customer's machine, and embedded in the CLI. The committed file must be
+      # exactly what the pinned chart and values render to, or the build stops.
+      - name: Semantic router render is current
+        run: bash .github/scripts/render-semantic-router.sh --check
+      - name: Build
+        env:
+          DIGESTS: ${{ needs.images.outputs.digests }}
+          VERSION: ${{ needs.gate.outputs.version }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$DIGESTS" > "$RUNNER_TEMP/digests.json"
+          enc="$(python3 -I .github/scripts/release-json.py --base64 \
+            --channel release --version "$VERSION" --commit "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --repository "$GITHUB_REPOSITORY" --ref "$GITHUB_REF" \
+            --digests "$RUNNER_TEMP/digests.json")"
+          mkdir -p dist/stage
+          (cd darkplum/services/cli && CGO_ENABLED=0 go build -trimpath \
+            -ldflags "-s -w -X github.com/scalecraft-dev/darkplum/cli/internal/release.encoded=$enc \
+            -X github.com/scalecraft-dev/darkplum/cli/internal/release.trustedRepository=$GITHUB_REPOSITORY" \
+            -o "$GITHUB_WORKSPACE/dist/stage/darkplum" ./cmd)
+          cp LICENSE NOTICE dist/stage/
+          tar -C dist/stage -czf "dist/darkplum_${VERSION}_${GOOS}_${GOARCH}.tar.gz" darkplum LICENSE NOTICE
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cli-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  # Anonymous: no login, no token, no permissions. The binary just built (the one
+  # customers will run) verifies the images CI just signed, with the identity it has
+  # baked in. Needs the GHCR packages to be public (docs/RELEASING.md): an image only
+  # the CI can read is not something a customer can verify.
+  verify:
+    name: Verify the signed images
+    needs: [gate, cli]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cli-linux-amd64
+          path: dist
+      - name: darkplum verify-release
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          tar -xzf "dist/darkplum_${VERSION}_linux_amd64.tar.gz" -C dist darkplum
+          ./dist/darkplum version | tee version.txt
+          # The workflow bakes in the repository it runs in as the trusted one. In the
+          # product's own repository that must be the compiled-in default (no
+          # NON-DEFAULT TRUST banner); anywhere else it must be the override.
+          if [ "$GITHUB_REPOSITORY" = "scalecraft-dev/darkplum" ]; then
+            ! grep -q 'NON-DEFAULT TRUST' version.txt || { echo "the release binary reports a non-default trusted repository"; exit 1; }
+          else
+            grep -q 'NON-DEFAULT TRUST' version.txt || { echo "a fork's binary must say it trusts the fork"; exit 1; }
+          fi
+          ./dist/darkplum verify-release
+
+  draft:
+    name: Draft release
+    needs: [gate, images, cli, verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: cli-*
+          path: dist
+          merge-multiple: true
+      - name: Checksums and manifest
+        env:
+          DIGESTS: ${{ needs.images.outputs.digests }}
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum darkplum_*.tar.gz > checksums.txt)
+          printf '%s' "$DIGESTS" > "$RUNNER_TEMP/digests.json"
+          python3 -I .github/scripts/release-json.py \
+            --channel release --version "$VERSION" --commit "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --repository "$GITHUB_REPOSITORY" --ref "$GITHUB_REF" \
+            --digests "$RUNNER_TEMP/digests.json" > dist/release.json
+          cat dist/checksums.txt
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-checksums: dist/checksums.txt
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" --draft --verify-tag --title "$TAG" --generate-notes \
+            dist/darkplum_*.tar.gz dist/checksums.txt dist/release.json
+
+  # Bumps scalecraft-dev/homebrew-tap to this release. Not part of the draft: it
+  # waits on the release-publish environment (a reviewer approves it AFTER the
+  # smoke gate and after the draft has been published), then checks that the
+  # release is public, that the archives match checksums.txt and carry a
+  # provenance attestation from this workflow, and only then writes the formula.
+  # Product repository only: a scratch organisation has no tap to bump.
+  tap:
+    name: Update the Homebrew tap
+    needs: [gate, draft]
+    if: github.repository == 'scalecraft-dev/darkplum'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release-publish
+    permissions:
+      contents: read
+    env:
+      TAP_REPO: scalecraft-dev/homebrew-tap
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The release is published, not a draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          draft="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" \
+            || { echo "cannot read release $TAG: publish the draft first, then re-run this job"; exit 1; }
+          [ "$draft" = "false" ] || { echo "$TAG is still a draft: publish it after the smoke gate, then re-run this job"; exit 1; }
+      - name: The archives are the ones the pipeline attested
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/rel"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/rel" \
+            --pattern checksums.txt --pattern 'darkplum_*.tar.gz'
+          cd "$RUNNER_TEMP/rel"
+          sha256sum -c checksums.txt
+          for f in darkplum_*.tar.gz; do
+            gh attestation verify "$f" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"
+          done
+      - name: Render the formula and push it to the tap
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+          # A fine-grained token limited to contents:write on the tap repository
+          # only, stored as an environment secret of release-publish.
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          [ -n "$TAP_TOKEN" ] || { echo "secret HOMEBREW_TAP_TOKEN is not set on the release-publish environment"; exit 1; }
+          echo "::add-mask::$TAP_TOKEN"
+          auth="$(printf 'x-access-token:%s' "$TAP_TOKEN" | base64 | tr -d '\n')"
+          echo "::add-mask::$auth"
+          git -c "http.extraheader=Authorization: basic $auth" clone --depth 1 "https://github.com/$TAP_REPO.git" "$RUNNER_TEMP/tap"
+          mkdir -p "$RUNNER_TEMP/tap/Formula"
+          python3 -I .github/scripts/render-formula.py --version "$VERSION" \
+            --repository "$GITHUB_REPOSITORY" --checksums "$RUNNER_TEMP/rel/checksums.txt" \
+            --template .github/packaging/homebrew/darkplum.rb.tmpl > "$RUNNER_TEMP/tap/Formula/darkplum.rb"
+          cd "$RUNNER_TEMP/tap"
+          git add Formula/darkplum.rb
+          if git diff --cached --quiet; then echo "the tap already has $VERSION"; exit 0; fi
+          git -c user.name="darkplum release" -c user.email="release@users.noreply.github.com" \
+            commit -m "darkplum $VERSION" -m "From $GITHUB_REPOSITORY $GITHUB_REF at $GITHUB_SHA (run $GITHUB_RUN_ID)."
+          git -c "http.extraheader=Authorization: basic $auth" push origin HEAD:main

@@ -7,8 +7,9 @@ answering, and — the part that needs care — rolling back.
 Everything here runs in your own cluster. The vendor key is a Kubernetes Secret
 (`darkplum-system/darkplum-provider-keys`), file-mounted into the gateway only.
 A key can be installed, replaced and removed from **Admin > Models > Model
-vendors** or with `make set-anthropic-key` / `make set-openai-key`; both write
-the same Secret.
+vendors** or with `darkplum keys set anthropic` / `darkplum keys set openai`;
+both write the same Secret. The `kubectl` commands in this runbook need the
+install's own kubeconfig: run `eval "$(darkplum kubeconfig)"` in the shell first.
 
 **Neither the key nor its ConfigMap mirror is in Git or Terraform**: a rebuilt
 cluster has no vendor key until it is installed again. The catalog filter, once
@@ -25,18 +26,19 @@ gateway has no Kubernetes permission at all.
 
 **Transport.** A key installed from the UI travels browser → load balancer →
 web → api → Kubernetes API. Only the last hop is always TLS. The api refuses a
-key unless Darkplum is served over HTTPS (`make expose-web CERT_ARN=…`);
-`localhost` is the exception, which is also the way in before you have a
-certificate: `kubectl port-forward -n darkplum-system svc/darkplum-web 8081:80`,
-then `http://localhost:8081`. "Served over HTTPS" means the api is configured for
-it (`SECURE_COOKIES=true` in the `darkplum-auth` Secret, which `make expose-web
-CERT_ARN=…` sets): if you terminate TLS at your own ingress instead, the page is
-HTTPS but the api still refuses a key until that setting is true and the api has
-been restarted. Inside the cluster, web → api and
+key unless Darkplum is served over HTTPS (every install's private address,
+`https://darkplum.<domain>`, is);
+`localhost` is the exception, which is also the way in when you are not on an
+allowed network: `eval "$(darkplum kubeconfig)" && kubectl port-forward -n
+darkplum-system svc/darkplum-web 8081:80`, then `http://localhost:8081`. "Served over HTTPS" means the api is configured for
+it (`SECURE_COOKIES` in the `darkplum-auth` Secret defaults to true; only the local
+dev overlay sets it false): if you terminate TLS at your own ingress and
+someone has set it false, the page is HTTPS but the api still refuses a key
+until that setting is true and the api has been restarted. Inside the cluster, web → api and
 api → gateway (for the verification call) are plain HTTP, like the rest of
 Darkplum's internal traffic, and the gateway accepts connections on its port only
 from the api (`gateway-ingress` NetworkPolicy). If that is not acceptable for a
-third-party spend credential in your environment, use the make target: terminal →
+third-party spend credential in your environment, use `darkplum keys set`: terminal →
 Kubernetes API over TLS, and nothing else sees the key.
 
 **One api replica.** The install rate limit, the cached vendor status and the
@@ -47,7 +49,7 @@ redeploy cannot wipe an installed key.
 
 **One filter, two ways to set it.** The models ticked in the UI and `MODELS=` on
 the command line are the same setting. The UI writes the database and mirrors it
-into the ConfigMap; the make target writes the ConfigMap. Each write carries a
+into the ConfigMap; `darkplum keys set` writes the ConfigMap. Each write carries a
 `<VENDOR>_MODEL_FILTER_SET_AT` stamp and the gateway uses whichever was written
 last (stamps only ever move forward, so a laptop clock cannot make a write lose).
 The backstop under all of this: a filter only decides which vendor models are
@@ -62,11 +64,11 @@ the next UI change overwrites it.
 
 ## 1. Releasing this version
 
-`make deploy` (everything) or `make deploy-platform` (api, gateway and web only,
-when the infrastructure is unchanged). The order inside is already right — the
-api migrates the database (migration 016) and must finish rolling before the
-gateway rolls. `make deploy-k8s` on its own is **not** enough: it applies the
-self-hosted model workloads and does not roll the api or the gateway.
+Install the new `darkplum` binary and run `darkplum deploy`. The order inside is
+already right — the api migrates the database (migration 016) and must finish
+rolling before the gateway rolls. Adding a model (`darkplum models add`) on its
+own is **not** enough: it applies the self-hosted model workload and does not
+roll the api or the gateway.
 
 Migration 017 adds `vendor_provider_settings` — the model list chosen in the UI
 per vendor. A gateway that starts before it exists simply uses the command-line
@@ -90,7 +92,8 @@ an old api never asks the gateway for vendor models (it does not send the
 gateway against a not-yet-migrated database keeps recording usage without the
 new column and picks it up within 30 seconds of the migration.
 
-`make deploy-model`, `remove-model` and `deploy-semantic-router` restart the
+`darkplum models add`, `darkplum models remove` and turning the semantic router on
+or off (`darkplum init --semantic-router`, then `darkplum deploy`) restart the
 gateway without touching the api. That is safe for the same reason.
 
 ## 2. Turning a vendor on
@@ -101,8 +104,7 @@ key*. The card shows *Installing* until the cluster has picked the key up, then
 *Review and enable*. Nothing restarts. **From a terminal:**
 
 ```bash
-read -s ANTHROPIC_API_KEY && export ANTHROPIC_API_KEY
-make set-anthropic-key MODELS='claude-*'
+darkplum keys set anthropic --models 'claude-*'    # the key is asked for at a hidden prompt
 ```
 
 1. Create the key at the vendor **scoped and capped first**: an Anthropic key
@@ -130,8 +132,8 @@ on the gateway Deployment. Vendor calls honour it.
 
 ## 3. Rotating a key
 
-*Replace key* on the vendor's card, or re-run the make target with the new key
-and no `MODELS`. The new key is verified with the vendor before anything is
+*Replace key* on the vendor's card, or re-run `darkplum keys set <vendor>` with the new key
+and no `--models`. The new key is verified with the vendor before anything is
 stored, so a mistyped key cannot break live traffic. The gateway re-reads the
 mounted file; there is no restart and no dropped request. Allow about two
 minutes: the floor is the kubelet's Secret sync (about a minute by default;
@@ -150,7 +152,7 @@ user)>`, for example `k1:9f2c...` (67 characters, inside every vendor's
 SAME value for the same person; correlating one person across vendors is
 therefore possible for anyone who sees more than one vendor's logs (accepted). The secret is the Kubernetes Secret `darkplum-user-hmac` in
 `darkplum-system` (files `user-hmac-key`, `user-hmac-key-id`), created by
-`make deploy-platform` and kept if it already exists. It exists nowhere else:
+`darkplum deploy` and kept if it already exists. It exists nowhere else:
 not Postgres, not the control plane, not an env var, never logged.
 
 Same user plus same secret gives the same value, so the vendor can still tell
@@ -179,17 +181,17 @@ compromise or a policy requirement.
 3. No restart: the gateway re-reads the mounted files (kubelet sync, about a
    minute, then up to 3 seconds). Until the sync lands the old `k1:` values keep
    being sent; there is no window with a raw value.
-4. `make deploy-platform` generates a key only when the Secret is NotFound; any
+4. `darkplum deploy` generates a key only when the Secret is NotFound; any
    other kubectl error aborts it, so a bad context can never replace a live key.
-   Re-running it keeps the installed key and id. To rotate
-   through make, run it with `USER_HMAC_KEY` and `USER_HMAC_KEY_ID` set.
+   Re-running it keeps the installed key and id. Rotation is the `kubectl`
+   replacement in step 2; deploy has no environment override for it.
 
 ## 3c. Strict parameter mode (`params_mode`)
 
 By default a request parameter a backend cannot honour is dropped and reported in `X-Darkplum-Dropped-Params`, the Activity `dropped_params` column and a first-time audit event. An admin can set `params_mode: "strict"` on `PUT /api/v1/routing-policy` so every drop becomes a 400 `unsupported_parameter` instead.
 
 - Strict only takes effect on gateways running the release that reads it. Until migration 029 is applied the gateway treats every organisation as lenient and logs `principal_routing_policies.params_mode does not exist yet`.
-- `make deploy-platform` rolls the api, then the gateway, in one run. A strict value set before the gateway has rolled is ignored by the old gateways; verify with a request carrying an unknown key (strict answers 400 naming it).
+- `darkplum deploy` rolls the api, then the gateway, in one run. A strict value set before the gateway has rolled is ignored by the old gateways; verify with a request carrying an unknown key (strict answers 400 naming it).
 - In strict mode a `user` that cannot be pseudonymised (no `darkplum-user-hmac` secret, e.g. the dev overlay) is a 400 naming `user`, because the field would otherwise be dropped. Install the secret (3b) before enabling strict mode.
 
 ## 4. When a vendor is not answering
@@ -199,9 +201,9 @@ Model vendors** shows the same state:
 
 | state | meaning | action |
 |---|---|---|
-| `not_configured` | no key file mounted | *Install key* in Admin > Models, or `make set-…-key` |
-| `filter_missing` | key present, no catalog filter | re-run `make set-…-key MODELS=…`. A hand-edited ConfigMap does nothing until the gateway restarts: `kubectl rollout restart -n darkplum-system deploy/darkplum-gateway` |
-| `filter_matched_nothing` | the filter admits none of the models the key can reach | widen `MODELS`, or widen the key's scope at the vendor |
+| `not_configured` | no key file mounted | *Install key* in Admin > Models, or `darkplum keys set <vendor>` |
+| `filter_missing` | key present, no catalog filter | re-run `darkplum keys set <vendor> --models …`. A hand-edited ConfigMap does nothing until the gateway restarts: `kubectl rollout restart -n darkplum-system deploy/darkplum-gateway` |
+| `filter_matched_nothing` | the filter admits none of the models the key can reach | widen `--models`, or widen the key's scope at the vendor |
 | `auth_failed` | the vendor rejected the key, or the key file is empty/unreadable | rotate (section 3) |
 | *key check:* `workspace_required` | an organisation-level Anthropic key with no workspace ID | enter the workspace ID (Anthropic console > Workspaces), or use a key created inside a workspace |
 | *key check:* `vendor_error` | the vendor answered the check with a non-auth HTTP error (status and error type shown) | the vendor's answer to this key: check its organisation, billing and permissions in the vendor console |
@@ -220,7 +222,7 @@ Model vendors** shows the same state:
    vendor's text or the key.
 2. `503` "This cluster was deployed before keys could be installed from here" —
    the Secret, ConfigMap or the api's Role do not exist yet. Run
-   `make deploy-platform` once. `503` "Darkplum is not permitted to write the
+   `darkplum deploy` once. `503` "Darkplum is not permitted to write the
    vendor-key Secret" — the RoleBinding is missing or the api is not running as
    `darkplum-api`: `kubectl auth can-i patch secret/darkplum-provider-keys -n
    darkplum-system --as=system:serviceaccount:darkplum-system:darkplum-api`.
@@ -229,10 +231,10 @@ Model vendors** shows the same state:
    `kubectl exec -n darkplum-system deploy/darkplum-gateway -- ls
    /var/run/darkplum/provider-keys` (the image is distroless; if `ls` is absent,
    read the vendor's `state` in the gateway's `/health` instead). A kubelet under
-   pressure can take several minutes. The make target's restart is the
-   break-glass: `make set-…-key` with the same key.
+   pressure can take several minutes. The command's restart is the
+   break-glass: `darkplum keys set <vendor>` with the same key.
 4. `409` "the gateway … is older than this page" — the gateway predates UI key
-   install; upgrade it, or use the make target.
+   install; upgrade it, or use `darkplum keys set`.
 5. If a future NetworkPolicy restricts the api's egress, it must allow the
    Kubernetes API server (on EKS that is an `ipBlock`, not a pod selector) or
    installs fail at step 2's `503`.
@@ -337,10 +339,8 @@ different thing from the inference key:
   visibly apart from the inference key) or:
 
 ```bash
-read -s ANTHROPIC_ADMIN_KEY && export ANTHROPIC_ADMIN_KEY
-make set-anthropic-billing-key            # checks it can read usage first
-read -s OPENAI_ADMIN_KEY && export OPENAI_ADMIN_KEY
-make set-openai-billing-key
+darkplum keys set anthropic --billing     # hidden prompt; checks it can read usage first
+darkplum keys set openai --billing
 ```
 
 Spend then shows *vendor-reported* beside *estimated*, per day and per model,
@@ -348,10 +348,10 @@ with the difference. Expect small deltas: list price versus your contract,
 rounding, and up to a day of reporting lag (Anthropic says usage appears within
 about five minutes; cost reports are daily). Bedrock spend comes from AWS Cost
 Explorer (`ce:GetCostAndUsage`, the api's own read-only Pod Identity role; a
-local stack uses the developer's credentials with `DEV_AWS=1`), which lags up
+local stack uses the developer's credentials with `DEV_AWS=1 scripts/dev.sh up`), which lags up
 to 24 hours and reports by usage type rather than model id.
 
-Removing a billing key (`make remove-…-billing-key` or the card) stops the
+Removing a billing key (`darkplum keys remove <vendor> --billing` or the card) stops the
 pulls; estimates keep working. Revoke it at the vendor as well.
 
 ## 5. Turning a vendor off
@@ -361,10 +361,10 @@ offers to turn the vendor's enabled models off in the same step; your model list
 is kept for next time), or:
 
 ```bash
-make remove-anthropic-key      # or remove-openai-key
+darkplum keys remove anthropic      # or openai
 ```
 
-The make target removes the key and the command-line filter and restarts the
+The command removes the key and the command-line filter and restarts the
 gateway; the UI removes the key without a restart. The vendor's models
 keep their settings, stop answering (`404 model_not_found`), and show as
 unreachable in Admin > Models within about two minutes. Then revoke the key at
@@ -383,7 +383,7 @@ infrastructure" while a current gateway sends it to the vendor.
 catalog.**
 
 1. Remove both keys — *Remove key* on each vendor card, or
-   `make remove-anthropic-key && make remove-openai-key`
+   `darkplum keys remove anthropic && darkplum keys remove openai`
 2. In **Admin > Models > Policy**, set the organisation's residency back to
    *Your cloud account only*.
 3. In **Admin > Models**, disable every model under the Anthropic and OpenAI
@@ -409,8 +409,8 @@ has no vendor backends.
 
 ## 7. Verifying a release
 
-- `make dev-up`, then install a key from Admin > Models (or
-  `make set-anthropic-key DEV=1 …`), exercises the whole path on a local kind
+- `scripts/dev.sh up`, then install a key from Admin > Models (or
+  `scripts/dev.sh cli keys set anthropic --models 'claude-*'`), exercises the whole path on a local kind
   cluster.
 - After any deploy, the api's permission is checkable in one line each:
   `kubectl auth can-i patch secret/darkplum-provider-keys -n darkplum-system

@@ -1,0 +1,128 @@
+name: Prerelease
+
+# Release candidates from a prerelease/** branch: images under
+# ghcr.io/<owner>/darkplum-rc-*, signed with THIS workflow as the caller, and a CLI
+# built for the rc channel. A release-channel CLI refuses these (its identity
+# policy names release.yml at a tag); an rc CLI refuses release images. Used to
+# exercise the whole install path end to end before anything is tagged.
+
+on:
+  push:
+    branches: ["prerelease/**"]
+
+permissions: {}
+
+concurrency:
+  group: prerelease-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  meta:
+    name: Version
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Restricts who can run an rc identity: the environment's branch rules allow
+    # prerelease/** only.
+    environment: prerelease
+    permissions: {}
+    outputs:
+      image-tag: ${{ steps.v.outputs.image-tag }}
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - id: v
+        env:
+          RUN: ${{ github.run_number }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          short="${SHA:0:7}"
+          echo "image-tag=rc-${RUN}-${short}" >> "$GITHUB_OUTPUT"
+          echo "version=0.0.0-rc.${RUN}+${short}" >> "$GITHUB_OUTPUT"
+
+  images:
+    name: Images
+    needs: meta
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/_build-sign.yml
+    with:
+      channel: rc
+      image-tag: ${{ needs.meta.outputs.image-tag }}
+
+  cli:
+    name: CLI (${{ matrix.goos }}/${{ matrix.goarch }})
+    needs: [meta, images]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - {goos: darwin, goarch: arm64}
+          - {goos: linux, goarch: amd64}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: darkplum/services/cli/go.mod
+          cache-dependency-path: darkplum/services/cli/go.sum
+      # The router's Kubernetes objects are rendered from its chart in CI, never on
+      # the customer's machine, and embedded in the CLI. The committed file must be
+      # exactly what the pinned chart and values render to, or the build stops.
+      - name: Semantic router render is current
+        run: bash .github/scripts/render-semantic-router.sh --check
+      - name: Build
+        env:
+          DIGESTS: ${{ needs.images.outputs.digests }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$DIGESTS" > "$RUNNER_TEMP/digests.json"
+          enc="$(python3 -I .github/scripts/release-json.py --base64 \
+            --channel rc --version "$VERSION" --commit "$GITHUB_SHA" \
+            --run-id "$GITHUB_RUN_ID" \
+            --repository "$GITHUB_REPOSITORY" --ref "$GITHUB_REF" \
+            --digests "$RUNNER_TEMP/digests.json")"
+          mkdir -p dist
+          (cd darkplum/services/cli && CGO_ENABLED=0 go build -trimpath \
+            -ldflags "-s -w -X github.com/scalecraft-dev/darkplum/cli/internal/release.encoded=$enc \
+            -X github.com/scalecraft-dev/darkplum/cli/internal/release.trustedRepository=$GITHUB_REPOSITORY" \
+            -o "$GITHUB_WORKSPACE/dist/darkplum-rc_${GOOS}_${GOARCH}" ./cmd)
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cli-rc-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/darkplum-rc_*
+          if-no-files-found: error
+          retention-days: 14
+
+  # Anonymous, with the rc binary just built: see the same job in release.yml.
+  verify:
+    name: Verify the signed images
+    needs: cli
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: cli-rc-linux-amd64
+          path: dist
+      - name: darkplum verify-release
+        run: |
+          set -euo pipefail
+          chmod +x dist/darkplum-rc_linux_amd64
+          ./dist/darkplum-rc_linux_amd64 version | tee version.txt
+          if [ "$GITHUB_REPOSITORY" = "scalecraft-dev/darkplum" ]; then
+            ! grep -q 'NON-DEFAULT TRUST' version.txt || { echo "the rc binary reports a non-default trusted repository"; exit 1; }
+          fi
+          ./dist/darkplum-rc_linux_amd64 verify-release
+

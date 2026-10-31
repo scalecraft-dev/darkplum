@@ -103,7 +103,7 @@ func TestInitWebAddressPaths(t *testing.T) {
 		env.now = func() time.Time { return clock }
 		env.sleep = func(d time.Duration) { clock = clock.Add(d) }
 		err := yesCmd(dir, nil).execute(env)
-		if err == nil || !IsReported(err) || !strings.Contains(out.String(), "re-run ./bin/darkplum init: it continues from here") {
+		if err == nil || !IsReported(err) || !strings.Contains(out.String(), "re-run darkplum init: it continues from here") {
 			t.Fatalf("want a reported timeout, got %v\n%s", err, out)
 		}
 		if _, serr := os.Stat(filepath.Join(dir, "terraform.tfvars")); serr == nil {
@@ -274,9 +274,9 @@ func TestInitReRunKeepsTheWebAddress(t *testing.T) {
 					out = o.String()
 				} else {
 					// Domain (Enter keeps it), networks (Enter keeps them), save.
-					env, o := testEnv(t, cloud, nil, "\n\n\n")
+					env, o := testEnv(t, cloud, nil, "\n\n\n\n")
 					env.now = time.Now
-					c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Profile: "acme", Region: "us-east-2", Mode: "bedrock", Backend: "local", Force: true}
+					c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Profile: "acme", Region: "us-east-2", Mode: "bedrock", Force: true}
 					err = c.execute(env)
 					out = o.String()
 				}
@@ -296,5 +296,45 @@ func TestInitReRunKeepsTheWebAddress(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// Adding the address to an existing install can create the hosted zone. The zone
+// is recorded in the install, or destroy could never list it as Darkplum's.
+func TestInitAddingTheAddressRecordsAZoneItCreated(t *testing.T) {
+	dir, in, rec := liveInstall(t)
+	cloud := newFakeCloud()
+	cloud.hzones = map[string]hostedZone{} // DNS is elsewhere: init creates the zone
+	// Add one (1), domain, networks, confirm the zone creation
+	env, out := testEnv(t, cloud, nil, "1\nacme.com\n\n\n")
+	env.lookupNS = func(string) ([]string, error) { return cloud.hzones["darkplum.acme.com"].NameServers, nil }
+	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1}
+	if err := c.execute(env); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if cloud.zoneCreates != 1 {
+		t.Fatalf("zones created: %d\n%s", cloud.zoneCreates, out)
+	}
+	got, err := in.Load()
+	if err != nil || got.CreatedZoneID != "ZNEWZONE123" {
+		t.Fatalf("the created zone is not in the install record: %+v %v", got, err)
+	}
+	rec.CreatedZoneID = "ZNEWZONE123"
+	sameRecord(t, in, rec) // nothing else about the install changed
+	if !strings.Contains(readFile(t, dir+"/terraform.tfvars"), `web_zone_id = "ZNEWZONE123"`) {
+		t.Error("the settings do not name the zone")
+	}
+}
+
+// A zone the customer supplied is theirs: not recorded.
+func TestInitAddingTheAddressDoesNotRecordASuppliedZone(t *testing.T) {
+	dir, in, _ := liveInstall(t)
+	env, out := testEnv(t, newFakeCloud(), nil, "1\nacme.com\n\n\n")
+	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1}
+	if err := c.execute(env); err != nil {
+		t.Fatalf("%v\n%s", err, out)
+	}
+	if got, _ := in.Load(); got.CreatedZoneID != "" {
+		t.Errorf("recorded a zone init did not create: %q", got.CreatedZoneID)
 	}
 }

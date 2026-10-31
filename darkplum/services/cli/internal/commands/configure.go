@@ -29,7 +29,6 @@ type ConfigureCmd struct {
 	Yes         bool          `help:"Take every default: enables every ready model for everyone who can sign in, and waits for a loading self-hosted model when nothing else is ready. Still asks for the admin email and password; a password is never read from a flag, the environment or a pipe."`
 	Wait        bool          `help:"Wait for the self-hosted model to finish loading, then enable it and chat with it once."`
 	WaitTimeout time.Duration `name:"wait-timeout" help:"How long to wait for the self-hosted model." default:"40m"`
-	Tfvars      string        `help:"Install settings written by darkplum init (default: terraform/aws/terraform.tfvars)." default:""`
 }
 
 // configureEnv is everything configure touches outside its flags, so tests
@@ -50,6 +49,17 @@ type configureEnv struct {
 	web       webAddress                                 // from the install settings
 	tfOutputs func() (map[string]json.RawMessage, error) // `terraform output -json`, read-only
 	probe     func(url string) error                     // HTTPS reachability from this machine
+
+	// The workspace's record of when the deploy began (nil: no workspace).
+	loadClock func() (deployClock, bool)
+	saveClock func(deployClock) error
+}
+
+func (e *configureEnv) clockNow() time.Time {
+	if e.now == nil {
+		return time.Now()
+	}
+	return e.now()
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) error {
@@ -69,9 +79,10 @@ func (c *ConfigureCmd) Run(g *Globals) error {
 	if !term.IsTerminal(fd) {
 		return errors.New("configure asks for the admin password, so it needs a terminal (stdin is not one)")
 	}
-	path := c.Tfvars
-	if path == "" {
-		path = defaultTFVars
+	in, rec, err := openInstall(g.Install)
+	if err != nil {
+		printCheckTo(os.Stdout, noInstallRow(err))
+		return reportedError{"no install to configure"}
 	}
 	var (
 		mu  sync.Mutex
@@ -83,7 +94,7 @@ func (c *ConfigureCmd) Run(g *Globals) error {
 		interactive: !c.Yes,
 		namespace:   g.Namespace,
 		resolve: func() (clusterTarget, checkResult, error) {
-			return installCluster(path, runWithStderr)
+			return installCluster(in, runWithStderr)
 		},
 		newKube: func(t clusterTarget, ns string) *kube.Client { return t.kube(ns) },
 		newFwd: func(t clusterTarget) Forwarder {
@@ -98,9 +109,11 @@ func (c *ConfigureCmd) Run(g *Globals) error {
 		hold:  true,
 		probe: probeHTTPS,
 	}
-	if tf, err := readTFVars(path); err == nil {
+	env.loadClock = func() (deployClock, bool) { return loadDeployClock(in) }
+	env.saveClock = func(c deployClock) error { return saveDeployClock(in, c) }
+	if tf, err := readTFVars(in.TFVars()); err == nil {
 		env.web = webAddressFrom(tf)
-		env.tfOutputs = func() (map[string]json.RawMessage, error) { return terraformOutputs(path, tf.Profile) }
+		env.tfOutputs = func() (map[string]json.RawMessage, error) { return terraformOutputs(in, rec) }
 	}
 
 	// Ctrl-C (or closing the terminal: SIGHUP) cancels the run, which closes the tunnel on its way out. A
@@ -136,7 +149,7 @@ func (c *ConfigureCmd) Run(g *Globals) error {
 			os.Exit(130)
 		}
 	}()
-	err := c.execute(ctx, env)
+	err = c.execute(ctx, env)
 	close(finished)
 	return err
 }
@@ -152,6 +165,7 @@ type configureRun struct {
 	email string // who to sign in as, for the finish screen
 	sso   bool
 
+	begin, last time.Time // run start, and the end of the previous row
 	reconnected bool
 	problems    int    // ✗ rows that did not stop the run
 	note        string // shown on the finish screen
@@ -170,7 +184,18 @@ func (r *configureRun) problem(name, detail, hint string) {
 }
 
 func (r *configureRun) pass(name, detail string) {
-	printCheckTo(r.out, checkResult{name: name, status: checkPass, detail: detail})
+	printCheckTo(r.out, checkResult{name: name, status: checkPass, detail: detail + r.took()})
+}
+
+// took is " · 12s" for the time since the previous row when that was a second or
+// more, and moves the mark: the wait is billed to the row it ended.
+func (r *configureRun) took() string {
+	prev, now := r.last, r.clockNow()
+	r.last = now
+	if prev.IsZero() || now.Sub(prev) < time.Second {
+		return ""
+	}
+	return " · " + elapsed(now.Sub(prev))
 }
 
 func (c *ConfigureCmd) execute(ctx context.Context, env *configureEnv) error {
@@ -184,6 +209,8 @@ func (c *ConfigureCmd) execute(ctx context.Context, env *configureEnv) error {
 	}
 
 	r := &configureRun{configureEnv: env, cmd: c, t: t, kc: env.newKube(t, env.namespace)}
+	r.begin = env.clockNow()
+	r.last = r.begin
 	if err := r.waitServices(ctx); err != nil {
 		return err
 	}
@@ -194,7 +221,7 @@ func (c *ConfigureCmd) execute(ctx context.Context, env *configureEnv) error {
 	defer r.fwd.Close()
 	base, err := r.fwd.Open(ctx)
 	if err != nil {
-		return r.fail("connection", firstLine(err.Error()), "check the services with ./bin/darkplum status, then re-run", "could not open a connection to the web service")
+		return r.fail("connection", firstLine(err.Error()), "check the services with darkplum status, then re-run", "could not open a connection to the web service")
 	}
 	r.api = &apiClient{fwd: r.fwd, http: env.httpc, base: base, cookies: map[string]string{}, reconnect: r.reconnect}
 	// Registered after the Close above, so it runs first: end the CLI's own
@@ -265,7 +292,7 @@ func (r *configureRun) waitServices(ctx context.Context) error {
 			return r.fail("services", "darkplum is only partly deployed", "finish the deploy, then re-run", "darkplum is only partly deployed")
 		}
 		if r.now().Sub(start) >= timeout {
-			return r.fail("services", "not ready after 5 min: "+strings.Join(waiting, ", "), "see which pod is stuck: ./bin/darkplum status", "services not ready")
+			return r.fail("services", "not ready after 5 min: "+strings.Join(waiting, ", "), "see which pod is stuck: darkplum status", "services not ready")
 		}
 		if r.now().Sub(lastSaid) >= 30*time.Second || lastSaid == start {
 			fmt.Fprintf(r.out, "%s waiting for %s to be ready…\n", sDim("…"), strings.Join(waiting, ", "))
@@ -287,13 +314,13 @@ func (r *configureRun) waitAPI(ctx context.Context) (authConfig, error) {
 		resp, err := r.api.do(ctx, http.MethodGet, "/auth/config", nil, true)
 		switch {
 		case errors.Is(err, errForwardLost):
-			return authConfig{}, r.fail("connection", firstLine(err.Error()), "re-run ./bin/darkplum configure", "connection lost")
+			return authConfig{}, r.fail("connection", firstLine(err.Error()), "re-run darkplum configure", "connection lost")
 		case err != nil:
 			last = firstLine(err.Error())
 		case resp.status == http.StatusOK:
 			var cfg authConfig
 			if jerr := json.Unmarshal(resp.body, &cfg); jerr != nil {
-				return cfg, r.fail("api", "unexpected answer from /auth/config", "check the services with ./bin/darkplum status", "unexpected api answer")
+				return cfg, r.fail("api", "unexpected answer from /auth/config", "check the services with darkplum status", "unexpected api answer")
 			}
 			if cfg.OIDC.Enabled || cfg.SetupRequired != nil {
 				return cfg, nil
@@ -302,16 +329,16 @@ func (r *configureRun) waitAPI(ctx context.Context) (authConfig, error) {
 			unknown++
 			last = "the api could not read its database"
 			if unknown >= 4 {
-				return cfg, r.fail("api", last, "check the api and its database: ./bin/darkplum status", "api database unavailable")
+				return cfg, r.fail("api", last, "check the api and its database: darkplum status", "api database unavailable")
 			}
 		case resp.status == http.StatusBadGateway || resp.status == http.StatusServiceUnavailable || resp.status == http.StatusGatewayTimeout:
 			last = fmt.Sprintf("the api is not answering yet (%d)", resp.status)
 		default:
 			msg, _ := resp.errMessage()
-			return authConfig{}, r.fail("api", fmt.Sprintf("%d %s", resp.status, msg), "check the services with ./bin/darkplum status", "unexpected api answer")
+			return authConfig{}, r.fail("api", fmt.Sprintf("%d %s", resp.status, msg), "check the services with darkplum status", "unexpected api answer")
 		}
 		if r.now().After(deadline) {
-			return authConfig{}, r.fail("api", last, "check the services with ./bin/darkplum status", "api not answering")
+			return authConfig{}, r.fail("api", last, "check the services with darkplum status", "api not answering")
 		}
 		if err := r.sleep(ctx, 3*time.Second); err != nil {
 			return authConfig{}, reportedError{"stopped"}
@@ -377,7 +404,7 @@ func nameFromEmail(email string) string {
 func (r *configureRun) secret(label string) (string, error) {
 	v, err := r.prompt.AskSecret(label)
 	if errors.Is(err, errNoTerminal) {
-		return "", r.fail("password", "needs a terminal", "run ./bin/darkplum configure in a terminal; a password is never read from a pipe, flag or the environment", "no terminal for the password")
+		return "", r.fail("password", "needs a terminal", "run darkplum configure in a terminal; a password is never read from a pipe, flag or the environment", "no terminal for the password")
 	}
 	return v, err
 }
@@ -423,7 +450,7 @@ func (r *configureRun) createAdmin(ctx context.Context) (bool, error) {
 	resp, err := r.api.do(ctx, http.MethodPost, "/auth/setup",
 		map[string]string{"email": email, "name": name, "password": pw}, false)
 	if err != nil {
-		return false, r.fail("first admin", "the connection dropped while creating it", "re-run ./bin/darkplum configure; it checks whether the admin was created", "connection lost during setup")
+		return false, r.fail("first admin", "the connection dropped while creating it", "re-run darkplum configure; it checks whether the admin was created", "connection lost during setup")
 	}
 	switch resp.status {
 	case http.StatusCreated, http.StatusOK:
@@ -435,7 +462,7 @@ func (r *configureRun) createAdmin(ctx context.Context) (bool, error) {
 			"nothing was changed; sign in with that account, or ask whoever created it to add you", "first admin already claimed")
 	default:
 		msg, _ := resp.errMessage()
-		return false, r.fail("first admin", fmt.Sprintf("refused (%d): %s", resp.status, msg), "re-run ./bin/darkplum configure", "first admin not created")
+		return false, r.fail("first admin", fmt.Sprintf("refused (%d): %s", resp.status, msg), "re-run darkplum configure", "first admin not created")
 	}
 }
 
@@ -454,7 +481,7 @@ func (r *configureRun) login(ctx context.Context) (bool, error) {
 		}
 		resp, err := r.api.do(ctx, http.MethodPost, "/auth/login", map[string]string{"email": email, "password": pw}, false)
 		if err != nil {
-			return false, r.fail("sign in", firstLine(err.Error()), "re-run ./bin/darkplum configure", "sign-in failed")
+			return false, r.fail("sign in", firstLine(err.Error()), "re-run darkplum configure", "sign-in failed")
 		}
 		switch resp.status {
 		case http.StatusOK:
@@ -467,12 +494,12 @@ func (r *configureRun) login(ctx context.Context) (bool, error) {
 				continue
 			}
 			return false, r.fail("sign in", "email or password is wrong",
-				"locked out? ./bin/darkplum admin create adds another admin", "sign-in failed")
+				"locked out? darkplum admin create adds another admin", "sign-in failed")
 		case http.StatusTooManyRequests:
-			return false, r.fail("sign in", "too many sign-in attempts", "wait a minute, then re-run ./bin/darkplum configure", "sign-in rate limited")
+			return false, r.fail("sign in", "too many sign-in attempts", "wait a minute, then re-run darkplum configure", "sign-in rate limited")
 		default:
 			msg, _ := resp.errMessage()
-			return false, r.fail("sign in", fmt.Sprintf("refused (%d): %s", resp.status, msg), "re-run ./bin/darkplum configure", "sign-in failed")
+			return false, r.fail("sign in", fmt.Sprintf("refused (%d): %s", resp.status, msg), "re-run darkplum configure", "sign-in failed")
 		}
 	}
 }
@@ -514,7 +541,7 @@ func (r *configureRun) modelsAndChat(ctx context.Context) error {
 			wait = true // the default answer, under --yes
 		}
 		if !wait {
-			r.note = "The self-hosted model is still loading. Re-run ./bin/darkplum configure once it is ready to enable it."
+			r.note = "The self-hosted model is still loading. Re-run darkplum configure once it is ready to enable it."
 			return nil
 		}
 		if m, err = r.waitSelfHosted(ctx); err != nil {
@@ -588,15 +615,15 @@ func (r *configureRun) enableModels(ctx context.Context, ms []adminModel, vs vll
 			r.problem("self-hosted model", vs.phase, vs.hint)
 		case vs.ready:
 			printCheckTo(r.out, checkResult{name: "self-hosted model", status: checkWarn, detail: "loaded; the gateway lists it within a minute",
-				hint: "re-run ./bin/darkplum configure in a minute to enable it, or pass --wait"})
+				hint: "re-run darkplum configure in a minute to enable it, or pass --wait"})
 		default:
 			printCheckTo(r.out, checkResult{name: "self-hosted model", status: checkWarn, detail: vs.phase + " (15-25 min after deploy)",
-				hint: "it needs enabling once it is ready: re-run ./bin/darkplum configure then, or pass --wait"})
+				hint: "it needs enabling once it is ready: re-run darkplum configure then, or pass --wait"})
 		}
 	}
 
 	if len(ms) == 0 && !vs.present {
-		r.problem("models", "none found yet", "Bedrock models appear a minute or two after the deploy; if they do not, check model access in the Bedrock console and ./bin/darkplum status, then re-run")
+		r.problem("models", "none found yet", "Bedrock models appear a minute or two after the deploy; if they do not, check model access in the Bedrock console and darkplum status, then re-run")
 		return ms, nil
 	}
 	if len(candidates) == 0 {
@@ -690,7 +717,7 @@ func (r *configureRun) waitSelfHosted(ctx context.Context) (adminModel, error) {
 				"self-hosted model not ready")
 		}
 		if err := r.sleep(ctx, 15*time.Second); err != nil {
-			fmt.Fprintf(r.out, "\n  %s\n", sDim("Stopped waiting. The model keeps loading; re-run ./bin/darkplum configure later."))
+			fmt.Fprintf(r.out, "\n  %s\n", sDim("Stopped waiting. The model keeps loading; re-run darkplum configure later."))
 			return adminModel{}, reportedError{"stopped waiting"}
 		}
 	}
@@ -703,11 +730,12 @@ func (r *configureRun) chat(ctx context.Context, m adminModel) error {
 	for try := 1; ; try++ {
 		res, resp, err := r.api.chat(ctx, m.ModelID, r.now)
 		if err != nil {
-			r.problem("test chat", firstLine(err.Error()), "try a chat in the web UI; ./bin/darkplum status checks the services")
+			r.problem("test chat", firstLine(err.Error()), "try a chat in the web UI; darkplum status checks the services")
 			return nil
 		}
 		if resp.status == http.StatusOK {
 			r.pass("test chat", fmt.Sprintf("%s answered in %.1fs", m.label(), res.latency.Seconds()))
+			r.firstChat()
 			if res.reply != "" {
 				reply := res.reply
 				if utf8.RuneCountInString(reply) > 160 {
@@ -736,7 +764,7 @@ func chatFailure(m adminModel, status int, code, msg string) (detail, hint strin
 	case code == "model_not_enabled":
 		return "the gateway has not picked up the newly enabled model yet", "try a chat in the web UI in a minute"
 	case status == http.StatusNotFound:
-		return "the gateway does not list " + m.ModelID + " yet", "wait a minute, then re-run ./bin/darkplum configure"
+		return "the gateway does not list " + m.ModelID + " yet", "wait a minute, then re-run darkplum configure"
 	case m.selfHosted() && status >= 500:
 		return fmt.Sprintf("the self-hosted model did not answer (%d): it may still be loading", status),
 			"follow it: " + kubectlHint("-n "+inferenceNamespace+" logs -f deploy/vllm-inference -c vllm")
@@ -744,11 +772,11 @@ func chatFailure(m adminModel, status int, code, msg string) (detail, hint strin
 		return msg, "this model needs an AWS data-retention opt-in; choose another under Admin > Models"
 	case m.Provider == "bedrock":
 		return fmt.Sprintf("Bedrock refused or failed (%d): %s", status, msg),
-			"check model access in the Bedrock console for this account and region; ./bin/darkplum status checks the services"
+			"check model access in the Bedrock console for this account and region; darkplum status checks the services"
 	case status == http.StatusBadGateway || status == http.StatusServiceUnavailable || status == http.StatusGatewayTimeout:
-		return fmt.Sprintf("the gateway did not answer (%d)", status), "check the services with ./bin/darkplum status"
+		return fmt.Sprintf("the gateway did not answer (%d)", status), "check the services with darkplum status"
 	default:
-		return fmt.Sprintf("refused (%d): %s", status, msg), "try a chat in the web UI; ./bin/darkplum status checks the services"
+		return fmt.Sprintf("refused (%d): %s", status, msg), "try a chat in the web UI; darkplum status checks the services"
 	}
 }
 
@@ -764,8 +792,34 @@ func localURL(base string) string {
 	return strings.Replace(base, "127.0.0.1", "localhost", 1)
 }
 
+// firstChat says how long the whole path took, from the start of the deploy to
+// the first chat that worked. Once only: the moment is recorded, so a later
+// configure does not report a number that has been growing since.
+func (r *configureRun) firstChat() {
+	if r.loadClock == nil || r.saveClock == nil {
+		return
+	}
+	c, ok := r.loadClock()
+	if !ok || !c.FirstChat.IsZero() {
+		return
+	}
+	now := r.clockNow()
+	c.FirstChat = now.UTC()
+	if err := r.saveClock(c); err != nil {
+		return
+	}
+	detail := elapsed(now.Sub(c.Started)) + " from the start of the deploy to this chat"
+	if !c.Finished.IsZero() {
+		detail += " (deploy took " + elapsed(c.Finished.Sub(c.Started)) + ")"
+	}
+	fmt.Fprintf(r.out, "      %s\n", sDim("time to first chat: "+detail))
+}
+
 func (r *configureRun) finish(ctx context.Context) error {
 	w := r.out
+	if !r.begin.IsZero() {
+		fmt.Fprintf(w, "\n  %s", sDim("configure took "+elapsed(r.clockNow().Sub(r.begin))))
+	}
 	fmt.Fprintln(w)
 	r.teamLines()
 	fmt.Fprintln(w)
@@ -807,7 +861,7 @@ func (r *configureRun) holdOpen(ctx context.Context) error {
 			base, err := r.reconnect(ctx)
 			if err != nil {
 				return r.fail("connection", "closed: "+firstLine(err.Error()),
-					"re-run ./bin/darkplum configure to open it again (it skips the steps already done)", "connection closed")
+					"re-run darkplum configure to open it again (it skips the steps already done)", "connection closed")
 			}
 			r.api.base = base
 			fmt.Fprintf(r.out, "  Open darkplum: %s %s\n", sCmd(localURL(base)), sDim("(new address)"))

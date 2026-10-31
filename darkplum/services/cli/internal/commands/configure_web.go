@@ -10,10 +10,13 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/scalecraft-dev/darkplum/cli/internal/bundle"
+	"github.com/scalecraft-dev/darkplum/cli/internal/install"
+	"github.com/scalecraft-dev/darkplum/cli/internal/release"
+	"github.com/scalecraft-dev/darkplum/cli/internal/runner"
 )
 
 // The install's private HTTPS address, as configure sees it. The settings come
@@ -61,19 +64,44 @@ func webAddressFrom(tf tfvarsInfo) webAddress {
 	return a
 }
 
-// terraformOutputs runs `terraform output -json` in the install's Terraform
-// root, under the install's AWS profile. It reads state; it changes nothing.
-func terraformOutputs(tfvarsPath, profile string) (map[string]json.RawMessage, error) {
-	cmd := exec.Command("terraform", "-chdir="+filepath.Dir(tfvarsPath), "output", "-json")
-	cmd.Env = os.Environ()
-	if profile != "" {
-		cmd.Env = append(cmd.Env, "AWS_PROFILE="+profile)
-	}
-	out, err := cmd.Output()
+// terraformOutputs runs `terraform output -json` for the install, from its
+// verified bundle: the extraction is checked against the hash shipped in this
+// binary first (a tampered one is moved aside and replaced), Terraform's data
+// directory lives in the workspace, and the backend comes from the install's
+// backend.hcl. It reads state; it changes nothing.
+func terraformOutputs(in install.Install, rec install.Record) (map[string]json.RawMessage, error) {
+	b, err := bundle.Embedded()
 	if err != nil {
-		var ee *exec.ExitError
-		if errors.As(err, &ee) && len(ee.Stderr) > 0 {
-			return nil, errors.New(firstLine(strings.TrimSpace(string(ee.Stderr))))
+		return nil, err
+	}
+	m, err := release.Current()
+	if err != nil {
+		return nil, err
+	}
+	v, note, err := in.UseBundle(b, m.Version, time.Now)
+	if err != nil {
+		return nil, err
+	}
+	if note != "" {
+		fmt.Fprintln(os.Stderr, sWarn("! "+note))
+	}
+	key := bundle.Key(m.Version, b.Hash())
+	dirs := runner.TerraformDirs{Workspace: in.Dir(), Data: in.TFData(key), PluginCache: in.PluginCache(),
+		BackendHCL: in.BackendHCL(), TFVars: in.TFVars()}
+	var env []string
+	if rec.Profile != "" {
+		env = append(env, "AWS_PROFILE="+rec.Profile)
+	}
+	if stderr, err := runner.TerraformInit(v, dirs, rec.Profile, env); err != nil {
+		if s := strings.TrimSpace(stderr); s != "" {
+			return nil, errors.New(firstLine(s))
+		}
+		return nil, err
+	}
+	out, stderr, err := runner.Terraform(v, dirs, env, "output", "-json")
+	if err != nil {
+		if s := strings.TrimSpace(stderr); s != "" {
+			return nil, errors.New(firstLine(s))
 		}
 		return nil, err
 	}
@@ -176,7 +204,7 @@ func (r *configureRun) trustProxies() {
 	}
 	if err != nil {
 		r.problem("audit", "cannot read the install's Terraform outputs: "+firstLine(err.Error()),
-			"configure runs `terraform output` in terraform/aws, which the deploy initialised; check your AWS session for the install's profile, then re-run ./bin/darkplum configure")
+			"configure runs `terraform output` in terraform/aws, which the deploy initialised; check your AWS session for the install's profile, then re-run darkplum configure")
 		return
 	}
 	have, _ := r.kc.NS(nil, "get", "configmap", trustedProxiesConfigMap, "-o", `jsonpath={.data.trusted-proxies\.conf}`)
@@ -188,26 +216,26 @@ func (r *configureRun) trustProxies() {
 			return
 		}
 		printCheckTo(r.out, checkResult{name: "audit", status: checkWarn, detail: "the private address is not deployed yet; client addresses are not recorded",
-			hint: "deploy the install with its new settings, then re-run ./bin/darkplum configure"})
+			hint: "deploy the install with its new settings, then re-run darkplum configure"})
 		return
 	}
 	want := renderTrustedProxies(ips)
 	if _, err := r.kc.Run(webIngressManifest(r.namespace, ips), "apply", "-f", "-"); err != nil {
-		r.problem("audit", "could not apply the web-ingress policy: "+firstLine(err.Error()), "re-run ./bin/darkplum configure")
+		r.problem("audit", "could not apply the web-ingress policy: "+firstLine(err.Error()), "re-run darkplum configure")
 		return
 	}
 	if strings.TrimSpace(have) != strings.TrimSpace(want) {
 		if _, err := r.kc.Run(trustedProxiesManifest(r.namespace, want), "apply", "-f", "-"); err != nil {
-			r.problem("audit", "could not write the trusted-proxy list: "+firstLine(err.Error()), "re-run ./bin/darkplum configure")
+			r.problem("audit", "could not write the trusted-proxy list: "+firstLine(err.Error()), "re-run darkplum configure")
 			return
 		}
 		fmt.Fprintf(r.out, "%s restarting web to load the load balancer's addresses…\n", sDim("…"))
 		if _, err := r.kc.NS(nil, "rollout", "restart", "deployment/darkplum-web"); err != nil {
-			r.problem("audit", "could not restart web: "+firstLine(err.Error()), "re-run ./bin/darkplum configure")
+			r.problem("audit", "could not restart web: "+firstLine(err.Error()), "re-run darkplum configure")
 			return
 		}
 		if _, err := r.kc.NS(nil, "rollout", "status", "deployment/darkplum-web", "--timeout=180s"); err != nil {
-			r.problem("audit", "web did not come back after the restart: "+firstLine(err.Error()), "see which pod is stuck: ./bin/darkplum status")
+			r.problem("audit", "web did not come back after the restart: "+firstLine(err.Error()), "see which pod is stuck: darkplum status")
 			return
 		}
 	}
@@ -219,12 +247,12 @@ func (r *configureRun) trustProxies() {
 func (r *configureRun) untrustProxies() {
 	for _, kind := range []string{"configmap/" + trustedProxiesConfigMap, "networkpolicy/" + webIngressPolicy} {
 		if _, err := r.kc.NS(nil, "delete", kind, "--ignore-not-found"); err != nil {
-			r.problem("audit", "could not remove "+kind+": "+firstLine(err.Error()), "re-run ./bin/darkplum configure")
+			r.problem("audit", "could not remove "+kind+": "+firstLine(err.Error()), "re-run darkplum configure")
 			return
 		}
 	}
 	if _, err := r.kc.NS(nil, "rollout", "restart", "deployment/darkplum-web"); err != nil {
-		r.problem("audit", "could not restart web: "+firstLine(err.Error()), "re-run ./bin/darkplum configure")
+		r.problem("audit", "could not restart web: "+firstLine(err.Error()), "re-run darkplum configure")
 		return
 	}
 	printCheckTo(r.out, checkResult{name: "audit", status: checkWarn, detail: "the private address is gone: removed the old load balancer trust list and web-ingress policy",
@@ -264,14 +292,14 @@ func (r *configureRun) ssoRedirectCheck() {
 		return
 	}
 	printCheckTo(r.out, checkResult{name: "sso", status: checkWarn, detail: "redirect URL is " + string(b) + ", not on " + r.web.url(),
-		hint: "./bin/darkplum sso configure --redirect-url " + want + " (and add it at your identity provider)"})
+		hint: "darkplum sso configure --redirect-url " + want + " (and add it at your identity provider)"})
 }
 
 // teamLines is the finish screen's part about the team's address.
 func (r *configureRun) teamLines() {
 	w := r.out
 	if r.web.hostname == "" {
-		fmt.Fprintf(w, "  %s\n", sDim("No team address yet: re-run ./bin/darkplum init to add a private HTTPS address, then deploy."))
+		fmt.Fprintf(w, "  %s\n", sDim("No team address yet: re-run darkplum init to add a private HTTPS address, then deploy."))
 		return
 	}
 	fmt.Fprintf(w, "  Your team: %s\n", sCmd(r.web.url()))

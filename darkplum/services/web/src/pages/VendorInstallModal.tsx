@@ -8,10 +8,10 @@ import {
   type VendorVerification,
 } from '../lib/api'
 import { formatModelName } from '../lib/formatModelName'
+import { KeyTransportCommands, KeyTransportHelpText } from '../components/KeyTransportHelpText'
 import { VENDOR_KEY_COMMAND, formatRetryCountdown, vendorLabel } from '../lib/modelRouting'
 import {
   KEY_TRANSPORT_HELP_TEXT,
-  WEB_PORT_FORWARD_COMMAND,
   admittedDiff,
   groupAdmittedModels,
   keyFingerprint,
@@ -346,7 +346,9 @@ export function VendorInstallModal({
         setRefusedTransport(true)
         setModalError(message)
         clearKey()
-        break
+        // What is on screen is the notice, not the api's sentence.
+        setAnnouncement(KEY_TRANSPORT_HELP_TEXT[transportHelp ?? 'api_not_https'])
+        return
       case 'partially_installed':
         setPartial(message)
         setStep('result')
@@ -690,20 +692,18 @@ export function VendorInstallModal({
             the same answer. */}
         {keyBlockedByTransport && (
           <div className={styles.notice}>
-            <p className={styles.noticeText}>{KEY_TRANSPORT_HELP_TEXT[transportHelpKind]}</p>
-            {/* The port-forward first: it is the one remedy that works in both
-                cases, needs no certificate, and leaves this same screen able
-                to take the key a minute from now. */}
-            <CodeBlock>
-              <code>{WEB_PORT_FORWARD_COMMAND}</code>
-            </CodeBlock>
-            <CodeBlock>
-              <code>{VENDOR_KEY_COMMAND[vendor]}</code>
-            </CodeBlock>
+            <p className={styles.noticeText}><KeyTransportHelpText kind={transportHelpKind} /></p>
+            {/* In the order the sentence names them; the port-forward works in
+                both cases, needs no certificate, and leaves this same screen
+                able to take the key a minute from now. */}
+            <KeyTransportCommands kind={transportHelpKind} keyCommand={VENDOR_KEY_COMMAND[vendor]} />
           </div>
         )}
 
-        {modalError && !oldGateway && (
+        {/* Not while the transport notice is up: for a 403 the api's own sentence
+            names the same remedies, and a second copy that differs from the
+            notice above it is two answers to one question. */}
+        {modalError && !oldGateway && !keyBlockedByTransport && (
           <p className={styles.error} role="alert">{modalError}</p>
         )}
 

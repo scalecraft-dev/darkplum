@@ -33,8 +33,8 @@ jobs:
       run:
         working-directory: darkplum/services/${{ matrix.service }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: darkplum/services/${{ matrix.service }}/go.mod
           cache-dependency-path: darkplum/services/${{ matrix.service }}/go.sum
@@ -49,6 +49,12 @@ jobs:
       # here (no keys, no network) so they cannot rot unnoticed between runs.
       - if: matrix.service == 'gateway'
         run: go vet -tags vendorsmoke ./...
+      # kubectl and aws only run through internal/runner, and kubectl only through
+      # a handle from a validated cluster: no other file may import os/exec, name
+      # kubectl or helm, or build a kube.Client by hand. Also part of go test below;
+      # a named step so a failure reads as what it is.
+      - if: matrix.service == 'cli'
+        run: go test -count=1 -run 'TestNoExecOutsideRunner|TestCheckerCatchesViolations' ./internal/lint
       # The api and gateway integration tests (migrations, model sync, aliases,
       # service key, audit recorder) run against the Postgres service container;
       # without TEST_DATABASE_URL they would skip silently.
@@ -59,6 +65,30 @@ jobs:
         env:
           TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/dptest?sslmode=disable
 
+  # The Terraform + Kubernetes tree the CLI embeds (darkplum/embed.go). It is its
+  # own module so go:embed can reach terraform/ and k8s/; its tests prove nothing
+  # local (backend.tf, *.tfvars, *.tfstate*, .terraform/) can ship.
+  bundle:
+    name: Bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: darkplum
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: darkplum/go.mod
+          cache: false
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l embed.go embed_test.go)
+          if [ -n "$unformatted" ]; then echo "gofmt needed:"; echo "$unformatted"; exit 1; fi
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test -race -count=1 -timeout 5m ./...
+
   web:
     name: Web
     runs-on: ubuntu-latest
@@ -67,11 +97,11 @@ jobs:
       run:
         working-directory: darkplum/services/web
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
         with:
           version: 9
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: pnpm
@@ -94,8 +124,8 @@ jobs:
       run:
         working-directory: darkplum/terraform/aws
     steps:
-      - uses: actions/checkout@v4
-      - uses: hashicorp/setup-terraform@v3
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
         with:
           terraform_version: "1.14.9"
           # The default wrapper (a node shim that captures output) does not pass
@@ -106,10 +136,12 @@ jobs:
       - run: terraform init -backend=false -input=false
       - run: terraform validate
       # What `darkplum init` writes must be valid Terraform. Render a sample
-      # tfvars (hostile profile name included) and backend.tf from the Go code,
-      # validate the config with that backend.tf, then check Terraform reads the
-      # hostile value back unchanged.
-      - uses: actions/setup-go@v5
+      # tfvars (hostile profile name included) and backend.hcl from the Go code,
+      # validate the config (which declares backend "s3" {} and nothing else),
+      # check Terraform parses and formats backend.hcl as written (attribute-only
+      # HCL, so it is checked under a .tfvars name), then check Terraform reads
+      # the hostile value back unchanged.
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: darkplum/services/cli/go.mod
           cache-dependency-path: darkplum/services/cli/go.sum
@@ -118,10 +150,10 @@ jobs:
         run: |
           samples="$RUNNER_TEMP/samples"; mkdir -p "$samples"
           (cd ../../services/cli && DARKPLUM_RENDER_SAMPLES="$samples" go test ./internal/commands -run TestWriteRenderedSamples -count=1)
-          cp "$samples/backend.tf" backend.tf
           terraform init -backend=false -input=false -reconfigure
           terraform validate
-          rm backend.tf
+          cp "$samples/backend.hcl" "$samples/backend-check.tfvars"
+          terraform fmt -check -diff "$samples/backend-check.tfvars"
           terraform init -backend=false -input=false -reconfigure
           # Read the value back with the variable declarations only: in the full
           # config, `terraform console` configures the AWS provider, which waits on
@@ -143,6 +175,36 @@ jobs:
         run: |
           terraform init -backend=false -input=false
           terraform test
+      # The first-party image repositories: per-cluster names, immutable tags,
+      # force_delete, lifecycle. Mocked provider, no AWS.
+      - name: terraform test (ecr)
+        working-directory: darkplum/terraform/aws/modules/ecr
+        run: |
+          terraform init -backend=false -input=false
+          terraform test
+
+  plumbing:
+    name: Release plumbing
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      # The release workflows sign what customers deploy: every action in them is
+      # pinned to a commit, the manifest writer refuses channel/ref/prefix
+      # mix-ups, and the workflow files must at least parse.
+      - run: python3 -I -m unittest discover -s .github/scripts -p 'test_*.py' -v
+      - run: python3 -I .github/scripts/check-pinned-actions.py
+      # The router chart is rendered to plain objects in CI (helm is on the runner);
+      # the committed rendering must be what the pinned chart and values produce.
+      - name: Semantic router render is current
+        run: bash .github/scripts/render-semantic-router.sh --check
+      # The CLI runs terraform with -lockfile=readonly on the customer's machine,
+      # so the lock file must cover darwin/linux x arm64/amd64.
+      - run: python3 -I .github/scripts/check-lock-platforms.py
+      - name: workflows parse
+        run: |
+          python3 -c 'import sys, yaml; [yaml.safe_load(open(f)) for f in sys.argv[1:]]' .github/workflows/*.yml
+      - run: bash -n .github/scripts/require-ci-green.sh
 
   manifests:
     name: Kubernetes manifests and docs
@@ -152,40 +214,70 @@ jobs:
       run:
         working-directory: darkplum
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: darkplum/services/api/go.mod
           cache-dependency-path: darkplum/services/api/go.sum
-      - uses: azure/setup-kubectl@v4
+      - uses: azure/setup-kubectl@776406bce94f63e41d621b960d78ee25c8b76ede # v4
       - name: kustomize builds
         run: |
-          for overlay in dev dev-aws prod; do
+          for overlay in dev dev-aws; do
             kubectl kustomize k8s/overlays/$overlay > /dev/null || exit 1
           done
+      # scripts/dev.sh is contributor tooling; a full kind run stays manual. CI
+      # proves it parses, passes shellcheck, prints usage and refuses bad input
+      # before it touches docker, kind or kubectl.
+      - name: dev.sh lints and validates its arguments
+        run: |
+          bash -n scripts/dev.sh
+          shellcheck scripts/dev.sh
+          scripts/dev.sh help | grep -q 'scripts/dev.sh up'
+          if scripts/dev.sh nope >/dev/null 2>&1; then echo "dev.sh accepted an unknown command"; exit 1; fi
+          if scripts/dev.sh build nothing >/dev/null 2>&1; then echo "dev.sh build accepted an unknown service"; exit 1; fi
+          if DEV_PORT='8080;x' scripts/dev.sh up >/dev/null 2>&1; then echo "dev.sh up accepted a bad DEV_PORT"; exit 1; fi
+          if DEV_AWS_PROFILE='a|b' scripts/dev.sh up >/dev/null 2>&1; then echo "dev.sh up accepted a bad DEV_AWS_PROFILE"; exit 1; fi
+          if scripts/dev.sh eks-push --install ../x >/dev/null 2>&1; then echo "dev.sh eks-push accepted a path as an install name"; exit 1; fi
+      # The release-candidate e2e assertion scripts (docs/E2E-RELEASE-CHECK.md) are
+      # only worth running if they fail when they should: lint them, then run them
+      # against stand-ins for darkplum, kubectl and aws.
+      - name: e2e assertion scripts lint and self-test
+        run: |
+          shellcheck -x -P SCRIPTDIR scripts/e2e/*.sh scripts/e2e/selftest/darkplum scripts/e2e/selftest/aws
+          scripts/e2e/selftest.sh
       - name: model template renders
         run: |
           sed -e "s|MODEL_INSTANCE|ci|g" -e "s|PLACEHOLDER_MODEL_NAME|org/model|g" \
               -e "s|PLACEHOLDER_MODEL_REVISION|main|g" -e "s|PLACEHOLDER_SERVED_MODEL_NAME|ci|g" \
               -e "s|PLACEHOLDER_MAX_MODEL_LEN|8192|g" k8s/templates/vllm-model.yaml \
             | python3 -c 'import sys, yaml; docs = list(yaml.safe_load_all(sys.stdin)); assert {d["kind"] for d in docs} == {"Deployment", "Service"}, docs'
-      - name: Makefile parses
-        run: make -n help > /dev/null
-      # Configuration comes from `darkplum init`; no README, docs/*.md or Makefile
+      # Configuration comes from `darkplum init`; no README or docs/*.md
       # text may tell a user to copy or hand-edit terraform.tfvars (a deliberate
       # GitOps section sits inside tfvars-manual:begin/end markers).
       - name: docs do not say to copy or edit tfvars
         working-directory: .
         run: python3 -I .github/scripts/check-tfvars-docs.py
-      # make deploy must stop before doing any work when init has not run.
-      - name: make deploy refuses without terraform.tfvars
+      # darkplum deploy must stop before doing any work when init has not run: built
+      # from source, run in an empty directory with an empty home, it fails with the
+      # init hint and never reaches Terraform.
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: darkplum/services/cli/go.mod
+          cache-dependency-path: darkplum/services/cli/go.sum
+      - name: darkplum deploy refuses without an install
         run: |
-          empty=$(mktemp -d)
-          for target in deploy deploy-infra; do
-            if out=$(make "$target" TF_DIR="$empty" 2>&1); then echo "make $target succeeded without tfvars"; exit 1; fi
-            echo "$out" | grep -q 'Run ./bin/darkplum init first' || { echo "no init hint from make $target:"; echo "$out"; exit 1; }
-            if echo "$out" | grep -qE 'Initializing Terraform|Building darkplum CLI'; then echo "make $target did work before the guard"; exit 1; fi
+          (cd services/cli && go build -o "$RUNNER_TEMP/darkplum" ./cmd)
+          empty=$(mktemp -d); home=$(mktemp -d)
+          for cmd in deploy destroy; do
+            if out=$(cd "$empty" && DARKPLUM_HOME="$home" "$RUNNER_TEMP/darkplum" "$cmd" 2>&1); then echo "darkplum $cmd succeeded without an install"; exit 1; fi
+            echo "$out" | grep -q 'darkplum init' || { echo "no init hint from darkplum $cmd:"; echo "$out"; exit 1; }
+            if echo "$out" | grep -qE 'Initializing|terraform (init|apply|plan)'; then echo "darkplum $cmd did work before the guard:"; echo "$out"; exit 1; fi
           done
+      # No instruction to run make, and no Makefile, may come back (migrations and
+      # the router values snapshots are allowlisted in the script, with reasons).
+      - name: no make instructions and no Makefile
+        working-directory: .
+        run: python3 -I .github/scripts/check-no-make.py
       - name: API reference is generated from the golden
         working-directory: darkplum/services/api
         run: |

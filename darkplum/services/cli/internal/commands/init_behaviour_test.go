@@ -10,7 +10,7 @@ import (
 
 func writeBackendTF(t *testing.T, dir, bucket, region string) string {
 	t.Helper()
-	p := filepath.Join(dir, "backend.tf")
+	p := filepath.Join(dir, "backend.hcl")
 	body := renderBackend(backendSpec{Bucket: bucket, Key: legacyStateKey, Region: region, KMSKeyARN: kmsARN})
 	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
@@ -25,10 +25,10 @@ func TestInitS3ReRunReusesBucketFromBackendTF(t *testing.T) {
 	cloud := newFakeCloud()
 	cloud.state = backendState{KeyARN: kmsARN, BucketExists: true}
 	env, out := testEnv(t, cloud, nil, "-")
-	if err := yesCmd(dir, func(c *InitCmd) { c.Backend = "s3" }).execute(env); err != nil {
-		t.Fatalf("a reused backend.tf is not an overwrite, --yes must succeed: %v\n%s", err, out)
+	if err := yesCmd(dir, nil).execute(env); err != nil {
+		t.Fatalf("a reused backend.hcl is not an overwrite, --yes must succeed: %v\n%s", err, out)
 	}
-	got := readFile(t, filepath.Join(dir, "backend.tf"))
+	got := readFile(t, filepath.Join(dir, "backend.hcl"))
 	if !strings.Contains(got, existing) || strings.Contains(got, "a1b2c3") {
 		t.Errorf("did not reuse the bucket:\n%s", got)
 	}
@@ -44,36 +44,9 @@ func TestInitS3IgnoresBackendTFFromAnotherAccount(t *testing.T) {
 	dir := t.TempDir()
 	writeBackendTF(t, dir, "darkplum-tfstate-999999999999-us-east-2-ffffff", "us-east-2")
 	env, _ := testEnv(t, newFakeCloud(), nil, "-")
-	err := yesCmd(dir, func(c *InitCmd) { c.Backend = "s3" }).execute(env)
+	err := yesCmd(dir, nil).execute(env)
 	if err == nil || !strings.Contains(err.Error(), "--force") {
-		t.Fatalf("a foreign backend.tf is an overwrite and needs --force, got %v", err)
-	}
-}
-
-func TestInitLocalMovesBackendTFAside(t *testing.T) {
-	dir := t.TempDir()
-	p := writeBackendTF(t, dir, "darkplum-tfstate-"+testAccount+"-us-east-2-ffffff", "us-east-2")
-	env, out := testEnv(t, newFakeCloud(), nil, "-")
-	if err := yesCmd(dir, nil).execute(env); err != nil { // --backend local
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(p); err == nil {
-		t.Error("backend.tf must not stay in force when switching to local")
-	}
-	st, err := os.Stat(p + ".bak")
-	if err != nil || st.Mode().Perm() != 0o600 {
-		t.Errorf("backend.tf.bak missing or not 0600: %v %v", err, st)
-	}
-	if !strings.Contains(out.String(), "moved to backend.tf.bak") || !strings.Contains(out.String(), "migrate-state") {
-		t.Errorf("no clear message:\n%s", out)
-	}
-	// And back to S3 again: a fresh bucket, backend.tf is written.
-	env, _ = testEnv(t, newFakeCloud(), nil, "-")
-	if err := yesCmd(dir, func(c *InitCmd) { c.Backend = "s3"; c.Force = true }).execute(env); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(readFile(t, p), "darkplum-tfstate-"+testAccount+"-us-east-2-a1b2c3") {
-		t.Error("s3 re-run did not write backend.tf")
+		t.Fatalf("a foreign backend.hcl is an overwrite and needs --force, got %v", err)
 	}
 }
 
@@ -85,7 +58,7 @@ func TestInitLocalStateBlocksBackendUnderYes(t *testing.T) {
 	}
 	cloud := newFakeCloud()
 	env, out := testEnv(t, cloud, nil, "-")
-	err := yesCmd(dir, func(c *InitCmd) { c.Backend = "s3"; c.Force = true }).execute(env)
+	err := yesCmd(dir, func(c *InitCmd) { c.Force = true }).execute(env)
 	if err == nil || !strings.Contains(err.Error(), "local state") {
 		t.Fatalf("--yes must refuse over live local state, got %v", err)
 	}
@@ -95,12 +68,12 @@ func TestInitLocalStateBlocksBackendUnderYes(t *testing.T) {
 	if cloud.createCalls != 0 {
 		t.Error("bucket created before the local-state acknowledgement")
 	}
-	if _, err := os.Stat(filepath.Join(dir, "backend.tf")); err == nil {
-		t.Error("backend.tf written")
+	if _, err := os.Stat(filepath.Join(dir, "backend.hcl")); err == nil {
+		t.Error("backend.hcl written")
 	}
 	// Interactive and confirmed: proceeds. Answers: networks (default), confirm local state (y), final confirm.
-	env, _ = testEnv(t, newFakeCloud(), nil, "\ny\n\n")
-	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Region: "us-east-2", Mode: "bedrock", Backend: "s3", Profile: "acme", Domain: "acme.com"}
+	env, _ = testEnv(t, newFakeCloud(), nil, "\n\ny\n\n")
+	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Region: "us-east-2", Mode: "bedrock", Profile: "acme", Domain: "acme.com"}
 	if err := c.execute(env); err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +127,7 @@ func TestInitRegionRows(t *testing.T) {
 	}
 	// Interactive: re-asks the region and carries on.
 	cloud2 := &regionFlaky{fakeCloud: newFakeCloud(), bad: "af-south-1"}
-	env, out = testEnv(t, cloud2, nil, "af-south-1\nus-east-2\n1\n\n2\n\n")
+	env, out = testEnv(t, cloud2, nil, "af-south-1\nus-east-2\n1\n\n\n\n")
 	c := &InitCmd{Cloud: "aws", Dir: t.TempDir(), ClusterName: "darkplum", GPUCount: 1, Profile: "acme", Domain: "acme.com"}
 	if err := c.execute(env); err != nil {
 		t.Fatalf("%v\n%s", err, out)
@@ -177,7 +150,7 @@ func (r *regionFlaky) CheckRegion(region string) error {
 }
 
 func TestInitRegionNoteOnlyWhenDefaultAccepted(t *testing.T) {
-	env, out := testEnv(t, newFakeCloud(), nil, "\n1\n\n2\n\n") // Enter accepts the profile region
+	env, out := testEnv(t, newFakeCloud(), nil, "\n1\n\n\n\n") // Enter accepts the profile region
 	c := &InitCmd{Cloud: "aws", Dir: t.TempDir(), ClusterName: "darkplum", GPUCount: 1, Profile: "acme", Domain: "acme.com"}
 	if err := c.execute(env); err != nil {
 		t.Fatal(err)
@@ -186,7 +159,7 @@ func TestInitRegionNoteOnlyWhenDefaultAccepted(t *testing.T) {
 		t.Errorf("default accepted: want the note:\n%s", out)
 	}
 	cloud := newFakeCloud()
-	env, out = testEnv(t, cloud, nil, "eu-west-1\n1\n\n2\n\n")
+	env, out = testEnv(t, cloud, nil, "eu-west-1\n1\n\n\n\n")
 	c = &InitCmd{Cloud: "aws", Dir: t.TempDir(), ClusterName: "darkplum", GPUCount: 1, Profile: "acme", Domain: "acme.com"}
 	cloud.zones = []string{"eu-west-1a", "eu-west-1b"}
 	if err := c.execute(env); err != nil {
@@ -241,7 +214,7 @@ func TestInitDryRunNextLineAndPreChecks(t *testing.T) {
 	cloud := newFakeCloud()
 	cloud.state = backendState{Checks: []string{"aws kms describe-key --key-id alias/darkplum-tfstate", "aws s3api head-bucket --bucket b"}}
 	env, out := testEnv(t, cloud, nil, "-")
-	if err := yesCmd(t.TempDir(), func(c *InitCmd) { c.Backend = "s3"; c.DryRun = true }).execute(env); err != nil {
+	if err := yesCmd(t.TempDir(), func(c *InitCmd) { c.DryRun = true }).execute(env); err != nil {
 		t.Fatal(err)
 	}
 	for _, want := range []string{"Next: re-run without --dry-run to write these files.", "read-only pre-checks that ran", "describe-key", "head-bucket", "unrecoverable"} {
@@ -249,13 +222,13 @@ func TestInitDryRunNextLineAndPreChecks(t *testing.T) {
 			t.Errorf("missing %q", want)
 		}
 	}
-	if strings.Contains(out.String(), "Next: make deploy") {
-		t.Error("a dry run must not point at make deploy")
+	if strings.Contains(out.String(), "Next: darkplum deploy") {
+		t.Error("a dry run must not point at darkplum deploy")
 	}
 }
 
 func TestInitModeChoicesAreAlignedWithCosts(t *testing.T) {
-	env, out := testEnv(t, newFakeCloud(), nil, "1\n\n2\n\n")
+	env, out := testEnv(t, newFakeCloud(), nil, "1\n\n\n\n")
 	c := &InitCmd{Cloud: "aws", Dir: t.TempDir(), ClusterName: "darkplum", GPUCount: 1, Profile: "acme", Region: "us-east-2", Domain: "acme.com"}
 	if err := c.execute(env); err != nil {
 		t.Fatal(err)
@@ -263,8 +236,8 @@ func TestInitModeChoicesAreAlignedWithCosts(t *testing.T) {
 	for _, want := range []string{
 		"1) Bedrock only     no GPU · ~US$10/day base · ~20 min · recommended for a trial",
 		"2) Self-hosted GPU  base + ~US$1/h per g5.xlarge · ~35-50 min",
-		"Switch later by re-running ./bin/darkplum init.",
-		"✓ 9 passed, ! 1 warning",
+		"Switch later by re-running darkplum init.",
+		"✓ 10 passed",
 	} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("missing %q in:\n%s", want, out)
@@ -310,5 +283,25 @@ func TestInitErrorsAreReportedRows(t *testing.T) {
 	err = (&InitCmd{Cloud: "gcp", Yes: true}).execute(env)
 	if !IsReported(err) || !strings.Contains(out.String(), "✗ gcp terraform root") {
 		t.Errorf("%v\n%s", err, out)
+	}
+}
+
+// A backend.tf in the Terraform root is a Makefile-era install. init refuses to
+// write beside it and says how to take it over; nothing is written or created.
+func TestInitRefusesAMakefileEraRoot(t *testing.T) {
+	dir := t.TempDir()
+	legacy := legacyBackendTF(backendSpec{Bucket: "darkplum-tfstate-" + testAccount + "-us-east-2-ffffff", Key: legacyStateKey, Region: "us-east-2", KMSKeyARN: kmsARN})
+	if err := os.WriteFile(filepath.Join(dir, "backend.tf"), []byte(legacy), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cloud := newFakeCloud()
+	env, out := testEnv(t, cloud, nil, "-")
+	err := yesCmd(dir, nil).execute(env)
+	if err == nil || !strings.Contains(out.String(), "darkplum init --adopt") {
+		t.Fatalf("want a refusal pointing at --adopt, got %v\n%s", err, out)
+	}
+	entries, _ := os.ReadDir(dir)
+	if len(entries) != 1 || cloud.createCalls != 0 {
+		t.Errorf("a refusal wrote %v / created %d", entries, cloud.createCalls)
 	}
 }

@@ -16,11 +16,13 @@ import (
 	"time"
 
 	"golang.org/x/term"
+
+	"github.com/scalecraft-dev/darkplum/cli/internal/install"
 )
 
 // InitCmd is `darkplum init`: prompt for the few choices that shape an install,
 // check them against the operator's own cloud account, and write
-// terraform.tfvars (and an S3 backend.tf). It deploys nothing — `make deploy`
+// terraform.tfvars (and the S3 backend settings in backend.hcl). It deploys nothing — `darkplum deploy`
 // does that — and holds no credential: every cloud call is the operator's own
 // `aws` CLI.
 type InitCmd struct {
@@ -34,18 +36,23 @@ type InitCmd struct {
 	GPUCount      int    `help:"Number of GPU nodes (gpu mode); each self-hosted model takes one." name:"gpu-count" default:"1"`
 	ClusterName   string `help:"EKS cluster name; prefix of related resources." name:"cluster-name" default:"darkplum"`
 	Throwaway     bool   `help:"Test install: one-day backups, no deletion protection, no final snapshot. Never for real data."`
-	Backend       string `help:"Where Terraform keeps state: s3 (a versioned, KMS-encrypted bucket in your account; default) or local (plain-text file; not for synced folders)." enum:"s3,local," default:""`
 	Offline       bool   `help:"Make no Hugging Face call. A model outside the catalog then needs --model-revision."`
 	Yes           bool   `help:"Take every default and ask nothing (for scripts). Refuses to overwrite or accept a gated model."`
 	DryRun        bool   `help:"Run the checks and print what would be written and created, without writing or creating anything." name:"dry-run" aliases:"stdout"`
-	Force         bool   `help:"Overwrite an existing terraform.tfvars without asking (a .bak copy is kept)."`
-	Dir           string `help:"Terraform root to write into. Defaults to terraform/<cloud> under the current directory." default:""`
+	Force         bool   `hidden:"" help:"Overwrite the install's existing settings without asking (a backup is kept)."`
+	Dir           string `hidden:"" help:"Where an install made by an older version lives, for --adopt. Otherwise the install's own workspace is used." default:""`
+	Adopt         bool   `help:"Take over an install the Makefile flow created (terraform/aws, state in S3): record it in ~/.darkplum/installs/<name>, leave its state where it is, and rename its backend.tf and terraform.tfvars to *.adopted. Use --dir for another Terraform root and the global --install to name the workspace (default: the cluster name)."`
+
+	// installName is the workspace --adopt creates: the global --install, else the cluster name.
+	installName string
 
 	Domain         string `help:"A domain you control. The team reaches Darkplum privately at https://darkplum.<domain> (the name is public, its address is not). Required with --yes." default:""`
 	Hostname       string `help:"Name the team opens instead of darkplum.<domain>; must be inside --domain." default:""`
 	ZoneID         string `name:"zone-id" help:"Use this existing public Route53 zone for the name instead of creating one." default:""`
 	CertificateARN string `name:"certificate-arn" help:"Use this existing ACM certificate (this account and region) instead of issuing one." default:""`
 	AllowedCIDRs   string `name:"allowed-cidrs" help:"Comma-separated IPv4 networks allowed to reach the address (VPN, office). Default: the VPC." default:""`
+
+	SemanticRouter string `name:"semantic-router" enum:"on,off," help:"Run the optional in-cluster intent classifier (the vLLM Semantic Router) that routed aliases can use: on or off. Asked when omitted; an install keeps its current setting under --yes. Applied by darkplum deploy." default:""`
 }
 
 // initCloud is the per-cloud half of init: identity, zones, quota, name
@@ -117,7 +124,11 @@ func randomSuffix() string {
 const baseUSDPerDay = 10
 
 // Run executes `darkplum init`.
-func (c *InitCmd) Run(_ *Globals) error {
+func (c *InitCmd) Run(g *Globals) error {
+	c.installName = g.Install
+	if c.Adopt {
+		return c.runAdopt(os.Stdout)
+	}
 	tty := term.IsTerminal(int(os.Stdin.Fd()))
 	env := &initEnv{
 		out:         os.Stdout,
@@ -151,9 +162,6 @@ func (c *InitCmd) missingFlagsError() error {
 	if c.Mode == "" && c.Model == "" {
 		missing = append(missing, "--mode bedrock|gpu")
 	}
-	if c.Backend == "" {
-		missing = append(missing, "--backend s3|local")
-	}
 	if c.Domain == "" {
 		missing = append(missing, "--domain <a domain you control>")
 	}
@@ -171,10 +179,13 @@ type settings struct {
 	gpuCount                          int
 	geo, bedrockRegion                string
 	throwaway                         bool
-	backend                           string // "s3" | "local"
-	liveChecked                       string // cluster name the live-install lookup already ran for
+	liveChecked                       string          // cluster name the live-install lookup already ran for
+	locked                            *install.Record // the install's record, when it exists: cluster, region, account and state are fixed
 	web                               webSettings
-	checks                            []checkResult
+	// router is the semantic router setting; routerSet says it was answered (a
+	// flag or the question), so a run that did not ask keeps the record's value.
+	router, routerSet bool
+	checks            []checkResult
 }
 
 func reportedErr(format string, a ...any) error { return reportedError{fmt.Sprintf(format, a...)} }
@@ -237,35 +248,70 @@ func (c *InitCmd) execute(env *initEnv) error {
 		return err
 	}
 
+	// The install lives in its workspace (~/.darkplum/installs/<cluster>), never in
+	// the checkout. --dir names the workspace directory explicitly (tests, and
+	// setups that keep it elsewhere); it must exist.
 	dir := c.Dir
 	if dir == "" {
-		dir = filepath.Join("terraform", "aws")
-	}
-	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
-		return env.fail("terraform root", dir, "run from the darkplum/ directory or pass --dir", "no Terraform root at "+dir)
-	}
-
-	// An install from before the private address: offer to add just that.
-	// Interactive only: a script re-running init (--yes) keeps today's
-	// behaviour, a full rewrite guarded by --force.
-	if raw := existingTFVars(filepath.Join(dir, "terraform.tfvars")); env.interactive && raw != nil && raw["web_domain"] == "" && !c.Force {
-		merge := false
-		{
-			i, err := env.prompt.Select("This install has no private web address yet. What should init do?", []Option{
-				{"Add one", "asks only for the address; keeps every other setting"},
-				{"Start over", "asks every question again"},
-			}, 0)
+		home, err := install.DefaultHome()
+		if err != nil {
+			return env.fail("home", err.Error(), "set DARKPLUM_HOME to an absolute path, or fix HOME", "cannot find the darkplum home directory")
+		}
+		if env.interactive && !c.Force {
+			name, err := c.pickInstall(env, home)
 			if err != nil {
 				return err
 			}
-			merge = i == 0
+			if name != "" {
+				c.ClusterName = name
+			}
 		}
-		if merge {
-			return c.mergeWeb(env, dir)
+		in, err := install.Open(home, c.ClusterName)
+		if err != nil {
+			return env.fail("cluster name", c.ClusterName, "use 2-40 lowercase letters, digits and single hyphens, starting with a letter", "invalid --cluster-name")
+		}
+		dir = in.Dir()
+		// An install from the Makefile flow in this checkout: take it over first.
+		if legacyRootHere() {
+			return env.fail("existing install", "this checkout holds an install from the Makefile flow",
+				"run `darkplum init --adopt` to take it over (its state stays where it is)", "this directory holds an install from the Makefile flow; run darkplum init --adopt")
+		}
+	} else {
+		if st, err := os.Stat(dir); err != nil || !st.IsDir() {
+			return env.fail("workspace", dir, "create the directory or drop --dir", "no workspace directory at "+dir)
+		}
+		// A backend.tf here is a Makefile-era install: adopt it first.
+		if _, err := os.Stat(filepath.Join(dir, "backend.tf")); err == nil {
+			return env.fail("existing install", filepath.Join(dir, "backend.tf")+" is from the Makefile flow",
+				"run `darkplum init --adopt` to take this install over (its state stays where it is)", "this directory holds an install from the Makefile flow; run darkplum init --adopt")
+		}
+	}
+
+	// Running init again on an install shows its settings and asks what to change.
+	// Interactive only: a script re-running init (--yes) keeps today's behaviour, a
+	// full rewrite guarded by --force.
+	if raw := existingTFVars(filepath.Join(dir, "terraform.tfvars")); env.interactive && raw != nil && !c.Force {
+		if done, err := c.existingInstall(env, dir, raw); done {
+			return err
 		}
 	}
 
 	s := &settings{throwaway: c.Throwaway, gpuCount: c.GPUCount}
+	// An install that exists is not re-decided: its cluster, region, account and
+	// state location are fixed (see lockedFields). A fresh install has none.
+	if in, oerr := install.OpenDir(dir, c.ClusterName); oerr == nil {
+		if rec, lerr := in.Load(); lerr == nil {
+			s.locked = &rec
+			s.router = rec.SemanticRouter
+			if c.Region != "" && c.Region != rec.Region {
+				return env.fail("region", c.Region, "the install is in "+rec.Region+" and cannot move; create a new install for another region", "the region of an existing install cannot change")
+			}
+			c.Region = rec.Region
+			if c.Profile == "" {
+				c.Profile = rec.Profile
+			}
+		}
+	}
 	record := func(r checkResult) {
 		printCheckTo(w, r)
 		s.checks = append(s.checks, r)
@@ -304,6 +350,10 @@ func (c *InitCmd) execute(env *initEnv) error {
 		}
 		if err := validateAccountID(id.Account); err != nil {
 			return reportedErr("unexpected account id %q from sts", id.Account)
+		}
+		if s.locked != nil && !contains(s.locked.AccountIDs, id.Account) {
+			return env.fail("aws account", fmt.Sprintf("credentials are for %s, the install is in %s", id.Account, strings.Join(s.locked.AccountIDs, ", ")),
+				"use the install's profile; an install cannot move to another account", "the account of an existing install cannot change")
 		}
 		s.profile, s.account = profile, id.Account
 		fmt.Fprintf(w, "  Installing into account %s as %s\n", sInfo(id.Account), sInfo(id.Arn))
@@ -371,7 +421,7 @@ func (c *InitCmd) execute(env *initEnv) error {
 				return err
 			}
 			mode = []string{"bedrock", "gpu"}[i]
-			fmt.Fprintf(w, "  %s\n", sDim("Switch later by re-running ./bin/darkplum init."))
+			fmt.Fprintf(w, "  %s\n", sDim("Switch later by re-running darkplum init."))
 		} else {
 			mode = "bedrock"
 		}
@@ -389,6 +439,11 @@ func (c *InitCmd) execute(env *initEnv) error {
 
 	// 5. Private web address.
 	if err := c.chooseWeb(env, s, cloud, existingTFVars(filepath.Join(dir, "terraform.tfvars")), record); err != nil {
+		return err
+	}
+
+	// 6. Semantic router (optional; stored in the install record, applied by deploy).
+	if err := c.chooseRouter(env, s); err != nil {
 		return err
 	}
 
@@ -439,7 +494,7 @@ func (c *InitCmd) execute(env *initEnv) error {
 				return err
 			}
 			if !ok {
-				return reportedErr("stopped: raise the GPU quota (or choose Bedrock only) and re-run ./bin/darkplum init")
+				return reportedErr("stopped: raise the GPU quota (or choose Bedrock only) and re-run darkplum init")
 			}
 		}
 	}
@@ -447,36 +502,18 @@ func (c *InitCmd) execute(env *initEnv) error {
 	// A fresh checkout of a live install: its state answers before the name
 	// check, which would otherwise call the install's own cluster a clash.
 	s.cluster = c.ClusterName
-	if err := c.preflightLiveInstall(env, s, dir, cloud); err != nil {
-		return err
-	}
-
-	// Cluster name collisions.
-	cluster, err := chooseCluster(env, cloud, region, c.ClusterName, record)
-	if err != nil {
-		return err
-	}
-	s.cluster = cluster
-
-	// Backend.
-	backend := c.Backend
-	if backend == "" {
-		backend = "s3"
-		if env.interactive {
-			i, err := env.prompt.Select("Where should Terraform keep its state?", []Option{
-				{"S3 bucket in your account", "versioned, KMS-encrypted, private; recommended"},
-				{"Local file", "plain text on this machine; holds the database password"},
-			}, 0)
-			if err != nil {
-				return err
-			}
-			backend = []string{"s3", "local"}[i]
+	if s.locked == nil {
+		if err := c.preflightLiveInstall(env, s, dir, cloud); err != nil {
+			return err
 		}
-	}
-	s.backend = backend
-	if backend == "local" {
-		record(checkResult{name: "terraform state", status: checkWarn, detail: "local file",
-			hint: "terraform.tfstate holds the RDS password in plain text: keep it out of Dropbox/iCloud/git and back it up"})
+
+		// Cluster name collisions. An existing install's own cluster, bucket and
+		// state are not collisions, so none of this runs for one.
+		cluster, err := chooseCluster(env, cloud, region, c.ClusterName, record)
+		if err != nil {
+			return err
+		}
+		s.cluster = cluster
 	}
 
 	return c.finish(env, s, dir, cloud)
@@ -608,7 +645,7 @@ func (c *InitCmd) resolveCustom(env *initEnv, id, rev string) (catalogModel, err
 			return m, reportedErr("model %s not found on Hugging Face", id)
 		case errors.Is(err, errHFGated):
 			printCheckTo(w, checkResult{name: "model", status: checkWarn, detail: id + " is gated",
-				hint: "needs a Hugging Face token: after make deploy run `make set-hf-token`"})
+				hint: "needs a Hugging Face token: after the deploy run `darkplum keys set huggingface`"})
 			if !env.interactive {
 				return m, reportedErr("%s is gated; run init interactively to confirm, or choose an ungated model", id)
 			}
@@ -687,7 +724,7 @@ func (s *settings) tfvars() []tfvarsKV {
 	return kv
 }
 
-// existingBackend reads the bucket, key and region named in an existing backend.tf.
+// existingBackend reads the bucket, key and region named in an existing backend.hcl.
 func existingBackend(path string) (bucket, key, region string, ok bool) {
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -723,20 +760,32 @@ func localStateResources(dir string) int {
 // finish writes (or, with --dry-run, prints) the files and creates the state
 // backend. Read-only pre-checks run first; nothing is touched until the final
 // confirmation, and tfvars is written last so its presence means the install is
-// ready for make deploy.
+// ready for the deploy.
 func (c *InitCmd) finish(env *initEnv, s *settings, dir string, cloud initCloud) error {
 	w := env.out
 	tfvarsPath := filepath.Join(dir, "terraform.tfvars")
-	backendPath := filepath.Join(dir, "backend.tf")
+	backendPath := filepath.Join(dir, backendFileName)
 
 	// Where state lives: kept from backend.tf, an existing Darkplum bucket, or a
 	// new one (init_state.go). May rename the cluster, so tfvars renders after.
-	var plan statePlan
-	if s.backend == "s3" {
-		var err error
-		if plan, err = c.planState(env, s, dir, cloud); err != nil {
+	plan, err := c.planState(env, s, dir, cloud)
+	if err != nil {
+		return err
+	}
+	// planState may have renamed the cluster (name collision): the workspace is
+	// named after the final cluster.
+	if c.Dir == "" && s.cluster != c.ClusterName {
+		home, err := install.DefaultHome()
+		if err != nil {
 			return err
 		}
+		in, err := install.Open(home, s.cluster)
+		if err != nil {
+			return err
+		}
+		dir = in.Dir()
+		tfvarsPath = filepath.Join(dir, "terraform.tfvars")
+		backendPath = filepath.Join(dir, backendFileName)
 	}
 	bucket, reused, st := plan.bucket, plan.kept, plan.st
 	tfvarsText := renderTFVars(s.tfvars(), env.now())
@@ -744,33 +793,29 @@ func (c *InitCmd) finish(env *initEnv, s *settings, dir string, cloud initCloud)
 	if spec.KMSKeyARN == "" {
 		spec.KMSKeyARN = kmsKeyPlaceholder
 	}
-	localResources := 0
-	if s.backend == "s3" {
-		localResources = localStateResources(dir)
+	if s.locked != nil {
+		if err := lockedFields(*s.locked, s, spec); err != nil {
+			return env.fail("existing install", err.Error(), "region, account, cluster name and the state location are fixed once an install exists; create a new install instead", "an existing install's identity cannot change")
+		}
 	}
+	localResources := localStateResources(dir)
 	_, backendExists := os.Stat(backendPath)
-	switchingToLocal := s.backend == "local" && backendExists == nil
 
 	fmt.Fprintln(w)
 	if c.DryRun {
 		fmt.Fprintf(w, "%s\n%s\n", sHeader("terraform.tfvars (dry run — not written)"), tfvarsText)
-		if s.backend == "s3" {
-			fmt.Fprintf(w, "%s\n%s\n", sHeader("backend.tf (dry run — not written)"), renderBackend(spec))
-			fmt.Fprintf(w, "%s\n", sHeader("read-only pre-checks that ran"))
-			for _, ch := range st.Checks {
-				fmt.Fprintf(w, "  %s\n", sDim(ch))
-			}
-			fmt.Fprintf(w, "\n%s\n", sHeader("would run in account "+s.account+" (dry run — nothing run)"))
-			for _, cmd := range plannedBackendCommands(s.profile, s.account, bucket, s.region, st) {
-				fmt.Fprintf(w, "  %s\n", sDim(formatAWS(cmd)))
-			}
-			fmt.Fprintf(w, "\n  %s %s\n\n", sWarn("!"), kmsWarning)
+		fmt.Fprintf(w, "%s\n%s\n", sHeader(backendFileName+" (dry run — not written)"), renderBackend(spec))
+		fmt.Fprintf(w, "%s\n", sHeader("read-only pre-checks that ran"))
+		for _, ch := range st.Checks {
+			fmt.Fprintf(w, "  %s\n", sDim(ch))
 		}
+		fmt.Fprintf(w, "\n%s\n", sHeader("would run in account "+s.account+" (dry run — nothing run)"))
+		for _, cmd := range plannedBackendCommands(s.profile, s.account, bucket, s.region, st) {
+			fmt.Fprintf(w, "  %s\n", sDim(formatAWS(cmd)))
+		}
+		fmt.Fprintf(w, "\n  %s %s\n\n", sWarn("!"), kmsWarning)
 		if s.web.createZone {
 			fmt.Fprintf(w, "  %s would create the public hosted zone %s, show its 4 NS records to add at your DNS provider, and wait until they resolve\n\n", sWarn("!"), s.web.hostname)
-		}
-		if switchingToLocal {
-			fmt.Fprintf(w, "  %s would rename %s to backend.tf.bak (state stays in S3; see terraform init -migrate-state)\n\n", sWarn("!"), backendPath)
 		}
 		if localResources > 0 {
 			fmt.Fprintf(w, "  %s %d resources in local state would NOT move to S3 automatically; after writing, run: cd %s && terraform init -migrate-state\n\n", sWarn("!"), localResources, dir)
@@ -785,14 +830,14 @@ func (c *InitCmd) finish(env *initEnv, s *settings, dir string, cloud initCloud)
 		return nil
 	}
 
-	// Overwrite guard (a reused backend.tf names the same bucket, so it is not
+	// Overwrite guard (a reused backend.hcl names the same bucket, so it is not
 	// an overwrite worth asking about).
 	var existing []string
 	if _, err := os.Stat(tfvarsPath); err == nil {
 		existing = append(existing, "terraform.tfvars")
 	}
-	if s.backend == "s3" && backendExists == nil && !reused {
-		existing = append(existing, "backend.tf")
+	if backendExists == nil && !reused {
+		existing = append(existing, backendFileName)
 	}
 	if len(existing) > 0 && !c.Force {
 		if !env.interactive {
@@ -808,7 +853,7 @@ func (c *InitCmd) finish(env *initEnv, s *settings, dir string, cloud initCloud)
 	}
 
 	// Existing local state does not follow to S3: migrating is a manual step, so
-	// make the operator acknowledge it BEFORE backend.tf is written.
+	// make the operator acknowledge it BEFORE backend.hcl is written.
 	if localResources > 0 {
 		cmd := "cd " + dir + " && terraform init -migrate-state"
 		printCheckTo(w, checkResult{name: "local state", status: checkWarn, detail: fmt.Sprintf("%d resources in %s", localResources, filepath.Join(dir, "terraform.tfstate")),
@@ -833,7 +878,7 @@ func (c *InitCmd) finish(env *initEnv, s *settings, dir string, cloud initCloud)
 	}
 	if env.interactive {
 		what := "Save these settings?"
-		if s.backend == "s3" && !st.BucketExists {
+		if !st.BucketExists {
 			what = fmt.Sprintf("Save these settings? This creates a private, encrypted bucket in account %s to hold the install's state", s.account)
 		}
 		if s.web.createZone {
@@ -849,32 +894,25 @@ func (c *InitCmd) finish(env *initEnv, s *settings, dir string, cloud initCloud)
 	}
 
 	var wrote []string
-	if switchingToLocal {
-		if err := os.Rename(backendPath, backendPath+".bak"); err != nil {
-			return reportedErr("could not move %s aside: %v", backendPath, err)
-		}
-		_ = os.Chmod(backendPath+".bak", 0o600)
-		printCheckTo(w, checkResult{name: "backend.tf", status: checkWarn, detail: "moved to backend.tf.bak",
-			hint: "terraform now uses local state; existing S3 state stays in the bucket. To bring it local run: cd " + dir + " && terraform init -migrate-state"})
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return reportedErr("could not create the install workspace %s: %v", dir, err)
 	}
-	if s.backend == "s3" {
-		fmt.Fprintf(w, "%s preparing state bucket %s…\n", sDim("…"), bucket)
-		arn, err := cloud.CreateBackend(bucket, s.region, st)
-		if err != nil {
-			return env.fail("state bucket", firstLine(err.Error()), "needs s3:CreateBucket/PutBucket* and kms:CreateKey/CreateAlias in "+s.region+"; re-run init (it reuses what was created), or use --backend local", "could not create the state backend")
-		}
-		spec.KMSKeyARN = arn
-		if plan.staleEmpty {
-			if err := setAsideBackendCache(dir, env.now()); err != nil {
-				return reportedErr("could not set aside Terraform's saved backend settings in %s: %v", filepath.Join(dir, ".terraform"), err)
-			}
-			fmt.Fprintf(w, "  %s\n", sDim("set aside Terraform's saved settings for the earlier, empty state at "+plan.cache.url()))
-		}
-		if err := writeFileAtomic(backendPath, []byte(renderBackend(spec))); err != nil {
-			return err
-		}
-		wrote = append(wrote, backendPath)
+	fmt.Fprintf(w, "%s preparing state bucket %s…\n", sDim("…"), bucket)
+	arn, err := cloud.CreateBackend(bucket, s.region, st)
+	if err != nil {
+		return env.fail("state bucket", firstLine(err.Error()), "needs s3:CreateBucket/PutBucket* and kms:CreateKey/CreateAlias in "+s.region+"; re-run init (it reuses what was created)", "could not create the state backend")
 	}
+	spec.KMSKeyARN = arn
+	if plan.staleEmpty {
+		if err := setAsideBackendCache(dir, env.now()); err != nil {
+			return reportedErr("could not set aside Terraform's saved backend settings in %s: %v", filepath.Join(dir, ".terraform"), err)
+		}
+		fmt.Fprintf(w, "  %s\n", sDim("set aside Terraform's saved settings for the earlier, empty state at "+plan.cache.url()))
+	}
+	if err := writeFileAtomic(backendPath, []byte(renderBackend(spec))); err != nil {
+		return err
+	}
+	wrote = append(wrote, backendPath)
 	if s.web.createZone {
 		if err := c.createAndDelegate(env, s, cloud); err != nil {
 			return err
@@ -885,12 +923,15 @@ func (c *InitCmd) finish(env *initEnv, s *settings, dir string, cloud initCloud)
 		return err
 	}
 	wrote = append(wrote, tfvarsPath)
-	fmt.Fprintln(w)
-	if s.backend == "s3" {
-		fmt.Fprintf(w, "  %s %s\n", sWarn("!"), kmsWarning)
+	// The record is written last: its presence is what makes this an install.
+	if err := c.saveRecord(dir, s, spec, env.now()); err != nil {
+		return reportedErr("could not record the install in %s: %v", dir, err)
 	}
+	wrote = append(wrote, filepath.Join(dir, "install.json"))
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "  %s %s\n", sWarn("!"), kmsWarning)
 	if plan.staleLive != nil {
-		fmt.Fprintf(w, "  %s before make deploy, move the earlier state: %s\n", sWarn("!"), sCmd(migrateCmd(dir, s.profile)))
+		fmt.Fprintf(w, "  %s before the deploy, move the earlier state: %s\n", sWarn("!"), sCmd(migrateCmd(dir, s.profile)))
 	}
 	c.summary(env, s, wrote, false)
 	return nil
@@ -921,14 +962,68 @@ func (c *InitCmd) summary(env *initEnv, s *settings, wrote []string, dry bool) {
 	}
 	fmt.Fprintln(w, line)
 	if len(wrote) > 0 {
-		fmt.Fprintf(w, "  Settings saved. %s\n", sDim("Change them by re-running ./bin/darkplum init."))
+		fmt.Fprintf(w, "  Settings saved. %s\n", sDim("Change them by re-running darkplum init."))
 	}
 	if s.web.domain != "" {
 		fmt.Fprintf(w, "  Your team's address after deploy: %s %s\n", sCmd("https://"+s.web.hostname), sDim("(from "+strings.Join(s.web.allowed, ", ")+")"))
+	}
+	if s.router {
+		fmt.Fprintf(w, "  Semantic router: %s %s\n", sInfo("on"), sDim("(deploy installs it; its classifier models download on first start, 1-3 minutes)"))
 	}
 	eta := "~20 min"
 	if s.gpu {
 		eta = "~35-50 min"
 	}
-	fmt.Fprintf(w, "\n  Next: %s  %s, then %s\n", sCmd("make deploy"), sDim("("+eta+")"), sCmd("./bin/darkplum configure"))
+	fmt.Fprintf(w, "\n  Next: %s  %s, then %s\n", sCmd("darkplum deploy"), sDim("("+eta+")"), sCmd("darkplum configure"))
+}
+
+// saveRecord writes install.json beside the settings. A re-run keeps what the
+// record already knows (when the install was created, the bundle last applied).
+func (c *InitCmd) saveRecord(dir string, s *settings, spec backendSpec, now time.Time) error {
+	in, err := install.OpenDir(dir, s.cluster)
+	if err != nil {
+		return err
+	}
+	rec := install.Record{
+		Name: s.cluster, ClusterName: s.cluster, Region: s.region, Profile: s.profile, AccountIDs: []string{s.account}, SemanticRouter: s.router,
+		Created: now.UTC(),
+		Backend: install.Backend{Type: "s3", Bucket: spec.Bucket, Key: spec.Key, Region: spec.Region, KMSKeyID: spec.KMSKeyARN, Encrypt: true, UseLockfile: true},
+	}
+	if old, err := in.Load(); err == nil {
+		// Whatever the flags, --force and --yes included, a live install's identity
+		// is not rewritten.
+		if err := lockedFields(old, s, spec); err != nil {
+			return err
+		}
+		rec.Created, rec.Bundle, rec.AdoptedFrom, rec.CreatedZoneID = old.Created, old.Bundle, old.AdoptedFrom, old.CreatedZoneID
+		if !s.routerSet {
+			rec.SemanticRouter = old.SemanticRouter // a run that did not ask does not decide
+		}
+	}
+	if s.web.createZone {
+		rec.CreatedZoneID = s.web.zoneID
+	}
+	return in.Save(rec)
+}
+
+// lockedFields refuses any change to what makes an install this install: its
+// cluster, region, AWS account(s) and where its Terraform state lives. Changing
+// them is not an edit, it is a different install (a new cluster in a new place
+// with the old one orphaned), so no flag overrides it.
+func lockedFields(old install.Record, s *settings, spec backendSpec) error {
+	switch {
+	case s.cluster != old.ClusterName:
+		return fmt.Errorf("the cluster is %s, not %s", old.ClusterName, s.cluster)
+	case s.region != old.Region:
+		return fmt.Errorf("the install is in %s, not %s", old.Region, s.region)
+	case len(old.AccountIDs) != 1:
+		return fmt.Errorf("the install records %d AWS accounts (%s), and Start over answers for exactly one, so it cannot confirm it is the same install; leave its settings, or change them from the other choices in this menu",
+			len(old.AccountIDs), strings.Join(old.AccountIDs, ", "))
+	case old.AccountIDs[0] != s.account:
+		return fmt.Errorf("the install is in account %s, not %s", strings.Join(old.AccountIDs, ", "), s.account)
+	case spec.Bucket != old.Backend.Bucket || spec.Key != old.Backend.Key || spec.Region != old.Backend.Region:
+		return fmt.Errorf("the install keeps its state at s3://%s/%s (%s), not s3://%s/%s (%s)",
+			old.Backend.Bucket, old.Backend.Key, old.Backend.Region, spec.Bucket, spec.Key, spec.Region)
+	}
+	return nil
 }

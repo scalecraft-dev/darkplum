@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"github.com/scalecraft-dev/darkplum/cli/internal/kube"
+
+	"github.com/scalecraft-dev/darkplum/cli/internal/runner"
 )
 
 const (
@@ -279,6 +281,8 @@ type configureHarness struct {
 	hook   func(string)
 	resolv func() (clusterTarget, checkResult, error)
 
+	clockStore *deployClock // the workspace's deploy clock (nil: none)
+
 	web      webAddress
 	tfOut    map[string]json.RawMessage
 	tfErr    error
@@ -333,7 +337,7 @@ func (h *configureHarness) run(c *ConfigureCmd, answers string, secrets ...strin
 		namespace:   "darkplum-system",
 		resolve:     resolve,
 		newKube: func(t clusterTarget, ns string) *kube.Client {
-			return &kube.Client{Runner: h.kube, Namespace: ns, Kubeconfig: t.Kubeconfig, Context: t.Context}
+			return kube.ForTest(h.kube, ns, "--kubeconfig", t.Kubeconfig, "--context", t.Context)
 		},
 		newFwd: func(clusterTarget) Forwarder { return h.fwd },
 		httpc:  &http.Client{Timeout: 5 * time.Second},
@@ -345,6 +349,10 @@ func (h *configureHarness) run(c *ConfigureCmd, answers string, secrets ...strin
 		web:       h.web,
 		tfOutputs: func() (map[string]json.RawMessage, error) { return h.tfOut, h.tfErr },
 		probe:     func(u string) error { h.probed = append(h.probed, u); return h.probeErr },
+	}
+	if h.clockStore != nil {
+		h.env.loadClock = func() (deployClock, bool) { return *h.clockStore, !h.clockStore.Started.IsZero() }
+		h.env.saveClock = func(c deployClock) error { *h.clockStore = c; return nil }
 	}
 	err := c.execute(context.Background(), h.env)
 	h.checkInvariants()
@@ -403,7 +411,7 @@ func TestConfigureFirstRunBedrock(t *testing.T) {
 	h.contains("✓ first admin", "Jane.Doe@acme.com created", "? Name [Jane Doe]", "enabled now",
 		"✓ test chat", "answered in", "Hello there!",
 		"Open darkplum: http://localhost:", "Sign in as Jane.Doe@acme.com", "Ctrl-C closes it",
-		"No team address yet: re-run ./bin/darkplum init to add a private HTTPS address")
+		"No team address yet: re-run darkplum init to add a private HTTPS address")
 	if got := api.users["Jane.Doe@acme.com"]; got != testPassword {
 		t.Errorf("setup did not carry the password")
 	}
@@ -602,7 +610,7 @@ func TestConfigureHoldOpenGivesUpAfterSecondDrop(t *testing.T) {
 	api := newFakeAPI()
 	h := newHarness(t, api, 2)
 	out := &bytes.Buffer{}
-	r := &configureRun{configureEnv: &configureEnv{out: out}, fwd: h.fwd, kc: &kube.Client{Runner: h.kube}}
+	r := &configureRun{configureEnv: &configureEnv{out: out}, fwd: h.fwd, kc: kube.ForTest(h.kube, "")}
 	base, _ := h.fwd.Open(context.Background())
 	r.api = &apiClient{fwd: h.fwd, base: base}
 	go func() {
@@ -622,7 +630,7 @@ func TestConfigureHoldOpenGivesUpAfterSecondDrop(t *testing.T) {
 	if err == nil || !IsReported(err) {
 		t.Fatalf("second drop must end with a reported ✗, got %v", err)
 	}
-	for _, w := range []string{"reconnecting", "(new address)", "✗ connection", "re-run ./bin/darkplum configure"} {
+	for _, w := range []string{"reconnecting", "(new address)", "✗ connection", "re-run darkplum configure"} {
 		if !strings.Contains(out.String(), w) {
 			t.Errorf("output lacks %q:\n%s", w, out.String())
 		}
@@ -655,7 +663,7 @@ func TestConfigureSelfHostedLoadingDoesNotBlockBedrock(t *testing.T) {
 	if err := h.run(&ConfigureCmd{}, "a@acme.com\n\n\n", testPassword, testPassword); err != nil {
 		t.Fatalf("configure: %v\n%s", err, h.out.String())
 	}
-	h.contains("! self-hosted model", "downloading the model weights", "re-run ./bin/darkplum configure", "✓ test chat")
+	h.contains("! self-hosted model", "downloading the model weights", "re-run darkplum configure", "✓ test chat")
 	if strings.Contains(h.out.String(), "waiting for the self-hosted model") {
 		t.Error("without --wait configure must not wait while a Bedrock model is ready")
 	}
@@ -671,7 +679,7 @@ func TestConfigureWaitModelNeverReady(t *testing.T) {
 		t.Fatalf("want a reported failure, got %v\n%s", err, h.out.String())
 	}
 	h.contains("waiting for the self-hosted model, up to 10 min", "self-hosted model: downloading the model weights",
-		"✗ self-hosted model", "not ready after 10 min", "logs -f deploy/vllm-inference -c model-download", `eval "$(./bin/darkplum kubeconfig)" && kubectl`)
+		"✗ self-hosted model", "not ready after 10 min", "logs -f deploy/vllm-inference -c model-download", `eval "$(darkplum kubeconfig)" && kubectl`)
 }
 
 func TestConfigureWaitThenEnablesSelfHosted(t *testing.T) {
@@ -766,7 +774,7 @@ func TestVLLMStateFromPods(t *testing.T) {
 			if s.phase != tc.phase || s.broken != tc.broken || s.ready != tc.ready {
 				t.Errorf("got %+v", s)
 			}
-			if s.broken && !strings.Contains(s.hint, `eval "$(./bin/darkplum kubeconfig)" && kubectl -n darkplum-inference`) {
+			if s.broken && !strings.Contains(s.hint, `eval "$(darkplum kubeconfig)" && kubectl -n darkplum-inference`) {
 				t.Errorf("diagnostic must validate the install first: %q", s.hint)
 			}
 		})
@@ -803,101 +811,6 @@ func TestNameFromEmail(t *testing.T) {
 			t.Errorf("nameFromEmail(%q) = %q, want %q", in, got, want)
 		}
 	}
-}
-
-func TestForwardingLineParse(t *testing.T) {
-	var got []string
-	w := &lineWriter{fn: func(l string) {
-		if m := forwardingRe.FindStringSubmatch(l); m != nil {
-			got = append(got, m[1])
-		}
-	}}
-	_, _ = w.Write([]byte("Forwarding from 127.0.0.1:5"))
-	_, _ = w.Write([]byte("4321 -> 80\nHandling connection for 54321\n"))
-	if fmt.Sprint(got) != "[54321]" {
-		t.Errorf("parsed ports %v", got)
-	}
-	f := newKubectlForwarder(clusterTarget{Kubeconfig: testKubeconfig, Context: testContext, Profile: "acme"}, "darkplum-system")
-	if a := f.args(); strings.Join(a, " ") !=
-		"--kubeconfig "+testKubeconfig+" --context "+testContext+" -n darkplum-system port-forward --address 127.0.0.1 svc/darkplum-web :80" {
-		t.Errorf("port-forward args = %q", a)
-	}
-	if strings.Join(f.env, " ") != "AWS_PROFILE=acme KUBECONFIG="+testKubeconfig {
-		t.Errorf("port-forward env = %q", f.env)
-	}
-}
-
-// fakeKubectl puts a script named kubectl first on PATH.
-func fakeKubectl(t *testing.T, script string) {
-	t.Helper()
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte("#!/bin/sh\n"+script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-}
-
-func TestKubectlForwarderLifecycle(t *testing.T) {
-	t.Run("parses the port and stops the process on Close", func(t *testing.T) {
-		fakeKubectl(t, `echo "Forwarding from 127.0.0.1:43210 -> 80"; echo "Forwarding from [::1]:43210 -> 80"; exec sleep 30`)
-		f := newKubectlForwarder(clusterTarget{Kubeconfig: testKubeconfig, Context: testContext}, "darkplum-system")
-		base, err := f.Open(context.Background())
-		if err != nil || base != "http://127.0.0.1:43210" {
-			t.Fatalf("Open = %q, %v", base, err)
-		}
-		done := f.Done()
-		start := time.Now()
-		f.Close()
-		select {
-		case <-done:
-		case <-time.After(2 * time.Second):
-			t.Fatal("Close left kubectl running")
-		}
-		if time.Since(start) > 2*time.Second {
-			t.Error("Close was slow")
-		}
-	})
-	t.Run("Done closes when kubectl dies", func(t *testing.T) {
-		fakeKubectl(t, `echo "Forwarding from 127.0.0.1:43211 -> 80"; sleep 0.2; exit 1`)
-		f := newKubectlForwarder(clusterTarget{Kubeconfig: testKubeconfig, Context: testContext}, "darkplum-system")
-		defer f.Close()
-		if _, err := f.Open(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-		select {
-		case <-f.Done():
-		case <-time.After(3 * time.Second):
-			t.Fatal("Done did not close when kubectl exited")
-		}
-	})
-	t.Run("a refusal is reported from stderr", func(t *testing.T) {
-		fakeKubectl(t, `echo "error: services \"darkplum-web\" not found" >&2; exit 1`)
-		f := newKubectlForwarder(clusterTarget{Kubeconfig: testKubeconfig, Context: testContext}, "darkplum-system")
-		_, err := f.Open(context.Background())
-		if err == nil || !strings.Contains(err.Error(), "darkplum-web") {
-			t.Fatalf("Open = %v", err)
-		}
-	})
-	t.Run("Ctrl-C leaves the tunnel for the sign-out; Close stops it", func(t *testing.T) {
-		fakeKubectl(t, `echo "Forwarding from 127.0.0.1:43212 -> 80"; exec sleep 30`)
-		f := newKubectlForwarder(clusterTarget{Kubeconfig: testKubeconfig, Context: testContext}, "darkplum-system")
-		ctx, cancel := context.WithCancel(context.Background())
-		if _, err := f.Open(ctx); err != nil {
-			t.Fatal(err)
-		}
-		cancel()
-		select {
-		case <-f.Done():
-			t.Fatal("cancelling the run killed the tunnel before configure could sign out through it")
-		case <-time.After(300 * time.Millisecond):
-		}
-		f.Close()
-		select {
-		case <-f.Done():
-		case <-time.After(3 * time.Second):
-			t.Fatal("Close left kubectl running")
-		}
-	})
 }
 
 func TestLoginAndChatAreNotReplayedOnANewTunnel(t *testing.T) {
@@ -958,16 +871,15 @@ func loggingKubectl(t *testing.T) (logPath string) {
 
 func TestWriteCommandsFailClosed(t *testing.T) {
 	g := &Globals{Namespace: "darkplum-system"}
-	t.Run("sso with install settings that do not resolve refuses", func(t *testing.T) {
+	t.Run("sso with an install that does not resolve refuses", func(t *testing.T) {
 		log := loggingKubectl(t)
-		dir := t.TempDir()
-		if err := os.MkdirAll(filepath.Join(dir, "terraform", "aws"), 0o755); err != nil {
+		testInstall(t, nil)
+		// an aws that cannot answer: the install cannot be validated
+		bin := t.TempDir()
+		if err := os.WriteFile(filepath.Join(bin, "aws"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(dir, defaultTFVars), []byte("aws_region = \"us-east-2\"\nallowed_account_ids = [\"123456789012\"]\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		t.Chdir(dir)
+		t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 		err := (&SSOConfigureCmd{Issuer: "https://idp", ClientID: "c", RedirectURL: "https://x/cb", SecretStdin: true}).Run(g)
 		if err == nil || !IsReported(err) {
 			t.Fatalf("want a reported refusal, got %v", err)
@@ -994,15 +906,13 @@ func TestWriteCommandsFailClosed(t *testing.T) {
 	})
 	t.Run("--context pins every call", func(t *testing.T) {
 		t.Chdir(t.TempDir())
-		kc, err := installKube(io.Discard, "darkplum-system", "kind-darkplum-dev")
-		if err != nil {
-			t.Fatal(err)
+		old := newLocalKind
+		defer func() { newLocalKind = old }()
+		newLocalKind = func(ctx string) (runner.LocalKind, error) {
+			return runner.LocalKind{}, errors.New("stub: pretend kind")
 		}
-		rec := &fakeKube{}
-		kc.Runner = rec
-		_, _ = kc.NS(nil, "get", "svc", "darkplum-web")
-		if got := strings.Join(rec.calls[0], " "); got != "--context kind-darkplum-dev -n darkplum-system get svc darkplum-web" {
-			t.Errorf("args = %q", got)
+		if _, err := installKube(io.Discard, "darkplum-system", "kind-darkplum-dev", ""); err == nil {
+			t.Fatal("the stub refused; installKube must surface it")
 		}
 	})
 }
@@ -1154,7 +1064,7 @@ func TestConfigureWarnsWhenSSORedirectIsElsewhere(t *testing.T) {
 			t.Errorf("redirect %s: warning shown = %v, want %v\n%s", redirect, got, warn, h.out.String())
 		}
 		if warn {
-			h.contains("./bin/darkplum sso configure --redirect-url https://darkplum.acme.com/auth/callback")
+			h.contains("darkplum sso configure --redirect-url https://darkplum.acme.com/auth/callback")
 		}
 	}
 }

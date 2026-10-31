@@ -112,7 +112,7 @@ func gatherFlags(n *kong.Node) []*kong.Flag {
 	var out []*kong.Flag
 	for cur := n; cur != nil; cur = cur.Parent {
 		for _, f := range cur.Flags {
-			if seen[f.Name] {
+			if seen[f.Name] || f.Hidden {
 				continue
 			}
 			seen[f.Name] = true

@@ -29,7 +29,7 @@ func TestInitStateLegacyKeyByClusterName(t *testing.T) {
 	t.Run("same name stops", func(t *testing.T) {
 		err, out, cloud, _ := run(t, stateContents{Resources: 90, ClusterName: "darkplum"})
 		if err == nil || !strings.Contains(out, restore) || cloud.createCalls != 0 {
-			t.Fatalf("want stop with backend.tf to restore, got %v\n%s", err, out)
+			t.Fatalf("want stop with backend.hcl to restore, got %v\n%s", err, out)
 		}
 	})
 	t.Run("unreadable name stops", func(t *testing.T) {
@@ -60,7 +60,7 @@ func TestInitStateLiveInstallBeatsNameCollision(t *testing.T) {
 	cloud.buckets = []stateBucket{{Name: bucketN("bf3057")}}
 	cloud.state = backendState{KeyARN: fakeKMS, BucketExists: true}
 	cloud.objectsFull = map[string]stateContents{bucketN("bf3057") + "/" + legacyStateKey: {Resources: 120, ClusterName: "darkplum"}}
-	for _, answers := range []string{"-", "\n"} { // --yes, and interactive (networks default; a rename prompt would hit EOF)
+	for _, answers := range []string{"-", "\n\n"} { // --yes, and interactive (networks default, router default; a rename prompt would hit EOF)
 		dir := t.TempDir()
 		env, out := testEnv(t, cloud, nil, answers)
 		c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Region: "us-east-2", Mode: "bedrock", Profile: "acme", Domain: "acme.com", Yes: answers == "-"}
@@ -113,7 +113,7 @@ func TestInitStateLiveInstallFailsClosed(t *testing.T) {
 			if err := s3Cmd(dir, nil).execute(env); err == nil {
 				t.Fatalf("%s: want refusal\n%s", name, out)
 			}
-			if !strings.Contains(out.String(), "s3:ListAllMyBuckets") || !strings.Contains(out.String(), "--backend local") {
+			if !strings.Contains(out.String(), "s3:ListAllMyBuckets") {
 				t.Errorf("%s: no hint:\n%s", name, out)
 			}
 			if entries, _ := os.ReadDir(dir); len(entries) != 0 || cloud.createCalls != 0 {
@@ -156,8 +156,8 @@ func TestInitStateLiveInstallFailsClosed(t *testing.T) {
 		cloud.objects = map[string]int{bucketN("ffffff") + "/darkplum/aws/darkplum/terraform.tfstate": 0} // exists: forces a rename
 		cloud.objectsFull = map[string]stateContents{live + "/darkplum/aws/darkplum-2/terraform.tfstate": {Resources: 5}}
 		dir := t.TempDir()
-		env, out := testEnv(t, cloud, nil, "\ndarkplum-2\n\n")
-		c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Region: "us-east-2", Mode: "bedrock", Backend: "s3", Profile: "acme", Domain: "acme.com"}
+		env, out := testEnv(t, cloud, nil, "\n\ndarkplum-2\n\n")
+		c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Region: "us-east-2", Mode: "bedrock", Profile: "acme", Domain: "acme.com"}
 		err := c.execute(env)
 		if err == nil || !strings.Contains(err.Error(), "an install already keeps state at s3://"+live+"/darkplum/aws/darkplum-2/terraform.tfstate") {
 			t.Fatalf("renamed cluster's live install missed: %v\n%s", err, out)
@@ -221,7 +221,6 @@ func bucketN(suffix string) string { return stateBucketName(testAccount, "us-eas
 
 func s3Cmd(dir string, extra func(*InitCmd)) *InitCmd {
 	return yesCmd(dir, func(c *InitCmd) {
-		c.Backend = "s3"
 		c.Profile = "acme"
 		if extra != nil {
 			extra(c)
@@ -246,12 +245,12 @@ func writeCache(t *testing.T, dir, bucket, key string) string {
 
 func backendLine(t *testing.T, dir, name string) string {
 	t.Helper()
-	for _, l := range strings.Split(readFile(t, filepath.Join(dir, "backend.tf")), "\n") {
+	for _, l := range strings.Split(readFile(t, filepath.Join(dir, "backend.hcl")), "\n") {
 		if strings.HasPrefix(strings.TrimSpace(l), name+" ") {
 			return strings.TrimSpace(l)
 		}
 	}
-	t.Fatalf("backend.tf has no %s", name)
+	t.Fatalf("backend.hcl has no %s", name)
 	return ""
 }
 
@@ -369,8 +368,8 @@ func TestInitStateSeveralBuckets(t *testing.T) {
 	t.Run("interactive asks", func(t *testing.T) {
 		dir := t.TempDir()
 		// networks (default), bucket 2, final confirm
-		env, out := testEnv(t, several(), nil, "\n2\n\n")
-		c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Region: "us-east-2", Mode: "bedrock", Backend: "s3", Profile: "acme", Domain: "acme.com"}
+		env, out := testEnv(t, several(), nil, "\n\n2\n\n")
+		c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Region: "us-east-2", Mode: "bedrock", Profile: "acme", Domain: "acme.com"}
 		if err := c.execute(env); err != nil {
 			t.Fatalf("%v\n%s", err, out)
 		}
@@ -394,11 +393,11 @@ func TestInitStateNewInstallKeyCarriesClusterName(t *testing.T) {
 	}
 }
 
-// An existing backend.tf keeps the same bucket, key and region (the whole file
+// An existing backend.hcl keeps the same bucket, key and region (the whole file
 // comes out identical when the key ARN is unchanged).
 func TestInitStateExistingBackendKeepsBucketKeyRegion(t *testing.T) {
 	dir := t.TempDir()
-	p := filepath.Join(dir, "backend.tf")
+	p := filepath.Join(dir, "backend.hcl")
 	before := renderBackend(backendSpec{Bucket: bucketN("ffffff"), Key: legacyStateKey, Region: "us-east-2", KMSKeyARN: fakeKMS})
 	if err := os.WriteFile(p, []byte(before), 0o600); err != nil {
 		t.Fatal(err)
@@ -412,7 +411,7 @@ func TestInitStateExistingBackendKeepsBucketKeyRegion(t *testing.T) {
 		t.Fatalf("%v\n%s", err, out)
 	}
 	if got := readFile(t, p); got != before {
-		t.Errorf("backend.tf changed:\n--- got\n%s\n--- want\n%s", got, before)
+		t.Errorf("backend.hcl changed:\n--- got\n%s\n--- want\n%s", got, before)
 	}
 	if len(cloud.reads) != 0 {
 		t.Errorf("an existing install's key is not re-checked: %v", cloud.reads)
@@ -436,9 +435,9 @@ func TestInitStateKeptBucketVersioningOffWarns(t *testing.T) {
 	}
 }
 
-// A fresh checkout (no backend.tf, no saved settings) must find a live install
+// A fresh checkout (no backend.hcl, no saved settings) must find a live install
 // in any reusable bucket, under the legacy key or this cluster's key, before it
-// picks a bucket, and print the backend.tf that manages it.
+// picks a bucket, and print the backend.hcl that manages it.
 func TestInitStateFreshCheckoutFindsLiveInstall(t *testing.T) {
 	cases := map[string]struct {
 		bucket, key string
@@ -460,7 +459,7 @@ func TestInitStateFreshCheckoutFindsLiveInstall(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), "an install already keeps state at s3://"+tc.bucket+"/"+tc.key) {
 				t.Fatalf("want refusal, got %v\n%s", err, out)
 			}
-			for _, want := range []string{`bucket       = "` + tc.bucket + `"`, `key          = "` + tc.key + `"`, `kms_key_id   = "` + fakeKMS + `"`, "save the following as backend.tf"} {
+			for _, want := range []string{`bucket       = "` + tc.bucket + `"`, `key          = "` + tc.key + `"`, `kms_key_id   = "` + fakeKMS + `"`, "save the following as backend.hcl"} {
 				if !strings.Contains(out.String(), want) {
 					t.Errorf("restore instructions lack %q:\n%s", want, out)
 				}
@@ -507,8 +506,8 @@ func TestInitStateKeyCollision(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "another install named darkplum already keeps state here") {
 			t.Fatalf("%d resources: want collision refusal, got %v\n%s", n, err, out)
 		}
-		if _, err := os.Stat(filepath.Join(dir, "backend.tf")); err == nil || cloud.createCalls != 0 {
-			t.Errorf("%d resources: wrote backend.tf / created %d", n, cloud.createCalls)
+		if _, err := os.Stat(filepath.Join(dir, "backend.hcl")); err == nil || cloud.createCalls != 0 {
+			t.Errorf("%d resources: wrote backend.hcl / created %d", n, cloud.createCalls)
 		}
 	}
 
@@ -522,8 +521,8 @@ func TestInitStateKeyCollision(t *testing.T) {
 
 	// Interactive: another name is asked for and lands in both files.
 	dir = notFresh(t)
-	env, out = testEnv(t, taken(42), nil, "\ndarkplum-2\n\n")
-	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Region: "us-east-2", Mode: "bedrock", Backend: "s3", Profile: "acme", Domain: "acme.com"}
+	env, out = testEnv(t, taken(42), nil, "\n\ndarkplum-2\n\n")
+	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Region: "us-east-2", Mode: "bedrock", Profile: "acme", Domain: "acme.com"}
 	if err := c.execute(env); err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}
@@ -582,7 +581,7 @@ func TestInitStateStaleCacheWithResourcesRefuses(t *testing.T) {
 	if _, err := os.Stat(cache); err != nil {
 		t.Error("non-empty state's settings were moved")
 	}
-	if _, err := os.Stat(filepath.Join(dir, "backend.tf")); err == nil || cloud.createCalls != 0 {
+	if _, err := os.Stat(filepath.Join(dir, "backend.hcl")); err == nil || cloud.createCalls != 0 {
 		t.Error("wrote a backend away from live state")
 	}
 }
@@ -609,7 +608,7 @@ func TestInitStateFinalLineSaysConfigure(t *testing.T) {
 	if err := s3Cmd(t.TempDir(), nil).execute(env); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "then ./bin/darkplum configure") || strings.Contains(out.String(), "darkplum status") {
+	if !strings.Contains(out.String(), "then darkplum configure") || strings.Contains(out.String(), "darkplum status") {
 		t.Errorf("final line:\n%s", out)
 	}
 }

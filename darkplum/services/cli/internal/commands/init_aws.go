@@ -1,15 +1,15 @@
 package commands
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/scalecraft-dev/darkplum/cli/internal/runner"
 )
 
 // cmdRunner runs an external command and returns trimmed stdout. On failure the
@@ -17,19 +17,9 @@ import (
 // such as ResourceNotFoundException.
 type cmdRunner func(name string, args ...string) (string, error)
 
-func runWithStderr(name string, args ...string) (string, error) {
-	cmd := exec.Command(name, args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	err := cmd.Run()
-	out := strings.TrimSpace(stdout.String())
-	if err != nil {
-		if msg := strings.TrimSpace(stderr.String()); msg != "" {
-			return out, fmt.Errorf("%w: %s", err, msg)
-		}
-	}
-	return out, err
-}
+// runWithStderr is the real command runner: the runner package starts aws and
+// terraform and nothing else.
+func runWithStderr(name string, args ...string) (string, error) { return runner.Tool(name, args...) }
 
 // identity is who the AWS CLI resolved the session to.
 type identity struct {
@@ -186,7 +176,7 @@ func (a *awsCloud) NameCollisions(region, name string) []checkResult {
 		rows = append(rows, unknown("log group", err))
 	} else if out == "1" {
 		rows = append(rows, checkResult{name: "log group", status: checkWarn, detail: lg + " exists",
-			hint: "left from an earlier install; make deploy imports and reuses it"})
+			hint: "left from an earlier install; the deploy imports and reuses it"})
 	} else {
 		rows = append(rows, checkResult{name: "log group", status: checkPass})
 	}
@@ -201,7 +191,7 @@ func firstLine(s string) string {
 }
 
 // stateBucketName: the random suffix keeps the globally unique S3 namespace from
-// being squatted or colliding; a re-run reuses the name recorded in backend.tf,
+// being squatted or colliding; a re-run reuses the name recorded in backend.hcl,
 // and a new install reuses an existing Darkplum bucket (StateBuckets).
 func stateBucketName(account, region, suffix string) string {
 	return stateBucketPrefix(account, region) + suffix
@@ -220,7 +210,7 @@ func stateKeyFor(cluster string) string {
 const (
 	stateKeyAlias = "alias/darkplum-tfstate"
 	// legacyStateKey is the key every install used before the cluster name was
-	// part of it. An existing backend.tf keeps whatever key it names.
+	// part of it. An existing backend.hcl keeps whatever key it names.
 	legacyStateKey    = "darkplum/aws/terraform.tfstate"
 	kmsKeyPlaceholder = "<kms-key-arn>"
 	kmsWarning        = "Deleting the KMS key alias/darkplum-tfstate makes every state file in the bucket unrecoverable."
@@ -609,7 +599,7 @@ func formatAWS(args []string) string {
 }
 
 // CreateBackend creates what Inspect found missing and returns the KMS key ARN
-// for backend.tf. The alias is created immediately after the key and the key is
+// for backend.hcl. The alias is created immediately after the key and the key is
 // scheduled for deletion if that fails, so a re-run can never accumulate keys.
 func (a *awsCloud) CreateBackend(bucket, region string, st backendState) (string, error) {
 	arn := st.KeyARN

@@ -152,7 +152,7 @@ export type ProviderState =
  * Where the model filter in force for a vendor was written.
  *
  *   db    the UI, or anything else that wrote through the api
- *   env   the command line (`make set-*-key MODELS=…`), mirrored into the
+ *   env   the command line (`darkplum keys set <vendor> --models …`), mirrored into the
  *         gateway's environment
  *   none  no filter, which for a vendor means no models are offered
  *

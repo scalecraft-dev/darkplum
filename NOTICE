@@ -15,8 +15,8 @@ Third-party components this repository uses or deploys:
   Open Font License 1.1.
 - The optional routed-alias classifier is the vLLM Semantic Router
   (https://github.com/vllm-project/semantic-router), Apache License 2.0,
-  deployed as an unmodified container image by `make deploy-semantic-router`.
+  deployed as an unmodified container image by `darkplum deploy` when the semantic router is turned on.
 - vLLM (https://github.com/vllm-project/vllm), Apache License 2.0, is
   deployed as an unmodified container image to serve self-hosted models.
-- Model weights fetched by `make deploy-model` come from the Hugging Face Hub
+- Model weights fetched by `darkplum models add` come from the Hugging Face Hub
   under each model's own license, which you accept when you deploy it.

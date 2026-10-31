@@ -131,7 +131,7 @@ variable "db_deletion_protection" {
   description = <<-EOT
     Refuse to delete the RDS instance until this is set to false and applied.
     Protects against an accidental `terraform destroy` or console deletion
-    taking every conversation, library item and setting with it. `make destroy`
+    taking every conversation, library item and setting with it. `darkplum destroy`
     turns it off itself immediately before destroying.
   EOT
   type        = bool

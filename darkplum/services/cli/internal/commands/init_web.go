@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/scalecraft-dev/darkplum/cli/internal/install"
 )
 
 // The install's private web address: https://darkplum.<domain> (or
@@ -624,7 +626,7 @@ func (c *InitCmd) createAndDelegate(env *initEnv, s *settings, cloud initCloud) 
 		elapsed := env.now().Sub(start)
 		if elapsed >= timeout {
 			return env.fail("delegation", fmt.Sprintf("not visible after %s", minutes(timeout)),
-				"add the 4 NS records above at your DNS provider, then re-run ./bin/darkplum init: it continues from here. Nothing else was written", "delegation not visible")
+				"add the 4 NS records above at your DNS provider, then re-run darkplum init: it continues from here. Nothing else was written", "delegation not visible")
 		}
 		if i%4 == 0 {
 			fmt.Fprintf(w, "  %s waiting for the NS records %s\n", sDim("…"), sDim(fmt.Sprintf("(%d min)", int(elapsed.Minutes()))))
@@ -650,7 +652,7 @@ func (c *InitCmd) mergeWeb(env *initEnv, dir string) error {
 	path := filepath.Join(dir, "terraform.tfvars")
 	tf, err := readTFVars(path)
 	if err != nil {
-		return env.fail("install settings", firstLine(err.Error()), "re-run ./bin/darkplum init and choose Start over", "cannot read the install settings")
+		return env.fail("install settings", firstLine(err.Error()), "re-run darkplum init and choose Start over", "cannot read the install settings")
 	}
 	s := &settings{profile: tf.Profile, region: tf.Region}
 	record := func(r checkResult) {
@@ -658,7 +660,7 @@ func (c *InitCmd) mergeWeb(env *initEnv, dir string) error {
 		s.checks = append(s.checks, r)
 	}
 	if s.region == "" {
-		return env.fail("install settings", "no region", "re-run ./bin/darkplum init and choose Start over", "install settings name no region")
+		return env.fail("install settings", "no region", "re-run darkplum init and choose Start over", "install settings name no region")
 	}
 	cloud := env.newCloud(tf.Profile)
 	fmt.Fprintf(w, "%s resolving AWS identity…\n", sDim("…"))
@@ -684,13 +686,10 @@ func (c *InitCmd) mergeWeb(env *initEnv, dir string) error {
 	if err != nil {
 		return err
 	}
-	text := string(b)
-	if !strings.HasSuffix(text, "\n") {
-		text += "\n"
-	}
-	text += "# Private web address, added by `darkplum init`.\n"
-	for _, kv := range s.web.kvs() {
-		text += fmt.Sprintf("%s = %s\n", kv.Key, hclValue(kv.Value))
+	// The address's own lines are replaced (a change), every other line is kept.
+	text, err := rewriteTFVars(string(b), func(k string) bool { return webKeys[k] }, s.web.kvs())
+	if err != nil {
+		return env.fail("install settings", err.Error(), "choose Start over to answer the questions again", "cannot edit the install's settings safely")
 	}
 	fmt.Fprintln(w)
 	if c.DryRun {
@@ -718,6 +717,11 @@ func (c *InitCmd) mergeWeb(env *initEnv, dir string) error {
 		if err := c.createAndDelegate(env, s, cloud); err != nil {
 			return err
 		}
+		// The zone exists in the account now. Record it before anything else can fail, so
+		// destroy can list it as Darkplum's to mention (the Terraform state never holds it).
+		if err := c.recordCreatedZone(dir, s.web.zoneID); err != nil {
+			return reportedErr("the hosted zone %s was created, but it could not be recorded in the install (%v). Note its id: `darkplum destroy` cannot list it until it is recorded", s.web.zoneID, err)
+		}
 		text += fmt.Sprintf("web_zone_id = %s\n", hclString(s.web.zoneID))
 	}
 	if err := writeFileAtomic(path, []byte(text)); err != nil {
@@ -725,6 +729,21 @@ func (c *InitCmd) mergeWeb(env *initEnv, dir string) error {
 	}
 	fmt.Fprintf(w, "\n%s\n", sSuccess("✓ private address added; every other setting is unchanged"))
 	fmt.Fprintf(w, "  Your team's address after deploy: %s %s\n", sCmd("https://"+s.web.hostname), sDim("(from "+strings.Join(s.web.allowed, ", ")+")"))
-	fmt.Fprintf(w, "\n  Next: %s, then %s\n", sCmd("make deploy"), sCmd("./bin/darkplum configure"))
+	fmt.Fprintf(w, "\n  Next: %s, then %s\n", sCmd("darkplum deploy"), sCmd("darkplum configure"))
 	return nil
+}
+
+// recordCreatedZone adds the hosted zone init created to the install's record, and
+// changes nothing else in it.
+func (c *InitCmd) recordCreatedZone(dir, zoneID string) error {
+	in, err := install.OpenDir(dir, c.ClusterName)
+	if err != nil {
+		return err
+	}
+	rec, err := in.Load()
+	if err != nil {
+		return err
+	}
+	rec.CreatedZoneID = zoneID
+	return in.Save(rec)
 }

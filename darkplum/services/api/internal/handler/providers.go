@@ -79,8 +79,9 @@ func validVendor(v string) bool {
 }
 
 // secretFileName is the data key this vendor's key is stored under in the
-// darkplum-provider-keys Secret -- matches the Makefile's PK_FILE for the
-// same vendor (Makefile:599,609) so the UI and CLI paths are interchangeable.
+// darkplum-provider-keys Secret -- matches the CLI's (`darkplum keys set`,
+// services/cli/internal/vendor) file name for the same vendor so the UI and
+// CLI paths are interchangeable.
 func secretFileName(vendor string) string {
 	switch vendor {
 	case vendorAnthropic:
@@ -93,8 +94,8 @@ func secretFileName(vendor string) string {
 }
 
 // configFilterKey and configFilterSetAtKey are the darkplum-provider-config
-// ConfigMap data keys for a vendor's filter -- matches the Makefile's
-// PK_FILTER for the same vendor (Makefile:600,610).
+// ConfigMap data keys for a vendor's filter -- matches the CLI's
+// (services/cli/internal/vendor) keys for the same vendor.
 func configFilterKey(vendor string) string      { return strings.ToUpper(vendor) + "_MODEL_FILTER" }
 func configFilterSetAtKey(vendor string) string { return configFilterKey(vendor) + "_SET_AT" }
 
@@ -152,7 +153,7 @@ func filterSourceFor(providers []gatewayProviderStatus, vendor string) string {
 
 // currentWorkspaceID is the workspace id in force right now for an
 // "absent = keep current" write: the stored row's value, except when the
-// gateway reports the env pair as winning (a newer `make set-*-key` write) or
+// gateway reports the env pair as winning (a newer `darkplum keys set` write) or
 // there is no stored row, where it is the gateway-reported effective value.
 // Always "" for openai.
 func currentWorkspaceID(vendor string, rowExists bool, rowWorkspaceID *string, providers []gatewayProviderStatus) string {
@@ -204,8 +205,8 @@ func vendorDisplayName(vendor string) string {
 	}
 }
 
-// vendorExampleFilter mirrors the Makefile's PK_EXAMPLE for the same vendor
-// (Makefile:604,614), used only in error copy.
+// vendorExampleFilter mirrors the CLI's example filter for the same vendor
+// (services/cli/internal/vendor), used only in error copy.
 func vendorExampleFilter(vendor string) string {
 	switch vendor {
 	case vendorAnthropic:
@@ -227,8 +228,7 @@ func validKeyFormat(k string) bool { return keyFormatRe.MatchString(k) }
 
 // bareWildcardPattern reports whether p, after removing every '*' and '?'
 // character, is empty -- i.e. it admits everything the key can reach,
-// mirroring the Makefile's set-*-key guard (`[[ -z "${PAT//[*?]/}" ]]`,
-// Makefile:625).
+// mirroring the CLI's `darkplum keys set` guard (vendor.BareWildcard).
 func bareWildcardPattern(p string) bool {
 	return strings.NewReplacer("*", "", "?", "").Replace(p) == ""
 }
@@ -244,9 +244,9 @@ func firstBareWildcard(patterns []string) (string, bool) {
 	return "", false
 }
 
-// bareWildcardMessage mirrors the Makefile's set-*-key wording (Makefile:
-// 626-628) so an admin sees the same explanation whether they hit this from
-// the UI or the CLI.
+// bareWildcardMessage mirrors the CLI's `darkplum keys set` wording so an
+// admin sees the same explanation whether they hit this from the UI or the
+// CLI.
 func bareWildcardMessage(vendor, pattern string) string {
 	return fmt.Sprintf(
 		"%q admits every model this key can reach, including ones %s has not released yet. "+
@@ -364,7 +364,11 @@ func keyInstallTransportOK(secureCookies bool, host string) bool {
 // insecureTransportMessage is PUT key's and POST verify's (key-present)
 // exact 403 message when keyInstallTransportOK is false -- confirmed with
 // the web engineer and carla's runbook.
-const insecureTransportMessage = "Installing a key from here needs HTTPS, because the key would cross the network unencrypted. Serve Darkplum over HTTPS (make expose-web CERT_ARN=…), or use make set-<vendor>-key."
+const insecureTransportMessage = "Installing a key from here needs HTTPS, because the key would cross the network unencrypted. Open Darkplum at its HTTPS address (darkplum status prints it, if this install has a team address), or over a port-forward at http://localhost:8081 (eval \"$(darkplum kubeconfig)\" && kubectl port-forward -n darkplum-system svc/darkplum-web 8081:80), or use the darkplum keys set command."
+
+// insecureBillingTransportMessage is the same refusal for a billing key, whose
+// CLI path needs --billing.
+const insecureBillingTransportMessage = "Installing a key from here needs HTTPS, because the key would cross the network unencrypted. Open Darkplum at its HTTPS address (darkplum status prints it, if this install has a team address), or over a port-forward at http://localhost:8081 (eval \"$(darkplum kubeconfig)\" && kubectl port-forward -n darkplum-system svc/darkplum-web 8081:80), or use the darkplum keys set command with --billing."
 
 // requireSecureTransport refuses 403 insecure_transport when
 // keyInstallTransportOK is false for this request. Callers: PutKey always;
@@ -598,7 +602,7 @@ func (h *ProvidersHandler) requireUIKeyInstall(c *gin.Context) bool {
 	_, features := h.models.cachedProviders()
 	if !hasProviderFeature(features, providerFeatureUIKeyInstall) {
 		errJSON(c, http.StatusConflict, "gateway_too_old",
-			"the gateway does not support installing vendor keys from the UI yet; redeploy the gateway to the current version, or use make set-<vendor>-key")
+			"the gateway does not support installing vendor keys from the UI yet; redeploy the gateway to the current version, or use the darkplum keys set command")
 		return false
 	}
 	return true
@@ -622,9 +626,9 @@ func (h *ProvidersHandler) requireKubeAvailable(c *gin.Context) bool {
 // internal/kube's three named failure modes -- confirmed with the web
 // engineer and carla's runbook; do not reword without updating both.
 const (
-	kubeNotInClusterMessage  = "Installing a key from here needs Darkplum to be running in Kubernetes. Use make set-<vendor>-key instead."
-	kubeObjectMissingMessage = "This cluster was deployed before keys could be installed from here. Run make deploy-platform once, then try again."
-	kubeForbiddenMessage     = "Darkplum is not permitted to write the vendor-key Secret on this cluster. Run make deploy-platform to restore its role, then try again."
+	kubeNotInClusterMessage  = "Installing a key from here needs Darkplum to be running in Kubernetes. Use the darkplum keys set command instead."
+	kubeObjectMissingMessage = "This cluster was deployed before keys could be installed from here. Run darkplum deploy once, then try again."
+	kubeForbiddenMessage     = "Darkplum is not permitted to write the vendor-key Secret on this cluster. Run darkplum deploy to restore its role, then try again."
 	kubeUnavailableMessage   = "Could not reach the Kubernetes API server; try again."
 )
 
@@ -774,7 +778,7 @@ func (h *ProvidersHandler) syncModelsBounded() {
 }
 
 // mirrorConfigMap writes this vendor's filter and its SET_AT stamp into the
-// darkplum-provider-config ConfigMap, matching the Makefile's own
+// darkplum-provider-config ConfigMap, matching the CLI's own
 // <VENDOR>_MODEL_FILTER[_SET_AT] keys exactly.
 //
 // For anthropic the workspace id is written in the same patch (ANTHROPIC_WORKSPACE_ID,
@@ -1246,7 +1250,7 @@ func (h *ProvidersHandler) PutFilter(c *gin.Context) {
 
 	// installing_until and removing_until are deliberately absent from both
 	// the INSERT column list and the UPDATE SET clause: a fresh row (Adopt,
-	// or a key installed only via `make set-*-key`) gets NULL for both (no
+	// or a key installed only via `darkplum keys set`) gets NULL for both (no
 	// install/removal in progress), and an existing row's current values
 	// are left untouched either way.
 	upsertOnce := func() error {

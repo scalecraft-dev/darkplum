@@ -74,7 +74,9 @@ import {
   API_NOT_HTTPS_HELP,
   INSECURE_TRANSPORT_HELP,
   INSTALL_WINDOW_MS,
+  SECURE_COOKIES_FIX_COMMAND,
   WEB_PORT_FORWARD_COMMAND,
+  transportCommandRoles,
   WEB_PORT_FORWARD_URL,
   admittedDiff,
   canInstallKeyOverTransport,
@@ -1115,7 +1117,7 @@ for (const [name, message] of [
 // not involve a certificate, so it goes first. (In the api-misconfigured case
 // it does not: there the certificate IS the fix, and the port-forward is the
 // way to get a key in before it lands.)
-if (INSECURE_TRANSPORT_HELP.indexOf('port-forward') > INSECURE_TRANSPORT_HELP.indexOf('CERT_ARN')) {
+if (INSECURE_TRANSPORT_HELP.indexOf('port-forward') > INSECURE_TRANSPORT_HELP.indexOf('HTTPS address')) {
   failures.push('INSECURE_TRANSPORT_HELP names the certificate before the port-forward')
 }
 if (!API_NOT_HTTPS_HELP.startsWith('This page is HTTPS')) {
@@ -1127,14 +1129,57 @@ if (!API_NOT_HTTPS_HELP.includes('SECURE_COOKIES')) {
 // The port the command opens is the port the copy sends them to. Getting this
 // pair out of step sends an administrator to a page that is not there, in the
 // one state where they have already been told twice that something is wrong.
+// No markdown in on-screen copy: nothing renders it, so a backtick shows up
+// literally. Commands travel as { code } parts.
+for (const [name, message] of [
+  ['INSECURE_TRANSPORT_HELP', INSECURE_TRANSPORT_HELP],
+  ['API_NOT_HTTPS_HELP', API_NOT_HTTPS_HELP],
+] as const) {
+  if (message.includes('`')) failures.push(`${name} carries a literal backtick`)
+}
+if (API_NOT_HTTPS_HELP.includes('darkplum deploy')) {
+  failures.push('API_NOT_HTTPS_HELP must not send an administrator to a redeploy that does not set SECURE_COOKIES')
+}
+// The api-side fix is a command to copy, guarded like the port-forward, and it
+// really sets the setting the api reads and restarts the api that reads it.
+// Wrapping must never break these assertions, so they read the command with its
+// backslash-newline continuations joined.
+const joined = (c: string) => c.replace(/ \\\n\s*/g, ' ')
+if (!joined(SECURE_COOKIES_FIX_COMMAND).startsWith('eval "$(darkplum kubeconfig)" && kubectl')) {
+  failures.push('SECURE_COOKIES_FIX_COMMAND must select the install\'s cluster first')
+}
+for (const needle of [
+  'kubectl patch secret darkplum-auth -n darkplum-system -p \'{"stringData":{"SECURE_COOKIES":"true"}}\'',
+  'kubectl rollout restart -n darkplum-system deployment/darkplum-api',
+]) {
+  if (!joined(SECURE_COOKIES_FIX_COMMAND).includes(needle)) failures.push(`SECURE_COOKIES_FIX_COMMAND lacks ${needle}`)
+}
+// Every line of every transport command fits the narrowest place it is shown (a
+// 520px modal) without scrolling.
+for (const [name, cmd] of [['SECURE_COOKIES_FIX_COMMAND', SECURE_COOKIES_FIX_COMMAND], ['WEB_PORT_FORWARD_COMMAND', WEB_PORT_FORWARD_COMMAND]] as const) {
+  for (const line of cmd.split('\n')) {
+    if (line.length > 58) failures.push(`${name} has a ${line.length}-character line (max 58): ${line}`)
+  }
+}
+// Which blocks show: the api fix only where the api copy is, never without the forward.
+check('transportCommandRoles(api, forward)', transportCommandRoles('api_not_https', true).join(','), 'fix,forward,key')
+check('transportCommandRoles(page, forward)', transportCommandRoles('page_not_https', true).join(','), 'forward,key')
+check('transportCommandRoles(api, no forward)', transportCommandRoles('api_not_https', false).join(','), 'key')
+if (!API_NOT_HTTPS_HELP.includes('first command below')) {
+  failures.push('API_NOT_HTTPS_HELP must point at the fix command, which is shown first')
+}
 const forwardedPort = new URL(WEB_PORT_FORWARD_URL).port
 if (!WEB_PORT_FORWARD_COMMAND.endsWith(`${forwardedPort}:80`)) {
   failures.push(
     `WEB_PORT_FORWARD_COMMAND forwards a different port from the one ${WEB_PORT_FORWARD_URL} opens`,
   )
 }
-if (!WEB_PORT_FORWARD_COMMAND.startsWith('kubectl port-forward -n darkplum-system svc/darkplum-web')) {
-  failures.push('WEB_PORT_FORWARD_COMMAND must match the command the Makefile prints')
+// `darkplum kubeconfig` prints the export that points kubectl at THIS install's
+// cluster; a bare kubectl would act on whatever context happens to be current.
+// Two lines with a backslash continuation, so the block is not handed to the
+// reader pre-scrolled; pasted into a shell it is still one command.
+if (!joined(WEB_PORT_FORWARD_COMMAND).startsWith('eval "$(darkplum kubeconfig)" && kubectl port-forward -n darkplum-system svc/darkplum-web')) {
+  failures.push('WEB_PORT_FORWARD_COMMAND must select the install\'s cluster first and then port-forward darkplum-web')
 }
 
 // --- vendor_error copy ---------------------------------------------------------

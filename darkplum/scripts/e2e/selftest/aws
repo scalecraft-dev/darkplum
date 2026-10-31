@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# A stand-in for aws for selftest.sh (only what destroy-account-mismatch needs).
+case "$*" in
+  *"eks describe-cluster"*) printf 'acme\tACTIVE\tarn:aws:eks:us-east-2:123456789012:cluster/acme\n' ;;
+  *) echo "fake aws: unsupported $*" >&2; exit 98 ;;
+esac

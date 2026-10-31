@@ -1,0 +1,39 @@
+# Rendered by .github/scripts/render-formula.py from a published release's
+# checksums.txt and pushed to scalecraft-dev/homebrew-tap by release.yml (job
+# "tap"). Edit the template here, never the tap's copy.
+class Darkplum < Formula
+  desc "Operate a private AI platform in your own AWS account"
+  homepage "https://github.com/@REPO@"
+  version "@VERSION@"
+  license "Apache-2.0"
+
+  on_macos do
+    on_arm do
+      url "https://github.com/@REPO@/releases/download/v@VERSION@/darkplum_@VERSION@_darwin_arm64.tar.gz"
+      sha256 "@SHA256_DARWIN_ARM64@"
+    end
+    on_intel do
+      url "https://github.com/@REPO@/releases/download/v@VERSION@/darkplum_@VERSION@_darwin_amd64.tar.gz"
+      sha256 "@SHA256_DARWIN_AMD64@"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "https://github.com/@REPO@/releases/download/v@VERSION@/darkplum_@VERSION@_linux_arm64.tar.gz"
+      sha256 "@SHA256_LINUX_ARM64@"
+    end
+    on_intel do
+      url "https://github.com/@REPO@/releases/download/v@VERSION@/darkplum_@VERSION@_linux_amd64.tar.gz"
+      sha256 "@SHA256_LINUX_AMD64@"
+    end
+  end
+
+  def install
+    bin.install "darkplum"
+  end
+
+  test do
+    assert_match "darkplum #{version} (release)", shell_output("#{bin}/darkplum version")
+  end
+end

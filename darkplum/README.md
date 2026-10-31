@@ -1,6 +1,6 @@
 # darkplum operations guide
 
-Deploy a private AI platform in your own AWS account. Your prompts never reach
+Deploy a private AI platform in your own AWS account with the `darkplum` CLI. Your prompts never reach
 darkplum: self-hosted open-source models never leave your cluster, and Bedrock
 models run under your own account, your own keys and your own audit trail.
 
@@ -29,7 +29,7 @@ License 2.0.
 │  │                       │                      (IAM allowlist│      │
 │  │                       ▼                       geo-scoped)  │      │
 │  │  darkplum-inference (GPU nodes, g5.xlarge, optional)       │      │
-│  │  └── vLLM per open-source model (make deploy-model)        │      │
+│  │  └── vLLM per open-source model (darkplum models add)      │      │
 │  └────────────────────────────────────────────────────────────┘      │
 │                                                                      │
 │  RDS Postgres (private, encrypted)  ·  VPC (3 AZs, NAT)  ·  ECR      │
@@ -48,42 +48,75 @@ vLLM); re-run `init` later to add self-hosted open-source models.
 | AWS CLI | >= 2.x | https://aws.amazon.com/cli/ |
 | Terraform | >= 1.10 | https://developer.hashicorp.com/terraform/install |
 | kubectl | >= 1.28 | https://kubernetes.io/docs/tasks/tools/ |
-| jq | any | https://jqlang.github.io/jq/download/ |
+| gh (optional) | any recent | https://cli.github.com/ , only to verify a manual download's attestation |
 
-You must have AWS credentials configured (`aws configure` or environment variables).
+That is all: no Docker, Go, make, jq or git. You must have AWS credentials for
+the account you install into (`aws configure`, or `aws sso login`).
+
+## Install the CLI
+
+> **Not yet released.** The Homebrew formula and release downloads below do not
+> exist until the first signed release is published. Until then, build from
+> source. From this directory (`darkplum/` in the repository), with Go as in
+> `services/cli/go.mod`: `(cd services/cli && go build -o ../../darkplum ./cmd)`
+> builds `./darkplum` (or move it onto your `PATH`). Run `./darkplum init`, then
+> deploy with images from `scripts/dev.sh eks-push --install <name>` (Docker; it
+> prints the exact `./darkplum deploy --unsigned-images ...` line). A development
+> build trusts no signature and marks the install unsigned. See
+> [CONTRIBUTING.md](../CONTRIBUTING.md).
+
+```bash
+brew install scalecraft-dev/tap/darkplum
+```
+
+Without Homebrew, download the archive for your platform and `checksums.txt`
+from the [releases page](https://github.com/scalecraft-dev/darkplum/releases)
+and verify them before you run anything:
+
+```bash
+sha256sum -c checksums.txt --ignore-missing      # shasum -a 256 -c on macOS
+gh attestation verify darkplum_<version>_<os>_<arch>.tar.gz --repo scalecraft-dev/darkplum \
+  --signer-workflow scalecraft-dev/darkplum/.github/workflows/release.yml
+tar -xzf darkplum_<version>_<os>_<arch>.tar.gz darkplum
+```
+
+The binary is not notarised by Apple. It is the trust anchor of the install
+(it carries the Terraform and manifests it applies and decides which image
+signatures to accept), so its authenticity is the check that matters most; see
+"What you are trusting" in the [repository README](../README.md#what-you-are-trusting).
 
 ## Quick start
 
 ```bash
-# Validate your environment first (tools, cloud creds, GPU quota).
-# Pass --profile/--region to match the account you install into.
-make cli && ./bin/darkplum doctor check --cloud aws --profile <your-profile>
+# Optional: check this machine first (tools, cloud credentials, GPU quota).
+darkplum doctor check --profile <your-profile>
 
 # Answer a few questions (account, region, Bedrock-only or self-hosted GPU model,
 # a domain you control for the team's private address, where Terraform keeps
-# state). Writes terraform/aws/terraform.tfvars; nothing is deployed yet.
-./bin/darkplum init --profile <your-profile>
+# state). Nothing is deployed yet.
+darkplum init --profile <your-profile>
 
-# Deploy everything (takes 35-50 minutes). CLOUD defaults to aws.
-make deploy             # equivalent to: make deploy CLOUD=aws
+# Deploy everything (takes 35-50 minutes). Shows the Terraform plan first and
+# never approves a delete on its own.
+darkplum deploy
 
 # First run (~2 min, longer while a self-hosted model loads): create the first
 # admin, enable models, send a test chat, record client addresses for the audit
 # log, and print the team's address (https://darkplum.<domain>, reachable from
 # the networks you allowed). Safe to re-run; --wait waits for a loading model.
-./bin/darkplum configure
+darkplum configure
 
 # Prove the gateway's IAM role can only reach the Bedrock models you configured
-make verify-bedrock-iam
+darkplum verify
 
-# Check status while waiting for a self-hosted model to load (if gpu_desired_size > 0)
-make status
+# Check status while waiting for a self-hosted model to load (if you chose one)
+darkplum status
 
-# Test inference
-make test
+# Test a self-hosted model directly
+darkplum models test <name>
 
-# Tear down when done
-make destroy
+# Tear down when done (asks you to type the cluster name)
+darkplum destroy
 ```
 
 ## Cost
@@ -102,41 +135,44 @@ On-demand us-east-2 list prices, 24/7 (730 h/month). Region and usage change the
 | **With one self-hosted model** | **~$1.43** | **~$1,035** |
 
 Bedrock tokens are billed by AWS per model on top of this. The GPU node group
-scales to zero (`gpu_desired_size = 0`): `make deploy` then skips self-hosted
+scales to zero (`gpu_desired_size = 0`): `darkplum deploy` then skips self-hosted
 vLLM and installs a Bedrock-only platform, the cheapest path to first chat;
-re-run `./bin/darkplum init` (choose Self-hosted GPU) and `make deploy` again to add self-hosted models.
-**Run `make destroy` when you are done testing.**
+re-run `darkplum init` (choose Self-hosted GPU) and `darkplum deploy` again to add self-hosted models.
+**Run `darkplum destroy` when you are done testing.**
 
 ## Cloud selection
 
-Each cloud is a standalone Terraform root module under `terraform/<cloud>/`. You
-deploy into exactly one. `make deploy` selects it via `CLOUD` (defaults to `aws`);
-see `terraform/README.md` for the structure and the normalized output contract
-the Kubernetes/platform steps rely on.
+Each cloud is a standalone Terraform root module under `terraform/<cloud>/`,
+embedded in the CLI. You deploy into exactly one; see `terraform/README.md` for
+the structure and the normalized output contract the Kubernetes/platform steps
+rely on.
 
 - **AWS** — `terraform/aws/` (EKS + IRSA/Pod Identity + RDS + Bedrock). Available.
 - **GCP** — `terraform/gcp/` (GKE + Workload Identity + Cloud SQL + Vertex). Planned.
 
 ## Configuration
 
-Configuration lives in `terraform/aws/terraform.tfvars`, written by
-`./bin/darkplum init`. Re-run `init` to change region, hosting mode, model or GPU
-type: it keeps a `.bak` copy of the previous file, then run `make deploy` again.
-`make deploy` refuses to start without that file and re-runs `darkplum doctor`
-first (session lifetime, account match, GPU quota).
+An install's settings are kept in a private workspace on your machine, written
+by `darkplum init`; `darkplum status` shows which install you are acting on.
+Re-run `init` to change region, hosting mode, model or GPU type: it keeps a
+backup of the previous settings. Then run `darkplum deploy`, which applies the
+change. `darkplum deploy` refuses to start without an install and re-checks
+your AWS session, account match and GPU quota first. Keep a laptop-independent
+record of the choices you made: the settings are not stored in your account yet,
+though the Terraform state is.
 
 `init` keeps Terraform state in a versioned, KMS-encrypted, private S3 bucket in
-your own account (`--backend local` opts out; local state holds the database
-password in plain text, so keep it out of synced folders). It also pins the AWS
-provider to your account (`allowed_account_ids`), so credentials for another
-account fail at plan time. Preview everything with `darkplum init --dry-run`. The profile is not stored
-in `backend.tf`; `make deploy` passes it to `terraform init`. If you run
-`terraform init` yourself, add `-backend-config=profile=<your-profile>` (or set
-`AWS_PROFILE`). Never delete the `alias/darkplum-tfstate` KMS key: it makes all
-state in the bucket unrecoverable. Installs in the same account and region share
-the state bucket and KMS key (each under its own `darkplum/aws/<cluster>/` key),
-so they are one trust domain; installs that must not trust each other need
-separate AWS accounts.
+your own account. It also pins the AWS provider to your account
+(`allowed_account_ids`), so credentials for another account fail at plan time.
+Preview everything with `darkplum init --dry-run`. The Terraform code only
+declares `backend "s3" {}`; the bucket, key and region are recorded with the
+install and handed to Terraform by the CLI. Hand-driving Terraform (or a GitOps
+pipeline) is supported for advanced use; see `terraform/README.md`. Never
+delete the `alias/darkplum-tfstate` KMS key: it makes all state in the bucket
+unrecoverable. Installs in the same account and region share the state bucket
+and KMS key (each under its own `darkplum/aws/<cluster>/` key), so they are one
+trust domain; installs that must not trust each other need separate AWS
+accounts.
 
 **Upgrading.** The default self-hosted model is unchanged (Mistral-7B-Instruct-v0.3,
 served as `mistral-7b`), so an existing install keeps its model and API name on
@@ -185,34 +221,31 @@ See `terraform/aws/variables.tf` for the full list.
 | Model load into GPU memory | 2-5 min |
 | **Total** | **35-50 min** |
 
-## Makefile targets
+## Commands
 
-| Target | Description |
-|--------|-------------|
-| `make deploy` | Full deploy: infrastructure + workloads |
-| `make deploy-infra` | Provision AWS infrastructure only |
-| `make deploy-k8s` | Deploy K8s workloads only (requires infra) |
-| `make deploy-model NAME= MODEL=` | Add another self-hosted open-source model (one GPU each) |
-| `make remove-model NAME=` | Remove a model added with `deploy-model` |
-| `make list-models` | List self-hosted model deployments and gateway upstreams |
-| `make verify-bedrock-iam` | Prove the gateway's IAM role allows only the configured Bedrock models |
-| `make set-hf-token` | Store a Hugging Face token for gated models (from `$HF_TOKEN`) |
-| `make set-anthropic-key MODELS='claude-*'` | Install or rotate the organisation's Anthropic API key (from `$ANTHROPIC_API_KEY`) and set its catalog filter |
-| `make set-openai-key MODELS='gpt-*'` | Same for OpenAI (from `$OPENAI_API_KEY`) |
-| `make remove-anthropic-key` / `make remove-openai-key` | Remove a vendor key and its filter; its models stop answering |
-| `make deploy-semantic-router` | Install the open-source intent classifier for routed aliases |
+| Command | Description |
+|---------|-------------|
+| `darkplum init` | Create an install, or show an existing one and change its settings (`--dry-run` previews) |
+| `darkplum deploy` | Create or update the install: infrastructure, verified images, the platform. Safe to re-run; also the upgrade path |
+| `darkplum configure` | First run: first admin, models, a test chat, open the web UI |
+| `darkplum status` | Show cluster, node, pod and GPU status |
+| `darkplum doctor check` | Check this machine can run an install (tools, credentials, GPU quota) |
+| `darkplum verify` | Prove the gateway's IAM role allows only the configured Bedrock models |
+| `darkplum models add <name> --hf <id>` | Add another self-hosted open-source model (one GPU each) |
+| `darkplum models remove <name>` / `list` / `test <name>` | Remove a model added with `models add`; list models and gateway upstreams; send a test chat to one |
+| `darkplum keys set huggingface` | Store a Hugging Face token for gated models |
+| `darkplum keys set anthropic --models 'claude-*'` | Install or rotate the organisation's Anthropic API key and set its catalog filter |
+| `darkplum keys set openai --models 'gpt-*'` | Same for OpenAI |
+| `darkplum keys remove anthropic\|openai` / `keys list` | Remove a vendor key and its filter (its models stop answering); show which keys are installed |
+| `darkplum init --semantic-router on\|off` | Turn the open-source intent classifier for routed aliases on or off; `darkplum deploy` applies it |
+| `darkplum sso configure` / `darkplum admin create` | Configure OIDC sign-in; create a local break-glass admin |
+| `darkplum kubeconfig` | Point this shell's kubectl at the install's cluster (`eval "$(darkplum kubeconfig)"`) |
+| `darkplum version` | The release, the digests it deploys, the third-party images it pins |
+| `darkplum destroy` | Tear down all resources (type the cluster name to confirm) |
 | `pnpm run check:parity` (in `services/web`) | Verify every API route has a UI and vice versa against `docs/api-routes.json` |
-| `make remove-semantic-router` | Remove it (routed aliases fall back to their default route) |
-| `make expose-web` / `make unexpose-web` | Deprecated; conflicts with the private web address. Do not use |
-| `make test` | Send a test chat completion request |
-| `make status` | Show cluster, node, pod, and GPU status |
-| `make destroy` | Tear down all resources |
-| `make check-prereqs` | Validate required tools are installed |
-| `make dev-up [DEV_PORT=8080] [DEV_AWS=1]` | Local kind stack with mocked inference (no cloud account needed) |
-| `make dev-build-api` / `dev-build-gateway` / `dev-build-web` | Rebuild one service's image and roll it into the local cluster |
-| `make dev-test` | Smoke-test the local stack |
-| `make dev-logs` / `make dev-status` | Tail the local services / show their pods |
-| `make dev-down` | Delete the local kind cluster |
+
+Working on darkplum itself (local kind stack, rebuilding one service) uses
+`scripts/dev.sh`; see [CONTRIBUTING.md](../CONTRIBUTING.md).
 
 ## API reference
 
@@ -242,11 +275,11 @@ can connect. Nothing is internet-facing.
 
 - **Your domain's DNS is a Route53 zone in the same account:** Terraform
   creates a zone for the name, delegates it from yours, issues the certificate
-  and adds the record. All of it is removed by `make destroy`.
+  and adds the record. All of it is removed by `darkplum destroy`.
 - **Your DNS is elsewhere:** `darkplum init` creates the zone for the name
   itself, prints four NS records to add at your DNS provider and waits until
   they resolve (re-running init resumes). Terraform then issues the certificate
-  in it. `make destroy` leaves that zone, so your NS records never point at a
+  in it. `darkplum destroy` leaves that zone, so your NS records never point at a
   deleted zone; remove both yourself when you retire the install.
 - **Your own zone or certificate:** `darkplum init --zone-id` /
   `--certificate-arn`. Records are added to a supplied zone; neither is ever
@@ -254,18 +287,13 @@ can connect. Nothing is internet-facing.
   for 30+ more days and cover the name (a wildcard covers one label).
 
 The load balancer terminates TLS and passes each browser's address to nginx in
-a PROXY protocol header. `./bin/darkplum configure` writes the load balancer's
+a PROXY protocol header. `darkplum configure` writes the load balancer's
 own addresses into nginx's trusted list and a `web-ingress` NetworkPolicy, so
 the audit log records the browser's address and no other peer can claim one.
 Until it has run, the logged address is the load balancer's.
 
-The operator's fallback is `./bin/darkplum configure`, which opens a private
+The operator's fallback is `darkplum configure`, which opens a private
 port-forward and prints its `http://localhost:<port>` address.
-
-`make expose-web` and `make unexpose-web` are deprecated: they turn the
-cluster-internal `darkplum-web` Service into a second, kubectl-managed load
-balancer (plain HTTP unless given a certificate) beside the private address,
-outside its allowed-networks rule and client-address audit. Do not use them.
 
 The gateway itself is never exposed: its `/health` endpoint reports routing and
 policy state and is meant for in-cluster probes and operators only.
@@ -315,20 +343,20 @@ prompt closest wins: self-hosted over cloud-managed over external API. A request
 never silently travels further than it has to.
 
 **Changing the default self-hosted model.** Any vLLM-supported, ungated Hugging
-Face model that fits in 24GB VRAM (A10G) works. Re-run `./bin/darkplum init`,
+Face model that fits in 24GB VRAM (A10G) works. Re-run `darkplum init`,
 pick Self-hosted GPU and choose a model from the reviewed list or a custom
 Hugging Face id (`--model <id>` skips the prompt). `init` checks the repo is
-public and has safetensors weights, pins its current commit SHA and writes the
-result; then run `make deploy-infra` (and `make deploy-k8s`) to apply it.
+public and has safetensors weights, pins its current commit SHA and records the
+result; then run `darkplum deploy` to apply it.
 
 **Running more than one self-hosted model.** Each model is its own vLLM
 deployment and takes one GPU, so grow the GPU node group first
-(re-run `./bin/darkplum init --mode gpu --gpu-count 2`, then `make deploy-infra`), then:
+(re-run `darkplum init --mode gpu --gpu-count 2`, then `darkplum deploy`), then:
 
 ```bash
-make deploy-model NAME=qwen MODEL=Qwen/Qwen2.5-7B-Instruct SERVED=qwen-2.5-7b REVISION=<commit-sha>
-make list-models
-make remove-model NAME=qwen
+darkplum models add qwen --hf Qwen/Qwen2.5-7B-Instruct --served qwen-2.5-7b --revision <commit-sha>
+darkplum models list
+darkplum models remove qwen
 ```
 
 The gateway re-discovers models every minute; a new model shows up under
@@ -339,7 +367,7 @@ unreachable until it returns.
 Model backends run third-party weights, so they are locked down: safetensors only
 (pickled weights are refused), no Kubernetes API token, ingress from the gateway
 only, and egress limited to public HTTPS for the weight download — never the
-instance metadata service or anything inside the cluster. Pin `REVISION` to a
+instance metadata service or anything inside the cluster. Pin `--revision` to a
 commit SHA so a re-download cannot change the weights.
 
 **Choosing which Bedrock models are reachable.** `bedrock_model_patterns` is the
@@ -360,7 +388,7 @@ by Bedrock unless that mode is raised to `aws_review`, and darkplum uses the
 read to mark such models **Needs AWS opt-in** in Admin > Models before anyone
 sends a prompt. Raising the mode is an account-owner decision made with your
 own credentials — the role cannot write it — and what it means is in
-`docs/RUNBOOK-vendor-apis.md`. `make verify-bedrock-iam` simulates the deployed role and fails
+`docs/RUNBOOK-vendor-apis.md`. `darkplum verify` simulates the deployed role and fails
 if anything outside the allowlist would be permitted.
 
 **Anthropic and OpenAI (your own vendor keys).** Install a key from the product
@@ -377,38 +405,38 @@ card. Nothing is restarted. Installing from the product needs darkplum to be
 served over HTTPS, or reached on `localhost` — see below; without either, the card
 shows the terminal path instead.
 
-*From a terminal:* the key is read from the environment, never passed on the
-command line, and checked against the vendor before anything is changed:
+*From a terminal:* the key is typed at a hidden prompt (or piped with
+`--key-stdin`; `ANTHROPIC_API_KEY` / `OPENAI_API_KEY` are also read when set),
+never passed as an argument, and checked against the vendor before anything is
+changed:
 
 ```bash
-read -s ANTHROPIC_API_KEY && export ANTHROPIC_API_KEY
-make set-anthropic-key MODELS='claude-*'          # MODELS = catalog filter (globs)
-# add WORKSPACE=wrkspc_... if the key was created at organisation level (see below)
+darkplum keys set anthropic --models 'claude-*'   # --models = catalog filter (globs)
+# add --workspace wrkspc_... if the key was created at organisation level (see below)
 
-read -s OPENAI_API_KEY && export OPENAI_API_KEY
-make set-openai-key MODELS='gpt-*'
+darkplum keys set openai --models 'gpt-*'
 ```
 
 **Create the Anthropic key inside a workspace.** Anthropic requires every request
 made with a key created at *organisation* level to name a workspace
 (`anthropic-workspace-id`); darkplum sends that header when you give it a
-workspace ID — the optional field on the install form, or `WORKSPACE=wrkspc_…`
-on the make target — and the key check tells you when a key needs one. A key
+workspace ID — the optional field on the install form, or `--workspace wrkspc_…`
+on the command — and the key check tells you when a key needs one. A key
 created inside a workspace (Anthropic console > Workspaces > API keys) needs
 nothing, and that is the better choice anyway: the workspace is where the spend
 limit lives.
 
-The list you tick in the product and `MODELS` on the command line are the same
+The list you tick in the product and `--models` on the command line are the same
 setting — the catalog filter. Whichever was set last is the one in force; after a
-command-line change the card says so and offers to adopt it. `MODELS` is required
+command-line change the card says so and offers to adopt it. `--models` is required
 the first time. There is no IAM allowlist beneath the
 gateway for a vendor key, so this filter *is* the catalog bound: only matching
 models can ever be listed, enabled or allowlisted, and an empty filter means no
-vendor models at all. Name a family: a bare `*` is refused (`ALLOW_ALL=1`
+vendor models at all. Name a family: a bare `*` is refused (`--allow-all`
 overrides), because a glob also admits models the vendor releases later — they
 arrive disabled, like any new model. After the filter, the gateway also drops
 ids that are plainly not chat models (embeddings, audio, image, moderation);
-that is catalog hygiene, not a bound. The target prints how many models the key can reach and
+that is catalog hygiene, not a bound. The command prints how many models the key can reach and
 which of them the filter admits.
 
 Then choose **Review and enable** on the vendor's card.
@@ -429,7 +457,7 @@ sends it from your browser through the web tier and the api, in memory, on its w
 into that Secret — so that path must be HTTPS: the api refuses a key over plain
 HTTP (local `localhost` development excepted), and inside the cluster the hops
 between web, api and gateway are plain HTTP, as they are for everything else
-darkplum carries. The make target avoids all of that: the key goes from your
+darkplum carries. The command avoids all of that: the key goes from your
 terminal to the Kubernetes API over TLS and nowhere else. The api's only
 Kubernetes permission is `patch` on that one Secret and on the filter's
 ConfigMap — it cannot reach any other Secret — but be clear about what that does
@@ -437,7 +465,7 @@ not mean: a Kubernetes `patch` returns the object, so a compromised api could
 read the vendor keys, on top of what compromising it already yields. The install form is why the web app now ships a strict
 Content-Security-Policy: a script injected into the admin UI could already act as
 the signed-in admin, and a pasted key would add disclosure to that. *Replace key*,
-or the same make target, rotates it: the gateway re-reads the mounted file, so rotation is not a rollout
+or the same command, rotates it: the gateway re-reads the mounted file, so rotation is not a rollout
 (allow about two minutes for the kubelet to refresh the mount). Behind an egress
 proxy, set `HTTPS_PROXY` on the gateway; vendor calls honour it. A missing or
 rejected key, an empty filter or a vendor outage disables that vendor only —
@@ -503,7 +531,7 @@ cost reports; Bedrock reconciles through AWS Cost Explorer. Details and the
 honest caveats are in `docs/RUNBOOK-vendor-apis.md`.
 
 What is *not* configurable from the product: deploying self-hosted models
-(`make deploy-model`) and the Bedrock model patterns (Terraform) are still set at
+(`darkplum models add`) and the Bedrock model patterns (Terraform) are still set at
 deploy time.
 
 **Who may use which models** — policy per organisation, per user and per API
@@ -622,16 +650,19 @@ reserves room for them.
 
   Two classifiers are available per routed alias:
   - **Semantic Router** (recommended) — the open-source [vLLM Semantic Router](https://vllm-sr.ai)
-    (Apache-2.0) running on CPU inside the cluster, installed with
-    `make deploy-semantic-router`. Roughly 100 ms per decision on an unloaded CPU
-    node. Its decision names are configured in `k8s/semantic-router/values.yaml`
-    (defaults: `legal`, `code`, `general`) and must match your route names
+    (Apache-2.0) running on CPU inside the cluster, turned on with
+    `darkplum init --semantic-router on` and applied by `darkplum deploy`. Roughly 100 ms per decision on an unloaded CPU
+    node. Its decision names are the shipped defaults (`legal`, `code`, `general`;
+    changing them is not supported yet) and must match your route names
     (matching is case-insensitive and treats spaces as dashes, so a decision named
     `computer science` matches a route `computer-science`). The gateway only
     calls its classification API; it never carries traffic. It keeps its
     classifier weights in ephemeral storage and re-downloads them (~1-2 GB) on
-    every pod start; it needs about 2 GiB of memory, so add a CPU node before
-    enabling it on the default 2 x m5.large node group. Until it is installed, a
+    every pod start. It reads the text of the prompts sent to routed aliases, and
+    its pod may connect to any public address on port 443 (private ranges stay
+    blocked) because it downloads those models from Hugging Face at startup; it
+    needs about 2 GiB of memory, so add a CPU node before
+    enabling it on the default 2 x m5.large node group. Until it is turned on, a
     routed alias that names it always uses its default route — Admin > Routing
     warns you.
   - **Rules** — admin keywords plus three built-in signals (`builtin:code`,
@@ -656,12 +687,11 @@ reserves room for them.
 
 **Gated models** (Llama, Gemma and other licence-gated weights on Hugging Face):
 accept the licence on huggingface.co with your account, then store a read token
-once — it is read from the environment, never passed on the command line:
+once — typed at a hidden prompt, never passed on the command line:
 
 ```bash
-read -s HF_TOKEN && export HF_TOKEN
-make set-hf-token
-make deploy-model NAME=llama MODEL=meta-llama/Llama-3.1-8B-Instruct REVISION=<commit-sha>
+darkplum keys set huggingface
+darkplum models add llama --hf meta-llama/Llama-3.1-8B-Instruct --revision <commit-sha>
 ```
 
 ## Library: skills, tools and context
@@ -698,11 +728,19 @@ Verified so far against the mock model, a fake MCP server and the file-mount
 credential path. Live Anthropic, OpenAI and Bedrock tool turns, a real MCP
 server and the cluster Secret write path have not yet been exercised.
 
-## Upgrading existing AWS installs
+## Upgrading
 
-NetworkPolicy enforcement turns on with this release. Earlier releases set the
-vpc-cni add-on option in a form the add-on ignored, so the policies in
-`k8s/base/network-policies/` were stored but never enforced. Now they are, so:
+Install the new binary (`brew upgrade darkplum`, or download and verify it as
+above) and run `darkplum deploy` again. It shows the Terraform plan, never
+approves a delete on its own (`--confirm-plan`), refuses to apply an older
+release over a newer one (`--allow-downgrade` overrides) and applies in the
+right order: infrastructure, network policies, then workloads. Running it
+twice with the same binary changes nothing the second time. `darkplum version`
+shows what a binary will deploy.
+
+NetworkPolicy enforcement is on. Earlier releases set the vpc-cni add-on option
+in a form the add-on ignored, so the policies in `k8s/base/network-policies/`
+were stored but never enforced. Now they are, so:
 
 - the gateway may only reach DNS, HTTPS (not 169.254.0.0/16), the Pod Identity
   agent, the vLLM backends (`:8000`), the semantic router (`:8080`) and the
@@ -710,20 +748,23 @@ vpc-cni add-on option in a form the add-on ignored, so the policies in
   custom egress you added, is dropped;
 - the api accepts connections only from the web pod; use `kubectl port-forward`
   (node-local, unaffected) for operator access;
-- vLLM Services become headless (`clusterIP: None`); `make deploy-k8s` and
-  `make deploy-model` recreate an old one (a brief gap while it is deleted);
+- vLLM Services become headless (`clusterIP: None`); `darkplum deploy` and
+  `darkplum models add` recreate an old one (a brief gap while it is deleted);
 - Pod Identity role trust now also requires this cluster's ARN and account.
 
-Run `make deploy-infra` (enables enforcement, tightens role trust), then
-`make deploy-k8s` if you self-host models, then `make deploy-platform`.
-Do not run `deploy-platform` first: it would apply policies the cluster still
-does not enforce. The EKS control-plane log group is kept after `make destroy`
-(Kubernetes audit logs) and re-adopted by the next `make deploy-infra`.
+The EKS control-plane log group is kept after `darkplum destroy` (Kubernetes
+audit logs) and re-adopted by the next `darkplum deploy`.
+
+**An install made with the old make-based flow** is taken over with
+`darkplum init --adopt`, run from the `darkplum/` directory it was installed
+from. The Terraform state stays where it is. Review the plan `darkplum deploy`
+shows before approving it: the new Terraform owns the per-cluster image
+repositories and pins different module versions.
 
 ## Troubleshooting
 
 The `kubectl` commands below need the install's own kubeconfig. Run
-`eval "$(./bin/darkplum kubeconfig)"` in the shell first: it checks that the
+`eval "$(darkplum kubeconfig)"` in the shell first: it checks that the
 cluster belongs to the install's AWS account and points only that shell at a
 private kubeconfig, without touching `~/.kube/config` or your current context.
 
@@ -735,10 +776,10 @@ private kubeconfig, without touching `~/.kube/config` or your current context.
 
 **Out of GPU memory**: The model doesn't fit in 24GB VRAM. Use a smaller model or a quantized variant (AWQ/GPTQ).
 
-**Bedrock models missing from the catalog**: check `kubectl logs -n darkplum-system deploy/darkplum-gateway | grep -i bedrock` and the gateway's `/health` (port-forward `svc/darkplum-gateway 8082:8080`): a `last_error_kind` of `auth` means the gateway role has no credentials or no access to the model families in `bedrock_model_patterns` — run `make verify-bedrock-iam`; `unreachable` means the VPC endpoints or NAT path are broken. Models also need access granted per model in the Bedrock console.
+**Bedrock models missing from the catalog**: check `kubectl logs -n darkplum-system deploy/darkplum-gateway | grep -i bedrock` and the gateway's `/health` (port-forward `svc/darkplum-gateway 8082:8080`): a `last_error_kind` of `auth` means the gateway role has no credentials or no access to the model families in `bedrock_model_patterns` — run `darkplum verify`; `unreachable` means the VPC endpoints or NAT path are broken. Models also need access granted per model in the Bedrock console.
 
-**Cannot reach vLLM from another pod**: A NetworkPolicy restricts vLLM ingress to pods labeled `app.kubernetes.io/name: darkplum-gateway` only. `make test` uses `kubectl port-forward`, which bypasses NetworkPolicy. To call vLLM from a custom pod, add the gateway label to your pod or temporarily delete the NetworkPolicy: `kubectl delete -n darkplum-inference networkpolicy vllm-inference-ingress`
+**Cannot reach vLLM from another pod**: A NetworkPolicy restricts vLLM ingress to pods labeled `app.kubernetes.io/name: darkplum-gateway` only. `darkplum models test` uses a port-forward, which bypasses NetworkPolicy. To call vLLM from a custom pod, add the gateway label to your pod or temporarily delete the NetworkPolicy: `kubectl delete -n darkplum-inference networkpolicy vllm-inference-ingress`
 
-**`make destroy` hangs on namespace deletion**: GPU pods with device plugin state can block namespace teardown. The Makefile retries with `--force` after 120s. If it still hangs: `kubectl delete namespace darkplum-inference --force --grace-period=0`
+**`darkplum destroy` stops at "kubernetes resources did not go away"**: GPU pods with device plugin state can block namespace teardown. `darkplum destroy` forces nothing; it names what is holding them and leaves the infrastructure intact. Inspect with `kubectl get all -n darkplum-inference` after `eval "$(darkplum kubeconfig)"`. If you decide to force it: `kubectl delete namespace darkplum-inference --force --grace-period=0`, then re-run `darkplum destroy`.
 
-**`terraform destroy` fails on VPC/subnet deletion**: Orphaned ENIs from node groups can block VPC teardown. Check EC2 > Network Interfaces in the AWS console, delete any in "available" state attached to the VPC, then re-run `make destroy`.
+**`terraform destroy` fails on VPC/subnet deletion**: Orphaned ENIs from node groups can block VPC teardown. `darkplum destroy` lists tagged leftovers when it finishes. Check EC2 > Network Interfaces in the AWS console, delete any in "available" state attached to the VPC, then re-run `darkplum destroy`.

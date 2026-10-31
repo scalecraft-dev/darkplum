@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -126,11 +125,6 @@ func TestRenderedTFVarsKeepOneKeyPerLine(t *testing.T) {
 	if !strings.Contains(out, "on 2026-01-02") {
 		t.Error("clock not honoured")
 	}
-	// The Makefile's sed must read aws_profile back from the rendered file.
-	re := regexp.MustCompile(`(?m)^\s*aws_profile\s*=\s*"([^"]+)".*$`)
-	if m := re.FindStringSubmatch(renderTFVars([]tfvarsKV{{"aws_profile", "scalecraft"}, {"aws_region", "us-east-2"}}, fixedNow)); m == nil || m[1] != "scalecraft" {
-		t.Errorf("makefile sed shape broken: %v", m)
-	}
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 		if strings.HasPrefix(line, "#") {
 			continue
@@ -138,21 +132,6 @@ func TestRenderedTFVarsKeepOneKeyPerLine(t *testing.T) {
 		if !tfLineRe.MatchString(line) {
 			t.Errorf("not a key = value line: %q", line)
 		}
-	}
-}
-
-func TestMakefileSedReadsAWSProfile(t *testing.T) {
-	if _, err := exec.LookPath("sed"); err != nil {
-		t.Skip("no sed")
-	}
-	p := filepath.Join(t.TempDir(), "terraform.tfvars")
-	if err := os.WriteFile(p, []byte(renderTFVars([]tfvarsKV{{"aws_profile", "scalecraft"}, {"cluster_name", "x"}}, fixedNow)), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	// Same expression as the Makefile's TFVARS_AWS_PROFILE (BSD and GNU sed -E).
-	out, err := exec.Command("sed", "-nE", `s/^[[:space:]]*aws_profile[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p`, p).Output()
-	if err != nil || strings.TrimSpace(string(out)) != "scalecraft" {
-		t.Fatalf("sed gave %q, %v", out, err)
 	}
 }
 
@@ -277,6 +256,6 @@ func TestWriteRenderedSamples(t *testing.T) {
 		}
 	}
 	write("sample.tfvars", renderTFVars(s.tfvars(), fixedNow))
-	write("backend.tf", renderBackend(backendSpec{Bucket: stateBucketName(testAccount, "us-east-2", "a1b2c3"), Key: stateKeyFor(s.cluster), Region: "us-east-2",
+	write(backendFileName, renderBackend(backendSpec{Bucket: stateBucketName(testAccount, "us-east-2", "a1b2c3"), Key: stateKeyFor(s.cluster), Region: "us-east-2",
 		KMSKeyARN: "arn:aws:kms:us-east-2:" + testAccount + ":key/abc"}))
 }
