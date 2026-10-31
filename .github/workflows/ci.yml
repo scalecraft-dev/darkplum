@@ -238,6 +238,13 @@ jobs:
           if DEV_PORT='8080;x' scripts/dev.sh up >/dev/null 2>&1; then echo "dev.sh up accepted a bad DEV_PORT"; exit 1; fi
           if DEV_AWS_PROFILE='a|b' scripts/dev.sh up >/dev/null 2>&1; then echo "dev.sh up accepted a bad DEV_AWS_PROFILE"; exit 1; fi
           if scripts/dev.sh eks-push --install ../x >/dev/null 2>&1; then echo "dev.sh eks-push accepted a path as an install name"; exit 1; fi
+      # The release-candidate e2e assertion scripts (docs/E2E-RELEASE-CHECK.md) are
+      # only worth running if they fail when they should: lint them, then run them
+      # against stand-ins for darkplum, kubectl and aws.
+      - name: e2e assertion scripts lint and self-test
+        run: |
+          shellcheck -x scripts/e2e/*.sh scripts/e2e/selftest/darkplum scripts/e2e/selftest/aws
+          scripts/e2e/selftest.sh
       - name: model template renders
         run: |
           sed -e "s|MODEL_INSTANCE|ci|g" -e "s|PLACEHOLDER_MODEL_NAME|org/model|g" \
