@@ -92,6 +92,10 @@ func (c *DestroyCmd) Run(g *Globals) error {
 	return e.run(ctx)
 }
 
+// destroyPlanLimit bounds the read-only `terraform plan -destroy` that comes before
+// anything is deleted.
+const destroyPlanLimit = 30 * time.Minute
+
 type destroyEnv struct {
 	out     io.Writer
 	logPath string
@@ -288,7 +292,7 @@ func (e *destroyEnv) run(ctx context.Context) (err error) {
 		}
 		mutated = true
 		e.printf("%s\n", sInfo("→ turning off the database's deletion protection (a targeted apply)"))
-		if _, _, err := streamTerraform(ctx, tf, e.out, e.now, e.heartbeat, "terraform apply (protection)", e.force,
+		if _, _, err := streamTerraform(ctx, tf, e.out, e.now, e.heartbeat, "terraform apply (protection)", e.force, tfStreamOpts{},
 			"apply", "-auto-approve", "-input=false", vf, "-var", "db_deletion_protection=false", "-target="+rdsAddr); err != nil {
 			return e.stop(checkResult{name: "deletion protection", status: checkFail, detail: firstLine(err.Error()),
 				hint: "the database is unchanged and Kubernetes was not touched. If the session lapsed: `" + login + "`"}, "cannot turn off deletion protection")
@@ -327,7 +331,7 @@ func (e *destroyEnv) run(ctx context.Context) (err error) {
 	}
 	mutated = true
 	e.printf("%s\n", sInfo("→ terraform destroy (10-15 minutes)"))
-	tl, _, derr := streamTerraform(ctx, tf, e.out, e.now, e.heartbeat, "terraform destroy", e.force, "destroy", "-auto-approve", "-input=false", vf)
+	tl, _, derr := streamTerraform(ctx, tf, e.out, e.now, e.heartbeat, "terraform destroy", e.force, tfStreamOpts{}, "destroy", "-auto-approve", "-input=false", vf)
 	if derr != nil {
 		hint := "see the output above; the full log is " + e.logPath
 		if h := (&deployEnv{rec: rec}).loginHint(tl.String()); !strings.HasPrefix(h, "fix the above") {
@@ -449,9 +453,24 @@ func (e *destroyEnv) finalSnapshot(tf tfRunner) (string, error) {
 func (e *destroyEnv) sanityPlan(ctx context.Context, tf tfRunner, vf string, state map[string]bool) error {
 	planPath := filepath.Join(e.in.Dir(), "destroy-"+e.now().UTC().Format("20060102T150405Z")+".tfplan")
 	defer os.Remove(planPath)
-	if err := tf.Stream(ctx, io.Discard, runner.StreamOptions{Force: e.force}, "plan", "-destroy", "-input=false", "-out="+planPath, vf); err != nil {
-		return e.stop(checkResult{name: "plan -destroy", status: checkFail, detail: firstLine(err.Error()),
-			hint: "Terraform cannot plan the teardown; fix that first. Kubernetes was not touched"}, "the destroy does not plan")
+	// A refresh of a large stack can be quiet for minutes: a heartbeat says it is
+	// alive, and a plan (read-only) that has not finished in planLimit is stopped
+	// rather than waited for forever. Its output is kept for the failure, not shown.
+	tl, ctxErr, perr := streamTerraform(ctx, tf, e.out, e.now, e.heartbeat, "terraform plan -destroy", e.force,
+		tfStreamOpts{Limit: destroyPlanLimit, Quiet: true}, "plan", "-destroy", "-input=false", "-out="+planPath, vf)
+	if perr != nil {
+		hint := "Terraform cannot plan the teardown; fix that first. Kubernetes was not touched"
+		switch {
+		case errors.Is(ctxErr, context.DeadlineExceeded):
+			hint = fmt.Sprintf("the plan had not finished after %d minutes and was stopped. Nothing was changed; re-run `darkplum destroy`", int(destroyPlanLimit.Minutes()))
+		case errors.Is(ctxErr, context.Canceled):
+			hint = "interrupted. Nothing was changed"
+		default:
+			if h := (&deployEnv{rec: e.rec}).loginHint(tl.String()); !strings.HasPrefix(h, "fix the above") {
+				hint = h + ". Kubernetes was not touched"
+			}
+		}
+		return e.stop(checkResult{name: "plan -destroy", status: checkFail, detail: firstLine(perr.Error()), hint: hint}, "the destroy does not plan")
 	}
 	js, err := tf.Capture("show", "-json", planPath)
 	if err != nil {

@@ -1058,14 +1058,28 @@ func (e *deployEnv) planAndApply(ctx context.Context, tf tfRunner) error {
 	return nil
 }
 
-// streamTerraform runs one long Terraform command with its output on out, a
-// heartbeat while it is quiet, and a 45 minute cap. It returns the tail of what
-// Terraform printed (to recognise an expired session or a lock) and why its context ended
-// (nil, canceled or deadline exceeded), so the caller can tell a cancel or a
-// timeout from a failure.
-func streamTerraform(ctx context.Context, tf tfRunner, out io.Writer, now func() time.Time, heartbeat time.Duration, tag string, force <-chan struct{}, args ...string) (tl *tail, ctxErr error, err error) {
-	ctx, cancel := context.WithTimeout(ctx, 45*time.Minute)
-	defer cancel()
+// tfStreamOpts shapes one streamTerraform run.
+type tfStreamOpts struct {
+	// Limit stops the command after this long; 0 is no limit. Apply and destroy have
+	// none: killing Terraform mid-resource is worse than waiting, and the heartbeat,
+	// Ctrl-C and the post-interrupt backstop already bound a hang. A read-only plan
+	// has one.
+	Limit time.Duration
+	// Quiet keeps Terraform's output off the terminal (it is still kept for the
+	// failure summary) and prints the heartbeat on every tick.
+	Quiet bool
+}
+
+// streamTerraform runs one long Terraform command with its output on out and a
+// heartbeat while it is quiet. It returns the tail of what Terraform printed (to
+// recognise an expired session or a lock) and why its context ended (nil, canceled or
+// deadline exceeded), so the caller can tell a cancel or a timeout from a failure.
+func streamTerraform(ctx context.Context, tf tfRunner, out io.Writer, now func() time.Time, heartbeat time.Duration, tag string, force <-chan struct{}, o tfStreamOpts, args ...string) (tl *tail, ctxErr error, err error) {
+	if o.Limit > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, o.Limit)
+		defer cancel()
+	}
 	start := now()
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
@@ -1079,7 +1093,7 @@ func streamTerraform(ctx context.Context, tf tfRunner, out io.Writer, now func()
 			select {
 			case <-t.C:
 				// Terraform's own output says it is alive; the heartbeat is for quiet stretches.
-				if time.Since(tl.lastWrite()) < heartbeat {
+				if !o.Quiet && time.Since(tl.lastWrite()) < heartbeat {
 					continue
 				}
 				el := now().Sub(start).Round(time.Second)
@@ -1093,7 +1107,11 @@ func streamTerraform(ctx context.Context, tf tfRunner, out io.Writer, now func()
 		fmt.Fprintf(out, "%s\n", sDim(fmt.Sprintf("  waiting for terraform to finish safely (%dm%02ds since the interrupt); it releases the state lock when it stops. Ctrl-C again to kill it.",
 			int(d.Minutes()), int(d.Seconds())%60)))
 	}}
-	err = tf.Stream(ctx, io.MultiWriter(out, tl), opts, args...)
+	var sink io.Writer = io.MultiWriter(out, tl)
+	if o.Quiet {
+		sink = tl
+	}
+	err = tf.Stream(ctx, sink, opts, args...)
 	close(stop)
 	wg.Wait()
 	return tl, ctx.Err(), err
@@ -1102,7 +1120,7 @@ func streamTerraform(ctx context.Context, tf tfRunner, out io.Writer, now func()
 // streamTF is streamTerraform for deploy, turning a failure into the row that
 // says what to do about it.
 func (e *deployEnv) streamTF(ctx context.Context, tf tfRunner, stepNo int, label string, args ...string) error {
-	tl, ctxErr, err := streamTerraform(ctx, tf, e.out, e.now, e.heartbeat, fmt.Sprintf("[%d/%d] terraform %s", stepNo, deploySteps, label), e.force, args...)
+	tl, ctxErr, err := streamTerraform(ctx, tf, e.out, e.now, e.heartbeat, fmt.Sprintf("[%d/%d] terraform %s", stepNo, deploySteps, label), e.force, tfStreamOpts{}, args...)
 	if err == nil {
 		return nil
 	}
@@ -1110,8 +1128,6 @@ func (e *deployEnv) streamTF(ctx context.Context, tf tfRunner, stepNo int, label
 	switch {
 	case errors.Is(ctxErr, context.Canceled):
 		hint = "interrupted; Terraform stopped cleanly. Re-run `darkplum deploy` to continue"
-	case errors.Is(ctxErr, context.DeadlineExceeded):
-		hint = "stopped after 45 minutes. Re-run `darkplum deploy` to continue"
 	case strings.Contains(tl.String(), "Error acquiring the state lock"):
 		hint = "another Terraform run holds the state lock (its id is printed above). If you are sure nothing else is running: `terraform force-unlock <id>`"
 	default:
