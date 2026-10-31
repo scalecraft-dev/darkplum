@@ -27,11 +27,11 @@ func (s *StatusCmd) Run(g *Globals) error {
 	e := &statusEnv{out: os.Stdout, kc: c, ns: g.Namespace}
 	if m, err := release.Current(); err == nil {
 		e.proof.version = m.Version
-		if s.Context == "" {
-			if _, rec, err := openInstall(g.Install); err == nil {
-				e.proof.want = wantImages(m, rec.AccountIDs[0]+".dkr.ecr."+rec.Region+".amazonaws.com", rec.ClusterName)
-			}
-		}
+		// Where the images are comes from the install's own record (what deploy
+		// mirrored), not from a guess at the registry: an adopted install may have
+		// no single account, and the registry host is whatever deploy wrote.
+		// What they must be, the digest, is this build's.
+		e.build = &m
 	}
 	// The install's own settings tell which sections apply (web address, GPU). A
 	// cluster reached with --context has none; those sections are read live.
@@ -54,6 +54,7 @@ type statusEnv struct {
 	// proof is what this build can confirm about the images; recorded is the
 	// release version the install's own record says it runs (read by release()).
 	proof    imageProof
+	build    *release.Manifest // this build's manifest; nil for a dev build
 	recorded string
 }
 

@@ -37,6 +37,9 @@ func (e *statusEnv) release() bool {
 		return false
 	}
 	e.recorded = cm.Data["version"]
+	if e.build != nil {
+		e.proof.want = wantFromRecord(*e.build, cm.Data)
+	}
 	line := sInfo(cm.Data["version"])
 	if ch := cm.Data["channel"]; ch != "" {
 		line += sDim(" · channel " + ch)
@@ -64,17 +67,23 @@ type imageProof struct {
 	version string            // the version of this build
 }
 
-// wantImages is the reference each first-party service must run to count as this
-// release: the install's own ECR repository (Terraform names it
-// <registry>/<cluster>/darkplum-<service>) at the digest in this binary's release
-// manifest.
-func wantImages(m release.Manifest, registry, cluster string) map[string]string {
+// wantFromRecord is wantImages for an install whose registry is read from its
+// darkplum-install record: the repository each service was mirrored into
+// (image-<svc>, written by deploy), at the digest in this binary's manifest. A
+// record that does not name every service's repository confirms nothing (nil),
+// so "verified" is never said about a subset.
+func wantFromRecord(m release.Manifest, data map[string]string) map[string]string {
 	if len(m.Images) == 0 {
 		return nil
 	}
 	out := map[string]string{}
 	for svc, img := range m.Images {
-		out[svc] = registry + "/" + cluster + "/darkplum-" + svc + "@" + img.Digest
+		ref := data["image-"+svc]
+		at := strings.Index(ref, "@")
+		if at < 0 || !strings.HasSuffix(ref[:at], "/darkplum-"+svc) {
+			return nil
+		}
+		out[svc] = ref[:at] + "@" + img.Digest
 	}
 	return out
 }
@@ -146,6 +155,8 @@ func (e *statusEnv) imageTrust() (failed bool) {
 		failed = true
 	}
 	switch {
+	case len(e.proof.want) == 0 && seen > 0 && e.build != nil:
+		fmt.Fprintf(e.out, "%s  %s\n", sDim("images"), sWarn("! the install has no record of where its images were copied (deployed by an older darkplum?); run `darkplum deploy` to record it, then status can confirm them"))
 	case len(e.proof.want) == 0 && seen > 0:
 		fmt.Fprintf(e.out, "%s  %s\n", sDim("images"), sWarn("! this darkplum is a development build: it cannot confirm which images run"))
 	case len(differ) > 0 && e.recorded != "" && e.recorded == e.proof.version:

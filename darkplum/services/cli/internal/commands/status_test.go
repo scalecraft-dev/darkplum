@@ -254,13 +254,51 @@ func TestStatusOldInstallWithoutRecords(t *testing.T) {
 	}
 }
 
-func TestWantImages(t *testing.T) {
+func TestWantFromRecord(t *testing.T) {
 	m := release.Manifest{Images: map[string]release.Image{"api": {Digest: digestA}}}
-	if got := wantImages(m, ecr, "acme")["api"]; got != img("api", digestA) {
+	rec := map[string]string{"image-api": img("api", digestB)} // the record says where, the build says which
+	if got := wantFromRecord(m, rec)["api"]; got != img("api", digestA) {
 		t.Errorf("got %s", got)
 	}
-	if wantImages(release.Manifest{}, ecr, "acme") != nil {
+	for name, bad := range map[string]map[string]string{
+		"no record":         nil,
+		"no digest in ref":  {"image-api": ecr + "/acme/darkplum-api"},
+		"another service's": {"image-api": img("web", digestB)},
+	} {
+		if wantFromRecord(m, bad) != nil {
+			t.Errorf("%s confirmed something", name)
+		}
+	}
+	if wantFromRecord(release.Manifest{}, rec) != nil {
 		t.Error("a build with no images wants some")
+	}
+}
+
+// The registry comes from the install's record, so an install with several
+// accounts (adopted) or a registry the CLI would not guess is still confirmed.
+func TestStatusReadsTheRegistryFromTheRecord(t *testing.T) {
+	m := release.Manifest{Version: "v1.4.0", Images: map[string]release.Image{}}
+	good := map[string]dep{}
+	data := map[string]string{"version": "v1.4.0"}
+	for _, svc := range []string{"gateway", "api", "web"} {
+		m.Images[svc] = release.Image{Digest: digestA}
+		data["image-"+svc] = "999999999999.dkr.ecr.eu-west-1.amazonaws.com/acme/darkplum-" + svc + "@" + digestA
+		good["darkplum-"+svc] = dep{image: data["image-"+svc]}
+	}
+	rec, _ := json.Marshal(map[string]any{"data": data})
+	s := newStatusCluster()
+	s.release, s.deploys = string(rec), deployList(good)
+	var out bytes.Buffer
+	e := &statusEnv{out: &out, kc: s.client(), ns: testNS, build: &m, proof: imageProof{version: "v1.4.0"}}
+	if err := e.run(); err != nil || !strings.Contains(out.String(), "✓ verified") {
+		t.Fatalf("%v\n%s", err, out.String())
+	}
+	// no record of where the images went: nothing is confirmed, and it says why
+	s.release = ""
+	out.Reset()
+	e = &statusEnv{out: &out, kc: s.client(), ns: testNS, build: &m, proof: imageProof{version: "v1.4.0"}}
+	if err := e.run(); err != nil || strings.Contains(out.String(), "✓ verified") || !strings.Contains(out.String(), "no record of where its images") {
+		t.Errorf("%v\n%s", err, out.String())
 	}
 }
 
