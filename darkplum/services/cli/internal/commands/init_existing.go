@@ -87,8 +87,9 @@ func (c *InitCmd) existingInstall(env *initEnv, dir string, raw map[string]strin
 		{web, "the name your team opens, and the networks that may reach it"},
 		{"Start over", "asks every question again"},
 		{"Change model hosting", "Bedrock only, or add a self-hosted model on a GPU"},
+		{"Change the semantic router", "the optional in-cluster classifier for routed aliases: on or off"},
 		{"Nothing", "leave the install as it is"},
-	}, 3)
+	}, 4)
 	if err != nil {
 		return true, err
 	}
@@ -99,6 +100,8 @@ func (c *InitCmd) existingInstall(env *initEnv, dir string, raw map[string]strin
 		return false, nil
 	case 2:
 		return true, c.changeHosting(env, dir, tf)
+	case 3:
+		return true, c.changeRouter(env, dir, rec)
 	}
 	fmt.Fprintln(w, sDim("nothing changed"))
 	return true, nil
@@ -136,6 +139,11 @@ func describeInstall(w interface{ Write([]byte) (int, error) }, name string, tf 
 		row("address", a.url()+" "+sDim("(from "+strings.Join(a.allowed, ", ")+")"))
 	} else {
 		row("address", sDim("none yet"))
+	}
+	if rec.SemanticRouter {
+		row("router", "on "+sDim("(the in-cluster intent classifier for routed aliases)"))
+	} else {
+		row("router", sDim("off"))
 	}
 	if tf.Raw["db_deletion_protection"] == "false" {
 		row("database", sWarn("test install: one-day backups, no deletion protection"))

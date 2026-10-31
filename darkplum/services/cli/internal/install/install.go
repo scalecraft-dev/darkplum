@@ -211,6 +211,11 @@ type Record struct {
 	// (the domain's DNS is elsewhere). Only a zone recorded here is reported by
 	// destroy as Darkplum's to mention; a zone the customer supplied is theirs.
 	CreatedZoneID string `json:"created_zone_id,omitempty"`
+	// SemanticRouter is whether the install runs the optional in-cluster intent
+	// classifier. It is a setting of the install, not of Terraform: `darkplum
+	// deploy` applies the router when it is true and removes it when it is false.
+	// Off by default, as `make deploy-semantic-router` was opt-in.
+	SemanticRouter bool `json:"semantic_router,omitempty"`
 }
 
 // Backend is where Terraform keeps this install's state.

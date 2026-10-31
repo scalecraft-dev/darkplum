@@ -357,3 +357,25 @@ func TestRecordKeepsTheZoneInitCreated(t *testing.T) {
 		t.Fatalf("%+v %v", got, err)
 	}
 }
+
+func TestRecordKeepsTheRouterSetting(t *testing.T) {
+	in, err := OpenDir(t.TempDir(), "dp-trial")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := Record{Name: "dp-trial", ClusterName: "dp-trial", Region: "us-east-2", AccountIDs: []string{"123456789012"},
+		Backend: Backend{Type: "s3", Bucket: "b", Key: "k", Region: "us-east-2"}}
+	if err := in.Save(rec); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := in.Load(); got.SemanticRouter {
+		t.Error("a record that never said so has the router on")
+	}
+	rec.SemanticRouter = true
+	if err := in.Save(rec); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := in.Load(); err != nil || !got.SemanticRouter {
+		t.Fatalf("%+v %v", got, err)
+	}
+}

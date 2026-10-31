@@ -51,6 +51,8 @@ type InitCmd struct {
 	ZoneID         string `name:"zone-id" help:"Use this existing public Route53 zone for the name instead of creating one." default:""`
 	CertificateARN string `name:"certificate-arn" help:"Use this existing ACM certificate (this account and region) instead of issuing one." default:""`
 	AllowedCIDRs   string `name:"allowed-cidrs" help:"Comma-separated IPv4 networks allowed to reach the address (VPN, office). Default: the VPC." default:""`
+
+	SemanticRouter string `name:"semantic-router" enum:"on,off," help:"Run the optional in-cluster intent classifier (the vLLM Semantic Router) that routed aliases can use: on or off. Asked when omitted; an install keeps its current setting under --yes. Applied by darkplum deploy." default:""`
 }
 
 // initCloud is the per-cloud half of init: identity, zones, quota, name
@@ -180,7 +182,10 @@ type settings struct {
 	liveChecked                       string          // cluster name the live-install lookup already ran for
 	locked                            *install.Record // the install's record, when it exists: cluster, region, account and state are fixed
 	web                               webSettings
-	checks                            []checkResult
+	// router is the semantic router setting; routerSet says it was answered (a
+	// flag or the question), so a run that did not ask keeps the record's value.
+	router, routerSet bool
+	checks            []checkResult
 }
 
 func reportedErr(format string, a ...any) error { return reportedError{fmt.Sprintf(format, a...)} }
@@ -297,6 +302,7 @@ func (c *InitCmd) execute(env *initEnv) error {
 	if in, oerr := install.OpenDir(dir, c.ClusterName); oerr == nil {
 		if rec, lerr := in.Load(); lerr == nil {
 			s.locked = &rec
+			s.router = rec.SemanticRouter
 			if c.Region != "" && c.Region != rec.Region {
 				return env.fail("region", c.Region, "the install is in "+rec.Region+" and cannot move; create a new install for another region", "the region of an existing install cannot change")
 			}
@@ -433,6 +439,11 @@ func (c *InitCmd) execute(env *initEnv) error {
 
 	// 5. Private web address.
 	if err := c.chooseWeb(env, s, cloud, existingTFVars(filepath.Join(dir, "terraform.tfvars")), record); err != nil {
+		return err
+	}
+
+	// 6. Semantic router (optional; stored in the install record, applied by deploy).
+	if err := c.chooseRouter(env, s); err != nil {
 		return err
 	}
 
@@ -956,6 +967,9 @@ func (c *InitCmd) summary(env *initEnv, s *settings, wrote []string, dry bool) {
 	if s.web.domain != "" {
 		fmt.Fprintf(w, "  Your team's address after deploy: %s %s\n", sCmd("https://"+s.web.hostname), sDim("(from "+strings.Join(s.web.allowed, ", ")+")"))
 	}
+	if s.router {
+		fmt.Fprintf(w, "  Semantic router: %s %s\n", sInfo("on"), sDim("(deploy installs it; its classifier models download on first start, 1-3 minutes)"))
+	}
 	eta := "~20 min"
 	if s.gpu {
 		eta = "~35-50 min"
@@ -971,7 +985,7 @@ func (c *InitCmd) saveRecord(dir string, s *settings, spec backendSpec, now time
 		return err
 	}
 	rec := install.Record{
-		Name: s.cluster, ClusterName: s.cluster, Region: s.region, Profile: s.profile, AccountIDs: []string{s.account},
+		Name: s.cluster, ClusterName: s.cluster, Region: s.region, Profile: s.profile, AccountIDs: []string{s.account}, SemanticRouter: s.router,
 		Created: now.UTC(),
 		Backend: install.Backend{Type: "s3", Bucket: spec.Bucket, Key: spec.Key, Region: spec.Region, KMSKeyID: spec.KMSKeyARN, Encrypt: true, UseLockfile: true},
 	}
@@ -982,6 +996,9 @@ func (c *InitCmd) saveRecord(dir string, s *settings, spec backendSpec, now time
 			return err
 		}
 		rec.Created, rec.Bundle, rec.AdoptedFrom, rec.CreatedZoneID = old.Created, old.Bundle, old.AdoptedFrom, old.CreatedZoneID
+		if !s.routerSet {
+			rec.SemanticRouter = old.SemanticRouter // a run that did not ask does not decide
+		}
 	}
 	if s.web.createZone {
 		rec.CreatedZoneID = s.web.zoneID

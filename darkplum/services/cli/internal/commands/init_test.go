@@ -350,7 +350,7 @@ func TestInitNameCollision(t *testing.T) {
 	}
 	// Interactive: re-asks, and the second name is used. The fake flips to free.
 	dir := t.TempDir()
-	env, _ = testEnv(t, &collideOnce{fakeCloud: newFakeCloud()}, nil, "\ndarkplum-b\n\n")
+	env, _ = testEnv(t, &collideOnce{fakeCloud: newFakeCloud()}, nil, "\n\ndarkplum-b\n\n")
 	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Region: "us-east-2", Mode: "bedrock", Profile: "acme", Domain: "acme.com"}
 	if err := c.execute(env); err != nil {
 		t.Fatal(err)
@@ -421,7 +421,7 @@ func TestInitAbortOnEOFWritesNothing(t *testing.T) {
 func TestInitInteractiveGPUFlow(t *testing.T) {
 	dir := t.TempDir()
 	// profile, region, mode 2 (gpu), model 2 (mistral), backend 2 (local), final confirm
-	env, out := testEnv(t, newFakeCloud(), nil, "acme\n\n2\n2\nacme.com\n\n2\n\n")
+	env, out := testEnv(t, newFakeCloud(), nil, "acme\n\n2\n2\nacme.com\n\n\n2\n\n")
 	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1}
 	if err := c.execute(env); err != nil {
 		t.Fatalf("%v\n%s", err, out)
@@ -503,7 +503,7 @@ func TestInitGatedConfirmed(t *testing.T) {
 	sha := strings.Repeat("ab", 20)
 	dir := t.TempDir()
 	// profile, region, mode(gpu), model: custom(3), id, gated confirm y, sha, networks, backend local, final confirm
-	env, _ := testEnv(t, newFakeCloud(), &fakeHF{err: errHFGated}, "acme\n\n2\n3\nmeta/Gated-1\ny\n"+sha+"\n\n2\n\n")
+	env, _ := testEnv(t, newFakeCloud(), &fakeHF{err: errHFGated}, "acme\n\n2\n3\nmeta/Gated-1\ny\n"+sha+"\n\n\n2\n\n")
 	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Domain: "acme.com"}
 	if err := c.execute(env); err != nil {
 		t.Fatal(err)
