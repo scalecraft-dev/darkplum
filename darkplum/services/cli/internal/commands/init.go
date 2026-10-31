@@ -614,7 +614,7 @@ func (c *InitCmd) resolveCustom(env *initEnv, id, rev string) (catalogModel, err
 			return m, reportedErr("model %s not found on Hugging Face", id)
 		case errors.Is(err, errHFGated):
 			printCheckTo(w, checkResult{name: "model", status: checkWarn, detail: id + " is gated",
-				hint: "needs a Hugging Face token: after make deploy run `make set-hf-token`"})
+				hint: "needs a Hugging Face token: after the deploy run `darkplum keys set huggingface`"})
 			if !env.interactive {
 				return m, reportedErr("%s is gated; run init interactively to confirm, or choose an ungated model", id)
 			}

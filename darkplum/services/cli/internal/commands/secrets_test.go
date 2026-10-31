@@ -1,14 +1,11 @@
 package commands
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
 )
-
-func b64(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
 
 func secretJSON(data map[string]string) string {
 	enc := map[string]string{}
