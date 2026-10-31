@@ -356,7 +356,8 @@ func (h *deployHarness) script(gpu int) {
 	k.onFn("get nodes -o json", func([]string, []byte) ([]byte, error) { return []byte(h.nodesJSON(h.nodeArch, true)), nil })
 	k.on("get deploy darkplum-gateway", "", errors.New(`kubectl: Error from server (NotFound): deployments.apps "darkplum-gateway" not found`))
 	k.on("get svc darkplum-web", "", errors.New(`kubectl: Error from server (NotFound): services "darkplum-web" not found`))
-	k.on("owner=helm", "", nil)
+	k.on("owner=helm", `{"items":[]}`, nil)
+	k.on("darkplum.ai/component=semantic-router", "", nil) // none installed by Darkplum
 	k.on("get secret darkplum-auth", "", secretNotFound("darkplum-auth"))
 	k.on("get secret darkplum-user-hmac", "", secretNotFound("darkplum-user-hmac"))
 	k.on("create -f -", "", nil)

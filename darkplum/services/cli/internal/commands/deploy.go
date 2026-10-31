@@ -17,6 +17,7 @@ import (
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
+	darkplum "github.com/scalecraft-dev/darkplum"
 	"golang.org/x/term"
 
 	"github.com/scalecraft-dev/darkplum/cli/internal/bundle"
@@ -27,6 +28,7 @@ import (
 	"github.com/scalecraft-dev/darkplum/cli/internal/mirror"
 	"github.com/scalecraft-dev/darkplum/cli/internal/release"
 	"github.com/scalecraft-dev/darkplum/cli/internal/runner"
+	"github.com/scalecraft-dev/darkplum/cli/internal/semrouter"
 	"github.com/scalecraft-dev/darkplum/cli/internal/verify"
 )
 
@@ -49,6 +51,8 @@ type DeployCmd struct {
 	AllowDowngrade bool `name:"allow-downgrade" help:"Apply even though this darkplum is older than (or cannot be ordered against) the release that last applied the install."`
 	ConfirmPlan    bool `name:"confirm-plan" help:"Approve a Terraform plan that deletes or replaces resources. Without it deploy shows the list and asks; it never approves a delete on its own, and there is no --yes that would."`
 
+	ConvertRouterDefaults bool `name:"convert-router-defaults" help:"The semantic router is installed by helm with settings that differ from the ones Darkplum ships: take it over anyway, replacing them with the shipped decisions. Without it deploy stops and names the differences."`
+
 	GPUWait time.Duration `name:"gpu-wait" hidden:"" help:"How long to wait for a GPU to become allocatable before reporting the platform healthy without it." default:"15m"`
 
 	ReleaseImages  string `name:"release-images" hidden:"" help:"Development builds only: a release.json to deploy (its images are still verified)."`
@@ -58,7 +62,7 @@ type DeployCmd struct {
 // platformNS is where the platform's objects live; the manifests name it.
 const platformNS = "darkplum-system"
 
-const deploySteps = 13
+const deploySteps = 14
 
 // exitError is a command that did its work but wants a specific exit status.
 type exitError struct {
@@ -474,8 +478,14 @@ func (e *deployEnv) run(ctx context.Context) (err error) {
 	}
 	e.row(checkResult{name: "darkplum-install", status: checkPass, detail: m.Version + " · image-trust " + trustWord(imgs)})
 
-	// ---- 12. GPU model (never blocks the platform) and the Layer 1 self-test --------------
-	e.step(13, "Self-hosted model and the Layer 1 self-test")
+	// ---- 13. semantic router (the install's setting: applied or removed) ----------------
+	e.step(13, "Semantic router")
+	if err := e.routerStep(ctx, kc, fsys); err != nil {
+		return err
+	}
+
+	// ---- 14. GPU model (never blocks the platform) and the Layer 1 self-test --------------
+	e.step(14, "Self-hosted model and the Layer 1 self-test")
 	degraded := false
 	if out.GPUDesired == 0 {
 		e.row(checkResult{name: "self-hosted model", status: checkPass, detail: "gpu_desired_size = 0: Bedrock models only (raise it in `darkplum init`, then deploy)"})
@@ -521,6 +531,76 @@ func (e *deployEnv) run(ctx context.Context) (err error) {
 		e.printf("%s\n", sDim("Bedrock-only install. Add self-hosted models later: `darkplum init` (Self-hosted GPU), then `darkplum deploy`."))
 	}
 	e.printf("\nNext: darkplum configure\n")
+	return nil
+}
+
+// routerStep makes the cluster match the install's semantic router setting.
+//
+// On: DetectHelm, CheckTakeover (the proof Apply demands), Apply (objects, wait
+// until the router is ready, point the gateway at it), and only then
+// FinishTakeover, which deletes helm's release records so a later `helm upgrade`
+// cannot fight the CLI. A failure before that leaves the helm records in place.
+// Off: remove what Darkplum applied (selected by its label), and nothing else.
+func (e *deployEnv) routerStep(ctx context.Context, kc *kube.Client, fsys fs.FS) error {
+	if !e.rec.SemanticRouter {
+		return e.routerOff(kc, fsys)
+	}
+	if r := e.sessionOK(35); r.status == checkFail {
+		return e.stop(r, "the AWS session is about to expire; the router can take up to 30 minutes to become ready")
+	}
+	objs, err := semrouter.Objects(fsys, platformNS)
+	if err != nil {
+		return e.stop(checkResult{name: "semantic router", status: checkFail, detail: firstLine(err.Error()),
+			hint: "this build cannot install the router; use a release build, or turn it off in `darkplum init`"}, "this build has no semantic router")
+	}
+	rel, err := semrouter.DetectHelm(kc)
+	if err != nil {
+		return e.stop(checkResult{name: "semantic router", status: checkFail, detail: firstLine(err.Error()),
+			hint: "cannot tell whether a helm-installed router exists; the router was not touched"}, "cannot inspect helm releases")
+	}
+	tok, err := e.takeover(rel)
+	if err != nil {
+		return err
+	}
+	if tok.Found() {
+		e.row(checkResult{name: "semantic router", status: checkPass, detail: "taking over the helm release; its workload keeps running"})
+	}
+	if err := ctx.Err(); err != nil {
+		return e.stop(checkResult{name: "semantic router", status: checkFail, detail: "interrupted"}, "interrupted")
+	}
+	if err := semrouter.Apply(kc, tok, objs, e.out); err != nil {
+		return e.stop(checkResult{name: "semantic router", status: checkFail, detail: err.Error(),
+			hint: "the platform is deployed; re-run `darkplum deploy` (idempotent) or turn the router off in `darkplum init`"}, "the semantic router did not become ready")
+	}
+	if tok.Found() {
+		if err := semrouter.FinishTakeover(kc, tok); err != nil {
+			return e.stop(checkResult{name: "semantic router", status: checkFail, detail: err.Error(),
+				hint: "the router runs; re-run `darkplum deploy` to finish removing helm's release records"}, "cannot finish taking over the helm release")
+		}
+	}
+	e.row(checkResult{name: "semantic router", status: checkPass, detail: "on · " + semrouter.URL(platformNS)})
+	return nil
+}
+
+// routerOff removes the router Darkplum applied, when there is one. It never
+// touches a helm-installed router (no Darkplum label), nor the gateway's setting
+// that points at it.
+func (e *deployEnv) routerOff(kc *kube.Client, fsys fs.FS) error {
+	out, err := kc.NS(nil, "get", "deploy", "-l", semrouter.ComponentLabel+"="+semrouter.Component, "-o", "name")
+	if err != nil {
+		return e.stop(checkResult{name: "semantic router", status: checkFail, detail: firstLine(err.Error()),
+			hint: "cannot tell whether the router is installed"}, "cannot inspect the semantic router")
+	}
+	if strings.TrimSpace(out) == "" {
+		e.row(checkResult{name: "semantic router", status: checkPass, detail: "off"})
+		return nil
+	}
+	objs, _ := semrouter.Objects(fsys, platformNS) // kinds only; the label selects what is removed
+	if err := semrouter.Remove(kc, objs, e.out); err != nil {
+		return e.stop(checkResult{name: "semantic router", status: checkFail, detail: err.Error(),
+			hint: "re-run `darkplum deploy`"}, "cannot remove the semantic router")
+	}
+	e.row(checkResult{name: "semantic router", status: checkPass, detail: "off · removed; routed aliases fall back to their default route"})
 	return nil
 }
 
@@ -730,7 +810,17 @@ func (e *deployEnv) checkConflicts(kc *kube.Client) (reachable bool, err error) 
 			hint: "cannot tell how the web UI is exposed; nothing was changed"}, "cannot inspect the web service")
 	}
 
-	sec, err := kc.Run(nil, "-n", platformNS, "get", "secret", "-l", "owner=helm,name=semantic-router", "-o", "name")
+	return e.checkRouterTakeover(kc)
+}
+
+// checkRouterTakeover looks for a semantic router that helm installed (read only,
+// no helm binary). With the router on in the install's settings, a helm router
+// with the shipped values is taken over later (step 13) and one with other values
+// is refused here, before anything is changed, unless --convert-router-defaults
+// says the operator accepts losing them. With the router off the release is not
+// touched at all: it is not Darkplum's.
+func (e *deployEnv) checkRouterTakeover(kc *kube.Client) (reachable bool, err error) {
+	rel, err := semrouter.DetectHelm(kc)
 	if err != nil {
 		if unreachable(err) {
 			return false, nil
@@ -738,15 +828,45 @@ func (e *deployEnv) checkConflicts(kc *kube.Client) (reachable bool, err error) 
 		return true, e.stop(checkResult{name: "semantic router", status: checkFail, detail: firstLine(err.Error()),
 			hint: "cannot tell whether a helm-installed router exists; nothing was changed"}, "cannot inspect helm releases")
 	}
-	if strings.TrimSpace(sec) != "" {
-		return true, e.stop(checkResult{name: "semantic router", status: checkFail,
-			detail: "installed by helm (release semantic-router)",
-			hint: "this release does not manage the router: it has no helm, and no way yet to take the release over without losing any edits you made to its values. " +
-				"Nothing was changed. Stay on the release that installed it, or remove it first (`helm uninstall semantic-router -n darkplum-system` with your own cluster access); routed aliases then fall back to their default route."},
-			"helm-installed semantic router")
+	if !rel.Found {
+		return true, nil
+	}
+	if !e.rec.SemanticRouter {
+		e.row(checkResult{name: "semantic router", status: checkWarn, detail: "installed by helm (release semantic-router); this install's router setting is off",
+			hint: "deploy leaves it alone. To let Darkplum manage it: `darkplum init`, turn the semantic router on, then deploy"})
+		return true, nil
+	}
+	if _, err := e.takeover(rel); err != nil {
+		return true, err
 	}
 	return true, nil
 }
+
+// takeover decides whether the helm release can be taken over, and says so.
+func (e *deployEnv) takeover(rel semrouter.HelmRelease) (semrouter.Takeover, error) {
+	k8s, err := embeddedK8s()
+	if err != nil {
+		return semrouter.Takeover{}, e.stop(checkResult{name: "semantic router", status: checkFail, detail: firstLine(err.Error())}, "cannot read the bundle")
+	}
+	defaults, err := semrouter.DefaultValues(k8s)
+	if err != nil {
+		return semrouter.Takeover{}, e.stop(checkResult{name: "semantic router", status: checkFail, detail: firstLine(err.Error())}, "cannot read the router's values")
+	}
+	tok, err := semrouter.CheckTakeover(rel, defaults, e.flags.ConvertRouterDefaults)
+	var cust *semrouter.ErrCustomised
+	switch {
+	case errors.As(err, &cust):
+		return semrouter.Takeover{}, e.stop(checkResult{name: "semantic router", status: checkFail,
+			detail: "installed by helm with values that differ from the ones Darkplum ships: " + strings.Join(cust.Keys, ", "),
+			hint: "Nothing was changed. Taking it over replaces those values with the shipped decisions. Either pass --convert-router-defaults to accept that, " +
+				"or keep your helm release and turn the router off in `darkplum init` (deploy then leaves it alone)"}, "customised helm-installed semantic router")
+	case err != nil:
+		return semrouter.Takeover{}, e.stop(checkResult{name: "semantic router", status: checkFail, detail: firstLine(err.Error())}, "cannot judge the helm-installed router")
+	}
+	return tok, nil
+}
+
+func embeddedK8s() (fs.FS, error) { return fs.Sub(darkplum.Tree(), "k8s") }
 
 // webExposure describes a darkplum-web Service that is published outside the
 // cluster, or "" when it is cluster-internal.

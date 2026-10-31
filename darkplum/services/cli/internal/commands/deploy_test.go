@@ -244,23 +244,6 @@ func TestDeployClusterInternalWebServiceIsFine(t *testing.T) {
 	}
 }
 
-func TestDeployRefusesAHelmInstalledRouter(t *testing.T) {
-	h := newDeployHarness(t, 0)
-	liveCluster(h)
-	h.k.handlers = append([]skHandler{{"owner=helm", func([]string, []byte) ([]byte, error) {
-		return []byte("secret/sh.helm.release.v1.semantic-router.v1\n"), nil
-	}}}, h.k.handlers...)
-	if !IsReported(h.run()) {
-		t.Fatal("must refuse")
-	}
-	if h.tl.count("terraform") != 0 || h.writes() != 0 {
-		t.Errorf("went on:\n%s", h.tl)
-	}
-	h.mustContain("semantic-router", "Nothing was changed")
-	// The probe is a read of helm release Secrets only, pinned like every call.
-	h.k.assertClean()
-}
-
 func TestDeployInspectionFailureIsNotAssumedHealthy(t *testing.T) {
 	h := newDeployHarness(t, 0)
 	liveCluster(h)
