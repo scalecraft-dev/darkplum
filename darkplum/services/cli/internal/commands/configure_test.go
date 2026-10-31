@@ -281,6 +281,8 @@ type configureHarness struct {
 	hook   func(string)
 	resolv func() (clusterTarget, checkResult, error)
 
+	clockStore *deployClock // the workspace's deploy clock (nil: none)
+
 	web      webAddress
 	tfOut    map[string]json.RawMessage
 	tfErr    error
@@ -347,6 +349,10 @@ func (h *configureHarness) run(c *ConfigureCmd, answers string, secrets ...strin
 		web:       h.web,
 		tfOutputs: func() (map[string]json.RawMessage, error) { return h.tfOut, h.tfErr },
 		probe:     func(u string) error { h.probed = append(h.probed, u); return h.probeErr },
+	}
+	if h.clockStore != nil {
+		h.env.loadClock = func() (deployClock, bool) { return *h.clockStore, !h.clockStore.Started.IsZero() }
+		h.env.saveClock = func(c deployClock) error { *h.clockStore = c; return nil }
 	}
 	err := c.execute(context.Background(), h.env)
 	h.checkInvariants()

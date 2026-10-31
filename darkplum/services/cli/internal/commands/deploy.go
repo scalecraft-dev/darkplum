@@ -166,6 +166,9 @@ type deployEnv struct {
 	heartbeat time.Duration // how often apply reports it is still running
 	poll      time.Duration // how often to look at a cluster that is changing
 
+	// timing holds the run's clock for per-step and total elapsed time.
+	timing stepClock
+
 	// mutated is set when the run first changes anything, so a failure before then
 	// can say nothing was touched.
 	mutated bool
@@ -239,7 +242,57 @@ func (l *lockedWriter) Write(p []byte) (int, error) {
 func (e *deployEnv) printf(format string, a ...any) { fmt.Fprintf(e.out, format, a...) }
 
 func (e *deployEnv) step(n int, title string) {
+	e.endStep()
 	fmt.Fprintf(e.out, "\n%s\n", sHeader(fmt.Sprintf("[%d/%d] %s", n, deploySteps, title)))
+	e.timing.now = e.now
+	e.timing.stepStart, e.timing.stepOpen = e.timing.clock(), true
+	if e.timing.start.IsZero() {
+		e.timing.start = e.timing.stepStart
+	}
+}
+
+// endStep says how long the step that is ending took.
+func (e *deployEnv) endStep() {
+	t := &e.timing
+	if !t.stepOpen {
+		return
+	}
+	t.stepOpen = false
+	fmt.Fprintf(e.out, "  %s\n", sDim("step took "+elapsed(t.clock().Sub(t.stepStart))))
+}
+
+// finishTiming closes the last step and prints the total, once: on success just
+// before the verdict, on any failure from the deferred call in run.
+func (e *deployEnv) finishTiming() {
+	if e.timing.done || e.timing.start.IsZero() {
+		return
+	}
+	e.endStep()
+	e.timing.done = true
+	fmt.Fprintf(e.out, "\n%s\n", sDim("Total time: "+elapsed(e.timing.clock().Sub(e.timing.start))))
+}
+
+// markDeployStart records, in the workspace, when this deploy began, once the
+// preflight has passed (a refused preflight changed nothing and is not a deploy).
+// A deploy that never finished keeps its earlier start.
+func (e *deployEnv) markDeployStart() {
+	c, ok := loadDeployClock(e.in)
+	if ok && c.Finished.IsZero() {
+		return
+	}
+	e.timing.now = e.now
+	if err := saveDeployClock(e.in, deployClock{Started: e.timing.clock().UTC()}); err != nil {
+		e.printf("%s\n", sDim("(could not record the deploy start time: "+firstLine(err.Error())+")"))
+	}
+}
+
+func (e *deployEnv) markDeployFinished() {
+	c, ok := loadDeployClock(e.in)
+	if !ok || !c.Finished.IsZero() {
+		return
+	}
+	c.Finished = e.timing.clock().UTC()
+	_ = saveDeployClock(e.in, c)
 }
 
 func (e *deployEnv) row(r checkResult) { printCheckTo(e.out, r) }
@@ -286,6 +339,9 @@ func (e *deployEnv) run(ctx context.Context) (err error) {
 	e.printf("%s\n", sHeader("▸ deploy · "+e.rec.ClusterName+" · "+m.Version+" ("+m.Channel+")"))
 	e.printf("%s\n", sDim("log: "+e.logPath))
 	defer func() {
+		if err != nil {
+			e.finishTiming()
+		}
 		if _, exit := ExitCode(err); err != nil && !exit {
 			if !e.mutated {
 				e.printf("\n%s\n", sDim("Nothing was changed. Full log: "+e.logPath))
@@ -316,6 +372,8 @@ func (e *deployEnv) run(ctx context.Context) (err error) {
 	if err := e.inspectLive(); err != nil {
 		return err
 	}
+
+	e.markDeployStart()
 
 	// ---- 2. verify the images before anything is written ------------------------
 	e.step(2, "Verify the release's images")
@@ -530,6 +588,8 @@ func (e *deployEnv) run(ctx context.Context) (err error) {
 		return reportedError{"the gateway role does not behave as configured"}
 	}
 
+	e.markDeployFinished()
+	e.finishTiming()
 	e.printf("\n%s\n", sSuccess("✓ Darkplum is deployed."))
 	if degraded {
 		e.printf("%s\n", sWarn("! Degraded: the platform is healthy, the self-hosted model is not running (no GPU). Exit status 3."))

@@ -49,6 +49,17 @@ type configureEnv struct {
 	web       webAddress                                 // from the install settings
 	tfOutputs func() (map[string]json.RawMessage, error) // `terraform output -json`, read-only
 	probe     func(url string) error                     // HTTPS reachability from this machine
+
+	// The workspace's record of when the deploy began (nil: no workspace).
+	loadClock func() (deployClock, bool)
+	saveClock func(deployClock) error
+}
+
+func (e *configureEnv) clockNow() time.Time {
+	if e.now == nil {
+		return time.Now()
+	}
+	return e.now()
 }
 
 func sleepCtx(ctx context.Context, d time.Duration) error {
@@ -98,6 +109,8 @@ func (c *ConfigureCmd) Run(g *Globals) error {
 		hold:  true,
 		probe: probeHTTPS,
 	}
+	env.loadClock = func() (deployClock, bool) { return loadDeployClock(in) }
+	env.saveClock = func(c deployClock) error { return saveDeployClock(in, c) }
 	if tf, err := readTFVars(in.TFVars()); err == nil {
 		env.web = webAddressFrom(tf)
 		env.tfOutputs = func() (map[string]json.RawMessage, error) { return terraformOutputs(in, rec) }
@@ -152,6 +165,7 @@ type configureRun struct {
 	email string // who to sign in as, for the finish screen
 	sso   bool
 
+	begin, last time.Time // run start, and the end of the previous row
 	reconnected bool
 	problems    int    // ✗ rows that did not stop the run
 	note        string // shown on the finish screen
@@ -170,7 +184,18 @@ func (r *configureRun) problem(name, detail, hint string) {
 }
 
 func (r *configureRun) pass(name, detail string) {
-	printCheckTo(r.out, checkResult{name: name, status: checkPass, detail: detail})
+	printCheckTo(r.out, checkResult{name: name, status: checkPass, detail: detail + r.took()})
+}
+
+// took is " · 12s" for the time since the previous row when that was a second or
+// more, and moves the mark: the wait is billed to the row it ended.
+func (r *configureRun) took() string {
+	prev, now := r.last, r.clockNow()
+	r.last = now
+	if prev.IsZero() || now.Sub(prev) < time.Second {
+		return ""
+	}
+	return " · " + elapsed(now.Sub(prev))
 }
 
 func (c *ConfigureCmd) execute(ctx context.Context, env *configureEnv) error {
@@ -184,6 +209,8 @@ func (c *ConfigureCmd) execute(ctx context.Context, env *configureEnv) error {
 	}
 
 	r := &configureRun{configureEnv: env, cmd: c, t: t, kc: env.newKube(t, env.namespace)}
+	r.begin = env.clockNow()
+	r.last = r.begin
 	if err := r.waitServices(ctx); err != nil {
 		return err
 	}
@@ -708,6 +735,7 @@ func (r *configureRun) chat(ctx context.Context, m adminModel) error {
 		}
 		if resp.status == http.StatusOK {
 			r.pass("test chat", fmt.Sprintf("%s answered in %.1fs", m.label(), res.latency.Seconds()))
+			r.firstChat()
 			if res.reply != "" {
 				reply := res.reply
 				if utf8.RuneCountInString(reply) > 160 {
@@ -764,8 +792,34 @@ func localURL(base string) string {
 	return strings.Replace(base, "127.0.0.1", "localhost", 1)
 }
 
+// firstChat says how long the whole path took, from the start of the deploy to
+// the first chat that worked. Once only: the moment is recorded, so a later
+// configure does not report a number that has been growing since.
+func (r *configureRun) firstChat() {
+	if r.loadClock == nil || r.saveClock == nil {
+		return
+	}
+	c, ok := r.loadClock()
+	if !ok || !c.FirstChat.IsZero() {
+		return
+	}
+	now := r.clockNow()
+	c.FirstChat = now.UTC()
+	if err := r.saveClock(c); err != nil {
+		return
+	}
+	detail := elapsed(now.Sub(c.Started)) + " from the start of the deploy to this chat"
+	if !c.Finished.IsZero() {
+		detail += " (deploy took " + elapsed(c.Finished.Sub(c.Started)) + ")"
+	}
+	fmt.Fprintf(r.out, "      %s\n", sDim("time to first chat: "+detail))
+}
+
 func (r *configureRun) finish(ctx context.Context) error {
 	w := r.out
+	if !r.begin.IsZero() {
+		fmt.Fprintf(w, "\n  %s", sDim("configure took "+elapsed(r.clockNow().Sub(r.begin))))
+	}
 	fmt.Fprintln(w)
 	r.teamLines()
 	fmt.Fprintln(w)
