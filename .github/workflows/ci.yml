@@ -144,6 +144,22 @@ jobs:
           terraform init -backend=false -input=false
           terraform test
 
+  plumbing:
+    name: Release plumbing
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      # The release workflows sign what customers deploy: every action in them is
+      # pinned to a commit, the manifest writer refuses channel/ref/prefix
+      # mix-ups, and the workflow files must at least parse.
+      - run: python3 -I -m unittest discover -s .github/scripts -p 'test_*.py' -v
+      - run: python3 -I .github/scripts/check-pinned-actions.py
+      - name: workflows parse
+        run: |
+          python3 -c 'import sys, yaml; [yaml.safe_load(open(f)) for f in sys.argv[1:]]' .github/workflows/*.yml
+      - run: bash -n .github/scripts/require-ci-green.sh
+
   manifests:
     name: Kubernetes manifests and docs
     runs-on: ubuntu-latest
