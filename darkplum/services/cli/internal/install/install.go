@@ -1,0 +1,372 @@
+// Package install is the per-install workspace: everything one Darkplum install
+// keeps on the operator's machine, under ~/.darkplum/installs/<name>/, and nothing
+// anywhere else. The repository checkout is never written to, so a `git pull`,
+// a second checkout or a cleaned directory cannot lose or mix up an install.
+//
+//	~/.darkplum/
+//	  plugin-cache/                 shared Terraform provider cache
+//	  installs/<name>/
+//	    install.json                what this install is (Record), 0600
+//	    terraform.tfvars            its settings, 0600
+//	    backend.hcl                 -backend-config file for S3 state, 0600
+//	    bundle/<version>/           the verified Terraform + Kubernetes tree, read-only
+//	    tfdata/                     TF_DATA_DIR: terraform's own cache, outside the bundle
+//	    kubeconfig                  private kubeconfig for this install's cluster, 0600
+//	    logs/                       one log per command run
+package install
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/scalecraft-dev/darkplum/cli/internal/bundle"
+)
+
+// ErrNoInstall means there is nothing to act on.
+var ErrNoInstall = errors.New("no install")
+
+// Home is the root of all workspaces, normally ~/.darkplum.
+type Home string
+
+// DefaultHome is $DARKPLUM_HOME when set (tests, CI and containers), otherwise
+// ~/.darkplum. The variable moves the whole home; it never selects an install.
+func DefaultHome() (Home, error) {
+	if h := os.Getenv("DARKPLUM_HOME"); h != "" {
+		if !filepath.IsAbs(h) {
+			return "", fmt.Errorf("DARKPLUM_HOME must be an absolute path, got %q", h)
+		}
+		return Home(h), nil
+	}
+	u, err := os.UserHomeDir()
+	if err != nil {
+		return "", fmt.Errorf("cannot find your home directory: %w", err)
+	}
+	return Home(filepath.Join(u, ".darkplum")), nil
+}
+
+// PluginCache is shared by every install: provider binaries are large and
+// verified against the lock file on every init anyway.
+func (h Home) PluginCache() string { return filepath.Join(string(h), "plugin-cache") }
+
+func (h Home) installs() string { return filepath.Join(string(h), "installs") }
+
+// Same shape as the cluster_name variable in terraform/aws/variables.tf: an
+// install is named after its cluster, and that name becomes a directory.
+var nameRe = regexp.MustCompile(`^[a-z][a-z0-9-]{0,38}[a-z0-9]$`)
+
+// ValidName rejects anything that is not a plain cluster-style name, so a name
+// can never be a path ("../x", "a/b", ".") or collide with the workspace's own files.
+func ValidName(name string) error {
+	if !nameRe.MatchString(name) || strings.Contains(name, "--") {
+		return fmt.Errorf("install name %q must be 2-40 characters of lowercase letters, digits and single hyphens, starting with a letter and not ending with a hyphen", name)
+	}
+	return nil
+}
+
+// Install is one workspace. Use Open or Resolve; the zero value is not usable.
+type Install struct {
+	home Home
+	Name string
+}
+
+// Open returns the workspace for name without creating anything.
+func Open(h Home, name string) (Install, error) {
+	if err := ValidName(name); err != nil {
+		return Install{}, err
+	}
+	return Install{home: h, Name: name}, nil
+}
+
+// List returns the names of every install in the home, sorted.
+func List(h Home) ([]string, error) {
+	entries, err := os.ReadDir(h.installs())
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, e := range entries {
+		if e.IsDir() && ValidName(e.Name()) == nil {
+			if _, err := os.Stat(filepath.Join(h.installs(), e.Name(), recordFile)); err == nil {
+				names = append(names, e.Name())
+			}
+		}
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// Resolve picks the install a command acts on. An explicit name must exist. With
+// none given there must be exactly one install: the answer is never taken from
+// the environment, the current directory or "the last one used", because acting
+// on the wrong install is the failure this tool exists to prevent.
+func Resolve(h Home, flag string) (Install, error) {
+	names, err := List(h)
+	if err != nil {
+		return Install{}, err
+	}
+	if flag != "" {
+		in, err := Open(h, flag)
+		if err != nil {
+			return Install{}, err
+		}
+		for _, n := range names {
+			if n == flag {
+				return in, nil
+			}
+		}
+		return Install{}, fmt.Errorf("%w named %q (installs: %s)", ErrNoInstall, flag, listOrNone(names))
+	}
+	switch len(names) {
+	case 0:
+		return Install{}, fmt.Errorf("%w: run `darkplum init` first", ErrNoInstall)
+	case 1:
+		return Open(h, names[0])
+	default:
+		return Install{}, fmt.Errorf("several installs (%s): choose one with --install NAME", strings.Join(names, ", "))
+	}
+}
+
+func listOrNone(names []string) string {
+	if len(names) == 0 {
+		return "none"
+	}
+	return strings.Join(names, ", ")
+}
+
+// Paths. Nothing here touches the disk.
+
+func (i Install) Dir() string        { return filepath.Join(i.home.installs(), i.Name) }
+func (i Install) RecordPath() string { return filepath.Join(i.Dir(), recordFile) }
+func (i Install) TFVars() string     { return filepath.Join(i.Dir(), "terraform.tfvars") }
+func (i Install) BackendHCL() string { return filepath.Join(i.Dir(), "backend.hcl") }
+func (i Install) TFData() string     { return filepath.Join(i.Dir(), "tfdata") }
+func (i Install) Kubeconfig() string { return filepath.Join(i.Dir(), "kubeconfig") }
+func (i Install) LogsDir() string    { return filepath.Join(i.Dir(), "logs") }
+func (i Install) PluginCache() string {
+	return i.home.PluginCache()
+}
+
+// BundleDir is where one version of the shipped tree is extracted.
+func (i Install) BundleDir(version string) string {
+	return filepath.Join(i.Dir(), "bundle", sanitize(version))
+}
+
+// TerraformDir is the Terraform root inside an extracted bundle.
+func (i Install) TerraformDir(version string) string {
+	return filepath.Join(i.BundleDir(version), "terraform", "aws")
+}
+
+func sanitize(v string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '-':
+			return r
+		}
+		return '_'
+	}, v)
+}
+
+const recordFile = "install.json"
+
+// Record is what an install is: enough to know which cluster, account and
+// state it means before any command touches AWS.
+type Record struct {
+	Schema      int       `json:"schema"`
+	Name        string    `json:"name"`
+	ClusterName string    `json:"cluster_name"`
+	Region      string    `json:"region"`
+	Profile     string    `json:"profile,omitempty"`
+	AccountIDs  []string  `json:"account_ids"`
+	Backend     Backend   `json:"backend"`
+	Created     time.Time `json:"created"`
+	// AdoptedFrom is the Terraform root of a Makefile-era install this one took
+	// over; empty for a new install.
+	AdoptedFrom string `json:"adopted_from,omitempty"`
+	// Bundle is the version of the shipped tree the install was last applied
+	// with (empty until the first deploy).
+	Bundle string `json:"bundle,omitempty"`
+}
+
+// Backend is where Terraform keeps this install's state.
+type Backend struct {
+	Type        string `json:"type"` // "s3"
+	Bucket      string `json:"bucket"`
+	Key         string `json:"key"`
+	Region      string `json:"region"`
+	KMSKeyID    string `json:"kms_key_id,omitempty"`
+	Encrypt     bool   `json:"encrypt"`
+	UseLockfile bool   `json:"use_lockfile"`
+}
+
+const recordSchema = 1
+
+// Validate is what makes a record trustworthy to act on.
+func (r Record) Validate() error {
+	if r.Schema != recordSchema {
+		return fmt.Errorf("install record has schema %d, this darkplum understands %d", r.Schema, recordSchema)
+	}
+	if err := ValidName(r.Name); err != nil {
+		return err
+	}
+	if ValidName(r.ClusterName) != nil {
+		return fmt.Errorf("install record has an invalid cluster name %q", r.ClusterName)
+	}
+	if r.Region == "" {
+		return errors.New("install record has no region")
+	}
+	if len(r.AccountIDs) == 0 {
+		return errors.New("install record pins no AWS account")
+	}
+	for _, a := range r.AccountIDs {
+		if !regexp.MustCompile(`^[0-9]{12}$`).MatchString(a) {
+			return fmt.Errorf("install record has an invalid account id %q", a)
+		}
+	}
+	if r.Backend.Type != "s3" {
+		return fmt.Errorf("install record has unsupported backend %q", r.Backend.Type)
+	}
+	if r.Backend.Bucket == "" || r.Backend.Key == "" || r.Backend.Region == "" {
+		return errors.New("install record has an incomplete S3 backend")
+	}
+	return nil
+}
+
+// Load reads and validates the record. A missing install is ErrNoInstall.
+func (i Install) Load() (Record, error) {
+	b, err := os.ReadFile(i.RecordPath())
+	if errors.Is(err, fs.ErrNotExist) {
+		return Record{}, fmt.Errorf("%w named %q", ErrNoInstall, i.Name)
+	}
+	if err != nil {
+		return Record{}, err
+	}
+	var r Record
+	dec := json.NewDecoder(strings.NewReader(string(b)))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&r); err != nil {
+		return Record{}, fmt.Errorf("%s is unreadable: %w", i.RecordPath(), err)
+	}
+	if r.Name != i.Name {
+		return Record{}, fmt.Errorf("%s names install %q, not %q", i.RecordPath(), r.Name, i.Name)
+	}
+	if err := r.Validate(); err != nil {
+		return Record{}, err
+	}
+	return r, nil
+}
+
+// Save validates and writes the record atomically (0600; directory 0700).
+func (i Install) Save(r Record) error {
+	if r.Schema == 0 {
+		r.Schema = recordSchema
+	}
+	if err := r.Validate(); err != nil {
+		return err
+	}
+	if r.Name != i.Name {
+		return fmt.Errorf("record is for %q, workspace is %q", r.Name, i.Name)
+	}
+	b, err := json.MarshalIndent(r, "", "  ")
+	if err != nil {
+		return err
+	}
+	return i.WriteFile(recordFile, append(b, '\n'))
+}
+
+// WriteFile atomically writes a 0600 file directly inside the workspace.
+func (i Install) WriteFile(name string, data []byte) error {
+	if name != filepath.Base(name) || name == "." || name == ".." {
+		return fmt.Errorf("workspace file name %q must not contain a path", name)
+	}
+	return writeAtomic(filepath.Join(i.Dir(), name), data, 0o600)
+}
+
+// PrepareBundle extracts b as the given version (a no-op when already there and
+// intact) and returns the Terraform root. It never reuses a directory that does
+// not verify.
+func (i Install) PrepareBundle(b *bundle.Bundle, version string) (string, error) {
+	if version == "" {
+		return "", errors.New("bundle version is empty")
+	}
+	if err := os.MkdirAll(i.Dir(), 0o700); err != nil {
+		return "", err
+	}
+	if err := b.Extract(i.BundleDir(version)); err != nil {
+		return "", err
+	}
+	return i.TerraformDir(version), nil
+}
+
+// VerifyBundle re-checks an extracted version against the bundle shipped in this binary.
+func (i Install) VerifyBundle(b *bundle.Bundle, version string) error {
+	return bundle.Verify(i.BundleDir(version), b.Hash())
+}
+
+// PruneBundles removes every extracted bundle except those named. Callers keep
+// the current and the previous version, so a rollback needs no re-extraction.
+func (i Install) PruneBundles(keep ...string) error {
+	root := filepath.Join(i.Dir(), "bundle")
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	want := map[string]bool{}
+	for _, k := range keep {
+		want[sanitize(k)] = true
+	}
+	for _, e := range entries {
+		if want[e.Name()] {
+			continue
+		}
+		p := filepath.Join(root, e.Name())
+		// Extracted trees are read-only; make them removable.
+		_ = filepath.WalkDir(p, func(q string, d fs.DirEntry, err error) error {
+			if err == nil && d.IsDir() {
+				_ = os.Chmod(q, 0o700)
+			}
+			return nil
+		})
+		if err := os.RemoveAll(p); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func writeAtomic(path string, data []byte, perm os.FileMode) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	f, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name()) // no-op after the rename
+	if err := f.Chmod(perm); err != nil {
+		f.Close()
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), path)
+}

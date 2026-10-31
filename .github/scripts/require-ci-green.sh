@@ -10,7 +10,7 @@ repo="${1:?usage: require-ci-green.sh <owner/repo> <sha>}"
 sha="${2:?usage: require-ci-green.sh <owner/repo> <sha>}"
 
 # The job names in .github/workflows/ci.yml that must have run and passed.
-required=("Go (gateway)" "Go (api)" "Go (cli)" "Web" "Terraform" "Kubernetes manifests and docs" "Release plumbing")
+required=("Go (gateway)" "Go (api)" "Go (cli)" "Web" "Bundle" "Terraform" "Kubernetes manifests and docs" "Release plumbing")
 
 runs="$(gh api --paginate "repos/${repo}/commits/${sha}/check-runs?per_page=100" \
   --jq '.check_runs[] | [.name, .status, (.conclusion // "none")] | @tsv')"

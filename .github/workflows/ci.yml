@@ -59,6 +59,30 @@ jobs:
         env:
           TEST_DATABASE_URL: postgres://postgres:test@127.0.0.1:5432/dptest?sslmode=disable
 
+  # The Terraform + Kubernetes tree the CLI embeds (darkplum/embed.go). It is its
+  # own module so go:embed can reach terraform/ and k8s/; its tests prove nothing
+  # local (backend.tf, *.tfvars, *.tfstate*, .terraform/) can ship.
+  bundle:
+    name: Bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: darkplum
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: darkplum/go.mod
+          cache: false
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l embed.go embed_test.go)
+          if [ -n "$unformatted" ]; then echo "gofmt needed:"; echo "$unformatted"; exit 1; fi
+      - run: go build ./...
+      - run: go vet ./...
+      - run: go test -race -count=1 -timeout 5m ./...
+
   web:
     name: Web
     runs-on: ubuntu-latest
