@@ -65,6 +65,17 @@ func TestForwardingLineParse(t *testing.T) {
 	}
 }
 
+// A backend on another port still gets an OS-picked local port (":8000" means
+// "any local port"), bound to loopback, through the pinned selectors.
+func TestPortForwardPortArgs(t *testing.T) {
+	h := testHandle(t, "acme")
+	f := h.PortForwardPort("darkplum-inference", "svc/vllm-qwen", 8000)
+	if a := strings.Join(f.args(), " "); a !=
+		"--kubeconfig "+h.Kubeconfig()+" --context "+Context+" -n darkplum-inference port-forward --address 127.0.0.1 svc/vllm-qwen :8000" {
+		t.Errorf("port-forward args = %q", a)
+	}
+}
+
 // fakeKubectl puts a script named kubectl first on PATH.
 func fakeKubectl(t *testing.T, script string) {
 	t.Helper()

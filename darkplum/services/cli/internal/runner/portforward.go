@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -22,6 +23,7 @@ var forwardingRe = regexp.MustCompile(`Forwarding from 127\.0\.0\.1:(\d+)`)
 type PortForward struct {
 	flags              []string // --kubeconfig <private> --context darkplum
 	namespace, service string
+	remotePort         int
 	env                []string
 	check              func() error
 	openTimeout        time.Duration
@@ -35,7 +37,13 @@ type PortForward struct {
 // 80) in namespace on this cluster. Nothing is started until Open. A handle with
 // no pinned kubeconfig opens nothing.
 func (v ValidatedCluster) PortForward(namespace, service string) *PortForward {
-	pf := &PortForward{flags: v.Flags(), namespace: namespace, service: service,
+	return v.PortForwardPort(namespace, service, 80)
+}
+
+// PortForwardPort is PortForward to a service port other than 80 (a vLLM backend
+// listens on 8000). The local port is always chosen by the OS.
+func (v ValidatedCluster) PortForwardPort(namespace, service string, port int) *PortForward {
+	pf := &PortForward{flags: v.Flags(), namespace: namespace, service: service, remotePort: port,
 		env: v.Env(), openTimeout: 30 * time.Second}
 	if k, ok := v.Exec().(kubectlExec); ok {
 		pf.check = k.check
@@ -45,7 +53,7 @@ func (v ValidatedCluster) PortForward(namespace, service string) *PortForward {
 
 func (f *PortForward) args() []string {
 	return append(append([]string{}, f.flags...), "-n", f.namespace,
-		"port-forward", "--address", "127.0.0.1", f.service, ":80")
+		"port-forward", "--address", "127.0.0.1", f.service, ":"+strconv.Itoa(f.remotePort))
 }
 
 // Open starts a tunnel (closing any previous one) and returns its base URL.

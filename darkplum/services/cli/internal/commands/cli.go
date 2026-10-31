@@ -7,6 +7,7 @@ type CLI struct {
 
 	Admin      AdminCmd         `cmd:"" help:"Manage admin accounts."`
 	Sso        SSOCmd           `cmd:"" name:"sso" help:"Configure SSO / OIDC."`
+	Models     ModelsCmd        `cmd:"" help:"Self-hosted models: add, remove, list, test."`
 	Keys       KeysCmd          `cmd:"" help:"Vendor API keys: set, remove, list."`
 	Status     StatusCmd        `cmd:"" help:"Show control-plane and inference health."`
 	Init       InitCmd          `cmd:"" help:"Prompt for install settings and write terraform.tfvars (run before make deploy)."`
