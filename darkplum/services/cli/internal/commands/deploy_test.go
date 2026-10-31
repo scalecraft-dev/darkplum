@@ -1061,29 +1061,24 @@ func TestDeployStillStopsOnAWrongAccountClusterThatIsCreating(t *testing.T) {
 	}
 }
 
-func TestDeployRechecksExposureWhenTheClusterWasNotReadableAtPreflight(t *testing.T) {
-	// Unreachable API at preflight: carry on, but the internet-facing check must still
-	// happen before anything is applied to Kubernetes.
+// An ACTIVE cluster whose API cannot be reached is a network or access problem, not
+// a creation in progress: stop before Terraform, with nothing changed.
+func TestDeployStopsBeforeTerraformWhenAnActiveClustersAPIIsUnreachable(t *testing.T) {
 	h := newDeployHarness(t, 0)
 	h.awsf.base.describeErr = nil
-	calls := 0
 	h.k.handlers = append([]skHandler{{"get svc darkplum-web", func([]string, []byte) ([]byte, error) {
-		calls++
-		if calls == 1 {
-			return nil, errors.New("kubectl: Unable to connect to the server: dial tcp 10.0.0.1:443: i/o timeout")
-		}
-		return []byte(webSvc("LoadBalancer", "internet-facing", "abc.elb.amazonaws.com")), nil
+		return nil, errors.New("kubectl: Unable to connect to the server: dial tcp 10.0.0.1:443: i/o timeout")
 	}}}, h.k.handlers...)
 	if !IsReported(h.run()) {
-		t.Fatal("applied over an internet-facing web service")
+		t.Fatal("went on past an unreachable ACTIVE cluster")
 	}
-	if !h.tf.ran("apply") {
-		t.Error("the unreachable cluster should not have stopped terraform")
+	if h.tl.count("terraform") != 0 {
+		t.Errorf("terraform ran:\n%s", h.tl)
 	}
 	if h.writes() != 0 {
-		t.Errorf("Kubernetes was written to after the exposure was found:\n%s", h.tl)
+		t.Errorf("Kubernetes was written to:\n%s", h.tl)
 	}
-	h.mustContain("abc.elb.amazonaws.com")
+	h.mustContain("not reachable", "Nothing was changed")
 }
 
 func TestDeployAuthorizationFailureAtPreflightIsStillAHardStop(t *testing.T) {

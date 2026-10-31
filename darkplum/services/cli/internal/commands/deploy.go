@@ -781,6 +781,9 @@ const lbSchemeAnnotation = "service.beta.kubernetes.io/aws-load-balancer-scheme"
 //     address is a private load balancer, so applying it would take the public
 //     address down without warning;
 //   - a semantic router installed by helm, which this release does not manage.
+//
+// An ACTIVE cluster whose API cannot be reached also stops the run here. Only a
+// cluster still being created (ErrClusterNotReady) is carried past this point.
 func (e *deployEnv) inspectLive() error {
 	t, row, err := e.cluster()
 	switch {
@@ -804,9 +807,11 @@ func (e *deployEnv) inspectLive() error {
 		return err
 	}
 	if !reachable {
-		e.row(checkResult{name: "cluster", status: checkWarn, detail: "its API is not reachable from here yet",
-			hint: "continuing; the web exposure and router checks are repeated before anything is applied to Kubernetes"})
-		return nil
+		// The cluster is ACTIVE (it validated), so an unreachable API is a network or
+		// access problem, not a creation in progress. Stop before Terraform: nothing
+		// has been changed, and the exposure and router checks have not run.
+		return e.stop(checkResult{name: "cluster", status: checkFail, detail: "the cluster is ACTIVE but its API is not reachable from here",
+			hint: "check your network and that the cluster's API endpoint is reachable from this machine, then re-run. Nothing was changed"}, "cluster API unreachable")
 	}
 	e.inspected = true
 	return nil
