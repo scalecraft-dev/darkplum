@@ -684,14 +684,8 @@ func (c *InitCmd) mergeWeb(env *initEnv, dir string) error {
 	if err != nil {
 		return err
 	}
-	text := string(b)
-	if !strings.HasSuffix(text, "\n") {
-		text += "\n"
-	}
-	text += "# Private web address, added by `darkplum init`.\n"
-	for _, kv := range s.web.kvs() {
-		text += fmt.Sprintf("%s = %s\n", kv.Key, hclValue(kv.Value))
-	}
+	// The address's own lines are replaced (a change), every other line is kept.
+	text := rewriteTFVars(string(b), func(k string) bool { return webKeys[k] }, s.web.kvs())
 	fmt.Fprintln(w)
 	if c.DryRun {
 		fmt.Fprintf(w, "%s\n%s\n", sHeader("terraform.tfvars (dry run — not written)"), text)

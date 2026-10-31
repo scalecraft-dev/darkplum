@@ -123,8 +123,8 @@ const baseUSDPerDay = 10
 
 // Run executes `darkplum init`.
 func (c *InitCmd) Run(g *Globals) error {
+	c.installName = g.Install
 	if c.Adopt {
-		c.installName = g.Install
 		return c.runAdopt(os.Stdout)
 	}
 	tty := term.IsTerminal(int(os.Stdin.Fd()))
@@ -251,6 +251,15 @@ func (c *InitCmd) execute(env *initEnv) error {
 		if err != nil {
 			return env.fail("home", err.Error(), "set DARKPLUM_HOME to an absolute path, or fix HOME", "cannot find the darkplum home directory")
 		}
+		if env.interactive && !c.Force {
+			name, err := c.pickInstall(env, home)
+			if err != nil {
+				return err
+			}
+			if name != "" {
+				c.ClusterName = name
+			}
+		}
 		in, err := install.Open(home, c.ClusterName)
 		if err != nil {
 			return env.fail("cluster name", c.ClusterName, "use 2-40 lowercase letters, digits and single hyphens, starting with a letter", "invalid --cluster-name")
@@ -272,23 +281,12 @@ func (c *InitCmd) execute(env *initEnv) error {
 		}
 	}
 
-	// An install from before the private address: offer to add just that.
-	// Interactive only: a script re-running init (--yes) keeps today's
-	// behaviour, a full rewrite guarded by --force.
-	if raw := existingTFVars(filepath.Join(dir, "terraform.tfvars")); env.interactive && raw != nil && raw["web_domain"] == "" && !c.Force {
-		merge := false
-		{
-			i, err := env.prompt.Select("This install has no private web address yet. What should init do?", []Option{
-				{"Add one", "asks only for the address; keeps every other setting"},
-				{"Start over", "asks every question again"},
-			}, 0)
-			if err != nil {
-				return err
-			}
-			merge = i == 0
-		}
-		if merge {
-			return c.mergeWeb(env, dir)
+	// Running init again on an install shows its settings and asks what to change.
+	// Interactive only: a script re-running init (--yes) keeps today's behaviour, a
+	// full rewrite guarded by --force.
+	if raw := existingTFVars(filepath.Join(dir, "terraform.tfvars")); env.interactive && raw != nil && !c.Force {
+		if done, err := c.existingInstall(env, dir, raw); done {
+			return err
 		}
 	}
 

@@ -11,7 +11,7 @@ type CLI struct {
 	Verify     VerifyCmd        `cmd:"" help:"Prove the gateway role can invoke only the Bedrock models this install allows (Layer 1 IAM evidence)."`
 	Keys       KeysCmd          `cmd:"" help:"Vendor API keys: set, remove, list."`
 	Status     StatusCmd        `cmd:"" help:"Show control-plane and inference health."`
-	Init       InitCmd          `cmd:"" help:"Prompt for install settings and write terraform.tfvars (run before make deploy)."`
+	Init       InitCmd          `cmd:"" help:"Create an install, or show an existing one and change its settings (run before deploy)."`
 	Deploy     DeployCmd        `cmd:"" help:"Create or update the install: infrastructure, verified images, the platform. Safe to re-run; it is also how you upgrade."`
 	Destroy    DestroyCmd       `cmd:"" help:"Delete the install's cloud resources (asks you to type the cluster name)."`
 	Configure  ConfigureCmd     `cmd:"" help:"First run after make deploy: create the first admin, enable models, send a test chat, open the web UI."`
