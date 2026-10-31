@@ -25,6 +25,7 @@ type scriptKube struct {
 	mu       sync.Mutex
 	calls    []kcall
 	handlers []skHandler
+	tl       *timeline // when set, every call is also recorded here, in order across fakes
 }
 
 type skHandler struct {
@@ -51,6 +52,9 @@ func (k *scriptKube) Run(stdin []byte, name string, args ...string) ([]byte, err
 	k.calls = append(k.calls, kcall{append([]string{}, args...), append([]byte(nil), stdin...)})
 	handlers := append([]skHandler(nil), k.handlers...)
 	k.mu.Unlock()
+	if k.tl != nil {
+		k.tl.add("kubectl " + strings.Join(args, " "))
+	}
 	joined := strings.Join(args, " ")
 	for _, h := range handlers {
 		if strings.Contains(joined, h.pattern) {
@@ -99,3 +103,54 @@ func (k *scriptKube) assertClean(secrets ...string) {
 const notFoundErr = `kubectl: Error from server (NotFound): secrets "%s" not found`
 
 func secretNotFound(name string) error { return fmt.Errorf(notFoundErr, name) }
+
+// timeline is one ordered record shared by every fake in a test, so a test can
+// assert that one thing happened before another across terraform, aws and kubectl.
+type timeline struct {
+	mu sync.Mutex
+	ev []string
+}
+
+func (t *timeline) add(s string) { t.mu.Lock(); t.ev = append(t.ev, s); t.mu.Unlock() }
+
+// first is the index of the first event containing s, or -1.
+func (t *timeline) first(s string) int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for i, e := range t.ev {
+		if strings.Contains(e, s) {
+			return i
+		}
+	}
+	return -1
+}
+
+// last is the index of the last event containing s, or -1.
+func (t *timeline) last(s string) int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for i := len(t.ev) - 1; i >= 0; i-- {
+		if strings.Contains(t.ev[i], s) {
+			return i
+		}
+	}
+	return -1
+}
+
+func (t *timeline) count(s string) int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	n := 0
+	for _, e := range t.ev {
+		if strings.Contains(e, s) {
+			n++
+		}
+	}
+	return n
+}
+
+func (t *timeline) String() string {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return strings.Join(t.ev, "\n")
+}

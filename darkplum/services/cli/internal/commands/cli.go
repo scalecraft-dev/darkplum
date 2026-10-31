@@ -9,6 +9,7 @@ type CLI struct {
 	Sso        SSOCmd           `cmd:"" name:"sso" help:"Configure SSO / OIDC."`
 	Status     StatusCmd        `cmd:"" help:"Show control-plane and inference health."`
 	Init       InitCmd          `cmd:"" help:"Prompt for install settings and write terraform.tfvars (run before make deploy)."`
+	Deploy     DeployCmd        `cmd:"" help:"Create or update the install: infrastructure, verified images, the platform. Safe to re-run; it is also how you upgrade."`
 	Configure  ConfigureCmd     `cmd:"" help:"First run after make deploy: create the first admin, enable models, send a test chat, open the web UI."`
 	Kubeconfig KubeconfigCmd    `cmd:"" help:"Validate the install's cluster and print export KUBECONFIG=<its private kubeconfig> (never touches ~/.kube)."`
 	Doctor     DoctorCmd        `cmd:"" help:"Read-only environment and health diagnostics."`

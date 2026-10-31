@@ -1,6 +1,7 @@
 package commands
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/alecthomas/kong"
@@ -35,5 +36,27 @@ func TestGrammarBuildsAndParses(t *testing.T) {
 	cli = CLI{}
 	if _, err := p.Parse([]string{"--install", "acme", "kubeconfig"}); err != nil || cli.Install != "acme" {
 		t.Errorf("--install = %q, %v", cli.Install, err)
+	}
+}
+
+// Flags marked hidden (the development-only deploy flags) stay out of --help.
+func TestHiddenFlagsAreNotInHelp(t *testing.T) {
+	var cli CLI
+	var buf strings.Builder
+	k, err := kong.New(&cli, kong.Name("darkplum"), kong.Help(HelpPrinter), kong.Writers(&buf, &buf), kong.Exit(func(int) {}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := k.Parse([]string{"deploy", "--help"}); err != nil {
+		t.Log(err)
+	}
+	help := buf.String()
+	for _, hidden := range []string{"--release-images", "--unsigned-images", "--gpu-wait"} {
+		if strings.Contains(help, hidden) {
+			t.Errorf("%s is listed in deploy --help", hidden)
+		}
+	}
+	if !strings.Contains(help, "--confirm-plan") {
+		t.Errorf("--confirm-plan is missing from deploy --help:\n%s", help)
 	}
 }

@@ -17,6 +17,9 @@ func main() {
 		kong.UsageOnError(),
 	)
 	err := kctx.Run(&commands.Globals{Namespace: cli.Namespace, Install: cli.Install})
+	if code, ok := commands.ExitCode(err); ok { // a command that finished but wants a specific status
+		os.Exit(code)
+	}
 	if commands.IsReported(err) { // already shown as a ✗ row with a hint
 		os.Exit(1)
 	}
