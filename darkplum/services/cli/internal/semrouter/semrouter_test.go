@@ -17,6 +17,7 @@ import (
 
 	darkplum "github.com/scalecraft-dev/darkplum"
 	"github.com/scalecraft-dev/darkplum/cli/internal/kube"
+	"github.com/scalecraft-dev/darkplum/cli/internal/manifests"
 	"sigs.k8s.io/yaml"
 )
 
@@ -91,6 +92,48 @@ func TestObjectsAreLabelledAndPlaced(t *testing.T) {
 	}
 	if _, err := Objects(k8sFS(false), "darkplum-system"); !errors.Is(err, ErrNotRendered) {
 		t.Errorf("err = %v", err)
+	}
+}
+
+func TestObjectsClusterScopedKindsGetNoNamespaceAndAreManagedByDarkplum(t *testing.T) {
+	m := fstest.MapFS{
+		policiesPath: {Data: []byte("apiVersion: networking.k8s.io/v1\nkind: NetworkPolicy\nmetadata:\n  name: p\nspec: {}\n")},
+		valuesPath:   {Data: []byte("a: b\n")},
+		renderedPath: {Data: []byte("apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRole\nmetadata:\n  name: semantic-router\n  namespace: wrong\n  labels:\n    app.kubernetes.io/managed-by: Helm\n---\n" +
+			"apiVersion: rbac.authorization.k8s.io/v1\nkind: ClusterRoleBinding\nmetadata:\n  name: semantic-router\n  labels:\n    app.kubernetes.io/managed-by: Helm\n---\n" +
+			"apiVersion: v1\nkind: ServiceAccount\nmetadata:\n  name: semantic-router\n  labels:\n    app.kubernetes.io/managed-by: Helm\n")},
+	}
+	objs, err := Objects(m, "darkplum-system")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range objs {
+		md := o["metadata"].(map[string]any)
+		switch o.Kind() {
+		case "ClusterRole", "ClusterRoleBinding":
+			if _, has := md["namespace"]; has {
+				t.Errorf("%s carries a namespace: %v", o.Kind(), md["namespace"])
+			}
+		default:
+			if o.Namespace() != "darkplum-system" {
+				t.Errorf("%s namespace = %q", o.Kind(), o.Namespace())
+			}
+		}
+		if got := md["labels"].(map[string]any)[ManagedByLabel]; got != ManagedBy {
+			t.Errorf("%s managed-by = %v, want %s", o.Kind(), got, ManagedBy)
+		}
+	}
+}
+
+func TestRemoveDeletesTheClusterScopedKindsOfTheRenderedObjects(t *testing.T) {
+	f := &fakeKube{}
+	objs, _ := Objects(k8sFS(true), "darkplum-system")
+	objs = append(objs, manifests.Object{"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole", "metadata": map[string]any{"name": "x"}})
+	if err := Remove(f.client(), objs, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(f.calls[1], "clusterrole") {
+		t.Errorf("clusterrole is not in the delete: %v", f.calls)
 	}
 }
 

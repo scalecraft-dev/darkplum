@@ -65,8 +65,21 @@ func URL(namespace string) string {
 	return "http://" + ReleaseName + "." + namespace + ".svc.cluster.local:8080"
 }
 
+// clusterScoped are the kinds in the router's objects that have no namespace. A
+// namespace on one is wrong for the API and is never added.
+var clusterScoped = map[string]bool{"ClusterRole": true, "ClusterRoleBinding": true, "Namespace": true, "CustomResourceDefinition": true}
+
+// ManagedByLabel is helm's ownership marker. The chart renders it as "Helm"; once
+// this CLI applies the objects they are Darkplum's, and the label must say so
+// (after a takeover too: apply overwrites it on the adopted objects).
+const ManagedByLabel = "app.kubernetes.io/managed-by"
+
+// ManagedBy is the value Objects stamps.
+const ManagedBy = "darkplum"
+
 // Objects returns the router's objects (rendered chart and network policies),
-// each labelled and placed in namespace when it names none.
+// each labelled, managed-by darkplum, and placed in namespace when it names none
+// (cluster-scoped kinds get no namespace).
 func Objects(k8s fs.FS, namespace string) ([]manifests.Object, error) {
 	if _, err := fs.Stat(k8s, renderedPath); err != nil {
 		return nil, ErrNotRendered
@@ -85,7 +98,9 @@ func Objects(k8s fs.FS, namespace string) ([]manifests.Object, error) {
 		if md == nil {
 			return nil, fmt.Errorf("%s has no metadata", o.Kind())
 		}
-		if md["namespace"] == nil || md["namespace"] == "" {
+		if clusterScoped[o.Kind()] {
+			delete(md, "namespace")
+		} else if md["namespace"] == nil || md["namespace"] == "" {
 			md["namespace"] = namespace
 		}
 		lb, _ := md["labels"].(map[string]any)
@@ -94,6 +109,7 @@ func Objects(k8s fs.FS, namespace string) ([]manifests.Object, error) {
 			md["labels"] = lb
 		}
 		lb[ComponentLabel] = Component
+		lb[ManagedByLabel] = ManagedBy
 	}
 	return objs, nil
 }
@@ -158,7 +174,7 @@ func Apply(kc *kube.Client, tok Takeover, objs []manifests.Object, progress io.W
 
 // defaultKinds are removed by label even when the caller has no rendered
 // objects to take kinds from.
-var defaultKinds = []string{"deployment", "service", "configmap", "serviceaccount", "networkpolicy", "role", "rolebinding"}
+var defaultKinds = []string{"deployment", "service", "configmap", "serviceaccount", "networkpolicy", "role", "rolebinding", "clusterrole", "clusterrolebinding"}
 
 // Remove takes the router out: the gateway's setting first (so it stops calling
 // it), then every labelled object. A missing gateway or setting is fine; any
@@ -172,7 +188,7 @@ func Remove(kc *kube.Client, objs []manifests.Object, progress io.Writer) error 
 		kinds[k] = true
 	}
 	for _, o := range objs {
-		if k := strings.ToLower(o.Kind()); k != "" && o.Namespace() != "" {
+		if k := strings.ToLower(o.Kind()); k != "" {
 			kinds[k] = true
 		}
 	}
