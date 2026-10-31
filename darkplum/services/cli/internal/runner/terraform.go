@@ -2,12 +2,16 @@ package runner
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/scalecraft-dev/darkplum/cli/internal/bundle"
 )
@@ -30,43 +34,81 @@ type TerraformDirs struct {
 // workspace, so nothing terraform writes (data dir, saved plans, crash logs)
 // lands in the bundle. The caller cannot pass its own -chdir.
 func Terraform(v bundle.Verified, d TerraformDirs, env []string, args ...string) (stdout []byte, stderr string, err error) {
+	cmd, err := terraformCmd(context.Background(), v, d, env, args)
+	if err != nil {
+		return nil, "", err
+	}
+	var out, errb bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &errb
+	err = cmd.Run()
+	return out.Bytes(), errb.String(), err
+}
+
+// TerraformStream is Terraform for the long commands (plan, apply, destroy): the
+// output of both streams, interleaved, goes to out as it is produced. Cancelling
+// ctx sends Terraform an interrupt (it stops gracefully and releases the state
+// lock) rather than killing it; it is killed only if it ignores that for two
+// minutes.
+func TerraformStream(ctx context.Context, v bundle.Verified, d TerraformDirs, env []string, out io.Writer, args ...string) error {
+	cmd, err := terraformCmd(ctx, v, d, env, args)
+	if err != nil {
+		return err
+	}
+	w := &syncWriter{w: out}
+	cmd.Stdout, cmd.Stderr = w, w
+	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
+	cmd.WaitDelay = 2 * time.Minute
+	return cmd.Run()
+}
+
+// syncWriter serialises writes so the two streams cannot interleave mid-line
+// inside one Write call.
+type syncWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (s *syncWriter) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.w.Write(p)
+}
+
+func terraformCmd(ctx context.Context, v bundle.Verified, d TerraformDirs, env []string, args []string) (*exec.Cmd, error) {
 	if !v.Valid() {
-		return nil, "", errors.New("runner: terraform needs a verified bundle")
+		return nil, errors.New("runner: terraform needs a verified bundle")
 	}
 	for _, a := range args {
 		if strings.HasPrefix(a, "-chdir") {
-			return nil, "", fmt.Errorf("runner: %q is set by the runner", a)
+			return nil, fmt.Errorf("runner: %q is set by the runner", a)
 		}
 	}
 	if d.Workspace == "" || d.Data == "" || !filepath.IsAbs(d.Workspace) || !filepath.IsAbs(d.Data) {
-		return nil, "", errors.New("runner: terraform needs absolute workspace and data directories")
+		return nil, errors.New("runner: terraform needs absolute workspace and data directories")
 	}
 	if within(d.Data, v.Dir()) || within(d.Workspace, v.Dir()) {
-		return nil, "", errors.New("runner: terraform's data directory and working directory must be outside the bundle")
+		return nil, errors.New("runner: terraform's data directory and working directory must be outside the bundle")
 	}
 	for _, dir := range []string{d.Data, d.PluginCache} {
 		if dir != "" {
 			if err := os.MkdirAll(dir, 0o700); err != nil {
-				return nil, "", err
+				return nil, err
 			}
 		}
 	}
 	// Re-checked on every call, not once per command: a tree that changed between
 	// two Terraform calls of one run is as dangerous as one that was wrong at the start.
 	if _, err := bundle.Verify(v.Dir(), v.Hash()); err != nil {
-		return nil, "", fmt.Errorf("runner: the bundle changed since it was verified: %w", err)
+		return nil, fmt.Errorf("runner: the bundle changed since it was verified: %w", err)
 	}
-	cmd := exec.Command("terraform", append([]string{"-chdir=" + v.TerraformDir()}, args...)...)
+	cmd := exec.CommandContext(ctx, "terraform", append([]string{"-chdir=" + v.TerraformDir()}, args...)...)
 	cmd.Dir = d.Workspace
 	cmd.Env = append(terraformBaseEnv(os.Environ()), "TF_DATA_DIR="+d.Data, "TF_IN_AUTOMATION=1", "TF_INPUT=0")
 	if d.PluginCache != "" {
 		cmd.Env = append(cmd.Env, "TF_PLUGIN_CACHE_DIR="+d.PluginCache)
 	}
 	cmd.Env = append(cmd.Env, env...)
-	var out, errb bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &out, &errb
-	err = cmd.Run()
-	return out.Bytes(), errb.String(), err
+	return cmd, nil
 }
 
 // TerraformInit initialises the backend from the install's backend.hcl with the

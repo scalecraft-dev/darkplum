@@ -14,6 +14,9 @@ import (
 	"github.com/google/go-containerregistry/pkg/authn"
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/google/go-containerregistry/pkg/registry"
+	v1 "github.com/google/go-containerregistry/pkg/v1"
+	"github.com/google/go-containerregistry/pkg/v1/empty"
+	"github.com/google/go-containerregistry/pkg/v1/mutate"
 	"github.com/google/go-containerregistry/pkg/v1/random"
 	"github.com/google/go-containerregistry/pkg/v1/remote"
 
@@ -212,5 +215,47 @@ func TestECRAuth(t *testing.T) {
 	}
 	if _, err := ECRAuth(func(...string) (string, error) { return "  ", nil }, "", "us-east-2"); err == nil {
 		t.Error("an empty token was accepted")
+	}
+}
+
+func TestPlatformsListsRealPlatformsNotAttestations(t *testing.T) {
+	src := newRegistry(t)
+	var idx v1.ImageIndex = empty.Index
+	for _, p := range []v1.Platform{{OS: "linux", Architecture: "amd64"}, {OS: "linux", Architecture: "arm64"}, {OS: "unknown", Architecture: "unknown"}} {
+		im, err := random.Image(128, 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		p := p
+		idx = mutate.AppendManifests(idx, mutate.IndexAddendum{Add: im, Descriptor: v1.Descriptor{Platform: &p}})
+	}
+	repo := src.host + "/scalecraft-dev/darkplum-gateway"
+	ref, _ := name.NewTag(repo + ":1")
+	if err := remote.WriteIndex(ref, idx); err != nil {
+		t.Fatal(err)
+	}
+	d, _ := idx.Digest()
+	got, err := Platforms(context.Background(), release.Image{Repository: repo, Digest: d.String()}, Options{})
+	if err != nil || strings.Join(got, ",") != "linux/amd64,linux/arm64" {
+		t.Fatalf("Platforms = %v, %v", got, err)
+	}
+	if _, err := Platforms(context.Background(), release.Image{Repository: repo, Digest: "sha256:" + strings.Repeat("0", 64)}, Options{}); err == nil {
+		t.Error("an unknown digest must be an error")
+	}
+	if _, err := Platforms(context.Background(), release.Image{Repository: repo, Digest: "latest"}, Options{}); err == nil {
+		t.Error("a tag must be refused: the source is always repository@digest")
+	}
+}
+
+func TestDevTagIsPerSetOfDigests(t *testing.T) {
+	mk := func(a, b, c string) release.Manifest {
+		return release.Manifest{Channel: release.Dev, Images: map[string]release.Image{
+			"gateway": {Digest: "sha256:" + strings.Repeat(a, 64)}, "api": {Digest: "sha256:" + strings.Repeat(b, 64)}, "web": {Digest: "sha256:" + strings.Repeat(c, 64)}}}
+	}
+	t1, err := Tag(mk("1", "2", "3"))
+	t2, _ := Tag(mk("1", "2", "3"))
+	t3, _ := Tag(mk("1", "2", "4"))
+	if err != nil || t1 != t2 || t1 == t3 || !strings.HasPrefix(t1, "dev-") {
+		t.Errorf("tags = %q %q %q (%v)", t1, t2, t3, err)
 	}
 }

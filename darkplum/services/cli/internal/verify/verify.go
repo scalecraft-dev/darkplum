@@ -226,8 +226,24 @@ func (v *Verifier) VerifyImage(ctx context.Context, f Fetcher, img release.Image
 type Verified struct {
 	manifest release.Manifest
 	// Results is what each verified image established (partial on failure).
-	Results map[string]Result
-	ok      bool
+	Results  map[string]Result
+	ok       bool
+	unsigned bool
+}
+
+// Unsigned reports images that were not verified at all: a development build
+// deploying images it was handed (deploy --unsigned-images). Deploy records it
+// as image-trust: unsigned.
+func (v Verified) Unsigned() bool { return v.unsigned }
+
+// Unverified wraps images a development build was handed by hand. It exists only
+// for the dev channel's escape hatch: it refuses any manifest that is a release or
+// a release candidate, so a customer's binary has no way to skip verification.
+func Unverified(m release.Manifest) (Verified, error) {
+	if m.Channel != release.Dev {
+		return Verified{}, errors.New("verify: only a development build may deploy unverified images")
+	}
+	return Verified{manifest: m, Results: map[string]Result{}, ok: true, unsigned: true}, nil
 }
 
 // Valid reports whether every image verified.

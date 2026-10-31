@@ -330,3 +330,18 @@ func tamper(t *testing.T, raw []byte) []byte {
 	}
 	return out
 }
+
+func TestUnverifiedIsForTheDevChannelOnly(t *testing.T) {
+	for _, ch := range []string{release.Release, release.RC, ""} {
+		if _, err := Unverified(release.Manifest{Channel: ch}); err == nil {
+			t.Errorf("channel %q was allowed to skip verification", ch)
+		}
+	}
+	v, err := Unverified(release.Manifest{Channel: release.Dev})
+	if err != nil || !v.Valid() || !v.Unsigned() {
+		t.Fatalf("%+v %v", v, err)
+	}
+	if ForTest(release.Manifest{}).Unsigned() {
+		t.Error("a verified release must not report unsigned")
+	}
+}

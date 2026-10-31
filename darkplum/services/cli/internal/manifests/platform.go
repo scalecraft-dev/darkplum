@@ -159,10 +159,10 @@ func Platform(k8s fs.FS, in Inputs) ([]Phase, error) {
 	phases := []Phase{
 		{Name: "namespaces", Objects: ns},
 		{Name: "network policies", Objects: pol},
-		{Name: "identities and vendor-key objects", Objects: append(append([]Object{}, gwStatic...), apiStatic...)},
-		{Name: "api", Objects: apiWork, Rollouts: []string{"darkplum-api"}},
-		{Name: "gateway", Objects: gwWork, Rollouts: []string{"darkplum-gateway"}},
-		{Name: "web", Objects: webWork, Rollouts: []string{"darkplum-web"}},
+		{Name: PhaseIdentities, Objects: append(append([]Object{}, gwStatic...), apiStatic...)},
+		{Name: PhaseAPI, Objects: apiWork, Rollouts: []string{"darkplum-api"}},
+		{Name: PhaseGateway, Objects: gwWork, Rollouts: []string{"darkplum-gateway"}},
+		{Name: PhaseWeb, Objects: webWork, Rollouts: []string{"darkplum-web"}},
 	}
 	var all []Object
 	for _, p := range phases {

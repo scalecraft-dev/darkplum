@@ -13,6 +13,8 @@ package mirror
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/http"
@@ -48,6 +50,17 @@ func Tag(m release.Manifest) (string, error) {
 	switch m.Channel {
 	case release.Release:
 		return m.Version, nil
+	case release.Dev:
+		// Images given by hand (--unsigned-images): one tag per exact set of
+		// digests, so a different set can never collide with an immutable tag.
+		sum := sha256.New()
+		for _, svc := range release.Services {
+			if !strings.HasPrefix(m.Images[svc].Digest, "sha256:") {
+				return "", fmt.Errorf("a development build needs a digest for %s", svc)
+			}
+			sum.Write([]byte(m.Images[svc].Digest + "\n"))
+		}
+		return "dev-" + hex.EncodeToString(sum.Sum(nil))[:12], nil
 	case release.RC:
 		// 0.0.0-rc.7+abcdef0 -> rc-7-abcdef0
 		v := strings.TrimPrefix(m.Version, "0.0.0-rc.")
@@ -163,6 +176,49 @@ func copyPinned(ctx context.Context, svc string, img release.Image, repo, tag st
 	}
 	result.Copied = true
 	return result, nil
+}
+
+// Platforms lists the os/arch pairs an image provides, read from the source
+// registry by digest. Attestation manifests (unknown/unknown) are not platforms.
+// deploy compares it with the cluster's nodes before anything is applied, so an
+// image the nodes cannot run is a refusal and not an "exec format error" later.
+func Platforms(ctx context.Context, img release.Image, o Options) ([]string, error) {
+	ref, err := name.NewDigest(img.Ref(), name.StrictValidation)
+	if err != nil {
+		return nil, fmt.Errorf("%q is not repository@digest: %w", img.Ref(), err)
+	}
+	opts := append([]remote.Option{remote.WithContext(ctx), remote.WithAuth(authn.Anonymous)}, o.Source...)
+	desc, err := remote.Get(ref, opts...)
+	if err != nil {
+		return nil, fmt.Errorf("cannot read %s: %w", img.Ref(), err)
+	}
+	var out []string
+	if desc.MediaType.IsIndex() {
+		idx, err := desc.ImageIndex()
+		if err != nil {
+			return nil, err
+		}
+		im, err := idx.IndexManifest()
+		if err != nil {
+			return nil, err
+		}
+		for _, m := range im.Manifests {
+			if m.Platform == nil || m.Platform.OS == "unknown" || m.Platform.Architecture == "unknown" {
+				continue
+			}
+			out = append(out, m.Platform.OS+"/"+m.Platform.Architecture)
+		}
+		return out, nil
+	}
+	im, err := desc.Image()
+	if err != nil {
+		return nil, err
+	}
+	cf, err := im.ConfigFile()
+	if err != nil {
+		return nil, err
+	}
+	return []string{cf.OS + "/" + cf.Architecture}, nil
 }
 
 func notFound(err error) bool {

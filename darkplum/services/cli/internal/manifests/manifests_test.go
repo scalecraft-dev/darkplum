@@ -275,3 +275,53 @@ func TestJSONListIsWhatKubectlApplyTakes(t *testing.T) {
 		t.Fatalf("list = %s %v", l.Kind, err)
 	}
 }
+
+func TestGPUPlanPatchesTheModelAndPinsEverything(t *testing.T) {
+	plan, err := GPU(k8s(t), GPUInputs{ModelName: "Qwen/Qwen2.5-7B-Instruct", ModelRevision: "a09a35458c702b33eeacc393d103063234e8bc28", ServedModelName: "qwen-2.5-7b"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plan.DevicePlugin) != 1 || plan.DevicePlugin[0].Kind() != "DaemonSet" {
+		t.Errorf("device plugin = %v", Sorted(plan.DevicePlugin))
+	}
+	var kinds []string
+	for _, o := range plan.Workload {
+		kinds = append(kinds, o.Kind())
+	}
+	if strings.Join(kinds, ",") != "ServiceAccount,Deployment,Service" {
+		t.Errorf("workload kinds = %v", kinds)
+	}
+	b, _ := json.Marshal(plan)
+	for _, want := range []string{"Qwen/Qwen2.5-7B-Instruct", "a09a35458c702b33eeacc393d103063234e8bc28", "qwen-2.5-7b"} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("the render lacks %q", want)
+		}
+	}
+	if strings.Contains(string(b), "PLACEHOLDER_") {
+		t.Error("an unreplaced placeholder")
+	}
+	d, _ := find(plan.Workload, "Deployment", "vllm-inference")
+	if v, _ := EnvValue(d, "MODEL_NAME"); v != "Qwen/Qwen2.5-7B-Instruct" {
+		t.Errorf("MODEL_NAME = %q", v)
+	}
+}
+
+func TestGPUPlanRefusesBadInputs(t *testing.T) {
+	good := GPUInputs{ModelName: "Qwen/Qwen2.5-7B-Instruct", ModelRevision: "main", ServedModelName: "qwen"}
+	for name, mut := range map[string]func(*GPUInputs){
+		"empty model":        func(i *GPUInputs) { i.ModelName = "" },
+		"model with a space": func(i *GPUInputs) { i.ModelName = "a b" },
+		"yaml in revision":   func(i *GPUInputs) { i.ModelRevision = "main\n- --trust-remote-code" },
+		"served with caps":   func(i *GPUInputs) { i.ServedModelName = "Qwen" },
+		"flag as served":     func(i *GPUInputs) { i.ServedModelName = "--trust-remote-code" },
+	} {
+		in := good
+		mut(&in)
+		if _, err := GPU(k8s(t), in); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	if _, err := GPU(k8s(t), good); err != nil {
+		t.Fatal(err)
+	}
+}
