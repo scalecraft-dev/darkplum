@@ -324,7 +324,13 @@ func (e *destroyEnv) run(ctx context.Context) (err error) {
 	e.phase("[5/5] Delete")
 	if kc != nil {
 		mutated = true
-		if err := e.kubePhase(ctx, kc); err != nil {
+		// kubectl calls observe the interrupt: none starts once cancelled, and a
+		// running one is stopped.
+		if err := e.kubePhase(ctx, kc.WithContext(ctx)); err != nil {
+			if ctx.Err() != nil {
+				return e.stop(checkResult{name: "interrupted", status: checkFail, detail: "stopped at your request",
+					hint: "what was already deleted stays deleted; re-run `darkplum destroy` to continue"}, "interrupted")
+			}
 			return err
 		}
 	}

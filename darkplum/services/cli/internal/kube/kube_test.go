@@ -1,8 +1,10 @@
 package kube
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -79,5 +81,49 @@ func TestClientsFromHandlesRunNothingUnpinned(t *testing.T) {
 	}
 	if _, err := ForLocalKind("ns", runner.LocalKind{}).Run(nil, "get", "pods"); err == nil {
 		t.Error("kubectl ran through the zero LocalKind")
+	}
+}
+
+type ctxRunner struct {
+	plain, withCtx int
+}
+
+func (r *ctxRunner) Run([]byte, string, ...string) ([]byte, error) {
+	r.plain++
+	return []byte("p"), nil
+}
+func (r *ctxRunner) RunContext(context.Context, []byte, string, ...string) ([]byte, error) {
+	r.withCtx++
+	return []byte("c"), nil
+}
+
+type plainRunner struct{ n int }
+
+func (r *plainRunner) Run([]byte, string, ...string) ([]byte, error) { r.n++; return []byte("p"), nil }
+
+func TestWithContext(t *testing.T) {
+	// a runner that can be interrupted is used through its context
+	cr := &ctxRunner{}
+	ctx, cancel := context.WithCancel(context.Background())
+	c := ForTest(cr, "ns").WithContext(ctx)
+	if out, _ := c.NS(nil, "get", "pods"); out != "c" || cr.withCtx != 1 || cr.plain != 0 {
+		t.Errorf("out %q, ctx calls %d, plain calls %d", out, cr.withCtx, cr.plain)
+	}
+	// once cancelled, nothing starts, whichever runner it is
+	cancel()
+	if _, err := c.NS(nil, "get", "pods"); !errors.Is(err, context.Canceled) {
+		t.Errorf("err = %v", err)
+	}
+	pr := &plainRunner{}
+	c2 := ForTest(pr, "ns").WithContext(ctx)
+	if _, err := c2.Run(nil, "get", "pods"); !errors.Is(err, context.Canceled) || pr.n != 0 {
+		t.Errorf("a call started after cancel: err %v, calls %d", err, pr.n)
+	}
+	// the original client is unchanged, and the copy targets the same namespace
+	if _, err := ForTest(pr, "ns").Run(nil, "get", "pods"); err != nil || pr.n != 1 {
+		t.Errorf("a client without a context stopped working: %v", err)
+	}
+	if c2.Namespace() != "ns" {
+		t.Error("namespace changed")
 	}
 }

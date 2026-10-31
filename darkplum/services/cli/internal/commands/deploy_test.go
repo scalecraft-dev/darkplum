@@ -16,7 +16,9 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	"github.com/scalecraft-dev/darkplum/cli/internal/iamcheck"
+	"github.com/scalecraft-dev/darkplum/cli/internal/mirror"
 	"github.com/scalecraft-dev/darkplum/cli/internal/release"
+	"github.com/scalecraft-dev/darkplum/cli/internal/verify"
 )
 
 func TestDeployFreshBedrockOnlyInstallOrder(t *testing.T) {
@@ -1366,5 +1368,50 @@ func TestDeploySessionRecheckedBeforeTheModelAndBeforeLayer1(t *testing.T) {
 		if failAt == 4 && h.tl.count("iam simulate") != 0 {
 			t.Error("the self-test ran with a session about to lapse")
 		}
+	}
+}
+
+// An interrupt during a kube-side step ends the run there: nothing further is
+// applied or waited for, and the interrupted wait is not diagnosed as a failure.
+func TestDeployInterruptDuringARolloutStopsTheKubePhase(t *testing.T) {
+	for _, during := range []string{"rollout status deployment/darkplum-api", "mirror"} {
+		t.Run(during, func(t *testing.T) {
+			h := newDeployHarness(t, 0)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if during == "mirror" {
+				h.env.mirror = func(c context.Context, v verify.Verified, repos map[string]string, region string) ([]mirror.Mirrored, error) {
+					cancel()
+					return nil, c.Err()
+				}
+			} else {
+				h.k.handlers = append([]skHandler{{during, func([]string, []byte) ([]byte, error) {
+					cancel()
+					return nil, errors.New("kubectl: interrupted: context canceled")
+				}}}, h.k.handlers...)
+			}
+			h.passChecks()
+			err := h.env.run(ctx)
+			if !IsReported(err) {
+				t.Fatalf("err = %v\n%s", err, h.out.String())
+			}
+			h.mustContain("interrupted", "re-run `darkplum deploy`")
+			for _, later := range []string{"rollout status deployment/darkplum-gateway", "rollout status deployment/darkplum-web", "semantic-router", "iam simulate", "darkplum-install"} {
+				if h.tl.count(later) != 0 {
+					t.Errorf("%q ran after the interrupt:\n%s", later, h.tl)
+				}
+			}
+			if during != "mirror" {
+				// no diagnosis of the wait the interrupt cut short, no further kubectl at all
+				evs := strings.Split(h.tl.String(), "\n")
+				for _, e := range evs[h.tl.first(during)+1:] {
+					if strings.HasPrefix(e, "kubectl") {
+						t.Errorf("kubectl ran after the interrupt: %s", e)
+					}
+				}
+			} else if h.tl.count("apply -f -") != 0 {
+				t.Errorf("applied after an interrupted mirror:\n%s", h.tl)
+			}
+		})
 	}
 }

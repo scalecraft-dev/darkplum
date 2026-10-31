@@ -392,7 +392,9 @@ func (e *deployEnv) run(ctx context.Context) (err error) {
 		return e.stop(row, "cannot reach the cluster")
 	}
 	e.row(row)
-	kc := e.kube(t)
+	// Every kubectl call from here observes the interrupt: none starts once it is
+	// cancelled, and a running one (a rollout wait) is stopped, not waited out.
+	kc := e.kube(t).WithContext(ctx)
 	if !e.inspected {
 		// The cluster could not be read at preflight (it was still being created, or
 		// unreachable). It is up now; nothing has been applied to it yet.
@@ -419,8 +421,14 @@ func (e *deployEnv) run(ctx context.Context) (err error) {
 	if r := e.sessionOK(20); r.status == checkFail {
 		return e.stop(r, "the AWS session is about to expire")
 	}
+	if err := e.checkInterrupt(ctx); err != nil {
+		return err
+	}
 	mirrored, err := e.mirror(ctx, imgs, out.Repos, out.Region)
 	if err != nil {
+		if ierr := e.checkInterrupt(ctx); ierr != nil {
+			return ierr
+		}
 		detail, hint := firstLine(err.Error()), e.loginHint(err.Error())
 		var te *transport.Error
 		if errors.As(err, &te) {
@@ -480,6 +488,9 @@ func (e *deployEnv) run(ctx context.Context) (err error) {
 
 	// ---- 13. semantic router (the install's setting: applied or removed) ----------------
 	e.step(13, "Semantic router")
+	if err := e.checkInterrupt(ctx); err != nil {
+		return err
+	}
 	if err := e.routerStep(ctx, kc, fsys); err != nil {
 		return err
 	}
@@ -565,10 +576,13 @@ func (e *deployEnv) routerStep(ctx context.Context, kc *kube.Client, fsys fs.FS)
 	if tok.Found() {
 		e.row(checkResult{name: "semantic router", status: checkPass, detail: "taking over the helm release; its workload keeps running"})
 	}
-	if err := ctx.Err(); err != nil {
-		return e.stop(checkResult{name: "semantic router", status: checkFail, detail: "interrupted"}, "interrupted")
+	if err := e.checkInterrupt(ctx); err != nil {
+		return err
 	}
 	if err := semrouter.Apply(kc, tok, objs, e.out); err != nil {
+		if ierr := e.checkInterrupt(ctx); ierr != nil {
+			return ierr
+		}
 		return e.stop(checkResult{name: "semantic router", status: checkFail, detail: err.Error(),
 			hint: "the platform is deployed; re-run `darkplum deploy` (idempotent) or turn the router off in `darkplum init`"}, "the semantic router did not become ready")
 	}
@@ -602,6 +616,16 @@ func (e *deployEnv) routerOff(kc *kube.Client, fsys fs.FS) error {
 	}
 	e.row(checkResult{name: "semantic router", status: checkPass, detail: "off · removed; routed aliases fall back to their default route"})
 	return nil
+}
+
+// checkInterrupt ends the run, without a diagnosis of whatever the interrupt
+// cut short, when the context is done.
+func (e *deployEnv) checkInterrupt(ctx context.Context) error {
+	if ctx.Err() == nil {
+		return nil
+	}
+	return e.stop(checkResult{name: "interrupted", status: checkFail, detail: "stopped at your request",
+		hint: "completed steps are kept; re-run `darkplum deploy` to continue"}, "interrupted")
 }
 
 // loginHint is the remedy for an expired session when the failure looks like one.
@@ -1334,6 +1358,9 @@ var rolloutTimeout = map[string]string{"darkplum-api": "300s", "darkplum-gateway
 
 func (e *deployEnv) applyPlatform(ctx context.Context, kc *kube.Client, phases []manifests.Phase, out deployOutputs, images map[string]string) error {
 	for _, p := range phases {
+		if err := e.checkInterrupt(ctx); err != nil {
+			return err
+		}
 		switch p.Name {
 		case manifests.PhaseAPI:
 			e.step(9, "Deploy the api (it owns the database schema)")
@@ -1353,6 +1380,9 @@ func (e *deployEnv) applyPlatform(ctx context.Context, kc *kube.Client, phases [
 			return err
 		}
 		if _, err := kc.Run(list, "apply", "-f", "-"); err != nil {
+			if ierr := e.checkInterrupt(ctx); ierr != nil {
+				return ierr
+			}
 			return e.stop(checkResult{name: p.Name, status: checkFail, detail: firstLine(err.Error()),
 				hint: e.loginHint(err.Error())}, "kubectl apply failed")
 		}
@@ -1400,6 +1430,9 @@ func (e *deployEnv) secrets(kc *kube.Client, out deployOutputs) error {
 // digest that was mirrored: a rollout can finish on the old image when a tag moved.
 func (e *deployEnv) rollout(ctx context.Context, kc *kube.Client, deployment string, images map[string]string) error {
 	if _, err := kc.Run(nil, "-n", platformNS, "rollout", "status", "deployment/"+deployment, "--timeout="+rolloutTimeout[deployment]); err != nil {
+		if ierr := e.checkInterrupt(ctx); ierr != nil {
+			return ierr
+		}
 		e.diagnose(kc, deployment)
 		return e.stop(checkResult{name: deployment, status: checkFail, detail: firstLine(err.Error()),
 			hint: "the pods did not become ready; their state and logs are above. Nothing else was applied"}, deployment+" did not roll out")

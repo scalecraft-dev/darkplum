@@ -10,6 +10,9 @@
 package kube
 
 import (
+	"context"
+	"fmt"
+
 	"github.com/scalecraft-dev/darkplum/cli/internal/runner"
 )
 
@@ -25,6 +28,9 @@ type Client struct {
 	// leave this empty (the handle's Exec adds the selectors); ForTest sets it so a
 	// fake observes the same argv a real call produces.
 	flags []string
+	// ctx, when set (WithContext), ends calls: none starts once it is done, and a
+	// running one is interrupted if the runner can (a real cluster handle can).
+	ctx context.Context
 }
 
 // ForCluster returns a client that only ever talks to the install's validated
@@ -49,9 +55,27 @@ func ForTest(r Runner, namespace string, flags ...string) *Client {
 // Namespace is the namespace NS targets.
 func (c *Client) Namespace() string { return c.ns }
 
+// WithContext returns a client whose calls observe ctx. It targets exactly the
+// same cluster and namespace as c.
+func (c *Client) WithContext(ctx context.Context) *Client {
+	cp := *c
+	cp.ctx = ctx
+	return &cp
+}
+
 // Run invokes kubectl with the given args verbatim (no implicit namespace).
 func (c *Client) Run(stdin []byte, args ...string) (string, error) {
-	out, err := c.r.Run(stdin, runner.Kubectl, append(append([]string{}, c.flags...), args...)...)
+	full := append(append([]string{}, c.flags...), args...)
+	if c.ctx != nil {
+		if err := c.ctx.Err(); err != nil {
+			return "", fmt.Errorf("kubectl not run: interrupted: %w", err)
+		}
+		if cr, ok := c.r.(runner.ContextExec); ok {
+			out, err := cr.RunContext(c.ctx, stdin, runner.Kubectl, full...)
+			return string(out), err
+		}
+	}
+	out, err := c.r.Run(stdin, runner.Kubectl, full...)
 	return string(out), err
 }
 

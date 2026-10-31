@@ -1171,3 +1171,24 @@ func TestDeployAndDestroyGuardAgainstTheClustersOwnRecord(t *testing.T) {
 		h.contains("cluster's own record", "--allow-downgrade")
 	})
 }
+
+// An interrupt during the Kubernetes deletions stops there: no further call, and
+// Terraform's destroy never starts on a half-finished teardown.
+func TestDestroyInterruptDuringTheKubernetesPhase(t *testing.T) {
+	h := newDestroyHarness(t)
+	h.svcs = []objRef{{platformNS, "darkplum-web-lb"}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.k.handlers = append([]skHandler{{"delete svc", func([]string, []byte) ([]byte, error) {
+		cancel()
+		return nil, errors.New("kubectl: interrupted: context canceled")
+	}}}, h.k.handlers...)
+	err := h.env.run(ctx)
+	if !IsReported(err) {
+		t.Fatalf("err = %v\n%s", err, h.out.String())
+	}
+	h.contains("interrupted", "re-run `darkplum destroy`")
+	if h.tf.ran("destroy") {
+		t.Error("terraform destroy ran after the interrupt")
+	}
+}

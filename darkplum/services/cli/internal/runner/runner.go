@@ -23,11 +23,13 @@ package runner
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 )
 
 // Kubectl is the only program a cluster handle will run. Code outside this
@@ -38,6 +40,14 @@ const Kubectl = "kubectl"
 // go through stdin, never argv.
 type Exec interface {
 	Run(stdin []byte, name string, args ...string) ([]byte, error)
+}
+
+// ContextExec is an Exec that a context can stop: a cancelled context interrupts
+// the running command (SIGINT first, a kill if it does not leave). Real cluster
+// handles are ContextExecs; a fake need not be.
+type ContextExec interface {
+	Exec
+	RunContext(ctx context.Context, stdin []byte, name string, args ...string) ([]byte, error)
 }
 
 // ErrNotAllowed is returned when a caller asks the runner for a program it will
@@ -96,6 +106,12 @@ type kubectlExec struct {
 }
 
 func (k kubectlExec) Run(stdin []byte, name string, args ...string) ([]byte, error) {
+	return k.RunContext(context.Background(), stdin, name, args...)
+}
+
+// RunContext is Run that stops when ctx is done. A rollout wait is the long
+// call: an interrupt must not leave it blocking for its timeout.
+func (k kubectlExec) RunContext(ctx context.Context, stdin []byte, name string, args ...string) ([]byte, error) {
 	if name != Kubectl {
 		return nil, fmt.Errorf("%w: %q through a cluster handle", ErrNotAllowed, name)
 	}
@@ -107,7 +123,9 @@ func (k kubectlExec) Run(stdin []byte, name string, args ...string) ([]byte, err
 	if err := screenArgs(args); err != nil {
 		return nil, err
 	}
-	c := exec.Command(name, append(append([]string{}, k.prefix...), args...)...)
+	c := exec.CommandContext(ctx, name, append(append([]string{}, k.prefix...), args...)...)
+	c.Cancel = func() error { return c.Process.Signal(os.Interrupt) }
+	c.WaitDelay = 5 * time.Second
 	// KUBERC=off: a ~/.kube/kuberc cannot add default flags (a --context, an alias)
 	// to what a handle runs.
 	c.Env = append(os.Environ(), append([]string{"KUBERC=off"}, k.env...)...)
@@ -118,6 +136,9 @@ func (k kubectlExec) Run(stdin []byte, name string, args ...string) ([]byte, err
 	c.Stdout = &out
 	c.Stderr = &errb
 	if err := c.Run(); err != nil {
+		if ctx.Err() != nil {
+			return out.Bytes(), fmt.Errorf("%s: interrupted: %w", name, ctx.Err())
+		}
 		msg := strings.TrimSpace(errb.String())
 		if msg == "" {
 			msg = err.Error()

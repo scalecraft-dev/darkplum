@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -147,4 +148,26 @@ func TestKubectlForwarderLifecycle(t *testing.T) {
 			t.Fatal("Close left kubectl running")
 		}
 	})
+}
+
+// A cancelled context stops a running kubectl (a rollout wait) instead of
+// leaving it to run out its timeout.
+func TestKubectlExecRunContextStopsOnCancel(t *testing.T) {
+	fakeKubectl(t, `echo started; exec sleep 30`)
+	ex := kubectlExec{prefix: []string{"--kubeconfig", "/k", "--context", "darkplum"}}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() { time.Sleep(100 * time.Millisecond); cancel() }()
+	start := time.Now()
+	_, err := ex.RunContext(ctx, nil, Kubectl, "rollout", "status", "deploy/x", "--timeout=1800s")
+	if err == nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v, want it to wrap context.Canceled", err)
+	}
+	if took := time.Since(start); took > 10*time.Second {
+		t.Errorf("took %v: the wait was not interrupted", took)
+	}
+	// and Run keeps working without a context
+	fakeKubectl(t, `echo ok`)
+	if out, err := ex.Run(nil, Kubectl, "get", "pods"); err != nil || string(out) != "ok\n" {
+		t.Errorf("Run = %q, %v", out, err)
+	}
 }
