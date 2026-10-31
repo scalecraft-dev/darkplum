@@ -27,13 +27,23 @@ output "vpc_cidr" {
 }
 
 output "kube_config_command" {
-  description = "Command to point kubectl at the cluster."
+  description = "Deprecated, removed with the Makefile flow: it points the operator's own ~/.kube/config at the cluster. The darkplum CLI never does that; it writes a private kubeconfig per install."
   value       = "aws eks update-kubeconfig --region ${var.aws_region} --name ${module.eks.cluster_name}"
 }
 
 output "container_registry" {
-  description = "Container registry host to push platform images to."
+  description = "Container registry host the first-party image repositories live on."
   value       = "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com"
+}
+
+output "image_repositories" {
+  description = "Service name -> ECR repository URL (<cluster_name>/darkplum-<service>) that `darkplum deploy` mirrors the verified release images into."
+  value       = module.ecr.repository_urls
+}
+
+output "cluster_service_cidr" {
+  description = "The cluster's Kubernetes service CIDR. The gateway-egress-services NetworkPolicy scopes its rule to it, so the CLI never has to ask EKS."
+  value       = module.eks.cluster_service_cidr
 }
 
 output "database_url" {

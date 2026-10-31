@@ -52,18 +52,35 @@ spec:
         darkplum.ai/node-type: gpu-inference
       initContainers:
         - name: model-download
-          image: python:3.11-slim
+          # The pinned vLLM image already ships huggingface_hub, so the download
+          # needs no `pip install` at start-up and no second third-party image. Its
+          # entrypoint is the API server, hence the explicit command. Runs as an
+          # unprivileged user: nothing here needs root, and /model (an emptyDir) is
+          # writable by anyone.
+          image: vllm/vllm-openai:v0.6.6@sha256:6956052a3491118df885b37e240abebaf839b62495c3d54e617cb8401c54717b
           securityContext:
             allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 65532
+            runAsGroup: 65532
             capabilities:
               drop: ["ALL"]
           command:
-            - /bin/sh
+            - python3
             - -c
             - |
-              pip install -q huggingface-hub && \
-              hf download $(MODEL_NAME) --revision $(MODEL_REVISION) --local-dir /model
+              import os
+              from huggingface_hub import snapshot_download
+              snapshot_download(
+                  repo_id=os.environ["MODEL_NAME"],
+                  revision=os.environ["MODEL_REVISION"],
+                  local_dir="/model",
+              )
           env:
+            - name: HOME
+              value: /tmp
+            - name: HF_HOME
+              value: /tmp/hf
             - name: MODEL_NAME
               value: PLACEHOLDER_MODEL_NAME
             # Branch, tag or (recommended) a full commit SHA from the model's
@@ -82,6 +99,8 @@ spec:
           volumeMounts:
             - name: model-storage
               mountPath: /model
+            - name: hf-tmp
+              mountPath: /tmp
           resources:
             requests:
               cpu: "2"
@@ -90,7 +109,7 @@ spec:
               memory: 8Gi
       containers:
         - name: vllm
-          image: vllm/vllm-openai:v0.6.6
+          image: vllm/vllm-openai:v0.6.6@sha256:6956052a3491118df885b37e240abebaf839b62495c3d54e617cb8401c54717b
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
@@ -153,6 +172,9 @@ spec:
         - name: model-storage
           emptyDir:
             sizeLimit: 30Gi
+        - name: hf-tmp
+          emptyDir:
+            sizeLimit: 1Gi
         - name: shm
           emptyDir:
             medium: Memory

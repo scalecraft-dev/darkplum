@@ -20,6 +20,7 @@ def load(name, file):
 
 rj = load("release_json", "release-json.py")
 pin = load("check_pinned", "check-pinned-actions.py")
+lock = load("check_lock", "check-lock-platforms.py")
 
 SHA = "a" * 40
 D = {s: "sha256:" + c * 64 for s, c in zip(("gateway", "api", "web"), "123")}
@@ -101,6 +102,20 @@ class PinnedActions(unittest.TestCase):
             for n, line in enumerate((HERE.parent / "workflows" / f).read_text().splitlines(), 1):
                 if re.search(r"uses:\s*\S+@[0-9a-f]{40}", line):
                     self.assertRegex(line, r"#\s*v\d", f"{f}:{n} pinned action needs a '# vX.Y.Z' comment")
+
+
+class LockPlatforms(unittest.TestCase):
+    def test_shipped_lock_covers_four_platforms(self):
+        self.assertEqual(lock.main([]), 0)
+
+    def test_single_platform_lock_is_rejected(self):
+        text = 'provider "registry.terraform.io/hashicorp/aws" {\n  hashes = [\n    "h1:abc=",\n    "zh:def",\n  ]\n}\n'
+        bad = lock.check(text)
+        self.assertEqual(len(bad), 1)
+        self.assertIn("1 h1 hashes", bad[0])
+
+    def test_empty_lock_is_rejected(self):
+        self.assertTrue(lock.check("# nothing"))
 
 
 if __name__ == "__main__":

@@ -59,8 +59,10 @@ nothing branches yet; the key exists so the seam is ready when `vertex` lands.
 | `cluster_name` | Kubernetes cluster name |
 | `cluster_endpoint` | API server endpoint |
 | `provider_region` | Region infra runs in |
-| `kube_config_command` | Command to wire up `kubectl` |
-| `container_registry` | Registry host to push platform images to |
+| `kube_config_command` | Deprecated (goes away with the Makefile flow): wires the operator's own `~/.kube/config`. The CLI keeps a private kubeconfig per install instead |
+| `container_registry` | Registry host the first-party image repositories live on |
+| `image_repositories` | Service (`gateway`, `api`, `web`) -> repository URL, `<cluster_name>/darkplum-<service>`, IMMUTABLE tags, owned by Terraform (destroyed with the install) |
+| `cluster_service_cidr` | The cluster's Kubernetes service CIDR (scopes the gateway-egress-services NetworkPolicy) |
 | `database_url` (sensitive) | Control-plane Postgres connection string |
 | `rds_endpoint` | Database host:port |
 | `inference_backend` | `bedrock` \| `vertex` — the gateway Provider to use |
@@ -74,3 +76,9 @@ nothing branches yet; the key exists so the seam is ready when `vertex` lands.
 
 When you add a new cloud root, copy this contract verbatim and resolve every
 cloud difference *inside* the Terraform so these outputs stay identical.
+
+## Operator permissions for the image repositories
+
+The person running `darkplum deploy` mirrors the verified release images into the ECR repositories above, so their AWS role needs, on `arn:aws:ecr:<region>:<account>:repository/<cluster_name>/darkplum-*`:
+`ecr:BatchCheckLayerAvailability`, `ecr:BatchGetImage`, `ecr:CompleteLayerUpload`, `ecr:DescribeImages`, `ecr:GetDownloadUrlForLayer`, `ecr:InitiateLayerUpload`, `ecr:PutImage`, `ecr:UploadLayerPart`, and, on `*`, `ecr:GetAuthorizationToken`.
+Creating and deleting the repositories themselves (`ecr:CreateRepository`, `ecr:DeleteRepository`, `ecr:PutLifecyclePolicy`, `ecr:TagResource` and the matching reads) is part of the Terraform apply and destroy, not of the mirror. The nodes pull with the cluster's node role (`AmazonEC2ContainerRegistryReadOnly`), unchanged.

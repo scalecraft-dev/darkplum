@@ -203,3 +203,12 @@ module "web_access" {
   node_autoscaling_group_name = module.node_groups.cpu_autoscaling_group_name
   tags                        = local.tags
 }
+
+# The first-party image repositories (<cluster_name>/darkplum-{gateway,api,web}).
+# `darkplum deploy` mirrors the verified release images into them.
+module "ecr" {
+  source = "./modules/ecr"
+
+  cluster_name = var.cluster_name
+  tags         = local.tags
+}

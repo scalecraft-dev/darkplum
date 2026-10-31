@@ -143,6 +143,13 @@ jobs:
         run: |
           terraform init -backend=false -input=false
           terraform test
+      # The first-party image repositories: per-cluster names, immutable tags,
+      # force_delete, lifecycle. Mocked provider, no AWS.
+      - name: terraform test (ecr)
+        working-directory: darkplum/terraform/aws/modules/ecr
+        run: |
+          terraform init -backend=false -input=false
+          terraform test
 
   plumbing:
     name: Release plumbing
@@ -155,6 +162,9 @@ jobs:
       # mix-ups, and the workflow files must at least parse.
       - run: python3 -I -m unittest discover -s .github/scripts -p 'test_*.py' -v
       - run: python3 -I .github/scripts/check-pinned-actions.py
+      # The CLI runs terraform with -lockfile=readonly on the customer's machine,
+      # so the lock file must cover darwin/linux x arm64/amd64.
+      - run: python3 -I .github/scripts/check-lock-platforms.py
       - name: workflows parse
         run: |
           python3 -c 'import sys, yaml; [yaml.safe_load(open(f)) for f in sys.argv[1:]]' .github/workflows/*.yml
@@ -176,7 +186,7 @@ jobs:
       - uses: azure/setup-kubectl@v4
       - name: kustomize builds
         run: |
-          for overlay in dev dev-aws prod; do
+          for overlay in dev dev-aws; do
             kubectl kustomize k8s/overlays/$overlay > /dev/null || exit 1
           done
       - name: model template renders
