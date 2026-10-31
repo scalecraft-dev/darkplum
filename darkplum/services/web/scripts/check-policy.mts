@@ -1127,6 +1127,17 @@ if (!API_NOT_HTTPS_HELP.includes('SECURE_COOKIES')) {
 // The port the command opens is the port the copy sends them to. Getting this
 // pair out of step sends an administrator to a page that is not there, in the
 // one state where they have already been told twice that something is wrong.
+// No markdown in on-screen copy: nothing renders it, so a backtick shows up
+// literally. Commands travel as { code } parts.
+for (const [name, message] of [
+  ['INSECURE_TRANSPORT_HELP', INSECURE_TRANSPORT_HELP],
+  ['API_NOT_HTTPS_HELP', API_NOT_HTTPS_HELP],
+] as const) {
+  if (message.includes('`')) failures.push(`${name} carries a literal backtick`)
+}
+if (API_NOT_HTTPS_HELP.includes('darkplum deploy')) {
+  failures.push('API_NOT_HTTPS_HELP must not send an administrator to a redeploy that does not set SECURE_COOKIES')
+}
 const forwardedPort = new URL(WEB_PORT_FORWARD_URL).port
 if (!WEB_PORT_FORWARD_COMMAND.endsWith(`${forwardedPort}:80`)) {
   failures.push(
@@ -1135,7 +1146,9 @@ if (!WEB_PORT_FORWARD_COMMAND.endsWith(`${forwardedPort}:80`)) {
 }
 // `darkplum kubeconfig` prints the export that points kubectl at THIS install's
 // cluster; a bare kubectl would act on whatever context happens to be current.
-if (!WEB_PORT_FORWARD_COMMAND.startsWith('eval "$(darkplum kubeconfig)" && kubectl port-forward -n darkplum-system svc/darkplum-web')) {
+// Two lines with a backslash continuation, so the block is not handed to the
+// reader pre-scrolled; pasted into a shell it is still one command.
+if (!WEB_PORT_FORWARD_COMMAND.startsWith('eval "$(darkplum kubeconfig)" && \\\n  kubectl port-forward -n darkplum-system svc/darkplum-web')) {
   failures.push('WEB_PORT_FORWARD_COMMAND must select the install\'s cluster first and then port-forward darkplum-web')
 }
 

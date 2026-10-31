@@ -21,7 +21,7 @@ type SSOConfigureCmd struct {
 	ClientID    string `name:"client-id" help:"OIDC client ID."`
 	RedirectURL string `name:"redirect-url" help:"OIDC redirect URL."`
 	SecretStdin bool   `name:"secret-stdin" help:"Read the client secret from stdin instead of prompting."`
-	Context     string `name:"context" help:"Local kind context (kind-*) to act on, for a cluster Darkplum did not install. An install is found from its settings. A loopback address can still be an ssh tunnel to a remote cluster: the flag cannot tell, so do not point it at one. A loopback address can still be an ssh tunnel to a remote cluster: the flag cannot tell, so do not point it at one." default:""`
+	Context     string `name:"context" help:"Local kind context (kind-*) to act on, for a cluster Darkplum did not install. An install is found from its settings. A loopback address can still be an ssh tunnel to a remote cluster: the flag cannot tell, so do not point it at one." default:""`
 }
 
 // Run executes `darkplum sso configure`.

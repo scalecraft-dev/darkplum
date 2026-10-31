@@ -88,11 +88,13 @@
   max-width: 76ch;
 }
 
-/* Wide enough for the longest command on this card — the port-forward, at 96
-   characters — so neither block is handed to the reader pre-scrolled. */
+/* Wide enough for the longest command on this card — the port-forward, at 65
+   characters — so neither block is handed to the reader pre-scrolled. Still
+   narrower than the prose above it (76ch), which keeps the code reading as an
+   inset rather than as the body of the card. */
 .command {
   margin-top: var(--space-3);
-  max-width: 100ch;
+  max-width: 68ch;
 }
 
 /* The api's own warnings from a removal, verbatim. Same size as .next — they

@@ -8,9 +8,9 @@ import {
   type VendorVerification,
 } from '../lib/api'
 import { formatModelName } from '../lib/formatModelName'
+import { KeyTransportHelpText } from '../components/KeyTransportHelpText'
 import { VENDOR_KEY_COMMAND, formatRetryCountdown, vendorLabel } from '../lib/modelRouting'
 import {
-  KEY_TRANSPORT_HELP_TEXT,
   WEB_PORT_FORWARD_COMMAND,
   admittedDiff,
   groupAdmittedModels,
@@ -690,7 +690,7 @@ export function VendorInstallModal({
             the same answer. */}
         {keyBlockedByTransport && (
           <div className={styles.notice}>
-            <p className={styles.noticeText}>{KEY_TRANSPORT_HELP_TEXT[transportHelpKind]}</p>
+            <p className={styles.noticeText}><KeyTransportHelpText kind={transportHelpKind} /></p>
             {/* The port-forward first: it is the one remedy that works in both
                 cases, needs no certificate, and leaves this same screen able
                 to take the key a minute from now. */}
@@ -703,7 +703,10 @@ export function VendorInstallModal({
           </div>
         )}
 
-        {modalError && !oldGateway && (
+        {/* Not while the transport notice is up: for a 403 the api's own sentence
+            names the same remedies, and a second copy that differs from the
+            notice above it is two answers to one question. */}
+        {modalError && !oldGateway && !keyBlockedByTransport && (
           <p className={styles.error} role="alert">{modalError}</p>
         )}
 

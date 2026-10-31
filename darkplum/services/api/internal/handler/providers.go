@@ -244,8 +244,9 @@ func firstBareWildcard(patterns []string) (string, bool) {
 	return "", false
 }
 
-// bareWildcardMessage mirrors the CLI's `darkplum keys set` wording so an admin sees the same explanation whether they hit this from
-// the UI or the CLI.
+// bareWildcardMessage mirrors the CLI's `darkplum keys set` wording so an
+// admin sees the same explanation whether they hit this from the UI or the
+// CLI.
 func bareWildcardMessage(vendor, pattern string) string {
 	return fmt.Sprintf(
 		"%q admits every model this key can reach, including ones %s has not released yet. "+
@@ -363,7 +364,7 @@ func keyInstallTransportOK(secureCookies bool, host string) bool {
 // insecureTransportMessage is PUT key's and POST verify's (key-present)
 // exact 403 message when keyInstallTransportOK is false -- confirmed with
 // the web engineer and carla's runbook.
-const insecureTransportMessage = "Installing a key from here needs HTTPS, because the key would cross the network unencrypted. Open Darkplum at its HTTPS address (`darkplum status` prints it), or use `darkplum keys set <vendor>`."
+const insecureTransportMessage = "Installing a key from here needs HTTPS, because the key would cross the network unencrypted. Open Darkplum at its HTTPS address (darkplum status prints it, if this install has a team address), reach it over a port-forward at http://localhost:8081 (darkplum kubeconfig, then kubectl port-forward -n darkplum-system svc/darkplum-web 8081:80), or use the darkplum keys set command."
 
 // requireSecureTransport refuses 403 insecure_transport when
 // keyInstallTransportOK is false for this request. Callers: PutKey always;
@@ -597,7 +598,7 @@ func (h *ProvidersHandler) requireUIKeyInstall(c *gin.Context) bool {
 	_, features := h.models.cachedProviders()
 	if !hasProviderFeature(features, providerFeatureUIKeyInstall) {
 		errJSON(c, http.StatusConflict, "gateway_too_old",
-			"the gateway does not support installing vendor keys from the UI yet; redeploy the gateway to the current version, or use `darkplum keys set <vendor>`")
+			"the gateway does not support installing vendor keys from the UI yet; redeploy the gateway to the current version, or use the darkplum keys set command")
 		return false
 	}
 	return true
@@ -621,9 +622,9 @@ func (h *ProvidersHandler) requireKubeAvailable(c *gin.Context) bool {
 // internal/kube's three named failure modes -- confirmed with the web
 // engineer and carla's runbook; do not reword without updating both.
 const (
-	kubeNotInClusterMessage  = "Installing a key from here needs Darkplum to be running in Kubernetes. Use `darkplum keys set <vendor>` instead."
-	kubeObjectMissingMessage = "This cluster was deployed before keys could be installed from here. Run `darkplum deploy` once, then try again."
-	kubeForbiddenMessage     = "Darkplum is not permitted to write the vendor-key Secret on this cluster. Run `darkplum deploy` to restore its role, then try again."
+	kubeNotInClusterMessage  = "Installing a key from here needs Darkplum to be running in Kubernetes. Use the darkplum keys set command instead."
+	kubeObjectMissingMessage = "This cluster was deployed before keys could be installed from here. Run darkplum deploy once, then try again."
+	kubeForbiddenMessage     = "Darkplum is not permitted to write the vendor-key Secret on this cluster. Run darkplum deploy to restore its role, then try again."
 	kubeUnavailableMessage   = "Could not reach the Kubernetes API server; try again."
 )
 

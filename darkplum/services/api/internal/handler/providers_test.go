@@ -264,9 +264,9 @@ func TestKubeErrorJSON_ExactRunbookMessages(t *testing.T) {
 		code    string
 		message string
 	}{
-		{kube.ErrNotInCluster, "not_in_cluster", "Installing a key from here needs Darkplum to be running in Kubernetes. Use `darkplum keys set <vendor>` instead."},
-		{kube.ErrObjectMissing, "object_missing", "This cluster was deployed before keys could be installed from here. Run `darkplum deploy` once, then try again."},
-		{kube.ErrForbidden, "forbidden", "Darkplum is not permitted to write the vendor-key Secret on this cluster. Run `darkplum deploy` to restore its role, then try again."},
+		{kube.ErrNotInCluster, "not_in_cluster", "Installing a key from here needs Darkplum to be running in Kubernetes. Use the darkplum keys set command instead."},
+		{kube.ErrObjectMissing, "object_missing", "This cluster was deployed before keys could be installed from here. Run darkplum deploy once, then try again."},
+		{kube.ErrForbidden, "forbidden", "Darkplum is not permitted to write the vendor-key Secret on this cluster. Run darkplum deploy to restore its role, then try again."},
 	}
 	for _, tc := range cases {
 		status, body := runKubeErrorJSON(t, tc.err)

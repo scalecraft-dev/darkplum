@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import type { ProviderState, ProviderStatus, VendorName } from '../types'
+import { KeyTransportHelpText } from '../components/KeyTransportHelpText'
 import { VENDORS, VENDOR_KEY_COMMAND, vendorLabel } from '../lib/modelRouting'
 import {
-  KEY_TRANSPORT_HELP_TEXT,
   WEB_PORT_FORWARD_COMMAND,
   installPhase,
   installProgress,
@@ -544,7 +544,7 @@ function VendorRow({
               <p className={styles.next}>
                 {!canInstall
                   ? 'The gateway in this cluster is older than this page, so keys are installed from the command line here. Redeploy the platform to install them from Darkplum.'
-                  : KEY_TRANSPORT_HELP_TEXT[transportHelp ?? 'page_not_https']}
+                  : <KeyTransportHelpText kind={transportHelp ?? 'page_not_https'} />}
               </p>
               {/* The port-forward first, because it is the remedy that takes
                   ten seconds and needs no certificate. Copyable, like every
