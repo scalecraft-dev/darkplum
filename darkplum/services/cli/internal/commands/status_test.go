@@ -212,6 +212,21 @@ func TestStatusVerifiedNeedsADigestMatch(t *testing.T) {
 	}
 }
 
+// "verified" is about every first-party image of the release: two of three
+// running is a warning, never the green line.
+func TestStatusVerifiedNeedsEveryImage(t *testing.T) {
+	part := map[string]dep{}
+	for _, svc := range []string{"gateway", "api"} {
+		part["darkplum-"+svc] = dep{image: img(svc, digestA)}
+	}
+	s := newStatusCluster()
+	s.deploys = deployList(part)
+	out, err := s.runWith(releaseProof(), "v1.4.0")
+	if err != nil || strings.Contains(out, "✓ verified") || !strings.Contains(out, "only 2 of 3 first-party images are confirmed") {
+		t.Errorf("%v\n%s", err, out)
+	}
+}
+
 // A development build verified nothing, so it confirms nothing.
 func TestStatusDevBuildConfirmsNothing(t *testing.T) {
 	s := newStatusCluster()

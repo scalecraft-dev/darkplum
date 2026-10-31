@@ -154,8 +154,12 @@ func (e *statusEnv) imageTrust() (failed bool) {
 		failed = true
 	case len(differ) > 0:
 		fmt.Fprintf(e.out, "%s  %s\n", sDim("images"), sWarn("! "+strings.Join(differ, ", ")+" run images this darkplum ("+e.proof.version+") did not verify; run `darkplum deploy` to bring them to this release"))
-	case matched > 0 && len(unsigned) == 0:
+	case matched > 0 && matched == len(e.proof.want) && len(unsigned) == 0:
 		fmt.Fprintf(e.out, "%s  %s\n", sDim("images"), sSuccess("✓ verified: running the images "+e.proof.version+" signed (digests match)"))
+	case matched > 0 && matched < len(e.proof.want):
+		// Verified is a claim about every first-party image of the release. Some
+		// being absent (not deployed, or unlisted) is not that.
+		fmt.Fprintf(e.out, "%s  %s\n", sDim("images"), sWarn(fmt.Sprintf("! only %d of %d first-party images are confirmed as %s's; the rest are not running", matched, len(e.proof.want), e.proof.version)))
 	}
 	if len(rc) > 0 {
 		fmt.Fprintf(e.out, "%s  %s\n", sDim("images"), sWarn("! channel rc: a prerelease build, not for production"))
