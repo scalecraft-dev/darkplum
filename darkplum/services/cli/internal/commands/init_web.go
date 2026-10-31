@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/scalecraft-dev/darkplum/cli/internal/install"
 )
 
 // The install's private web address: https://darkplum.<domain> (or
@@ -715,6 +717,11 @@ func (c *InitCmd) mergeWeb(env *initEnv, dir string) error {
 		if err := c.createAndDelegate(env, s, cloud); err != nil {
 			return err
 		}
+		// The zone exists in the account now. Record it before anything else can fail, so
+		// destroy can list it as Darkplum's to mention (the Terraform state never holds it).
+		if err := c.recordCreatedZone(dir, s.web.zoneID); err != nil {
+			return reportedErr("the hosted zone %s was created, but it could not be recorded in the install (%v). Note its id: `darkplum destroy` cannot list it until it is recorded", s.web.zoneID, err)
+		}
 		text += fmt.Sprintf("web_zone_id = %s\n", hclString(s.web.zoneID))
 	}
 	if err := writeFileAtomic(path, []byte(text)); err != nil {
@@ -724,4 +731,19 @@ func (c *InitCmd) mergeWeb(env *initEnv, dir string) error {
 	fmt.Fprintf(w, "  Your team's address after deploy: %s %s\n", sCmd("https://"+s.web.hostname), sDim("(from "+strings.Join(s.web.allowed, ", ")+")"))
 	fmt.Fprintf(w, "\n  Next: %s, then %s\n", sCmd("darkplum deploy"), sCmd("darkplum configure"))
 	return nil
+}
+
+// recordCreatedZone adds the hosted zone init created to the install's record, and
+// changes nothing else in it.
+func (c *InitCmd) recordCreatedZone(dir, zoneID string) error {
+	in, err := install.OpenDir(dir, c.ClusterName)
+	if err != nil {
+		return err
+	}
+	rec, err := in.Load()
+	if err != nil {
+		return err
+	}
+	rec.CreatedZoneID = zoneID
+	return in.Save(rec)
 }
