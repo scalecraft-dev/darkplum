@@ -32,7 +32,7 @@ const DefaultMaxLen = 8192
 var placeholderRe = regexp.MustCompile(`PLACEHOLDER_[A-Z_]+`)
 
 var (
-	nameRe     = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,30}$`)
+	nameRe     = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,29}[a-z0-9])?$`)
 	hfRe       = regexp.MustCompile(`^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$`)
 	revisionRe = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 	servedRe   = regexp.MustCompile(`^[A-Za-z0-9._/-]+$`)
@@ -50,7 +50,7 @@ type Spec struct {
 // ValidateName checks an instance name (for add and remove).
 func ValidateName(name string) error {
 	if !nameRe.MatchString(name) {
-		return fmt.Errorf("NAME must be lowercase letters, digits and dashes, starting with a letter or digit (max 31 characters). Got %q.", name)
+		return fmt.Errorf("NAME must be lowercase letters, digits and dashes, starting and ending with a letter or digit (max 31 characters). Got %q.", name)
 	}
 	if name == "default" || name == "inference" {
 		return fmt.Errorf("NAME %q is reserved for the default vLLM deployment.", name)

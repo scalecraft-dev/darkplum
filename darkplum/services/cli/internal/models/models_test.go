@@ -30,6 +30,7 @@ func TestValidate(t *testing.T) {
 		"upper case":         {Name: "Qwen", HF: "a/b"},
 		"too long":           {Name: strings.Repeat("a", 32), HF: "a/b"},
 		"leading dash":       {Name: "-a", HF: "a/b"},
+		"trailing dash":      {Name: "a-", HF: "a/b"},
 		"no model":           {Name: "q"},
 		"model no slash":     {Name: "q", HF: "justname"},
 		"model with sed":     {Name: "q", HF: "a/b|c"},

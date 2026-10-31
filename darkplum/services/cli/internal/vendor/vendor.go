@@ -203,7 +203,11 @@ func (c *Checker) get(ctx context.Context, target string, header http.Header) (i
 	for k, v := range header {
 		req.Header[k] = v
 	}
-	resp, err := c.HTTP.Do(req)
+	// No redirect is followed: a redirect would carry the key header to wherever
+	// the answer points. A 3xx is simply "not 200".
+	hc := *c.HTTP
+	hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := hc.Do(req)
 	if err != nil {
 		return 0, nil, &UnreachableError{Err: stripURL(err)}
 	}

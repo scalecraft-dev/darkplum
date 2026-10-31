@@ -250,3 +250,20 @@ func TestGetKnowsBothVendors(t *testing.T) {
 		t.Error("huggingface is not a vendor key")
 	}
 }
+
+func TestNoRedirectIsFollowed(t *testing.T) {
+	var leaked bool
+	other := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { leaked = true }))
+	defer other.Close()
+	c := checker(t, func(w http.ResponseWriter, r *http.Request) { http.Redirect(w, r, other.URL, http.StatusFound) })
+	var rej *RejectedError
+	if _, err := c.Models(context.Background(), Anthropic, "k", ""); !errors.As(err, &rej) || rej.Code != 302 {
+		t.Errorf("err = %v", err)
+	}
+	if err := c.Billing(context.Background(), OpenAI, "k"); !errors.As(err, &rej) {
+		t.Errorf("billing err = %v", err)
+	}
+	if leaked {
+		t.Error("the redirect was followed, with the key")
+	}
+}

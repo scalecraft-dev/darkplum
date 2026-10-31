@@ -165,6 +165,8 @@ func (f *fakeCluster) Run(stdin []byte, name string, args ...string) ([]byte, er
 			f.secrets[md["namespace"].(string)+"/"+md["name"].(string)] = d
 		}
 		return nil, nil
+	case len(a) >= 3 && a[0] == "annotate":
+		return nil, nil
 	case len(a) >= 2 && a[0] == "rollout":
 		return nil, nil
 	}
@@ -743,5 +745,81 @@ func TestKeysGrammar(t *testing.T) {
 		if _, err := p.Parse(args); err == nil {
 			t.Errorf("%v parsed", args)
 		}
+	}
+}
+
+func TestKeysSetHuggingFaceRemovesTheLastAppliedCopy(t *testing.T) {
+	h := newKeysHarness(t)
+	h.withKey("hf_newToken")
+	if err := h.set(KeysSetCmd{Vendor: "huggingface"}); err != nil {
+		t.Fatal(err)
+	}
+	iApply, iAnn := -1, -1
+	for i, c := range h.f.calls {
+		if c.args[0] == "apply" && strings.Contains(c.stdin, "huggingface-token") {
+			iApply = i
+		}
+		if strings.Contains(c.line(), "annotate secret huggingface-token kubectl.kubernetes.io/last-applied-configuration-") {
+			iAnn = i
+			if c.args[0] != "-n" || c.args[1] != "darkplum-inference" {
+				t.Errorf("annotate is not in the inference namespace: %s", c.line())
+			}
+		}
+	}
+	if iApply < 0 || iAnn < iApply {
+		t.Errorf("annotation removal missing or before the apply (apply %d, annotate %d)", iApply, iAnn)
+	}
+}
+
+func TestKeyFromTheEnvironmentIsConfirmedAtATerminal(t *testing.T) {
+	h := newKeysHarness(t)
+	h.env.interactive = true
+	h.env.getenv = func(n string) string {
+		if n == "ANTHROPIC_API_KEY" {
+			return "sk-ant-abcdefWXYZ"
+		}
+		return ""
+	}
+	h.env.readKey = func(bool, string) (string, error) { return "typed-key", nil }
+	asked := 0
+	h.env.confirm = func(string) (bool, error) { asked++; return false, nil }
+	k, err := h.env.key(false, "ANTHROPIC_API_KEY", "x")
+	if err != nil || k != "typed-key" || asked != 1 {
+		t.Errorf("declined: key %q, asked %d, %v", k, asked, err)
+	}
+	o := h.out.String()
+	if !strings.Contains(o, "Found ANTHROPIC_API_KEY in your environment") || !strings.Contains(o, `"WXYZ"`) || strings.Contains(o, "abcdef") {
+		t.Errorf("out = %s", o)
+	}
+	h.env.confirm = func(string) (bool, error) { return true, nil }
+	if k, _ := h.env.key(false, "ANTHROPIC_API_KEY", "x"); k != "sk-ant-abcdefWXYZ" {
+		t.Errorf("confirmed key = %q", k)
+	}
+	// stdin is explicit: no question
+	asked = 0
+	h.env.confirm = func(string) (bool, error) { asked++; return true, nil }
+	if _, _ = h.env.key(true, "ANTHROPIC_API_KEY", "x"); asked != 0 {
+		t.Error("asked about the environment although --key-stdin was given")
+	}
+	// scripts take it silently
+	h.env.interactive = false
+	if k, _ := h.env.key(false, "ANTHROPIC_API_KEY", "x"); k != "sk-ant-abcdefWXYZ" || asked != 0 {
+		t.Errorf("non-interactive: %q, asked %d", k, asked)
+	}
+}
+
+func TestOnlyARealServerNotFoundCounts(t *testing.T) {
+	for msg, want := range map[string]bool{
+		`kubectl: Error from server (NotFound): secrets "x" not found`: true,
+		"the namespace was not found in the cache":                     false,
+		"NotFoundException":                        false,
+		`Error from server (Forbidden): not found`: false,
+	} {
+		if kubeNotFound(errors.New(msg), "secrets", "x") != want {
+			t.Errorf("kubeNotFound(%q) != %v", msg, want)
+		}
+	}
+	if kubeNotFound(nil, "secrets", "x") {
+		t.Error("nil")
 	}
 }

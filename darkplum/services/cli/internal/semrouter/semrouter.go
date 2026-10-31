@@ -179,7 +179,7 @@ func Remove(kc *kube.Client, objs []manifests.Object, progress io.Writer) error 
 }
 
 func notFound(err error) bool {
-	return err != nil && (strings.Contains(err.Error(), "NotFound") || strings.Contains(err.Error(), "not found"))
+	return err != nil && strings.Contains(err.Error(), "Error from server (NotFound)")
 }
 
 // ---- helm-era installs ------------------------------------------------------------

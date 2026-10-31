@@ -13,6 +13,8 @@ import (
 	"time"
 	"unicode"
 
+	"golang.org/x/term"
+
 	darkplum "github.com/scalecraft-dev/darkplum"
 	"github.com/scalecraft-dev/darkplum/cli/internal/kube"
 	"github.com/scalecraft-dev/darkplum/cli/internal/vendor"
@@ -65,7 +67,12 @@ type keysEnv struct {
 	readKey func(fromStdin bool, label string) (string, error)
 	check   *vendor.Checker
 	now     func() time.Time
-	k8s     fs.FS // the bundle's k8s/ tree (the inference namespace manifest)
+	// interactive is true at a terminal. A key found in the environment there is
+	// shown (last 4 characters) and confirmed before use: an exported variable is
+	// easy to forget, and the key it holds may belong to something else.
+	interactive bool
+	confirm     func(label string) (bool, error)
+	k8s         fs.FS // the bundle's k8s/ tree (the inference namespace manifest)
 }
 
 func newKeysEnv(g *Globals, contextFlag string) (*keysEnv, error) {
@@ -79,7 +86,8 @@ func newKeysEnv(g *Globals, contextFlag string) (*keysEnv, error) {
 		return nil, err
 	}
 	return &keysEnv{out: os.Stdout, kc: kc, getenv: os.Getenv, readKey: readPassword,
-		check: vendor.NewChecker(), now: time.Now, k8s: k8s}, nil
+		check: vendor.NewChecker(), now: time.Now, k8s: k8s,
+		interactive: term.IsTerminal(int(os.Stdin.Fd())), confirm: confirmYN}, nil
 }
 
 // Run executes `darkplum keys set`.
@@ -242,10 +250,24 @@ func (e *keysEnv) restartGateway() error {
 func (e *keysEnv) key(stdin bool, envName, label string) (string, error) {
 	var k string
 	var err error
+	fromEnv := !stdin && e.getenv(envName) != ""
+	if fromEnv && e.interactive {
+		v := strings.TrimSpace(e.getenv(envName))
+		tail := v
+		if len(tail) > 4 {
+			tail = tail[len(tail)-4:]
+		}
+		fmt.Fprintf(e.out, "Found %s in your environment (ends in %q).\n", envName, tail)
+		ok, cerr := e.confirm("Use that key?")
+		if cerr != nil {
+			return "", cerr
+		}
+		fromEnv = ok
+	}
 	switch {
 	case stdin:
 		k, err = e.readKey(true, label)
-	case e.getenv(envName) != "":
+	case fromEnv:
 		k = e.getenv(envName)
 	default:
 		k, err = e.readKey(false, label)
@@ -524,6 +546,11 @@ func (e *keysEnv) setHuggingFace(c *KeysSetCmd) error {
 	if _, err := e.kc.Run(secret, "apply", "--server-side", "--force-conflicts", "--field-manager=darkplum-cli", "-f", "-"); err != nil {
 		return fmt.Errorf("store the token: %w", err)
 	}
+	// A token stored by the Makefile flow (client-side apply) is also readable in
+	// this annotation; a rotation must not leave the old one there.
+	if _, err := e.kc.Run(nil, "-n", inferenceNamespace, "annotate", "secret", hfSecret, "kubectl.kubernetes.io/last-applied-configuration-"); err != nil {
+		return fmt.Errorf("the token is stored, but the old copy in the Secret's last-applied annotation could not be removed: %w", err)
+	}
 	fmt.Fprintf(e.out, "Hugging Face token stored in %s/%s. New model downloads use it; restart an existing\n"+
 		"deployment to pick it up:\n  %s\n", inferenceNamespace, hfSecret,
 		kubectlHint("rollout restart -n "+inferenceNamespace+" deploy/<vllm-deployment>"))
@@ -576,4 +603,10 @@ func (e *keysEnv) list() error {
 	}
 	fmt.Fprintf(e.out, "%s\n  token    %s\n", sHeader("▸ Hugging Face"), yes(hf["token"]))
 	return nil
+}
+
+// confirmYN asks a yes/no question on the terminal; the default is no.
+func confirmYN(label string) (bool, error) {
+	ans := strings.ToLower(promptLine(label + " [y/N]"))
+	return ans == "y" || ans == "yes", nil
 }
