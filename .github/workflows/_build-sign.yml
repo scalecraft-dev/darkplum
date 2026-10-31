@@ -98,10 +98,6 @@ jobs:
       # and the attempt of the job that signed, and "re-run failed jobs" gives only
       # the re-run job a new attempt, so each image records its own and the CLI
       # matches each image against its own.
-      # The digest and the attempt of THIS job. The signing certificate names the run
-      # and the attempt of the job that signed, and "re-run failed jobs" gives only
-      # the re-run job a new attempt, so each image records its own and the CLI
-      # matches each image against its own.
       - name: Record digest and attempt
         env:
           SERVICE: ${{ matrix.service }}

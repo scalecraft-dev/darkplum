@@ -63,7 +63,7 @@ func (f *PortForward) Open(ctx context.Context) (string, error) {
 	// configure to sign its session out through it. Close stops it, and it is
 	// deferred on every path; startup is cancelled explicitly below.
 	cmd := exec.CommandContext(context.WithoutCancel(ctx), "kubectl", f.args()...)
-	cmd.Env = append(os.Environ(), f.env...)
+	cmd.Env = append(os.Environ(), append([]string{"KUBERC=off"}, f.env...)...)
 	setProcessGroup(cmd)
 	cmd.Cancel = func() error { return killProcessGroup(cmd) }
 	cmd.WaitDelay = 2 * time.Second

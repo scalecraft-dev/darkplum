@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"golang.org/x/term"
+
+	"github.com/scalecraft-dev/darkplum/cli/internal/install"
 )
 
 // InitCmd is `darkplum init`: prompt for the few choices that shape an install,
@@ -240,19 +242,34 @@ func (c *InitCmd) execute(env *initEnv) error {
 		return err
 	}
 
+	// The install lives in its workspace (~/.darkplum/installs/<cluster>), never in
+	// the checkout. --dir names the workspace directory explicitly (tests, and
+	// setups that keep it elsewhere); it must exist.
 	dir := c.Dir
 	if dir == "" {
-		dir = filepath.Join("terraform", "aws")
-	}
-	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
-		return env.fail("terraform root", dir, "run from the darkplum/ directory or pass --dir", "no Terraform root at "+dir)
-	}
-
-	// A backend.tf here is a Makefile-era install: its state is already somewhere,
-	// and init no longer writes Terraform code into the checkout. Adopt it first.
-	if _, err := os.Stat(filepath.Join(dir, "backend.tf")); err == nil {
-		return env.fail("existing install", filepath.Join(dir, "backend.tf")+" is from the Makefile flow",
-			"run `darkplum init --adopt` to take this install over (its state stays where it is)", "this directory holds an install from the Makefile flow; run darkplum init --adopt")
+		home, err := install.DefaultHome()
+		if err != nil {
+			return env.fail("home", err.Error(), "set DARKPLUM_HOME to an absolute path, or fix HOME", "cannot find the darkplum home directory")
+		}
+		in, err := install.Open(home, c.ClusterName)
+		if err != nil {
+			return env.fail("cluster name", c.ClusterName, "use 2-40 lowercase letters, digits and single hyphens, starting with a letter", "invalid --cluster-name")
+		}
+		dir = in.Dir()
+		// An install from the Makefile flow in this checkout: take it over first.
+		if legacyRootHere() {
+			return env.fail("existing install", "this checkout holds an install from the Makefile flow",
+				"run `darkplum init --adopt` to take it over (its state stays where it is)", "this directory holds an install from the Makefile flow; run darkplum init --adopt")
+		}
+	} else {
+		if st, err := os.Stat(dir); err != nil || !st.IsDir() {
+			return env.fail("workspace", dir, "create the directory or drop --dir", "no workspace directory at "+dir)
+		}
+		// A backend.tf here is a Makefile-era install: adopt it first.
+		if _, err := os.Stat(filepath.Join(dir, "backend.tf")); err == nil {
+			return env.fail("existing install", filepath.Join(dir, "backend.tf")+" is from the Makefile flow",
+				"run `darkplum init --adopt` to take this install over (its state stays where it is)", "this directory holds an install from the Makefile flow; run darkplum init --adopt")
+		}
 	}
 
 	// An install from before the private address: offer to add just that.
@@ -724,6 +741,21 @@ func (c *InitCmd) finish(env *initEnv, s *settings, dir string, cloud initCloud)
 	if err != nil {
 		return err
 	}
+	// planState may have renamed the cluster (name collision): the workspace is
+	// named after the final cluster.
+	if c.Dir == "" && s.cluster != c.ClusterName {
+		home, err := install.DefaultHome()
+		if err != nil {
+			return err
+		}
+		in, err := install.Open(home, s.cluster)
+		if err != nil {
+			return err
+		}
+		dir = in.Dir()
+		tfvarsPath = filepath.Join(dir, "terraform.tfvars")
+		backendPath = filepath.Join(dir, backendFileName)
+	}
 	bucket, reused, st := plan.bucket, plan.kept, plan.st
 	tfvarsText := renderTFVars(s.tfvars(), env.now())
 	spec := backendSpec{Bucket: bucket, Key: plan.key, Region: s.region, KMSKeyARN: st.KeyARN}
@@ -826,6 +858,9 @@ func (c *InitCmd) finish(env *initEnv, s *settings, dir string, cloud initCloud)
 	}
 
 	var wrote []string
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return reportedErr("could not create the install workspace %s: %v", dir, err)
+	}
 	fmt.Fprintf(w, "%s preparing state bucket %s…\n", sDim("…"), bucket)
 	arn, err := cloud.CreateBackend(bucket, s.region, st)
 	if err != nil {
@@ -852,6 +887,11 @@ func (c *InitCmd) finish(env *initEnv, s *settings, dir string, cloud initCloud)
 		return err
 	}
 	wrote = append(wrote, tfvarsPath)
+	// The record is written last: its presence is what makes this an install.
+	if err := c.saveRecord(dir, s, spec, env.now()); err != nil {
+		return reportedErr("could not record the install in %s: %v", dir, err)
+	}
+	wrote = append(wrote, filepath.Join(dir, "install.json"))
 	fmt.Fprintln(w)
 	fmt.Fprintf(w, "  %s %s\n", sWarn("!"), kmsWarning)
 	if plan.staleLive != nil {
@@ -896,4 +936,22 @@ func (c *InitCmd) summary(env *initEnv, s *settings, wrote []string, dry bool) {
 		eta = "~35-50 min"
 	}
 	fmt.Fprintf(w, "\n  Next: %s  %s, then %s\n", sCmd("make deploy"), sDim("("+eta+")"), sCmd("./bin/darkplum configure"))
+}
+
+// saveRecord writes install.json beside the settings. A re-run keeps what the
+// record already knows (when the install was created, the bundle last applied).
+func (c *InitCmd) saveRecord(dir string, s *settings, spec backendSpec, now time.Time) error {
+	in, err := install.OpenDir(dir, s.cluster)
+	if err != nil {
+		return err
+	}
+	rec := install.Record{
+		Name: s.cluster, ClusterName: s.cluster, Region: s.region, Profile: s.profile, AccountIDs: []string{s.account},
+		Created: now.UTC(),
+		Backend: install.Backend{Type: "s3", Bucket: spec.Bucket, Key: spec.Key, Region: spec.Region, KMSKeyID: spec.KMSKeyARN, Encrypt: true, UseLockfile: true},
+	}
+	if old, err := in.Load(); err == nil {
+		rec.Created, rec.Bundle, rec.AdoptedFrom = old.Created, old.Bundle, old.AdoptedFrom
+	}
+	return in.Save(rec)
 }

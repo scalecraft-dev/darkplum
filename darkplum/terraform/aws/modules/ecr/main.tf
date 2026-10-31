@@ -45,15 +45,28 @@ resource "aws_ecr_lifecycle_policy" "this" {
         }
         action = { type = "expire" }
       },
+      # Count-based expiry applies only to version tags. ECR requires ALL patterns
+      # in a rule's tagPatternList to match, so each pattern is its own rule. The
+      # mirror pushes X.Y.Z (releases) and rc-N-sha (release candidates) and never
+      # tags anything else, so nothing else is ever pruned by count. ECR patterns
+      # only know "*".
       {
         rulePriority = 2
-        description  = "Keep the last ${var.keep_tagged_images} version-tagged images"
+        description  = "Keep the last ${var.keep_tagged_images} release-tagged images"
         selection = {
-          tagStatus = "tagged"
-          # Only version tags: the mirror pushes X.Y.Z (releases) and rc-N-sha
-          # (release candidates) and never tags anything else, so nothing else is
-          # ever pruned by count. ECR patterns only know "*".
-          tagPatternList = ["*.*.*", "rc-*"]
+          tagStatus      = "tagged"
+          tagPatternList = ["*.*.*"]
+          countType      = "imageCountMoreThan"
+          countNumber    = var.keep_tagged_images
+        }
+        action = { type = "expire" }
+      },
+      {
+        rulePriority = 3
+        description  = "Keep the last ${var.keep_tagged_images} release-candidate images"
+        selection = {
+          tagStatus      = "tagged"
+          tagPatternList = ["rc-*"]
           countType      = "imageCountMoreThan"
           countNumber    = var.keep_tagged_images
         }

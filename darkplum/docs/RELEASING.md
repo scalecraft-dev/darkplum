@@ -35,7 +35,7 @@ If an image job has to be re-run, that job gets a new attempt number and the oth
 
 A release-channel CLI therefore rejects rc images and an rc CLI rejects release images.
 
-The CLI also **only trusts the repository `scalecraft-dev/darkplum`**, compiled in. A manifest naming any other repository is refused, so a binary built from a fork, or a manifest pointed elsewhere, deploys nothing. `release.yml` and `prerelease.yml` never override this. The only override is a link-time flag on a binary an engineer builds by hand for the scratch exercise below (`-X github.com/scalecraft-dev/darkplum/cli/internal/release.trustedRepository=<org/repo>`); `darkplum version` prints `NON-DEFAULT TRUST` when it is set and nothing at run time can change it.
+The CLI also **only trusts one repository**, compiled in, and checks `release.json` against it. The workflows build the CLI with `-X ...release.trustedRepository=$GITHUB_REPOSITORY`, so in `scalecraft-dev/darkplum` it is the product's repository (the compiled-in default) and in a fork or a scratch organisation it is that repository: a fork's binary trusts only the fork's own images. `darkplum version` prints `NON-DEFAULT TRUST` whenever the trusted repository is not the product's, the release `verify` job asserts that banner is absent in the product repository (and present anywhere else), and nothing at run time can change it.
 
 ## One-time repository settings (owner)
 
@@ -80,17 +80,13 @@ The rc build uses the prerelease identity, so it does not prove the release path
 1. The owner creates a scratch organisation and a repository in it (for example `darkplum-scratch/darkplum-release`), and applies the settings above (tag protection, `release` environment, packages public).
 2. Push this branch's `.github/`, `darkplum/`, `LICENSE` and `NOTICE` to the scratch repo's `main`, unmodified. Nothing in the workflows hard-codes the repository: the manifest records `github.repository` of the run, and images are named under its owner.
 3. The scratch repo's `main` has no CI history, so for this exercise only, let its own CI run on `main` first (the same workflow files run there), then tag `v0.0.1`, approve the `release` environment, and let the workflow finish into a draft. Plain `vX.Y.Z` tags are fine in the scratch organisation.
-4. The workflow's own CLI correctly refuses these images (it trusts only `scalecraft-dev/darkplum`), and its anonymous `verify` job fails for the same reason. To exercise verification, build a verifier by hand from the same commit with the draft's `release.json` baked in and the scratch repository trusted:
+4. In the scratch organisation the workflow builds the CLI trusting the scratch repository, so its own anonymous `verify` job exercises the production identity path end to end (`NON-DEFAULT TRUST` is expected there). Download the draft's linux archive with a clean `HOME` and run it by hand too:
    ```bash
-   cd darkplum/services/cli
-   go build -trimpath -ldflags "-s -w \
-     -X github.com/scalecraft-dev/darkplum/cli/internal/release.encoded=$(base64 < release.json | tr -d '\n') \
-     -X github.com/scalecraft-dev/darkplum/cli/internal/release.trustedRepository=darkplum-scratch/darkplum-release" \
-     -o /tmp/darkplum-scratch ./cmd
-   /tmp/darkplum-scratch version         # prints NON-DEFAULT TRUST
-   /tmp/darkplum-scratch verify-release  # exact identity, anonymous, against the scratch images
+   tar -xzf darkplum_0.0.1_linux_amd64.tar.gz darkplum
+   ./darkplum version           # NON-DEFAULT TRUST: scratch-org/repo, channel release
+   ./darkplum verify-release    # exact identity, anonymous, against the scratch images
    ```
-   Then run it through the mirror steps once those exist, with a clean `HOME`, and confirm the verified identity names the scratch repo at `refs/tags/v0.0.1`.
+   Then run it through the mirror steps once those exist, and confirm the verified identity names the scratch repo at `refs/tags/v0.0.1`. That the same binary refuses the product's manifest is covered by the unit tests; do not edit a manifest by hand here.
 5. Negatives: re-sign an image from a branch in the scratch repo and confirm `verify-release` refuses it; confirm an rc image is refused by the release binary.
 6. Publish to a scratch brew tap; `brew install` with a clean `HOME`; record the quarantine behaviour of the curl path.
 7. Attach logs, digests and the verification output to the PR.

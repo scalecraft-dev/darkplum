@@ -32,7 +32,7 @@ func files(t *testing.T, fsys fs.FS) []string {
 // of what must never ship, so a bug in Denied cannot hide itself.
 func forbidden(p string) bool {
 	b := p[strings.LastIndex(p, "/")+1:]
-	return b == "backend.tf" || b == "tfplan" ||
+	return b == "backend.tf" || b == "tfplan" || (strings.HasSuffix(b, ".hcl") && b != ".terraform.lock.hcl") ||
 		strings.Contains(b, "tfvars") || strings.Contains(b, "tfstate") ||
 		strings.HasSuffix(b, ".bak") || strings.HasSuffix(b, ".tfplan") ||
 		strings.Contains("/"+p+"/", "/.terraform/") || strings.Contains("/"+p+"/", "/.pre-init/") ||
@@ -101,6 +101,8 @@ func TestTreeHidesWhatIsOnDisk(t *testing.T) {
 func TestFilterRemovesDecoys(t *testing.T) {
 	decoys := []string{
 		"terraform/aws/backend.tf",
+		"terraform/aws/backend.hcl",
+		"terraform/aws/modules/eks/override.hcl",
 		"terraform/aws/terraform.tfvars",
 		"terraform/aws/terraform.tfvars.json",
 		"terraform/aws/terraform.tfstate",
@@ -148,7 +150,7 @@ func TestFilterRemovesDecoys(t *testing.T) {
 // Everything on the independent forbidden list is denied by Denied.
 func TestDeniedCoversForbidden(t *testing.T) {
 	for _, p := range []string{
-		"terraform/aws/backend.tf", "a/b/terraform.tfvars", "x.tfvars.json", "terraform.tfstate",
+		"terraform/aws/backend.tf", "terraform/aws/backend.hcl", "x/y.tftest.hcl", "a/b/terraform.tfvars", "x.tfvars.json", "terraform.tfstate",
 		"terraform.tfstate.backup", "tfplan", "run.tfplan", "main.tf.bak", "a/.terraform/b", "a/.pre-init/b", "a/.darkplum/b",
 	} {
 		if !forbidden(p) {
@@ -158,7 +160,7 @@ func TestDeniedCoversForbidden(t *testing.T) {
 			t.Errorf("Denied(%q) = false", p)
 		}
 	}
-	for _, p := range []string{"terraform/aws/main.tf", "terraform/aws/.terraform.lock.hcl", "k8s/base/api/deployment.yaml", "terraform/aws/modules/ecr/tests/ecr.tftest.hcl"} {
+	for _, p := range []string{"terraform/aws/main.tf", "terraform/aws/.terraform.lock.hcl", "k8s/base/api/deployment.yaml"} {
 		if Denied(p) {
 			t.Errorf("Denied(%q) = true", p)
 		}

@@ -29,6 +29,9 @@ func Denied(p string) bool {
 	base := path.Base(p)
 	switch {
 	case base == "backend.tf", base == "tfplan",
+		// backend.hcl is the install's own state settings; any other .hcl is a
+		// local override or a test. Only the provider lock file ships.
+		strings.HasSuffix(base, ".hcl") && base != ".terraform.lock.hcl",
 		strings.HasSuffix(base, ".tfvars"), strings.HasSuffix(base, ".tfvars.json"),
 		strings.Contains(base, ".tfstate"), strings.HasSuffix(base, ".bak"),
 		strings.HasSuffix(base, ".tfplan"):

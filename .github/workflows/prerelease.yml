@@ -89,7 +89,8 @@ jobs:
             --digests "$RUNNER_TEMP/digests.json")"
           mkdir -p dist
           (cd darkplum/services/cli && CGO_ENABLED=0 go build -trimpath \
-            -ldflags "-s -w -X github.com/scalecraft-dev/darkplum/cli/internal/release.encoded=$enc" \
+            -ldflags "-s -w -X github.com/scalecraft-dev/darkplum/cli/internal/release.encoded=$enc \
+            -X github.com/scalecraft-dev/darkplum/cli/internal/release.trustedRepository=$GITHUB_REPOSITORY" \
             -o "$GITHUB_WORKSPACE/dist/darkplum-rc_${GOOS}_${GOARCH}" ./cmd)
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -114,6 +115,9 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x dist/darkplum-rc_linux_amd64
-          ./dist/darkplum-rc_linux_amd64 version
+          ./dist/darkplum-rc_linux_amd64 version | tee version.txt
+          if [ "$GITHUB_REPOSITORY" = "scalecraft-dev/darkplum" ]; then
+            ! grep -q 'NON-DEFAULT TRUST' version.txt || { echo "the rc binary reports a non-default trusted repository"; exit 1; }
+          fi
           ./dist/darkplum-rc_linux_amd64 verify-release
 

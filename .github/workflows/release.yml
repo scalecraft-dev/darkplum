@@ -115,7 +115,8 @@ jobs:
             --digests "$RUNNER_TEMP/digests.json")"
           mkdir -p dist/stage
           (cd darkplum/services/cli && CGO_ENABLED=0 go build -trimpath \
-            -ldflags "-s -w -X github.com/scalecraft-dev/darkplum/cli/internal/release.encoded=$enc" \
+            -ldflags "-s -w -X github.com/scalecraft-dev/darkplum/cli/internal/release.encoded=$enc \
+            -X github.com/scalecraft-dev/darkplum/cli/internal/release.trustedRepository=$GITHUB_REPOSITORY" \
             -o "$GITHUB_WORKSPACE/dist/stage/darkplum" ./cmd)
           cp LICENSE NOTICE dist/stage/
           tar -C dist/stage -czf "dist/darkplum_${VERSION}_${GOOS}_${GOARCH}.tar.gz" darkplum LICENSE NOTICE
@@ -147,7 +148,15 @@ jobs:
         run: |
           set -euo pipefail
           tar -xzf "dist/darkplum_${VERSION}_linux_amd64.tar.gz" -C dist darkplum
-          ./dist/darkplum version
+          ./dist/darkplum version | tee version.txt
+          # The workflow bakes in the repository it runs in as the trusted one. In the
+          # product's own repository that must be the compiled-in default (no
+          # NON-DEFAULT TRUST banner); anywhere else it must be the override.
+          if [ "$GITHUB_REPOSITORY" = "scalecraft-dev/darkplum" ]; then
+            ! grep -q 'NON-DEFAULT TRUST' version.txt || { echo "the release binary reports a non-default trusted repository"; exit 1; }
+          else
+            grep -q 'NON-DEFAULT TRUST' version.txt || { echo "a fork's binary must say it trusts the fork"; exit 1; }
+          fi
           ./dist/darkplum verify-release
 
   draft:

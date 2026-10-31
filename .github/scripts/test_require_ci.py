@@ -14,7 +14,7 @@ JOBS = ["Go (gateway)", "Go (api)", "Go (cli)", "Web", "Bundle", "Terraform", "K
 
 # gh api <path>: serve the next canned response for the workflow-runs endpoint, and
 # a fixed answer for the check-runs endpoint. FAKE_GH_DIR holds runs-N.json, checks.json, count.
-FAKE_GH = """#!/bin/sh
+FAKE_GH = r"""#!/bin/sh
 d="$FAKE_GH_DIR"
 case "$*" in
   *actions/workflows/ci.yml/runs*)
@@ -22,14 +22,18 @@ case "$*" in
     n=$(cat "$d/count" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "$d/count"
     f="$d/runs-$n.json"; [ -f "$f" ] || f=$(ls "$d"/runs-*.json | sort -V | tail -n1)
     cat "$f" ;;
-  *check-runs*) cat "$d/checks.json" ;;
+  *check-suites/*/check-runs*)
+    suite=$(echo "$*" | sed -n 's|.*check-suites/\([0-9]*\)/check-runs.*|\1|p')
+    echo "$*" >> "$d/checks-queries"
+    case "$*" in *page=1) f="$d/checks-$suite.json"; [ -f "$f" ] || f="$d/checks.json"; cat "$f" ;; *) echo '{"check_runs": []}' ;; esac ;;
   *) echo "unexpected gh $*" >&2; exit 2 ;;
 esac
 """
 
 
-def run_obj(status="completed", conclusion="success", created="2026-10-31T10:00:00Z", attempt=1, sha=SHA, url="https://x/run/1"):
-    return {"status": status, "conclusion": conclusion, "created_at": created, "run_attempt": attempt, "head_sha": sha, "html_url": url}
+def run_obj(status="completed", conclusion="success", created="2026-10-31T10:00:00Z", attempt=1, sha=SHA, url="https://x/run/1", suite=777):
+    return {"status": status, "conclusion": conclusion, "created_at": created, "run_attempt": attempt, "head_sha": sha, "html_url": url,
+            "check_suite_id": suite}
 
 
 def checks(names=JOBS, conclusion="success", override=None):
@@ -38,12 +42,14 @@ def checks(names=JOBS, conclusion="success", override=None):
 
 
 class RequireCIGreen(unittest.TestCase):
-    def go(self, responses, check_runs=None, wait="2", poll="0"):
+    def go(self, responses, check_runs=None, wait="2", poll="0", by_suite=None):
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
             for i, r in enumerate(responses, 1):
                 (d / f"runs-{i}.json").write_text(json.dumps({"workflow_runs": r}))
             (d / "checks.json").write_text(json.dumps(check_runs or checks()))
+            for sid, body in (by_suite or {}).items():
+                (d / f"checks-{sid}.json").write_text(json.dumps(body))
             gh = d / "gh"
             gh.write_text(FAKE_GH)
             gh.chmod(gh.stat().st_mode | stat.S_IEXEC)
@@ -108,6 +114,31 @@ class RequireCIGreen(unittest.TestCase):
         self.assertIn("Terraform", p.stderr)
         p, _ = self.go([[run_obj()]], check_runs=checks(override={"Web": "skipped"}))
         self.assertEqual(p.returncode, 1)
+
+    def test_only_the_authoritative_runs_check_suite_counts(self):
+        # another app's (or an older run's) green job of the same name on the commit
+        # must not satisfy the requirement: the jobs come from the CI run's own suite
+        p, _ = self.go([[run_obj(suite=777)]], check_runs=checks(), by_suite={777: checks(names=[j for j in JOBS if j != "Terraform"])})
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("Terraform", p.stderr)
+        p, _ = self.go([[run_obj(suite=888)]], check_runs=checks(override={"Web": "failure"}), by_suite={888: checks()})
+        self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_pages_through_a_large_suite(self):
+        many = [{"name": f"extra-{i}", "status": "completed", "conclusion": "success"} for i in range(150)]
+        # first page full (100 entries) without the required jobs would fail; the
+        # real script asks for page 2 only when page 1 is full
+        full = {"check_runs": many[:100]}
+        p, _ = self.go([[run_obj()]], by_suite={777: full})
+        self.assertEqual(p.returncode, 1)  # required jobs absent from pages 1-2
+        self.assertIn("required job not found", p.stderr)
+
+    def test_a_run_without_a_check_suite_is_refused(self):
+        r = run_obj()
+        del r["check_suite_id"]
+        p, _ = self.go([[r]])
+        self.assertEqual(p.returncode, 1)
+        self.assertIn("check suite", p.stderr)
 
     def test_required_jobs_match_ci_yml(self):
         ci = (SCRIPT.parent.parent / "workflows" / "ci.yml").read_text()

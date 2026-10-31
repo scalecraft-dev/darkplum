@@ -306,7 +306,7 @@ func TestIdentityMapsToEveryPinnedExtension(t *testing.T) {
 	e := extensions(fixtureIdentity())
 	for name, v := range map[string]string{
 		"SourceRepositoryURI": e.SourceRepositoryURI, "SourceRepositoryRef": e.SourceRepositoryRef, "SourceRepositoryDigest": e.SourceRepositoryDigest,
-		"BuildConfigURI": e.BuildConfigURI, "BuildConfigDigest": e.BuildConfigDigest, "BuildTrigger": e.BuildTrigger, "RunInvocationURI": e.RunInvocationURI,
+		"RunnerEnvironment": e.RunnerEnvironment, "BuildConfigURI": e.BuildConfigURI, "BuildConfigDigest": e.BuildConfigDigest, "BuildTrigger": e.BuildTrigger, "RunInvocationURI": e.RunInvocationURI,
 	} {
 		if v == "" {
 			t.Errorf("%s is not pinned", name)

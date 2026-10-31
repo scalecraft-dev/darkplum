@@ -47,12 +47,15 @@ var (
 	errClusterNotFound = runner.ErrClusterNotFound
 )
 
-// legacyRootHere reports a Makefile-era Terraform root in the current directory:
-// an install the CLI has not adopted yet.
+// legacyRootHere reports a Makefile-era Terraform root near the working
+// directory (the darkplum/ directory, or the repository root above it): an
+// install the CLI has not adopted yet.
 func legacyRootHere() bool {
-	for _, f := range []string{"backend.tf", "terraform.tfvars"} {
-		if _, err := os.Stat(filepath.Join("terraform", "aws", f)); err == nil {
-			return true
+	for _, root := range []string{filepath.Join("terraform", "aws"), filepath.Join("darkplum", "terraform", "aws")} {
+		for _, f := range []string{"backend.tf", "terraform.tfvars"} {
+			if _, err := os.Stat(filepath.Join(root, f)); err == nil {
+				return true
+			}
 		}
 	}
 	return false

@@ -401,3 +401,99 @@ func TestTerraformRequiresAVerifiedBundleAndKeepsOutputsOutOfIt(t *testing.T) {
 		t.Errorf("the bundle changed during a terraform run: %v", err)
 	}
 }
+
+// N3: nothing inherited can steer Terraform.
+func TestTerraformBaseEnvStripsEveryTFVariable(t *testing.T) {
+	in := []string{
+		"PATH=/usr/bin", "HOME=/h", "AWS_PROFILE=p",
+		"TF_VAR_cluster_name=evil", "TF_CLI_ARGS=-auto-approve", "TF_CLI_ARGS_apply=-target=x", "TF_WORKSPACE=prod",
+		"TF_STATE_LOCK=false", "TF_DATA_DIR=/elsewhere", "TF_CLI_CONFIG_FILE=/x", "TF_PLUGIN_CACHE_DIR=/c", "TF_INPUT=1",
+		"TF_IN_AUTOMATION=0", "tf_var_lower=1", "TF_LOG=debug", "TF_LOG_PATH=/tmp/l", "NOT_TF_X=1", "TFX=1",
+	}
+	got := strings.Join(terraformBaseEnv(in), " ")
+	for _, keep := range []string{"PATH=/usr/bin", "HOME=/h", "AWS_PROFILE=p", "TF_LOG=debug", "TF_LOG_PATH=/tmp/l", "NOT_TF_X=1", "TFX=1"} {
+		if !strings.Contains(got, keep) {
+			t.Errorf("%q was dropped: %s", keep, got)
+		}
+	}
+	for _, drop := range []string{"TF_VAR_", "TF_CLI_ARGS", "TF_WORKSPACE", "TF_STATE_LOCK", "TF_DATA_DIR=/elsewhere", "TF_CLI_CONFIG_FILE", "TF_PLUGIN_CACHE_DIR=/c", "TF_INPUT=1", "TF_IN_AUTOMATION=0", "tf_var_lower"} {
+		if strings.Contains(got, drop) {
+			t.Errorf("%q survived: %s", drop, got)
+		}
+	}
+}
+
+// N3 + N6, end to end with a fake terraform: inherited TF_* never reach it, and a
+// bundle edited between two calls is refused on the second.
+func TestTerraformIgnoresInheritedTFVarsAndReverifiesEveryCall(t *testing.T) {
+	b, err := bundle.New(fstest.MapFS{"terraform/aws/main.tf": {Data: []byte("# main")}, "k8s/base/kustomization.yaml": {Data: []byte("k")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	bdir := filepath.Join(t.TempDir(), "bundle", "k")
+	if err := b.Extract(bdir); err != nil {
+		t.Fatal(err)
+	}
+	v, err := bundle.Verify(bdir, b.Hash())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ws := t.TempDir()
+	dirs := TerraformDirs{Workspace: ws, Data: filepath.Join(ws, "tfdata", "k"), BackendHCL: filepath.Join(ws, "backend.hcl")}
+	bin := t.TempDir()
+	logf := filepath.Join(bin, "log")
+	script := "#!/bin/sh\nenv | grep '^TF_' | sort > '" + logf + "'\n"
+	if err := os.WriteFile(filepath.Join(bin, "terraform"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("TF_VAR_allowed_account_ids", `["999999999999"]`)
+	t.Setenv("TF_CLI_ARGS", "-auto-approve")
+	t.Setenv("TF_WORKSPACE", "prod")
+	t.Setenv("TF_LOG", "trace")
+	if _, _, err := Terraform(v, dirs, nil, "plan"); err != nil {
+		t.Fatal(err)
+	}
+	log, _ := os.ReadFile(logf)
+	for _, bad := range []string{"TF_VAR_", "TF_CLI_ARGS", "TF_WORKSPACE"} {
+		if strings.Contains(string(log), bad) {
+			t.Errorf("terraform inherited %s:\n%s", bad, log)
+		}
+	}
+	for _, want := range []string{"TF_DATA_DIR=" + dirs.Data, "TF_IN_AUTOMATION=1", "TF_INPUT=0", "TF_LOG=trace"} {
+		if !strings.Contains(string(log), want) {
+			t.Errorf("terraform did not get %s:\n%s", want, log)
+		}
+	}
+	// the tree changes after verification: the next call refuses
+	p := filepath.Join(bdir, "terraform", "aws", "main.tf")
+	_ = os.Chmod(p, 0o600)
+	if err := os.WriteFile(p, []byte("# edited"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_ = os.Remove(logf)
+	if _, _, err := Terraform(v, dirs, nil, "apply"); err == nil || !strings.Contains(err.Error(), "changed since it was verified") {
+		t.Errorf("an edited bundle ran: %v", err)
+	}
+	if _, err := os.Stat(logf); err == nil {
+		t.Error("terraform was started from an edited bundle")
+	}
+}
+
+// N5: a kuberc cannot add flags to what a handle runs.
+func TestKubectlRunsWithKubercOff(t *testing.T) {
+	h, _ := written(t)
+	bin := t.TempDir()
+	logf := filepath.Join(bin, "env")
+	if err := os.WriteFile(filepath.Join(bin, "kubectl"), []byte("#!/bin/sh\necho \"KUBERC=$KUBERC\" > '"+logf+"'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("KUBERC", "/home/me/.kube/kuberc")
+	if _, err := h.Exec().Run(nil, Kubectl, "get", "pods"); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := os.ReadFile(logf); strings.TrimSpace(string(got)) != "KUBERC=off" {
+		t.Errorf("kubectl saw %q", got)
+	}
+}

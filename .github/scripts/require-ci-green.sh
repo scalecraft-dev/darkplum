@@ -28,8 +28,8 @@ poll="${CI_POLL_SECONDS:-30}"
 # The job names in .github/workflows/ci.yml that must have run and passed.
 required=("Go (gateway)" "Go (api)" "Go (cli)" "Web" "Bundle" "Terraform" "Kubernetes manifests and docs" "Release plumbing")
 
-# latest_run prints "<status> <conclusion> <url>" for the newest push-to-main run
-# of ci.yml on this commit, or nothing when there is none yet.
+# latest_run prints "<status> <conclusion> <check_suite_id> <url>" for the newest
+# push-to-main run of ci.yml on this commit, or nothing when there is none yet.
 latest_run() {
   gh api "repos/${repo}/actions/workflows/ci.yml/runs?head_sha=${sha}&event=push&branch=main&per_page=30" |
     python3 -I -c '
@@ -38,7 +38,7 @@ runs = json.load(sys.stdin).get("workflow_runs", [])
 runs = [r for r in runs if r.get("head_sha") == sys.argv[1]]
 if runs:
     r = max(runs, key=lambda r: (r.get("created_at", ""), r.get("run_attempt", 0)))
-    print(r.get("status") or "unknown", r.get("conclusion") or "none", r.get("html_url") or "")
+    print(r.get("status") or "unknown", r.get("conclusion") or "none", r.get("check_suite_id") or 0, r.get("html_url") or "")
 ' "$sha"
 }
 
@@ -49,13 +49,12 @@ while :; do
   if [ -z "$line" ]; then
     echo "no CI run for ${sha} on main yet"
   elif [ "$status" = "completed" ]; then
-    rest="${line#* }"
-    conclusion="${rest%% *}"
+    read -r _ conclusion suite url <<<"$line"
     if [ "$conclusion" != "success" ]; then
-      echo "CI did not succeed on ${sha}: ${conclusion} (${rest#* })" >&2
+      echo "CI did not succeed on ${sha}: ${conclusion} (${url})" >&2
       exit 1
     fi
-    echo "CI succeeded on ${sha}: ${rest#* }"
+    echo "CI succeeded on ${sha}: ${url}"
     break
   else
     echo "CI is ${status} on ${sha}; waiting"
@@ -67,12 +66,30 @@ while :; do
   sleep "$poll"
 done
 
-runs="$(gh api "repos/${repo}/commits/${sha}/check-runs?per_page=100" |
-  python3 -I -c '
+if ! [[ "$suite" =~ ^[0-9]+$ ]] || [ "$suite" -eq 0 ]; then
+  echo "the CI run for ${sha} has no check suite id" >&2
+  exit 1
+fi
+
+# The jobs of THAT run's check suite only (not every check any app reported on the
+# commit), paged until a short page.
+runs=""
+page=1
+while :; do
+  chunk="$(gh api "repos/${repo}/check-suites/${suite}/check-runs?per_page=100&page=${page}" |
+    python3 -I -c '
 import json, sys
-for r in json.load(sys.stdin).get("check_runs", []):
+d = json.load(sys.stdin).get("check_runs", [])
+for r in d:
     print("\t".join([r.get("name", ""), r.get("status", ""), r.get("conclusion") or "none"]))
+print("COUNT\t%d" % len(d))
 ')"
+  count="$(printf '%s\n' "$chunk" | awk -F'\t' '$1 == "COUNT" {print $2}')"
+  runs="${runs}"$'\n'"$(printf '%s\n' "$chunk" | { grep -v '^COUNT' || true; })"
+  [ "${count:-0}" -lt 100 ] && break
+  page=$(( page + 1 ))
+  [ "$page" -le 20 ] || { echo "too many check runs to page through" >&2; exit 1; }
+done
 
 status=0
 for name in "${required[@]}"; do

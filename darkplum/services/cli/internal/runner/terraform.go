@@ -51,9 +51,14 @@ func Terraform(v bundle.Verified, d TerraformDirs, env []string, args ...string)
 			}
 		}
 	}
+	// Re-checked on every call, not once per command: a tree that changed between
+	// two Terraform calls of one run is as dangerous as one that was wrong at the start.
+	if _, err := bundle.Verify(v.Dir(), v.Hash()); err != nil {
+		return nil, "", fmt.Errorf("runner: the bundle changed since it was verified: %w", err)
+	}
 	cmd := exec.Command("terraform", append([]string{"-chdir=" + v.TerraformDir()}, args...)...)
 	cmd.Dir = d.Workspace
-	cmd.Env = append(os.Environ(), "TF_DATA_DIR="+d.Data, "TF_IN_AUTOMATION=1", "TF_INPUT=0")
+	cmd.Env = append(terraformBaseEnv(os.Environ()), "TF_DATA_DIR="+d.Data, "TF_IN_AUTOMATION=1", "TF_INPUT=0")
 	if d.PluginCache != "" {
 		cmd.Env = append(cmd.Env, "TF_PLUGIN_CACHE_DIR="+d.PluginCache)
 	}
@@ -82,4 +87,23 @@ func TerraformInit(v bundle.Verified, d TerraformDirs, profile string, env []str
 func within(p, dir string) bool {
 	rel, err := filepath.Rel(dir, p)
 	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// terraformBaseEnv is the inherited environment without anything that steers
+// Terraform: TF_VAR_* (variables the install never set), TF_CLI_ARGS* (extra
+// arguments), TF_WORKSPACE, TF_STATE*, TF_CLI_CONFIG_FILE, TF_DATA_DIR and every
+// other TF_* variable. Only TF_LOG and TF_LOG_PATH survive, for debugging.
+func terraformBaseEnv(environ []string) []string {
+	out := make([]string, 0, len(environ))
+	for _, kv := range environ {
+		k := kv
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			k = kv[:i]
+		}
+		if strings.HasPrefix(strings.ToUpper(k), "TF_") && k != "TF_LOG" && k != "TF_LOG_PATH" {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
 }

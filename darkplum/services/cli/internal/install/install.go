@@ -75,6 +75,9 @@ func ValidName(name string) error {
 type Install struct {
 	home Home
 	Name string
+	// dir, when set, is the workspace directory itself (OpenDir): for tests and
+	// for setups that keep the workspace somewhere other than under the home.
+	dir string
 }
 
 // Open returns the workspace for name without creating anything.
@@ -83,6 +86,19 @@ func Open(h Home, name string) (Install, error) {
 		return Install{}, err
 	}
 	return Install{home: h, Name: name}, nil
+}
+
+// OpenDir returns the workspace for name living at dir (an absolute path), not
+// under the home.
+func OpenDir(dir, name string) (Install, error) {
+	if err := ValidName(name); err != nil {
+		return Install{}, err
+	}
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return Install{}, err
+	}
+	return Install{Name: name, dir: abs}, nil
 }
 
 // List returns the names of every install in the home, sorted.
@@ -146,7 +162,12 @@ func listOrNone(names []string) string {
 
 // Paths. Nothing here touches the disk.
 
-func (i Install) Dir() string        { return filepath.Join(i.home.installs(), i.Name) }
+func (i Install) Dir() string {
+	if i.dir != "" {
+		return i.dir
+	}
+	return filepath.Join(i.home.installs(), i.Name)
+}
 func (i Install) RecordPath() string { return filepath.Join(i.Dir(), recordFile) }
 func (i Install) TFVars() string     { return filepath.Join(i.Dir(), "terraform.tfvars") }
 func (i Install) BackendHCL() string { return filepath.Join(i.Dir(), "backend.hcl") }

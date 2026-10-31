@@ -40,12 +40,17 @@ run "lifecycle_keeps_tagged_images_and_expires_only_untagged" {
     error_message = "Only untagged images may expire by age."
   }
   assert {
-    condition     = jsondecode(aws_ecr_lifecycle_policy.this["api"].policy).rules[1].selection.countNumber == 20
-    error_message = "Default retention is the last 20 tagged images."
+    condition     = jsondecode(aws_ecr_lifecycle_policy.this["api"].policy).rules[1].selection.countNumber == 20 && jsondecode(aws_ecr_lifecycle_policy.this["api"].policy).rules[2].selection.countNumber == 20
+    error_message = "Default retention is the last 20 images of each version-tag kind."
+  }
+  # ECR ANDs the patterns in one rule, so a rule listing both would match nothing.
+  assert {
+    condition     = alltrue([for r in slice(jsondecode(aws_ecr_lifecycle_policy.this["api"].policy).rules, 1, 3) : length(r.selection.tagPatternList) == 1])
+    error_message = "Each count-based rule must name exactly one tag pattern."
   }
   assert {
-    condition     = join(",", jsondecode(aws_ecr_lifecycle_policy.this["api"].policy).rules[1].selection.tagPatternList) == "*.*.*,rc-*"
-    error_message = "Count-based expiry must only ever match version tags (X.Y.Z and rc-N-sha), never an arbitrary tag."
+    condition     = join(",", [for r in slice(jsondecode(aws_ecr_lifecycle_policy.this["api"].policy).rules, 1, 3) : r.selection.tagPatternList[0]]) == "*.*.*,rc-*"
+    error_message = "Count-based expiry must only ever match version tags (X.Y.Z and rc-N-sha)."
   }
 }
 

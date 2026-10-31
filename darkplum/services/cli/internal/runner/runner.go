@@ -108,9 +108,9 @@ func (k kubectlExec) Run(stdin []byte, name string, args ...string) ([]byte, err
 		return nil, err
 	}
 	c := exec.Command(name, append(append([]string{}, k.prefix...), args...)...)
-	if len(k.env) > 0 {
-		c.Env = append(os.Environ(), k.env...)
-	}
+	// KUBERC=off: a ~/.kube/kuberc cannot add default flags (a --context, an alias)
+	// to what a handle runs.
+	c.Env = append(os.Environ(), append([]string{"KUBERC=off"}, k.env...)...)
 	if stdin != nil {
 		c.Stdin = bytes.NewReader(stdin)
 	}

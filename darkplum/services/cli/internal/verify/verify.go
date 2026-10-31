@@ -96,6 +96,9 @@ func extensions(id release.Identity) certificate.Extensions {
 		BuildConfigDigest:      id.Commit,
 		BuildTrigger:           id.Trigger,
 		RunInvocationURI:       id.RunInvocationURI,
+		// Signed by a GitHub-hosted runner: a self-hosted runner added to the
+		// repository could otherwise produce a certificate with every other field right.
+		RunnerEnvironment: "github-hosted",
 	}
 }
 
