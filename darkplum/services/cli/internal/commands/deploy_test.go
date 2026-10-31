@@ -1022,6 +1022,14 @@ func TestDeployResumesAnUnfinishedFirstApply(t *testing.T) {
 	if !IsReported(h2.run()) || h2.tf.ran("plan") {
 		t.Fatal("resumed a state whose key names another cluster")
 	}
+	// ... nor when the key merely contains /<cluster>/ somewhere (the old substring test passed it).
+	h3 := newDeployHarness(t, 0)
+	h3.tf.stateOut = "module.vpc.aws_vpc.this\n"
+	h3.env.rec.Backend.Key = "darkplum/aws/someone-else/" + h3.env.rec.ClusterName + "/terraform.tfstate"
+	if !IsReported(h3.run()) || h3.tf.ran("plan") {
+		t.Fatal("resumed a state whose key only contains the cluster name")
+	}
+	h3.mustContain("is not the one init derives")
 }
 
 // The resume trap: "Re-run darkplum deploy" must work when the previous run was

@@ -107,8 +107,10 @@ func checkStateOwnership(tf tfRunner, rec install.Record, state map[string]bool,
 		if strict {
 			return "", errors.New("the state holds resources but no outputs, so it cannot be shown to belong to this install (an unfinished apply looks like this; so does someone else's state)")
 		}
-		if !strings.Contains(rec.Backend.Key, "/"+rec.ClusterName+"/") {
-			return "", fmt.Errorf("the state holds resources but no outputs, and its key %q does not name cluster %s", rec.Backend.Key, rec.ClusterName)
+		// The exact key init writes for this cluster, not a path that merely mentions
+		// it: "darkplum/aws/x/" + cluster + "/y/terraform.tfstate" is someone else's.
+		if rec.Backend.Key != stateKeyFor(rec.ClusterName) {
+			return "", fmt.Errorf("the state holds resources but no outputs, and its key %q is not the one init derives for cluster %s (%q)", rec.Backend.Key, rec.ClusterName, stateKeyFor(rec.ClusterName))
 		}
 		return "the state has resources but no outputs yet (an unfinished earlier apply); continuing because its key names this cluster", nil
 	}
