@@ -243,7 +243,7 @@ jobs:
       # against stand-ins for darkplum, kubectl and aws.
       - name: e2e assertion scripts lint and self-test
         run: |
-          shellcheck -x scripts/e2e/*.sh scripts/e2e/selftest/darkplum scripts/e2e/selftest/aws
+          shellcheck -x -P SCRIPTDIR scripts/e2e/*.sh scripts/e2e/selftest/darkplum scripts/e2e/selftest/aws
           scripts/e2e/selftest.sh
       - name: model template renders
         run: |
