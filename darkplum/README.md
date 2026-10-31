@@ -48,11 +48,21 @@ vLLM); re-run `init` later to add self-hosted open-source models.
 | AWS CLI | >= 2.x | https://aws.amazon.com/cli/ |
 | Terraform | >= 1.10 | https://developer.hashicorp.com/terraform/install |
 | kubectl | >= 1.28 | https://kubernetes.io/docs/tasks/tools/ |
+| gh (optional) | any recent | https://cli.github.com/ , only to verify a manual download's attestation |
 
 That is all: no Docker, Go, make, jq or git. You must have AWS credentials for
 the account you install into (`aws configure`, or `aws sso login`).
 
 ## Install the CLI
+
+> **Not yet released.** The Homebrew formula and release downloads below do not
+> exist until the first signed release is published. Until then, build from
+> source: `cd services/cli && go build -o ../../darkplum ./cmd` (Go as in
+> `services/cli/go.mod`), then `darkplum init`, and deploy with images from
+> `scripts/dev.sh eks-push --install <name>` (Docker; it prints the exact
+> `darkplum deploy --unsigned-images ...` line). A development build trusts no
+> signature and marks the install unsigned. See
+> [CONTRIBUTING.md](../CONTRIBUTING.md).
 
 ```bash
 brew install scalecraft-dev/tap/darkplum

@@ -11,7 +11,7 @@ before anyone is told about it.
 | `.github/workflows/prerelease.yml` | a push to `prerelease/**` | release-candidate images `darkplum-rc-*` and an rc-channel CLI (workflow artifacts only) |
 | `.github/workflows/_build-sign.yml` | called by the two above only | the image build, and a sigstore bundle (DSSE, v0.3) attached to each image digest as an OCI referrer |
 
-Nothing in these workflows publishes. Publishing a draft is a person's decision after the smoke gate below.
+Nothing in these workflows publishes a release. Publishing a draft is a person's decision after the smoke gate below. The one thing that follows publication, bumping the Homebrew tap, is its own job (`tap`, below) behind a second reviewer approval.
 
 ### The order of a release run
 
@@ -20,6 +20,7 @@ Nothing in these workflows publishes. Publishing a draft is a person's decision 
 3. **CLI** for four platforms with the release manifest baked in.
 4. **Verify**: the freshly built linux CLI runs `darkplum verify-release`, anonymously, against the images just pushed. This is the same verifier a customer's machine runs, so what CI accepts is what customers will accept.
 5. **Draft release**.
+6. **Tap** (`environment: release-publish`, product repository only). It is queued behind the draft but waits for a reviewer, who approves it only after the draft has been smoke-tested and published. It then refuses to continue unless the release is public, checks the downloaded archives against `checksums.txt` and `gh attestation verify`, renders `.github/packaging/homebrew/darkplum.rb.tmpl` with `.github/scripts/render-formula.py` (every archive's SHA-256 goes into the formula, which is what lets Homebrew check the download) and pushes `Formula/darkplum.rb` to `scalecraft-dev/homebrew-tap` on `main`. If it ran before you published, publish and use **Re-run failed jobs**. Without this job the tap is not bumped.
 
 If an image job has to be re-run, that job gets a new attempt number and the others keep theirs. `release.json` carries the attempt per image and the CLI matches each image's signing certificate against its own, so a partial re-run still verifies.
 
@@ -45,6 +46,7 @@ These cannot be set from code and the workflows assume them:
 2. Environments:
    - `release` with at least one required reviewer. The gate job waits on it.
    - `prerelease`, with deployment branches restricted to `prerelease/**`.
+   - `release-publish` with at least one required reviewer, holding the secret **`HOMEBREW_TAP_TOKEN`**: a fine-grained personal access token (or a GitHub App token) limited to `scalecraft-dev/homebrew-tap` with Contents: read and write, and nothing else. It is an environment secret, so only the `tap` job can read it, and only after approval. The repository `scalecraft-dev/homebrew-tap` must exist with a `Formula/` directory (or an empty `main`).
 3. Actions may create packages, and the six GHCR packages (`darkplum-{gateway,api,web}`, `darkplum-rc-{gateway,api,web}`) are made **public after their first push**. The anonymous verify job, and every customer's verification, read the signatures without credentials; a private package fails verification, which is the right outcome until it is public.
 4. Branch protection on `main` requiring the `Go (*)`, `Web`, `Bundle`, `Terraform`, `Kubernetes manifests and docs` and `Release plumbing` checks. The gate refuses a tag whose commit lacks any of them, and it reads the CI workflow's own run for the commit as the authority.
 5. Workflow permissions default to read-only; every job declares what it needs.
@@ -88,12 +90,12 @@ The rc build uses the prerelease identity, so it does not prove the release path
    ```
    Then run it through the mirror steps once those exist, and confirm the verified identity names the scratch repo at `refs/tags/v0.0.1`. That the same binary refuses the product's manifest is covered by the unit tests; do not edit a manifest by hand here.
 5. Negatives: re-sign an image from a branch in the scratch repo and confirm `verify-release` refuses it; confirm an rc image is refused by the release binary.
-6. Publish to a scratch brew tap; `brew install` with a clean `HOME`; record the quarantine behaviour of the curl path.
+6. Publish to a scratch brew tap by hand (the `tap` job is skipped outside `scalecraft-dev/darkplum`): render the formula with `render-formula.py` from the draft's `checksums.txt` and your scratch repository, push it to the scratch tap, `brew install` with a clean `HOME`; record the quarantine behaviour of the curl path.
 7. Attach logs, digests and the verification output to the PR.
 
 ## After merge: smoke gate before anyone is told
 
-The first real tag is cut and left as a **draft**. Until this checklist passes, nothing is published, the install instructions in the READMEs (which already describe `brew install scalecraft-dev/tap/darkplum` and the manual download) are not linked or announced, and the brew tap is not bumped. Until the first release exists those instructions describe a flow no one can follow yet, so do not publish the docs ahead of the release:
+The first real tag is cut and left as a **draft**. Until this checklist passes, nothing is published, the install instructions in the READMEs (which already describe `brew install scalecraft-dev/tap/darkplum` and the manual download) are not linked or announced, and the brew tap is not bumped (the `tap` job stays unapproved). Until the first release exists those instructions describe a flow no one can follow yet, so do not publish the docs ahead of the release:
 
 - [ ] Download the draft's artifacts with a clean `HOME` (no `~/.darkplum`, no `~/.terraform.d`, no `~/.kube`).
 - [ ] `darkplum version` shows channel `release`, the tag, and three digests.
@@ -101,7 +103,7 @@ The first real tag is cut and left as a **draft**. Until this checklist passes, 
 - [ ] Mirror to a throwaway ECR; deploy Bedrock-only through the verification step.
 - [ ] `checksums.txt` verifies (see "Verifying a release by hand").
 
-Then publish the draft, bump the tap, and only then announce the install instructions.
+Then publish the draft, approve the `tap` job (it bumps the tap), check `brew install scalecraft-dev/tap/darkplum` and `brew test darkplum` on a clean machine, and only then announce the install instructions. The end-to-end checklist for the rc and the release candidate's install is `E2E-RELEASE-CHECK.md`.
 
 ## Revert point
 

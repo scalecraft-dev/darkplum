@@ -52,9 +52,25 @@ Sign-in is local accounts or your identity provider over OIDC
 
 ## Quick start
 
+> **Not yet released.** `brew install scalecraft-dev/tap/darkplum` and the
+> release downloads below do not exist until the first signed release is
+> published. Until then, build from source (needs Go, as in
+> `darkplum/services/cli/go.mod`, and Docker for the images):
+>
+> ```bash
+> git clone https://github.com/scalecraft-dev/darkplum && cd darkplum/darkplum
+> (cd services/cli && go build -o ../../darkplum ./cmd)      # a development build
+> ./darkplum init --cluster-name demo   # a few questions; then build and push images:
+> scripts/dev.sh eks-push --install demo    # prints the exact `darkplum deploy --unsigned-images` line
+> ```
+>
+> A development build trusts no signature and marks the install `image-trust:
+> unsigned` until a signed release is deployed over it. See
+> [CONTRIBUTING.md](CONTRIBUTING.md).
+
 **On AWS.** You need the AWS CLI (signed in to the account you will install
-into), Terraform 1.10 or newer, and kubectl. Nothing else: no Docker, Go,
-make, jq or git.
+into), Terraform 1.10 or newer, and kubectl. From a release, nothing else: no
+Docker, Go, make, jq or git.
 
 ```bash
 brew install scalecraft-dev/tap/darkplum
@@ -65,7 +81,9 @@ darkplum configure     # first admin, models, a test chat, then the web UI
 
 No Homebrew? Download the archive for your platform from the
 [releases page](https://github.com/scalecraft-dev/darkplum/releases), check
-it, and put `darkplum` on your `PATH`:
+it, and put `darkplum` on your `PATH` (the `gh` CLI is needed for the
+attestation check below; it is optional, but without it you have only the
+checksum, which proves the download matches the release, not who built it):
 
 ```bash
 sha256sum -c checksums.txt --ignore-missing      # shasum -a 256 -c on macOS
@@ -118,8 +136,9 @@ guide is [darkplum/README.md](darkplum/README.md).
   Kubernetes manifests it applies and the identity (this repository's release
   workflow) that the images it deploys must be signed by. If you run a
   tampered binary, nothing else can protect you, so verify what you download
-  (Homebrew does the checksum for you; for a manual download, the commands
-  above).
+  (the Homebrew formula pins each archive's SHA-256, and the release workflow
+  writes it only after verifying the published archives against their
+  attestation; for a manual download, run the commands above).
 - **Image signature checks are defence in depth.** Before it copies the
   gateway, api and web images into your registry, by digest, the CLI verifies
   each one against the identity compiled into the binary. That catches a

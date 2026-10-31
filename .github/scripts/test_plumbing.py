@@ -21,6 +21,7 @@ def load(name, file):
 rj = load("release_json", "release-json.py")
 pin = load("check_pinned", "check-pinned-actions.py")
 lock = load("check_lock", "check-lock-platforms.py")
+formula = load("render_formula", "render-formula.py")
 
 SHA = "a" * 40
 # one image per service, each with the run attempt of the job that signed it
@@ -154,3 +155,48 @@ class LockPlatforms(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+TEMPLATE = (HERE.parent / "packaging" / "homebrew" / "darkplum.rb.tmpl").read_text()
+
+
+def sums(version="1.2.3", skip=(), extra=()):
+    lines = [f"{c * 64}  darkplum_{version}_{p}.tar.gz"
+             for c, p in zip("abcd", formula.PLATFORMS) if p not in skip]
+    return "\n".join(lines + list(extra)) + "\n"
+
+
+class HomebrewFormula(unittest.TestCase):
+    def test_renders_every_platform_with_its_own_sha(self):
+        out = formula.render(TEMPLATE, "1.2.3", "scalecraft-dev/darkplum", sums())
+        for c, p in zip("abcd", formula.PLATFORMS):
+            url = f"https://github.com/scalecraft-dev/darkplum/releases/download/v1.2.3/darkplum_1.2.3_{p}.tar.gz"
+            i = out.index(url)
+            self.assertIn(f'sha256 "{c * 64}"', out[i:i + len(url) + 120])
+        self.assertNotRegex(out, r"@[A-Z0-9_]+@")
+        self.assertIn('version "1.2.3"', out)
+
+    def test_refuses_a_missing_extra_duplicate_or_stale_archive(self):
+        bad = {
+            "missing": sums(skip=("linux_arm64",)),
+            "extra": sums(extra=("e" * 64 + "  darkplum_1.2.3_windows_amd64.tar.gz",)),
+            "stale": sums(version="1.2.2"),
+            "dup": sums(extra=("a" * 64 + "  darkplum_1.2.3_darwin_arm64.tar.gz",)),
+            "short sha": "abc  darkplum_1.2.3_darwin_arm64.tar.gz\n",
+            "garbage": sums(extra=("not a line",)),
+        }
+        for name, text in bad.items():
+            with self.subTest(name):
+                with self.assertRaises(formula.Invalid):
+                    formula.render(TEMPLATE, "1.2.3", "scalecraft-dev/darkplum", text)
+
+    def test_refuses_a_hostile_version_or_repository(self):
+        for v, r in (("1.2.3\"; exit 1", "scalecraft-dev/darkplum"), ("v1.2.3", "scalecraft-dev/darkplum"),
+                     ("1.2.3", "a/b\nsystem 'x'"), ("1.2.3", "no-slash")):
+            with self.subTest(v=v, r=r):
+                with self.assertRaises(formula.Invalid):
+                    formula.render(TEMPLATE, v, r, sums())
+
+    def test_an_unreplaced_placeholder_is_an_error(self):
+        with self.assertRaises(formula.Invalid):
+            formula.render(TEMPLATE + "# @NEW_THING@\n", "1.2.3", "scalecraft-dev/darkplum", sums())

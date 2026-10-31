@@ -6,8 +6,10 @@ name: Release
 # in, and a checksums file with its own attestation.
 #
 # Nothing is published from here. The draft is smoke-tested by a human (see
-# darkplum/docs/RELEASING.md) and only then published; docs, the brew tap and
-# any announcement wait for that.
+# darkplum/docs/RELEASING.md) and only then published; docs and any
+# announcement wait for that. The Homebrew tap is bumped by the last job, which
+# waits for a reviewer on the release-publish environment and refuses to run
+# until the release is public.
 
 on:
   push:
@@ -207,3 +209,72 @@ jobs:
           set -euo pipefail
           gh release create "$TAG" --draft --verify-tag --title "$TAG" --generate-notes \
             dist/darkplum_*.tar.gz dist/checksums.txt dist/release.json
+
+  # Bumps scalecraft-dev/homebrew-tap to this release. Not part of the draft: it
+  # waits on the release-publish environment (a reviewer approves it AFTER the
+  # smoke gate and after the draft has been published), then checks that the
+  # release is public, that the archives match checksums.txt and carry a
+  # provenance attestation from this workflow, and only then writes the formula.
+  # Product repository only: a scratch organisation has no tap to bump.
+  tap:
+    name: Update the Homebrew tap
+    needs: [gate, draft]
+    if: github.repository == 'scalecraft-dev/darkplum'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: release-publish
+    permissions:
+      contents: read
+    env:
+      TAP_REPO: scalecraft-dev/homebrew-tap
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: The release is published, not a draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          draft="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" \
+            || { echo "cannot read release $TAG: publish the draft first, then re-run this job"; exit 1; }
+          [ "$draft" = "false" ] || { echo "$TAG is still a draft: publish it after the smoke gate, then re-run this job"; exit 1; }
+      - name: The archives are the ones the pipeline attested
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/rel"
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir "$RUNNER_TEMP/rel" \
+            --pattern checksums.txt --pattern 'darkplum_*.tar.gz'
+          cd "$RUNNER_TEMP/rel"
+          sha256sum -c checksums.txt
+          for f in darkplum_*.tar.gz; do
+            gh attestation verify "$f" --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"
+          done
+      - name: Render the formula and push it to the tap
+        env:
+          VERSION: ${{ needs.gate.outputs.version }}
+          # A fine-grained token limited to contents:write on the tap repository
+          # only, stored as an environment secret of release-publish.
+          TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          [ -n "$TAP_TOKEN" ] || { echo "secret HOMEBREW_TAP_TOKEN is not set on the release-publish environment"; exit 1; }
+          echo "::add-mask::$TAP_TOKEN"
+          auth="$(printf 'x-access-token:%s' "$TAP_TOKEN" | base64 | tr -d '\n')"
+          echo "::add-mask::$auth"
+          git -c "http.extraheader=Authorization: basic $auth" clone --depth 1 "https://github.com/$TAP_REPO.git" "$RUNNER_TEMP/tap"
+          mkdir -p "$RUNNER_TEMP/tap/Formula"
+          python3 -I .github/scripts/render-formula.py --version "$VERSION" \
+            --repository "$GITHUB_REPOSITORY" --checksums "$RUNNER_TEMP/rel/checksums.txt" \
+            --template .github/packaging/homebrew/darkplum.rb.tmpl > "$RUNNER_TEMP/tap/Formula/darkplum.rb"
+          cd "$RUNNER_TEMP/tap"
+          git add Formula/darkplum.rb
+          if git diff --cached --quiet; then echo "the tap already has $VERSION"; exit 0; fi
+          git -c user.name="darkplum release" -c user.email="release@users.noreply.github.com" \
+            commit -m "darkplum $VERSION" -m "From $GITHUB_REPOSITORY $GITHUB_REF at $GITHUB_SHA (run $GITHUB_RUN_ID)."
+          git -c "http.extraheader=Authorization: basic $auth" push origin HEAD:main
