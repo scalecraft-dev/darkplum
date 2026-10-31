@@ -1,4 +1,4 @@
-# Not applied directly — rendered by `make deploy-model NAME=<instance> MODEL=<hf-id>`.
+# Not applied directly — rendered by `darkplum models add <name> --hf <hf-id>`.
 #
 # One additional self-hosted open-source model: a vLLM Deployment + Service in
 # darkplum-inference, named vllm-<instance>. Each instance takes one GPU, so the
@@ -89,7 +89,7 @@ spec:
             - name: MODEL_REVISION
               value: PLACEHOLDER_MODEL_REVISION
             # Gated models (Llama, Gemma, ...) need a Hugging Face token that has
-            # accepted the model licence. Created with `make set-hf-token`; absent
+            # accepted the model licence. Created with `darkplum keys set huggingface`; absent
             # for ungated models.
             - name: HF_TOKEN
               valueFrom:
@@ -195,7 +195,7 @@ spec:
   # Headless: the gateway resolves the pod IP and dials it directly. A ClusterIP
   # would be matched by the VPC CNI's egress NetworkPolicy before kube-proxy
   # rewrites it to the pod IP, so the gateway-egress pod selector would not allow
-  # it. clusterIP is immutable; the Makefile recreates a Service that still has one.
+  # it. clusterIP is immutable; `darkplum deploy` recreates a Service that still has one.
   clusterIP: None
   selector:
     app.kubernetes.io/name: vllm-MODEL_INSTANCE

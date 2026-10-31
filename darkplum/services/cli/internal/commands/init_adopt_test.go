@@ -24,7 +24,7 @@ func legacyBackend() string {
 }
 
 // legacyRoot is a Makefile-era Terraform root: backend.tf + terraform.tfvars,
-// plus the .terraform cache a `make deploy` leaves.
+// plus the .terraform cache the old flow leaves.
 func legacyRoot(t *testing.T, tfvars, backend string) string {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), "terraform", "aws")

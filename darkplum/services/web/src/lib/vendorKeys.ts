@@ -734,7 +734,7 @@ export function canInstallKeyOverTransport(
  * is not the one to leave somebody stuck behind at 2am.
  */
 export const WEB_PORT_FORWARD_COMMAND =
-  'kubectl port-forward -n darkplum-system svc/darkplum-web 8081:80'
+  'eval "$(darkplum kubeconfig)" && kubectl port-forward -n darkplum-system svc/darkplum-web 8081:80'
 
 /** Where that port-forward puts Darkplum. Named in the copy so nobody has to
  *  infer the scheme from the port mapping. */
@@ -750,14 +750,14 @@ export const WEB_PORT_FORWARD_URL = 'http://localhost:8081'
  * not from the scheme in the address bar.
  */
 export const INSECURE_TRANSPORT_HELP =
-  'Installing a key from here needs HTTPS. Darkplum is not served over HTTPS here, so a key typed into this page would cross the network readable, and Darkplum refuses it. Reach Darkplum over a port-forward instead — run the first command below, then open http://localhost:8081 and install the key there — or serve it over HTTPS (make expose-web CERT_ARN=…), or install the key with the second command.'
+  'Installing a key from here needs HTTPS. Darkplum is not served over HTTPS here, so a key typed into this page would cross the network readable, and Darkplum refuses it. Reach Darkplum over a port-forward instead — run the first command below, then open http://localhost:8081 and install the key there — or open Darkplum at its HTTPS address (`darkplum status` prints it), or install the key with the second command.'
 
 /** The same refusal from a page that IS HTTPS: the api is the half that is
  *  not configured for it, so the remedy is on the api, not on this page. The
  *  port-forward works here too, and for the same reason — the api takes the
  *  loopback exception whatever SECURE_COOKIES says. */
 export const API_NOT_HTTPS_HELP =
-  "This page is HTTPS, but Darkplum's api is not configured as HTTPS-served, so it refuses a key. Re-run make expose-web CERT_ARN=…, or set SECURE_COOKIES=true in the darkplum-auth Secret and restart the api. To install a key before either of those, reach Darkplum over a port-forward — run the first command below, then open http://localhost:8081 — or install it with the second command."
+  "This page is HTTPS, but Darkplum's api is not configured as HTTPS-served, so it refuses a key. Re-run `darkplum deploy`, or set SECURE_COOKIES=true in the darkplum-auth Secret and restart the api. To install a key before either of those, reach Darkplum over a port-forward — run the first command below, then open http://localhost:8081 — or install it with the second command."
 
 /** Which of the two is true of this page. */
 export type KeyTransportHelp = 'page_not_https' | 'api_not_https'

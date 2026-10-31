@@ -1,7 +1,7 @@
 # Written by `darkplum init`.
 # Change a value by re-running darkplum init; every other variable keeps its
-# default (see variables.tf). Keep one `key = "value"` per line: the Makefile reads
-# aws_profile from here with sed.
+# default (see variables.tf). Keep one `key = "value"` per line: the darkplum CLI reads
+# this file line by line.
 aws_profile = "acme"
 allowed_account_ids = ["123456789012"]
 aws_region = "us-east-2"

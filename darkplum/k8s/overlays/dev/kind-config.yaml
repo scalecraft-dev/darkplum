@@ -1,6 +1,6 @@
 # Not a Kubernetes resource — used by `kind create cluster --config`.
-# The host port is rewritten by `make dev-up DEV_PORT=<port>`. With DEV_AWS=1 the
-# Makefile appends extraMounts for the AWS credential files that exist under
+# The host port is rewritten by `DEV_PORT=<port> scripts/dev.sh up`. With DEV_AWS=1 the
+# scripts/dev.sh appends extraMounts for the AWS credential files that exist under
 # ~/.aws (config, credentials, sso/) — never the whole directory.
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4

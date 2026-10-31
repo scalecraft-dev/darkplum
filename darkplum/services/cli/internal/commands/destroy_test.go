@@ -671,7 +671,7 @@ func TestDestroyReportSaysWhenALookupFailed(t *testing.T) {
 	h.contains("could not be checked")
 }
 
-// The brief's first bug: `make destroy` ran bare kubectl against the CURRENT
+// The brief's first bug: the old destroy script ran bare kubectl against the CURRENT
 // context, which was a production cluster. Here the real handle runs a fake kubectl
 // binary with a decoy KUBECONFIG and current-context in place.
 func TestDestroyNeverTouchesTheAmbientContext(t *testing.T) {

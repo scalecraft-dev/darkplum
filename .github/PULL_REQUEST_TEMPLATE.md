@@ -6,7 +6,7 @@
 
 ## How it was verified
 
-<!-- Tests added or changed; what you ran locally (go test, pnpm run typecheck / check:parity / build, make dev-up); anything you could not verify. -->
+<!-- Tests added or changed; what you ran locally (go test, pnpm run typecheck / check:parity / build, scripts/dev.sh up); anything you could not verify. -->
 
 ## Checklist
 

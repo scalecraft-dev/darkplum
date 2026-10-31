@@ -78,7 +78,7 @@ func (d *DoctorCheckCmd) Run(_ *Globals) error {
 	fmt.Printf("%s\n\n", header)
 
 	// Tools every install needs regardless of cloud: Terraform and kubectl. (jq and
-	// docker were the Makefile flow's; images are copied by darkplum itself now.)
+	// docker were the previous flow's; images are copied by darkplum itself now.)
 	checks := []checkResult{
 		checkTool("terraform"),
 		checkTool(runner.Kubectl),

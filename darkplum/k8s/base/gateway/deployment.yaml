@@ -21,7 +21,7 @@ spec:
       containers:
         - name: gateway
           image: darkplum-gateway:latest
-          imagePullPolicy: Always  # :latest is mutable; IfNotPresent keeps a node on the old image after make deploy-platform
+          imagePullPolicy: Always  # :latest is mutable; IfNotPresent keeps a node on the old image after darkplum deploy
           ports:
             - name: http
               containerPort: 8080
@@ -41,20 +41,20 @@ spec:
             - name: BEDROCK_REGION
               value: "us-east-1"
             # Catalog globs for Bedrock models (e.g. "*.anthropic.claude-*").
-            # `make deploy-platform` fills this from the Terraform
+            # `darkplum deploy` fills this from the Terraform
             # bedrock_model_filter output so the catalog matches the IAM
             # allowlist. Empty = list every discovered inference profile.
             - name: BEDROCK_MODEL_FILTER
               value: ""
             # Additional self-hosted vLLM backends as "name=url,name2=url2".
-            # Managed by `make deploy-model` / `make remove-model`.
+            # Managed by `darkplum models add` / `darkplum models remove`.
             - name: VLLM_UPSTREAMS
               value: ""
             # Catalog globs for models called directly at a vendor's own API
             # (class external_api: prompts leave the cluster AND the cloud
-            # account). Owned by `make set-anthropic-key` / `make set-openai-key`,
+            # account). Owned by `darkplum keys set anthropic` / `darkplum keys set openai`,
             # which write the darkplum-provider-config ConfigMap — a separate
-            # object, so re-running deploy-platform never resets them. There is no
+            # object, so re-running darkplum deploy never resets them. There is no
             # IAM allowlist below the gateway for a vendor key, so an empty filter
             # means NO vendor models, not all of them. A filter chosen in Admin >
             # Models lives in the database and is mirrored here by the api; the
@@ -74,8 +74,8 @@ spec:
                   optional: true
             # Sent as anthropic-workspace-id on every Anthropic request. Needed
             # only for a key created at organisation level rather than inside a
-            # workspace; set from Admin > Models or `make set-anthropic-key
-            # WORKSPACE=...`, same last-writer rule as the filter.
+            # workspace; set from Admin > Models or `darkplum keys set anthropic
+            # --workspace ...`, same last-writer rule as the filter.
             - name: ANTHROPIC_WORKSPACE_ID
               valueFrom:
                 configMapKeyRef:
@@ -108,7 +108,7 @@ spec:
             # Per-organisation HMAC secret (files user-hmac-key, user-hmac-key-id)
             # used to pseudonymise the OpenAI `user` field before it is sent to
             # Anthropic / Bedrock, which must never receive the raw identifier.
-            # Generated at install by `make deploy-platform` and read from files
+            # Generated at install by `darkplum deploy` and read from files
             # (USER_HMAC_DIR, default /var/run/darkplum/user-hmac), never from the
             # environment or the database. Rotation: docs/RUNBOOK-vendor-apis.md.
             - name: user-hmac

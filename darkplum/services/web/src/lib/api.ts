@@ -5,7 +5,7 @@ import { ROUTES, buildPath, type QueryValue, type Route } from './routes'
 /**
  * What this bundle can make sense of, declared on every request.
  *
- * Deploy order is not enforceable here — one repo, one `make deploy` — so the
+ * Deploy order is not enforceable here — one repo, one `darkplum deploy` — so the
  * server has to be able to tell an old bundle from a new one rather than assume
  * they moved together. Without this header the api leaves external_api models
  * out of every list it answers, which is what makes a stale cached bundle safe:

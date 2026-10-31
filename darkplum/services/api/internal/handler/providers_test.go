@@ -95,7 +95,7 @@ func TestBareWildcardPattern(t *testing.T) {
 		{"claude-*", false},
 		{"gpt-4*", false},
 		{"claude-3-opus", false},
-		{"", true}, // empty after stripping is still "admits everything" in the Makefile's own test
+		{"", true}, // empty after stripping is still "admits everything" in the CLI's own test
 	}
 	for _, tc := range cases {
 		if got := bareWildcardPattern(tc.pattern); got != tc.want {
@@ -264,9 +264,9 @@ func TestKubeErrorJSON_ExactRunbookMessages(t *testing.T) {
 		code    string
 		message string
 	}{
-		{kube.ErrNotInCluster, "not_in_cluster", "Installing a key from here needs Darkplum to be running in Kubernetes. Use make set-<vendor>-key instead."},
-		{kube.ErrObjectMissing, "object_missing", "This cluster was deployed before keys could be installed from here. Run make deploy-platform once, then try again."},
-		{kube.ErrForbidden, "forbidden", "Darkplum is not permitted to write the vendor-key Secret on this cluster. Run make deploy-platform to restore its role, then try again."},
+		{kube.ErrNotInCluster, "not_in_cluster", "Installing a key from here needs Darkplum to be running in Kubernetes. Use `darkplum keys set <vendor>` instead."},
+		{kube.ErrObjectMissing, "object_missing", "This cluster was deployed before keys could be installed from here. Run `darkplum deploy` once, then try again."},
+		{kube.ErrForbidden, "forbidden", "Darkplum is not permitted to write the vendor-key Secret on this cluster. Run `darkplum deploy` to restore its role, then try again."},
 	}
 	for _, tc := range cases {
 		status, body := runKubeErrorJSON(t, tc.err)

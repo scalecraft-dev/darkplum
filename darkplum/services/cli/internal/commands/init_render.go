@@ -19,8 +19,8 @@ type tfvarsKV struct {
 
 // hclString quotes s as an HCL string literal. Besides \ and ", the template
 // sequences ${ and %{ must be escaped or Terraform would interpolate them, and
-// control characters must not break the one-line-per-key layout the Makefile's
-// aws_profile sed relies on.
+// control characters must not break the one-line-per-key layout the CLI's
+// line-by-line tfvars reader relies on.
 func hclString(s string) string {
 	var b strings.Builder
 	b.WriteByte('"')
@@ -82,7 +82,7 @@ func renderTFVars(kvs []tfvarsKV, now time.Time) string {
 	if !now.IsZero() {
 		b.WriteString(" on " + now.UTC().Format("2006-01-02"))
 	}
-	b.WriteString(".\n# Change a value by re-running darkplum init; every other variable keeps its\n# default (see variables.tf). Keep one `key = \"value\"` per line: the Makefile reads\n# aws_profile from here with sed.\n")
+	b.WriteString(".\n# Change a value by re-running darkplum init; every other variable keeps its\n# default (see variables.tf). Keep one `key = \"value\"` per line: the darkplum CLI reads\n# this file line by line.\n")
 	for _, kv := range kvs {
 		fmt.Fprintf(&b, "%s = %s\n", kv.Key, hclValue(kv.Value))
 	}

@@ -93,7 +93,7 @@ output "model_revision" {
 }
 
 output "bedrock_invoke_arns" {
-  description = "The exact ARNs the gateway role may invoke (Layer 1 allowlist). Used by `make verify-bedrock-iam`."
+  description = "The exact ARNs the gateway role may invoke (Layer 1 allowlist). Used by `darkplum verify`."
   value       = local.bedrock_invoke_arns
 }
 

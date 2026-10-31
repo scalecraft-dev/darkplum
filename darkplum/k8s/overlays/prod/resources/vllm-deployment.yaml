@@ -23,7 +23,7 @@ spec:
         app.kubernetes.io/name: vllm-inference
         app.kubernetes.io/part-of: darkplum
         # Shared by every self-hosted model backend (this default one and any
-        # added with `make deploy-model`). NetworkPolicies select on it.
+        # added with `darkplum models add`). NetworkPolicies select on it.
         app.kubernetes.io/component: inference-backend
     spec:
       serviceAccountName: darkplum-vllm
@@ -75,7 +75,7 @@ spec:
             - name: MODEL_REVISION
               value: PLACEHOLDER_MODEL_REVISION
             # Gated models (Llama, Gemma, ...) need a Hugging Face token that has
-            # accepted the model licence. Created with `make set-hf-token`; absent
+            # accepted the model licence. Created with `darkplum keys set huggingface`; absent
             # for ungated models.
             - name: HF_TOKEN
               valueFrom:

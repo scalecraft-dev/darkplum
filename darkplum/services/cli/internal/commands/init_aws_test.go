@@ -329,45 +329,6 @@ func TestTFVarsRoundTripThroughDoctorReader(t *testing.T) {
 	}
 }
 
-// make deploy must stop before doing anything when init has not run.
-func TestMakeDeployRefusesWithoutTFVars(t *testing.T) {
-	if _, err := exec.LookPath("make"); err != nil {
-		t.Skip("no make")
-	}
-	root := filepath.Join("..", "..", "..", "..")
-	empty := t.TempDir()
-	for _, target := range []string{"deploy", "deploy-infra"} {
-		out, err := exec.Command("make", "-C", root, target, "TF_DIR="+empty).CombinedOutput()
-		if err == nil {
-			t.Errorf("make %s succeeded without tfvars", target)
-		}
-		if !strings.Contains(string(out), "darkplum init") {
-			t.Errorf("make %s: no init hint:\n%s", target, out)
-		}
-		if strings.Contains(string(out), "Building darkplum CLI") || strings.Contains(string(out), "Initializing Terraform") {
-			t.Errorf("make %s did work before the guard:\n%s", target, out)
-		}
-	}
-}
-
-func TestMakeGuardsOnlyForAWS(t *testing.T) {
-	if _, err := exec.LookPath("make"); err != nil {
-		t.Skip("no make")
-	}
-	root := filepath.Join("..", "..", "..", "..")
-	out, _ := exec.Command("make", "-n", "-C", root, "deploy", "CLOUD=gcp", "TF_DIR="+t.TempDir()).CombinedOutput()
-	if strings.Contains(string(out), "terraform.tfvars not found") || strings.Contains(string(out), "doctor check") {
-		t.Errorf("gcp must keep its own path, got the aws guards:\n%s", out)
-	}
-	out, _ = exec.Command("make", "-n", "-C", root, "deploy", "TF_DIR="+t.TempDir()).CombinedOutput()
-	if !strings.Contains(string(out), "terraform.tfvars not found") || !strings.Contains(string(out), "doctor check") {
-		t.Errorf("aws deploy lacks the tfvars guard or doctor step:\n%s", out)
-	}
-	if !strings.Contains(string(out), "--min-session 90") {
-		t.Errorf("no tfvars means the 90-minute bar; want it in:\n%s", out)
-	}
-}
-
 // The CI guard script (.github/scripts/check-tfvars-docs.py) must catch every
 // phrasing, including wrapped lines, and honour only the explicit marker block.
 func TestTFVarsDocsGuard(t *testing.T) {

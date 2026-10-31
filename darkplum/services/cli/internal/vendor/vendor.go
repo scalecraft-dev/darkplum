@@ -94,7 +94,7 @@ func BareWildcard(p string) bool {
 }
 
 // Patterns splits a catalog filter on commas after removing every space, as the
-// Makefile did. Empty entries are kept so that BareWildcard can refuse them.
+// previous flow did. Empty entries are kept so that BareWildcard can refuse them.
 func Patterns(filter string) []string {
 	filter = strings.ReplaceAll(filter, " ", "")
 	if filter == "" {

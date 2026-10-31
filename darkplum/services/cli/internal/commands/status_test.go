@@ -27,7 +27,7 @@ func TestOIDCConfigured(t *testing.T) {
 	}
 }
 
-// ---- the sections status gained from the Makefile ------------------------------
+// ---- the sections status gained from the previous flow ------------------------------
 
 type statusCluster struct {
 	*fakeCluster

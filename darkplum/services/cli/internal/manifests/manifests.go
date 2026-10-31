@@ -8,12 +8,12 @@
 //     field they belong to, and a rule that matches nothing, or more than once, is
 //     an error rather than a silent no-op.
 //   - After patching, assertions hold the whole render to the invariants that the
-//     old Makefile only hoped for: every Darkplum container runs exactly the
+//     old flow only hoped for: every Darkplum container runs exactly the
 //     expected digest in the customer's registry, nothing third-party is a mutable
 //     tag, no PLACEHOLDER_ survived, and the vendor-key objects carry no `data`
 //     (re-applying them must never be able to wipe an installed key).
 //   - Phases are ordered so network policies and identities exist before any
-//     workload starts (the Makefile applied policies after the pods were up).
+//     workload starts (the old flow applied policies after the pods were up).
 package manifests
 
 import (

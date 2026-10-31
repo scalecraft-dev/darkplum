@@ -97,18 +97,19 @@ export function vendorLabel(name: string | null | undefined): string {
 export const VENDORS: VendorName[] = ['anthropic', 'openai']
 
 /** The command that installs one vendor's key. Shown verbatim, to be copied:
- *  it must work as pasted, so it reads the key without echoing it and names the
- *  catalogue filter, which the target requires the first time. */
+ *  it must work as pasted. `darkplum keys set` asks for the key at a hidden
+ *  prompt (never on the command line) and needs the catalogue filter, --models,
+ *  the first time. */
 export const VENDOR_KEY_COMMAND: Record<VendorName, string> = {
-  anthropic: "read -s ANTHROPIC_API_KEY && export ANTHROPIC_API_KEY\nmake set-anthropic-key MODELS='claude-*'",
-  openai: "read -s OPENAI_API_KEY && export OPENAI_API_KEY\nmake set-openai-key MODELS='gpt-*'",
+  anthropic: "darkplum keys set anthropic --models 'claude-*'",
+  openai: "darkplum keys set openai --models 'gpt-*'",
 }
 
-/** Re-running the install target with MODELS is how the catalogue filter is
+/** Re-running the install command with --models is how the catalogue filter is
  *  changed; the key it already holds can be re-entered or rotated at the same time. */
 export const VENDOR_FILTER_COMMAND: Record<VendorName, string> = {
-  anthropic: "make set-anthropic-key MODELS='claude-*'",
-  openai: "make set-openai-key MODELS='gpt-*'",
+  anthropic: "darkplum keys set anthropic --models 'claude-*'",
+  openai: "darkplum keys set openai --models 'gpt-*'",
 }
 
 /** How a provider kind is named wherever models are grouped by it. */

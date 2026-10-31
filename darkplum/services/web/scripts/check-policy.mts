@@ -1115,7 +1115,7 @@ for (const [name, message] of [
 // not involve a certificate, so it goes first. (In the api-misconfigured case
 // it does not: there the certificate IS the fix, and the port-forward is the
 // way to get a key in before it lands.)
-if (INSECURE_TRANSPORT_HELP.indexOf('port-forward') > INSECURE_TRANSPORT_HELP.indexOf('CERT_ARN')) {
+if (INSECURE_TRANSPORT_HELP.indexOf('port-forward') > INSECURE_TRANSPORT_HELP.indexOf('HTTPS address')) {
   failures.push('INSECURE_TRANSPORT_HELP names the certificate before the port-forward')
 }
 if (!API_NOT_HTTPS_HELP.startsWith('This page is HTTPS')) {
@@ -1133,8 +1133,10 @@ if (!WEB_PORT_FORWARD_COMMAND.endsWith(`${forwardedPort}:80`)) {
     `WEB_PORT_FORWARD_COMMAND forwards a different port from the one ${WEB_PORT_FORWARD_URL} opens`,
   )
 }
-if (!WEB_PORT_FORWARD_COMMAND.startsWith('kubectl port-forward -n darkplum-system svc/darkplum-web')) {
-  failures.push('WEB_PORT_FORWARD_COMMAND must match the command the Makefile prints')
+// `darkplum kubeconfig` prints the export that points kubectl at THIS install's
+// cluster; a bare kubectl would act on whatever context happens to be current.
+if (!WEB_PORT_FORWARD_COMMAND.startsWith('eval "$(darkplum kubeconfig)" && kubectl port-forward -n darkplum-system svc/darkplum-web')) {
+  failures.push('WEB_PORT_FORWARD_COMMAND must select the install\'s cluster first and then port-forward darkplum-web')
 }
 
 // --- vendor_error copy ---------------------------------------------------------

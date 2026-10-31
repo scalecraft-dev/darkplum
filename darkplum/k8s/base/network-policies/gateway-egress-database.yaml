@@ -6,7 +6,7 @@
 # control that decides which hosts in the VPC may actually connect.
 #
 # Not in kustomization.yaml: PLACEHOLDER_VPC_CIDR is substituted by
-# `make deploy-platform` from the `vpc_cidr` Terraform output. Dev uses the
+# `darkplum deploy` from the `vpc_cidr` Terraform output. Dev uses the
 # in-cluster postgres pod instead (overlays/dev/patches/gateway-egress.yaml).
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy

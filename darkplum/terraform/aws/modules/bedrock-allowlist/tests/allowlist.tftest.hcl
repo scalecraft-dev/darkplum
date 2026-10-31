@@ -1,5 +1,5 @@
 # Offline: no providers, no AWS. These assert the SHAPE of the Layer 1 boundary.
-# `make verify-bedrock-iam` asserts the deployed role's actual behaviour.
+# `darkplum verify` asserts the deployed role's actual behaviour.
 
 variables {
   account_id     = "123456789012"
