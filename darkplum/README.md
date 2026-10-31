@@ -57,11 +57,12 @@ the account you install into (`aws configure`, or `aws sso login`).
 
 > **Not yet released.** The Homebrew formula and release downloads below do not
 > exist until the first signed release is published. Until then, build from
-> source: `cd services/cli && go build -o ../../darkplum ./cmd` (Go as in
-> `services/cli/go.mod`), then `darkplum init`, and deploy with images from
-> `scripts/dev.sh eks-push --install <name>` (Docker; it prints the exact
-> `darkplum deploy --unsigned-images ...` line). A development build trusts no
-> signature and marks the install unsigned. See
+> source. From this directory (`darkplum/` in the repository), with Go as in
+> `services/cli/go.mod`: `(cd services/cli && go build -o ../../darkplum ./cmd)`
+> builds `./darkplum` (or move it onto your `PATH`). Run `./darkplum init`, then
+> deploy with images from `scripts/dev.sh eks-push --install <name>` (Docker; it
+> prints the exact `./darkplum deploy --unsigned-images ...` line). A development
+> build trusts no signature and marks the install unsigned. See
 > [CONTRIBUTING.md](../CONTRIBUTING.md).
 
 ```bash

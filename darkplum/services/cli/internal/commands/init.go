@@ -39,8 +39,8 @@ type InitCmd struct {
 	Offline       bool   `help:"Make no Hugging Face call. A model outside the catalog then needs --model-revision."`
 	Yes           bool   `help:"Take every default and ask nothing (for scripts). Refuses to overwrite or accept a gated model."`
 	DryRun        bool   `help:"Run the checks and print what would be written and created, without writing or creating anything." name:"dry-run" aliases:"stdout"`
-	Force         bool   `help:"Overwrite an existing terraform.tfvars without asking (a .bak copy is kept)."`
-	Dir           string `help:"Terraform root to write into. Defaults to terraform/<cloud> under the current directory." default:""`
+	Force         bool   `hidden:"" help:"Overwrite the install's existing settings without asking (a backup is kept)."`
+	Dir           string `hidden:"" help:"Where an install made by an older version lives, for --adopt. Otherwise the install's own workspace is used." default:""`
 	Adopt         bool   `help:"Take over an install the Makefile flow created (terraform/aws, state in S3): record it in ~/.darkplum/installs/<name>, leave its state where it is, and rename its backend.tf and terraform.tfvars to *.adopted. Use --dir for another Terraform root and the global --install to name the workspace (default: the cluster name)."`
 
 	// installName is the workspace --adopt creates: the global --install, else the cluster name.
