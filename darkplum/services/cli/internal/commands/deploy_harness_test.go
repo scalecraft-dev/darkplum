@@ -51,6 +51,10 @@ type fakeTF struct {
 	cmds        [][]string
 	planMode    os.FileMode // mode of the saved plan when `show` read it
 	planFile    bool        // plan files are created by `plan`
+	// planBefore is what the plan path held at the moment terraform went to write it:
+	// its mode, or -1 when nothing was there (terraform would then create it with its
+	// own, umask-dependent mode).
+	planBefore map[string]int
 }
 
 func (f *fakeTF) record(args ...string) {
@@ -109,7 +113,20 @@ func (f *fakeTF) Stream(ctx context.Context, w io.Writer, _ runner.StreamOptions
 	if args[0] == "plan" && f.planFile {
 		for _, a := range args {
 			if strings.HasPrefix(a, "-out=") {
-				_ = os.WriteFile(strings.TrimPrefix(a, "-out="), []byte("plan"), 0o644)
+				p := strings.TrimPrefix(a, "-out=")
+				before := -1
+				if st, err := os.Stat(p); err == nil {
+					before = int(st.Mode().Perm())
+				}
+				f.mu.Lock()
+				if f.planBefore == nil {
+					f.planBefore = map[string]int{}
+				}
+				f.planBefore[p] = before
+				f.mu.Unlock()
+				// Like terraform: create with 0644 (before the umask), but an existing
+				// file keeps its mode.
+				_ = os.WriteFile(p, []byte("plan"), 0o644)
 			}
 		}
 	}

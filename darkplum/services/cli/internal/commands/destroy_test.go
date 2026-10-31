@@ -1067,3 +1067,49 @@ func TestDestroyEBSVolumesAndClassicLoadBalancersAreLeftovers(t *testing.T) {
 		}
 	}
 }
+
+// The destroy plan can hold secrets too: owner-only from the first byte.
+func TestDestroyPlanFileIsPrecreatedOwnerOnlyAndRemoved(t *testing.T) {
+	h := newDestroyHarness(t)
+	h.tf.planFile = true
+	h.aws.extra["rds describe-db-snapshots"] = `[]`
+	h.aws.extra["logs describe-log-groups"] = "0"
+	if err := h.run(); err != nil {
+		t.Fatalf("%v\n%s", err, h.out.String())
+	}
+	if len(h.tf.planBefore) != 1 {
+		t.Fatalf("plan paths seen: %v", h.tf.planBefore)
+	}
+	for p, mode := range h.tf.planBefore {
+		if mode != 0o600 {
+			t.Errorf("%s held mode %o (-1 = absent) when terraform wrote it, want 0600", p, mode)
+		}
+		if _, err := os.Stat(p); err == nil {
+			t.Errorf("%s was left behind", p)
+		}
+	}
+}
+
+func TestPrecreatePrivateRefusesWhatIsAlreadyThere(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "plan.tfplan")
+	if err := precreatePrivate(p); err != nil {
+		t.Fatal(err)
+	}
+	if st, _ := os.Stat(p); st.Mode().Perm() != 0o600 {
+		t.Errorf("mode = %v", st.Mode().Perm())
+	}
+	if err := precreatePrivate(p); err == nil {
+		t.Error("overwrote an existing file")
+	}
+	link := filepath.Join(dir, "link.tfplan")
+	if err := os.Symlink(filepath.Join(dir, "elsewhere"), link); err != nil {
+		t.Fatal(err)
+	}
+	if err := precreatePrivate(link); err == nil {
+		t.Error("followed a symlink")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "elsewhere")); err == nil {
+		t.Error("created the symlink's target")
+	}
+}

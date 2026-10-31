@@ -999,13 +999,16 @@ func (e *deployEnv) planAndApply(ctx context.Context, tf tfRunner) error {
 	defer os.Remove(planPath)
 	vf := "-var-file=" + tf.VarFile()
 
+	// A saved plan can hold secrets (the database password). Create it owner-only
+	// BEFORE Terraform writes it: Terraform truncates and fills an existing file
+	// without widening its mode, so it is never readable by anyone else, not even
+	// for the instant between its write and a chmod.
+	if err := precreatePrivate(planPath); err != nil {
+		return e.stop(checkResult{name: "plan file", status: checkFail, detail: firstLine(err.Error())}, "cannot protect the plan file")
+	}
 	e.printf("%s\n", sInfo("→ terraform plan"))
 	if err := e.streamTF(ctx, tf, 4, "plan", "plan", "-input=false", "-out="+planPath, vf); err != nil {
 		return err
-	}
-	// A saved plan can hold secrets (the database password): owner-only, always.
-	if err := os.Chmod(planPath, 0o600); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return e.stop(checkResult{name: "plan file", status: checkFail, detail: firstLine(err.Error())}, "cannot protect the plan file")
 	}
 	js, err := tf.Capture("show", "-json", planPath)
 	if err != nil {
@@ -1056,6 +1059,17 @@ func (e *deployEnv) planAndApply(ctx context.Context, tf tfRunner) error {
 	}
 	e.row(checkResult{name: "infrastructure", status: checkPass, detail: "applied"})
 	return nil
+}
+
+// precreatePrivate creates path as an empty file only its owner can read or write,
+// and fails if anything is already there (a symlink planted at a predictable name
+// included: O_EXCL does not follow it).
+func precreatePrivate(path string) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	return f.Close()
 }
 
 // tfStreamOpts shapes one streamTerraform run.

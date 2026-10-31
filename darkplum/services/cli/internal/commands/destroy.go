@@ -453,6 +453,9 @@ func (e *destroyEnv) finalSnapshot(tf tfRunner) (string, error) {
 func (e *destroyEnv) sanityPlan(ctx context.Context, tf tfRunner, vf string, state map[string]bool) error {
 	planPath := filepath.Join(e.in.Dir(), "destroy-"+e.now().UTC().Format("20060102T150405Z")+".tfplan")
 	defer os.Remove(planPath)
+	if err := precreatePrivate(planPath); err != nil {
+		return e.stop(checkResult{name: "plan -destroy", status: checkFail, detail: firstLine(err.Error()), hint: "cannot create the plan file privately. Nothing was changed"}, "cannot protect the plan file")
+	}
 	// A refresh of a large stack can be quiet for minutes: a heartbeat says it is
 	// alive, and a plan (read-only) that has not finished in planLimit is stopped
 	// rather than waited for forever. Its output is kept for the failure, not shown.

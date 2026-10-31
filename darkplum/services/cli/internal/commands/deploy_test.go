@@ -1253,6 +1253,15 @@ func TestDeployPlanFileIsOwnerOnlySweptAndNoOpIsSaid(t *testing.T) {
 	if h.tf.planMode != 0o600 {
 		t.Errorf("the saved plan was mode %v when terraform read it, want 0600", h.tf.planMode)
 	}
+	// ... and it was already 0600 when terraform first wrote it: never briefly readable.
+	if len(h.tf.planBefore) != 1 {
+		t.Fatalf("plan paths seen: %v", h.tf.planBefore)
+	}
+	for p, mode := range h.tf.planBefore {
+		if mode != 0o600 {
+			t.Errorf("%s held mode %o (-1 = absent) when terraform wrote it, want 0600 pre-created", p, mode)
+		}
+	}
 	for _, f := range []string{stale, staleD} {
 		if _, err := os.Stat(f); err == nil {
 			t.Errorf("%s was not swept", f)
