@@ -82,7 +82,7 @@ func renderTFVars(kvs []tfvarsKV, now time.Time) string {
 	if !now.IsZero() {
 		b.WriteString(" on " + now.UTC().Format("2006-01-02"))
 	}
-	b.WriteString(".\n# Change a value by re-running ./bin/darkplum init; every other variable keeps its\n# default (see variables.tf). Keep one `key = \"value\"` per line: the Makefile reads\n# aws_profile from here with sed.\n")
+	b.WriteString(".\n# Change a value by re-running darkplum init; every other variable keeps its\n# default (see variables.tf). Keep one `key = \"value\"` per line: the Makefile reads\n# aws_profile from here with sed.\n")
 	for _, kv := range kvs {
 		fmt.Fprintf(&b, "%s = %s\n", kv.Key, hclValue(kv.Value))
 	}

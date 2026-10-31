@@ -405,7 +405,7 @@ func TestConfigureFirstRunBedrock(t *testing.T) {
 	h.contains("✓ first admin", "Jane.Doe@acme.com created", "? Name [Jane Doe]", "enabled now",
 		"✓ test chat", "answered in", "Hello there!",
 		"Open darkplum: http://localhost:", "Sign in as Jane.Doe@acme.com", "Ctrl-C closes it",
-		"No team address yet: re-run ./bin/darkplum init to add a private HTTPS address")
+		"No team address yet: re-run darkplum init to add a private HTTPS address")
 	if got := api.users["Jane.Doe@acme.com"]; got != testPassword {
 		t.Errorf("setup did not carry the password")
 	}
@@ -624,7 +624,7 @@ func TestConfigureHoldOpenGivesUpAfterSecondDrop(t *testing.T) {
 	if err == nil || !IsReported(err) {
 		t.Fatalf("second drop must end with a reported ✗, got %v", err)
 	}
-	for _, w := range []string{"reconnecting", "(new address)", "✗ connection", "re-run ./bin/darkplum configure"} {
+	for _, w := range []string{"reconnecting", "(new address)", "✗ connection", "re-run darkplum configure"} {
 		if !strings.Contains(out.String(), w) {
 			t.Errorf("output lacks %q:\n%s", w, out.String())
 		}
@@ -657,7 +657,7 @@ func TestConfigureSelfHostedLoadingDoesNotBlockBedrock(t *testing.T) {
 	if err := h.run(&ConfigureCmd{}, "a@acme.com\n\n\n", testPassword, testPassword); err != nil {
 		t.Fatalf("configure: %v\n%s", err, h.out.String())
 	}
-	h.contains("! self-hosted model", "downloading the model weights", "re-run ./bin/darkplum configure", "✓ test chat")
+	h.contains("! self-hosted model", "downloading the model weights", "re-run darkplum configure", "✓ test chat")
 	if strings.Contains(h.out.String(), "waiting for the self-hosted model") {
 		t.Error("without --wait configure must not wait while a Bedrock model is ready")
 	}
@@ -673,7 +673,7 @@ func TestConfigureWaitModelNeverReady(t *testing.T) {
 		t.Fatalf("want a reported failure, got %v\n%s", err, h.out.String())
 	}
 	h.contains("waiting for the self-hosted model, up to 10 min", "self-hosted model: downloading the model weights",
-		"✗ self-hosted model", "not ready after 10 min", "logs -f deploy/vllm-inference -c model-download", `eval "$(./bin/darkplum kubeconfig)" && kubectl`)
+		"✗ self-hosted model", "not ready after 10 min", "logs -f deploy/vllm-inference -c model-download", `eval "$(darkplum kubeconfig)" && kubectl`)
 }
 
 func TestConfigureWaitThenEnablesSelfHosted(t *testing.T) {
@@ -768,7 +768,7 @@ func TestVLLMStateFromPods(t *testing.T) {
 			if s.phase != tc.phase || s.broken != tc.broken || s.ready != tc.ready {
 				t.Errorf("got %+v", s)
 			}
-			if s.broken && !strings.Contains(s.hint, `eval "$(./bin/darkplum kubeconfig)" && kubectl -n darkplum-inference`) {
+			if s.broken && !strings.Contains(s.hint, `eval "$(darkplum kubeconfig)" && kubectl -n darkplum-inference`) {
 				t.Errorf("diagnostic must validate the install first: %q", s.hint)
 			}
 		})
@@ -1058,7 +1058,7 @@ func TestConfigureWarnsWhenSSORedirectIsElsewhere(t *testing.T) {
 			t.Errorf("redirect %s: warning shown = %v, want %v\n%s", redirect, got, warn, h.out.String())
 		}
 		if warn {
-			h.contains("./bin/darkplum sso configure --redirect-url https://darkplum.acme.com/auth/callback")
+			h.contains("darkplum sso configure --redirect-url https://darkplum.acme.com/auth/callback")
 		}
 	}
 }

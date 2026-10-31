@@ -187,7 +187,7 @@ func installKube(w io.Writer, namespace, contextFlag, installName string) (*kube
 // kubectlHint is a kubectl command an operator can paste: it first has the
 // CLI validate the install and point that shell at its private kubeconfig.
 func kubectlHint(args string) string {
-	return `eval "$(./bin/darkplum kubeconfig)" && kubectl ` + args
+	return `eval "$(darkplum kubeconfig)" && kubectl ` + args
 }
 
 // KubeconfigCmd is `darkplum kubeconfig`.
@@ -196,7 +196,7 @@ type KubeconfigCmd struct {
 }
 
 // Run validates the install's cluster, rewrites its private kubeconfig and
-// prints `export KUBECONFIG=<path>` for `eval "$(./bin/darkplum kubeconfig)"`.
+// prints `export KUBECONFIG=<path>` for `eval "$(darkplum kubeconfig)"`.
 // It never touches ~/.kube/config or the current context. Rows go to stderr,
 // so only the export line reaches an eval.
 func (c *KubeconfigCmd) Run(g *Globals) error {

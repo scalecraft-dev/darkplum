@@ -14,7 +14,7 @@ type CLI struct {
 	Init       InitCmd          `cmd:"" help:"Create an install, or show an existing one and change its settings (run before deploy)."`
 	Deploy     DeployCmd        `cmd:"" help:"Create or update the install: infrastructure, verified images, the platform. Safe to re-run; it is also how you upgrade."`
 	Destroy    DestroyCmd       `cmd:"" help:"Delete the install's cloud resources (asks you to type the cluster name)."`
-	Configure  ConfigureCmd     `cmd:"" help:"First run after make deploy: create the first admin, enable models, send a test chat, open the web UI."`
+	Configure  ConfigureCmd     `cmd:"" help:"First run after darkplum deploy: create the first admin, enable models, send a test chat, open the web UI."`
 	Kubeconfig KubeconfigCmd    `cmd:"" help:"Validate the install's cluster and print export KUBECONFIG=<its private kubeconfig> (never touches ~/.kube)."`
 	Doctor     DoctorCmd        `cmd:"" help:"Read-only environment and health diagnostics."`
 	VerifyRel  VerifyReleaseCmd `cmd:"" name:"verify-release" hidden:"" help:"Verify, anonymously, that this build's images were signed by the release workflow (run by CI right after signing)."`

@@ -250,10 +250,10 @@ func Validate(cl Claim, aws AWSFunc) (ValidatedCluster, error) {
 		return ValidatedCluster{}, &Refusal{Detail: detail, Hint: hint, Cause: cause}
 	}
 	if cl.Region == "" {
-		return refuse("install settings name no region", "re-run ./bin/darkplum init", nil)
+		return refuse("install settings name no region", "re-run darkplum init", nil)
 	}
 	if len(cl.AccountIDs) == 0 {
-		return refuse("install settings pin no AWS account", "re-run ./bin/darkplum init so the install is pinned to one account", nil)
+		return refuse("install settings pin no AWS account", "re-run darkplum init so the install is pinned to one account", nil)
 	}
 	login := "aws sso login"
 	if cl.Profile != "" {
@@ -273,7 +273,7 @@ func Validate(cl Claim, aws AWSFunc) (ValidatedCluster, error) {
 	}
 	if !pinned {
 		return refuse(fmt.Sprintf("credentials are for account %s, not the install's account %s", caller, strings.Join(cl.AccountIDs, ",")),
-			"use the profile for the install's account (re-run ./bin/darkplum init to change it)", nil)
+			"use the profile for the install's account (re-run darkplum init to change it)", nil)
 	}
 
 	// 2. Only now look at the cluster.
@@ -299,11 +299,11 @@ func Validate(cl Claim, aws AWSFunc) (ValidatedCluster, error) {
 	ca, cerr := base64.StdEncoding.DecodeString(dc.CA)
 	arnAccount, ok := clusterARNAccount(dc.ARN, cl.Region, cl.Name)
 	if !ok {
-		return refuse("cluster ARN "+dc.ARN+" does not match "+cl.Name+" in "+cl.Region, "re-run ./bin/darkplum init", nil)
+		return refuse("cluster ARN "+dc.ARN+" does not match "+cl.Name+" in "+cl.Region, "re-run darkplum init", nil)
 	}
 	if arnAccount != caller {
 		return refuse(fmt.Sprintf("credentials are for account %s, the cluster is in %s", caller, arnAccount),
-			"use the profile for the install's account (re-run ./bin/darkplum init to change it)", nil)
+			"use the profile for the install's account (re-run darkplum init to change it)", nil)
 	}
 	// Only after the account is established: a cluster that is still being created
 	// in ANOTHER account is a refusal, not "not ready".

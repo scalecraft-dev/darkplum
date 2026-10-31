@@ -1,5 +1,5 @@
 # Written by `darkplum init`.
-# Change a value by re-running ./bin/darkplum init; every other variable keeps its
+# Change a value by re-running darkplum init; every other variable keeps its
 # default (see variables.tf). Keep one `key = "value"` per line: the Makefile reads
 # aws_profile from here with sed.
 aws_profile = "acme"
