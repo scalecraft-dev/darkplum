@@ -250,7 +250,7 @@ func newDeployHarness(t *testing.T, gpu int) *deployHarness {
 	}
 	h := &deployHarness{t: t, in: in, out: &bytes.Buffer{}, tl: &timeline{}, manifest: releaseManifest(),
 		images: map[string]string{}, imageID: map[string]string{}, nodeArch: "amd64",
-		iamRep:    iamcheck.Report{Checks: []iamcheck.Check{{Resource: "r", Want: "implicitDeny", Got: "implicitDeny"}}},
+		iamRep:    iamcheck.Report{Checks: []iamcheck.Check{{Resource: "r", Expect: "implicitDeny", Got: "implicitDeny", Pass: true}}},
 		session:   checkResult{name: "session lifetime", status: checkPass},
 		platforms: []string{"linux/amd64", "linux/arm64"},
 		clock:     &fakeClock{t: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)}}
@@ -305,7 +305,10 @@ func newDeployHarness(t *testing.T, gpu int) *deployHarness {
 			}
 			return out, nil
 		},
-		iam: func(iamcheck.Input) (iamcheck.Report, error) { h.tl.add("iam simulate"); return h.iamRep, h.iamErr },
+		iam: func(context.Context, iamcheck.Outputs) (iamcheck.Report, error) {
+			h.tl.add("iam simulate")
+			return h.iamRep, h.iamErr
+		},
 	}
 	h.env.flags.GPUWait = 5 * time.Minute
 	return h
@@ -344,6 +347,7 @@ func (h *deployHarness) script(gpu int) {
 		return nil, errors.New("no selector")
 	})
 	k.on("get svc vllm-inference", "None", nil)
+	k.on("annotate", "", nil)
 	k.on("apply", "", nil)
 }
 

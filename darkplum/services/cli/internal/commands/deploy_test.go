@@ -85,13 +85,21 @@ func TestDeployFreshBedrockOnlyInstallOrder(t *testing.T) {
 	for _, c := range h.k.matching("apply -f -") {
 		if strings.Contains(string(c.stdin), `"name":"darkplum-install"`) {
 			cm = true
-			if !strings.Contains(string(c.stdin), `"image-trust":"signed"`) || !strings.Contains(string(c.stdin), `"version":"1.2.3"`) {
+			if !strings.Contains(string(c.stdin), `"image-trust":"verified"`) || !strings.Contains(string(c.stdin), `"version":"1.2.3"`) || !strings.Contains(string(c.stdin), `"time":"`) {
 				t.Errorf("darkplum-install = %s", c.stdin)
 			}
 		}
 	}
 	if !cm {
 		t.Error("darkplum-install ConfigMap was not written")
+	}
+	// What `status` reads: ConfigMap keys and Deployment annotations.
+	if !strings.Contains(h.out.String(), "image-trust verified") {
+		t.Error("image trust not reported")
+	}
+	ann := h.k.matching("annotate deployment/darkplum-web")
+	if len(ann) != 1 || !strings.Contains(ann[0].joined(), "darkplum.ai/image-trust=verified") || !strings.Contains(ann[0].joined(), "darkplum.ai/release-channel=release") {
+		t.Errorf("annotations = %v", ann)
 	}
 	if rec, _ := h.in.Load(); rec.Bundle != "1.2.3" {
 		t.Errorf("the install record does not remember the applied release: %q", rec.Bundle)
@@ -783,7 +791,7 @@ func TestDeployNoGPUIsDegradedExitThree(t *testing.T) {
 func TestDeployLayer1(t *testing.T) {
 	t.Run("a role that does not behave as configured fails the deploy", func(t *testing.T) {
 		h := newDeployHarness(t, 0)
-		h.iamRep = iamcheck.Report{Checks: []iamcheck.Check{{Resource: "arn:x", Want: "implicitDeny", Got: "allowed"}}}
+		h.iamRep = iamcheck.Report{Checks: []iamcheck.Check{{Resource: "arn:x", Expect: "implicitDeny", Got: "allowed"}}}
 		if !IsReported(h.run()) {
 			t.Fatal("deploy passed with a gateway role wider than configured")
 		}
@@ -791,7 +799,7 @@ func TestDeployLayer1(t *testing.T) {
 	})
 	t.Run("IAM that cannot be asked is a warning, not a pass", func(t *testing.T) {
 		h := newDeployHarness(t, 0)
-		h.iamErr = errors.New("AccessDenied: iam:SimulatePrincipalPolicy")
+		h.iamErr = &iamcheck.SimulationError{First: "AccessDenied: iam:SimulatePrincipalPolicy"}
 		if err := h.run(); err != nil {
 			t.Fatal(err)
 		}
@@ -877,6 +885,9 @@ func TestDeployRecordsUnsignedTrust(t *testing.T) {
 		if strings.Contains(string(c.stdin), `"name":"darkplum-install"`) && !strings.Contains(string(c.stdin), `"image-trust":"unsigned"`) {
 			t.Errorf("an unsigned install was recorded as signed: %s", c.stdin)
 		}
+	}
+	if a := h.k.matching("annotate deployment/darkplum-api"); len(a) != 1 || !strings.Contains(a[0].joined(), "darkplum.ai/image-trust=unsigned") {
+		t.Errorf("deployment annotations = %v", a)
 	}
 }
 

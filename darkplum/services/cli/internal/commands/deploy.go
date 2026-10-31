@@ -147,10 +147,16 @@ func (c *DeployCmd) Run(g *Globals) error {
 }
 
 func openDeployLog(in install.Install, now time.Time) (*os.File, string, error) {
+	return openCommandLog(in, "deploy", now)
+}
+
+// openCommandLog creates <workspace>/logs/<command>-<time>.log (0600): the full
+// output of one run, kept for support and for the next run's diagnosis.
+func openCommandLog(in install.Install, command string, now time.Time) (*os.File, string, error) {
 	if err := os.MkdirAll(in.LogsDir(), 0o700); err != nil {
 		return nil, "", err
 	}
-	p := filepath.Join(in.LogsDir(), "deploy-"+now.UTC().Format("20060102T150405Z")+".log")
+	p := filepath.Join(in.LogsDir(), command+"-"+now.UTC().Format("20060102T150405Z")+".log")
 	f, err := os.OpenFile(p, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
 	if err != nil {
 		return nil, "", err
@@ -191,7 +197,7 @@ type deployEnv struct {
 	resolve   func(ctx context.Context) (verify.Verified, error)
 	platforms func(ctx context.Context, img release.Image) ([]string, error)
 	mirror    func(ctx context.Context, v verify.Verified, repos map[string]string, region string) ([]mirror.Mirrored, error)
-	iam       func(in iamcheck.Input) (iamcheck.Report, error)
+	iam       func(ctx context.Context, o iamcheck.Outputs) (iamcheck.Report, error)
 }
 
 // useRealSeams wires the production implementations of everything a test replaces.
@@ -212,8 +218,10 @@ func (e *deployEnv) useRealSeams() {
 		}
 		return mirror.Release(ctx, v, repos, auth, mirror.Options{})
 	}
-	e.iam = func(in iamcheck.Input) (iamcheck.Report, error) {
-		return iamcheck.Run(func(args ...string) (string, error) { return e.aws("aws", args...) }, in)
+	e.iam = func(ctx context.Context, o iamcheck.Outputs) (iamcheck.Report, error) {
+		return iamcheck.Run(ctx, func(args ...string) (string, error) {
+			return e.aws("aws", runner.ProfileArgs(e.rec.Profile, args...)...)
+		}, o)
 	}
 }
 
@@ -439,7 +447,7 @@ func (e *deployEnv) run(ctx context.Context) (err error) {
 		e.row(checkResult{name: "self-hosted model", status: checkWarn, detail: firstLine(err.Error()),
 			hint: "the platform is healthy and Bedrock models work; fix the GPU and run `darkplum deploy` again"})
 	}
-	iamFailed := e.layer1(out)
+	iamFailed := e.layer1(ctx, out)
 	if iamFailed {
 		return reportedError{"the gateway role does not behave as configured"}
 	}
@@ -476,7 +484,7 @@ func trustWord(v verify.Verified) string {
 	if v.Unsigned() {
 		return "unsigned"
 	}
-	return "signed"
+	return "verified"
 }
 
 // ---- dev-only flags ---------------------------------------------------------
@@ -787,41 +795,51 @@ func (e *deployEnv) planAndApply(ctx context.Context, tf tfRunner) error {
 	return nil
 }
 
-// streamTF runs one long Terraform command with its output on screen and in the
-// log, a heartbeat while it is quiet, and a 45 minute cap.
-func (e *deployEnv) streamTF(ctx context.Context, tf tfRunner, stepNo int, label string, args ...string) error {
+// streamTerraform runs one long Terraform command with its output on out, a
+// heartbeat while it is quiet, and a 45 minute cap. It returns the tail of what
+// Terraform printed (to recognise an expired session or a lock) and why its context ended
+// (nil, canceled or deadline exceeded), so the caller can tell a cancel or a
+// timeout from a failure.
+func streamTerraform(ctx context.Context, tf tfRunner, out io.Writer, now func() time.Time, heartbeat time.Duration, tag string, args ...string) (tl *tail, ctxErr error, err error) {
 	ctx, cancel := context.WithTimeout(ctx, 45*time.Minute)
 	defer cancel()
-	start := e.now()
+	start := now()
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		t := time.NewTicker(e.heartbeat)
+		t := time.NewTicker(heartbeat)
 		defer t.Stop()
 		for {
 			select {
 			case <-t.C:
-				el := e.now().Sub(start).Round(time.Second)
-				e.printf("%s\n", sDim(fmt.Sprintf("  [%d/%d] terraform %s %dm%02ds", stepNo, deploySteps, label, int(el.Minutes()), int(el.Seconds())%60)))
+				el := now().Sub(start).Round(time.Second)
+				fmt.Fprintf(out, "%s\n", sDim(fmt.Sprintf("  %s %dm%02ds", tag, int(el.Minutes()), int(el.Seconds())%60)))
 			case <-stop:
 				return
 			}
 		}
 	}()
-	tl := &tail{}
-	err := tf.Stream(ctx, io.MultiWriter(e.out, tl), args...)
+	tl = &tail{}
+	err = tf.Stream(ctx, io.MultiWriter(out, tl), args...)
 	close(stop)
 	wg.Wait()
+	return tl, ctx.Err(), err
+}
+
+// streamTF is streamTerraform for deploy, turning a failure into the row that
+// says what to do about it.
+func (e *deployEnv) streamTF(ctx context.Context, tf tfRunner, stepNo int, label string, args ...string) error {
+	tl, ctxErr, err := streamTerraform(ctx, tf, e.out, e.now, e.heartbeat, fmt.Sprintf("[%d/%d] terraform %s", stepNo, deploySteps, label), args...)
 	if err == nil {
 		return nil
 	}
 	hint := "see the output above; the full log is " + e.logPath
 	switch {
-	case errors.Is(ctx.Err(), context.Canceled):
+	case errors.Is(ctxErr, context.Canceled):
 		hint = "interrupted; Terraform stopped cleanly. Re-run `darkplum deploy` to continue"
-	case errors.Is(ctx.Err(), context.DeadlineExceeded):
+	case errors.Is(ctxErr, context.DeadlineExceeded):
 		hint = "stopped after 45 minutes. Re-run `darkplum deploy` to continue"
 	case strings.Contains(tl.String(), "Error acquiring the state lock"):
 		hint = "another Terraform run holds the state lock (its id is printed above). If you are sure nothing else is running: `terraform force-unlock <id>`"
@@ -1144,7 +1162,7 @@ func (e *deployEnv) recordInstall(kc *kube.Client, v verify.Verified, images map
 	}
 	data := map[string]string{
 		"version": e.manifest.Version, "channel": e.manifest.Channel, "commit": e.manifest.Commit,
-		"bundle": b.Hash()[:12], "image-trust": trustWord(v), "deployed-at": e.now().UTC().Format(time.RFC3339),
+		"bundle": b.Hash()[:12], "image-trust": trustWord(v), "time": e.now().UTC().Format(time.RFC3339),
 		"images-source-version": m.Version,
 	}
 	for _, svc := range release.Services {
@@ -1160,8 +1178,20 @@ func (e *deployEnv) recordInstall(kc *kube.Client, v verify.Verified, images map
 	if err != nil {
 		return err
 	}
-	_, err = kc.Run(body, "apply", "-f", "-")
-	return err
+	if _, err = kc.Run(body, "apply", "-f", "-"); err != nil {
+		return err
+	}
+	// The same facts on the Deployments, where `status` reads image trust. Metadata
+	// only: it does not roll the pods.
+	trust := trustWord(v)
+	for _, d := range []string{"darkplum-api", "darkplum-gateway", "darkplum-web"} {
+		if _, err := kc.Run(nil, "-n", platformNS, "annotate", "deployment/"+d, "--overwrite",
+			"darkplum.ai/image-trust="+trust, "darkplum.ai/release="+e.manifest.Version,
+			"darkplum.ai/release-channel="+e.manifest.Channel, "darkplum.ai/source-commit="+e.manifest.Commit); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ---- GPU model --------------------------------------------------------------------------
@@ -1247,19 +1277,20 @@ func gpuAllocatable(kc *kube.Client) bool {
 
 // layer1 runs the IAM self-test. A role that is wider or narrower than the install
 // says is a failure; being unable to ask IAM is a warning.
-func (e *deployEnv) layer1(out deployOutputs) (failed bool) {
-	rep, err := e.iam(iamcheck.Input{RoleARN: out.GatewayRoleARN, Region: out.InferenceRegion, Profile: e.rec.Profile, InvokeARNs: out.InvokeARNs})
-	if err != nil {
+func (e *deployEnv) layer1(ctx context.Context, out deployOutputs) (failed bool) {
+	rep, err := e.iam(ctx, iamcheck.Outputs{GatewayRoleARN: out.GatewayRoleARN, InferenceRegion: out.InferenceRegion, BedrockInvokeARNs: out.InvokeARNs})
+	var sim *iamcheck.SimulationError
+	if errors.As(err, &sim) || (err != nil && len(rep.Checks) == 0) {
 		e.row(checkResult{name: "layer 1 (IAM)", status: checkWarn, detail: firstLine(err.Error()),
 			hint: "could not ask IAM what the gateway role may do (needs iam:SimulatePrincipalPolicy); the allowlist was not verified"})
 		return false
 	}
 	for _, c := range rep.Checks {
 		st := checkPass
-		if !c.OK() {
+		if !c.Pass {
 			st = checkFail
 		}
-		e.row(checkResult{name: "layer 1 (IAM)", status: st, detail: fmt.Sprintf("%s: expected %s, got %s", c.Resource, c.Want, c.Got)})
+		e.row(checkResult{name: "layer 1 (IAM)", status: st, detail: fmt.Sprintf("%s: expected %s, got %s", c.Resource, c.Expect, c.Got)})
 	}
-	return !rep.OK()
+	return !rep.Passed()
 }
