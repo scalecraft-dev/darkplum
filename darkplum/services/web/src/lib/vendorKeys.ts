@@ -734,7 +734,7 @@ export function canInstallKeyOverTransport(
  * is not the one to leave somebody stuck behind at 2am.
  */
 export const WEB_PORT_FORWARD_COMMAND =
-  'eval "$(darkplum kubeconfig)" && \\\n  kubectl port-forward -n darkplum-system svc/darkplum-web 8081:80'
+  'eval "$(darkplum kubeconfig)" && \\\n  kubectl port-forward -n darkplum-system \\\n    svc/darkplum-web 8081:80'
 
 /** Where that port-forward puts Darkplum. Named in the copy so nobody has to
  *  infer the scheme from the port mapping. */
@@ -780,7 +780,20 @@ export const API_NOT_HTTPS_HELP = helpPlainText(API_NOT_HTTPS_HELP_PARTS)
  *  so this is the whole of it; guarded like the port-forward so it can only act
  *  on this install's cluster. */
 export const SECURE_COOKIES_FIX_COMMAND =
-  'eval "$(darkplum kubeconfig)" && \\\n  kubectl patch secret darkplum-auth -n darkplum-system -p \'{"stringData":{"SECURE_COOKIES":"true"}}\' && \\\n  kubectl rollout restart deployment/darkplum-api -n darkplum-system'
+  'eval "$(darkplum kubeconfig)" && \\\n  kubectl patch secret darkplum-auth -n darkplum-system \\\n    -p \'{"stringData":{"SECURE_COOKIES":"true"}}\' && \\\n  kubectl rollout restart -n darkplum-system \\\n    deployment/darkplum-api'
+
+export type TransportCommandRole = 'fix' | 'forward' | 'key'
+
+/** Which command blocks go under the transport copy, in the order the copy
+ *  names them. The api fix only when the copy about the api is showing: with an
+ *  older gateway (no forward either) the page is not offering a UI install. */
+export function transportCommandRoles(kind: KeyTransportHelp, withForward: boolean): TransportCommandRole[] {
+  const roles: TransportCommandRole[] = []
+  if (withForward && kind === 'api_not_https') roles.push('fix')
+  if (withForward) roles.push('forward')
+  roles.push('key')
+  return roles
+}
 
 /** Which of the two is true of this page. */
 export type KeyTransportHelp = 'page_not_https' | 'api_not_https'

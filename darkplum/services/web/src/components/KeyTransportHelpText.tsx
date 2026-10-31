@@ -1,8 +1,10 @@
+import { Fragment } from 'react'
 import { CodeBlock } from './ui/CodeBlock'
 import {
   KEY_TRANSPORT_HELP_PARTS,
   SECURE_COOKIES_FIX_COMMAND,
   WEB_PORT_FORWARD_COMMAND,
+  transportCommandRoles,
   type KeyTransportHelp,
 } from '../lib/vendorKeys'
 
@@ -32,24 +34,21 @@ export function KeyTransportCommands({
   withForward?: boolean
   wrapperClassName?: string
 }) {
-  const blocks: string[] = []
-  if (kind === 'api_not_https') blocks.push(SECURE_COOKIES_FIX_COMMAND)
-  if (withForward) blocks.push(WEB_PORT_FORWARD_COMMAND)
-  blocks.push(keyCommand)
+  const commands = { fix: SECURE_COOKIES_FIX_COMMAND, forward: WEB_PORT_FORWARD_COMMAND, key: keyCommand }
   return (
     <>
-      {blocks.map((cmd) => {
+      {transportCommandRoles(kind, withForward).map((role) => {
         const block = (
-          <CodeBlock key={cmd}>
-            <code>{cmd}</code>
+          <CodeBlock>
+            <code>{commands[role]}</code>
           </CodeBlock>
         )
         return wrapperClassName ? (
-          <div key={cmd} className={wrapperClassName}>
+          <div key={role} className={wrapperClassName}>
             {block}
           </div>
         ) : (
-          block
+          <Fragment key={role}>{block}</Fragment>
         )
       })}
     </>

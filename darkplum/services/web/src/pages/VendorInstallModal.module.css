@@ -250,9 +250,7 @@
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
-  /* Tighter than the modal's other panels: the 66-character port-forward line
-     has to fit the 520px modal without scrolling. */
-  padding: var(--space-2);
+  padding: var(--space-3);
   background: var(--info-bg);
   border-left: 2px solid var(--info-fg);
   border-radius: var(--radius-sm);
