@@ -722,34 +722,53 @@ func (e *destroyEnv) report(tf tfRunner) error {
 	// Things that must NOT be left: anything the cluster's controllers made in the
 	// account, found by the cluster tag (a load balancer, a network interface or a
 	// security group keeps a VPC, and the bill, alive).
-	if orphans := e.orphans(); len(orphans) > 0 {
+	orphans, unverified := e.orphans()
+	if len(orphans) > 0 {
 		e.phase("Still exists and should not")
 		for _, o := range orphans {
 			e.printf("  %s %s\n", sFail("✗"), o)
 		}
 		e.printf("\n  %s\n", sDim("These carry this cluster's tag. Delete them (or find what holds them) before the VPC can go; re-run `darkplum destroy` after."))
+		if len(unverified) > 0 {
+			e.printf("  %s\n", sWarn(fmt.Sprintf("! %d lookup(s) also failed, so there may be more: %s", len(unverified), strings.Join(unverified, "; "))))
+		}
 		return reportedError{fmt.Sprintf("%d resource(s) tagged for the cluster still exist", len(orphans))}
+	}
+	if len(unverified) > 0 {
+		// A lookup that failed is not proof of absence: no "Done", and a non-zero exit.
+		e.phase("Could not confirm the account is clean")
+		for _, u := range unverified {
+			e.printf("  %s %s\n", sWarn("?"), u)
+		}
+		e.printf("\n  %s\n", sDim("The infrastructure is destroyed, but these checks failed (a lapsed session or missing read permission looks like this). Fix that and re-run `darkplum destroy`: it only re-checks, nothing is deleted twice."))
+		return reportedError{fmt.Sprintf("%d check(s) for leftovers failed; the account was not confirmed clean", len(unverified))}
 	}
 	e.printf("\n%s\n", sSuccess("✓ Done. Nothing tagged for the cluster is left in the account."))
 	return nil
 }
 
-// orphans finds load balancers, network interfaces and security groups tagged for
-// this cluster. A lookup that fails is printed and is not an orphan.
-func (e *destroyEnv) orphans() []string {
+// orphans finds load balancers (v2 and Classic), network interfaces, security
+// groups and EBS volumes tagged for this cluster. A lookup that fails is not an
+// absence: it is returned as unverified, and the destroy then does not claim
+// the account is clean.
+func (e *destroyEnv) orphans() (found, unverified []string) {
 	rec := e.rec
 	c := rec.ClusterName
 	prof := func(args ...string) []string {
 		return runner.ProfileArgs(rec.Profile, append(args, "--region", rec.Region)...)
 	}
-	var found []string
 	list := func(kind string, out string, err error) {
 		if err != nil {
 			e.printf("  ? %s %s\n", kind, sDim("could not be checked: "+firstLine(err.Error())))
+			unverified = append(unverified, kind+": "+firstLine(err.Error()))
 			return
 		}
 		var ids []string
-		_ = json.Unmarshal([]byte(out), &ids)
+		if jerr := json.Unmarshal([]byte(out), &ids); jerr != nil {
+			e.printf("  ? %s %s\n", kind, sDim("unexpected answer"))
+			unverified = append(unverified, kind+": unexpected answer")
+			return
+		}
 		for _, id := range ids {
 			found = append(found, kind+" "+id)
 		}
@@ -760,13 +779,19 @@ func (e *destroyEnv) orphans() []string {
 		out, err = e.aws("aws", prof("ec2", "describe-security-groups", "--filters", f, "--query", "SecurityGroups[].GroupId", "--output", "json")...)
 		list("security group", out, err)
 	}
+	// Volumes a PersistentVolumeClaim made outlive the claim only if something went
+	// wrong; they keep billing and, attached, keep the VPC's instances alive.
+	out, err := e.aws("aws", prof("ec2", "describe-volumes", "--filters", "Name=tag-key,Values=kubernetes.io/cluster/"+c, "--query", "Volumes[].VolumeId", "--output", "json")...)
+	list("EBS volume", out, err)
 	// Load balancers carry the tag on the balancer, so list them and ask for tags.
-	out, err := e.aws("aws", prof("elbv2", "describe-load-balancers", "--query", "LoadBalancers[].LoadBalancerArn", "--output", "json")...)
+	out, err = e.aws("aws", prof("elbv2", "describe-load-balancers", "--query", "LoadBalancers[].LoadBalancerArn", "--output", "json")...)
 	if err != nil {
-		e.printf("  ? load balancer %s\n", sDim("could not be checked: "+firstLine(err.Error())))
+		list("load balancer", "", err)
 	} else {
 		var arns []string
-		_ = json.Unmarshal([]byte(out), &arns)
+		if jerr := json.Unmarshal([]byte(out), &arns); jerr != nil {
+			list("load balancer", "", errors.New("unexpected answer"))
+		}
 		for i := 0; i < len(arns); i += 20 {
 			end := min(i+20, len(arns))
 			args := []string{"elbv2", "describe-tags", "--resource-arns"}
@@ -776,6 +801,24 @@ func (e *destroyEnv) orphans() []string {
 			list("load balancer", tags, err)
 		}
 	}
+	// Classic ELBs (a Service of type LoadBalancer made by the in-tree controller).
+	out, err = e.aws("aws", prof("elb", "describe-load-balancers", "--query", "LoadBalancerDescriptions[].LoadBalancerName", "--output", "json")...)
+	if err != nil {
+		list("classic load balancer", "", err)
+	} else {
+		var names []string
+		if jerr := json.Unmarshal([]byte(out), &names); jerr != nil {
+			list("classic load balancer", "", errors.New("unexpected answer"))
+		}
+		for i := 0; i < len(names); i += 20 {
+			end := min(i+20, len(names))
+			args := []string{"elb", "describe-tags", "--load-balancer-names"}
+			args = append(args, names[i:end]...)
+			args = append(args, "--query", "TagDescriptions[?Tags[?Key=='kubernetes.io/cluster/"+c+"']].LoadBalancerName", "--output", "json")
+			tags, err := e.aws("aws", prof(args...)...)
+			list("classic load balancer", tags, err)
+		}
+	}
 	sort.Strings(found)
 	var uniq []string
 	for i, f := range found {
@@ -783,5 +826,5 @@ func (e *destroyEnv) orphans() []string {
 			uniq = append(uniq, f)
 		}
 	}
-	return uniq
+	return uniq, unverified
 }

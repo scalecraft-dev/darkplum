@@ -71,6 +71,13 @@ func (a *destroyAWS) run(name string, args ...string) (string, error) {
 	if strings.Contains(j, "ecr describe-repositories") {
 		return "", errors.New("RepositoryNotFoundException")
 	}
+	// The leftovers lookups find nothing unless a test says otherwise. They are
+	// scripted, not an error: a failed lookup is no longer treated as "none".
+	for _, q := range []string{"describe-network-interfaces", "describe-security-groups", "describe-volumes", "describe-load-balancers"} {
+		if strings.Contains(j, q) {
+			return "[]", nil
+		}
+	}
 	return "", fmt.Errorf("unexpected aws %s", j)
 }
 
@@ -1000,4 +1007,63 @@ func TestDestroyClusterStillBeingCreatedOrFailed(t *testing.T) {
 		}
 		h.contains("SKIPPING the Kubernetes phase", "FAILED")
 	})
+}
+
+// A leftovers lookup that fails is not "nothing left": no Done line, a non-zero
+// exit, and the lookup named.
+func TestDestroyFailedLeftoverLookupIsNotClean(t *testing.T) {
+	for _, q := range []string{"ec2 describe-network-interfaces", "ec2 describe-security-groups", "ec2 describe-volumes", "elbv2 describe-load-balancers", "elb describe-load-balancers"} {
+		t.Run(q, func(t *testing.T) {
+			h := newDestroyHarness(t)
+			h.aws.extra["rds describe-db-snapshots"] = `[]`
+			h.aws.extra["logs describe-log-groups"] = "0"
+			h.aws.extraErr[q] = errors.New("An error occurred (UnauthorizedOperation): not allowed")
+			err := h.run()
+			if !IsReported(err) {
+				t.Fatalf("err = %v\n%s", err, h.out.String())
+			}
+			if strings.Contains(h.out.String(), "Done") {
+				t.Errorf("said Done although a lookup failed:\n%s", h.out.String())
+			}
+			h.contains("Could not confirm the account is clean", "UnauthorizedOperation")
+			if !h.tf.ran("destroy") {
+				t.Error("the destroy itself should have run")
+			}
+		})
+	}
+}
+
+// Leftovers found AND a failed lookup: the finding fails the run and the failure is still said.
+func TestDestroyLeftoverAndFailedLookupAreBothReported(t *testing.T) {
+	h := newDestroyHarness(t)
+	h.aws.extra["rds describe-db-snapshots"] = `[]`
+	h.aws.extra["logs describe-log-groups"] = "0"
+	h.aws.extra["ec2 describe-volumes"] = `["vol-0abc"]`
+	h.aws.extraErr["elb describe-load-balancers"] = errors.New("Throttling")
+	if !IsReported(h.run()) {
+		t.Fatal("did not fail")
+	}
+	h.contains("EBS volume vol-0abc", "lookup(s) also failed", "Throttling")
+}
+
+// Volumes and Classic load balancers tagged for the cluster are leftovers too.
+func TestDestroyEBSVolumesAndClassicLoadBalancersAreLeftovers(t *testing.T) {
+	h := newDestroyHarness(t)
+	h.aws.extra["rds describe-db-snapshots"] = `[]`
+	h.aws.extra["logs describe-log-groups"] = "0"
+	h.aws.extra["ec2 describe-volumes"] = `["vol-0abc"]`
+	h.aws.extra["elb describe-load-balancers"] = `["a1b2c3"]`
+	h.aws.extra["elb describe-tags"] = `["a1b2c3"]`
+	if !IsReported(h.run()) {
+		t.Fatal("did not fail")
+	}
+	h.contains("EBS volume vol-0abc", "classic load balancer a1b2c3")
+	for _, ev := range h.tl.ev {
+		if strings.Contains(ev, "describe-volumes") && !strings.Contains(ev, "kubernetes.io/cluster/dp-trial") {
+			t.Errorf("an unfiltered volume lookup: %s", ev)
+		}
+		if strings.Contains(ev, "elb describe-tags") && !strings.Contains(ev, "kubernetes.io/cluster/dp-trial") {
+			t.Errorf("classic tags not filtered by the cluster tag: %s", ev)
+		}
+	}
 }
