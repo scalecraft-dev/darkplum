@@ -107,7 +107,7 @@ const semanticRouterProbeTimeout = 2 * time.Second
 // semanticRouterNotConfiguredWarning is the exact warning text surfaced on a
 // routed alias using classifier_kind='semantic_router' when the gateway's
 // own /health reports routing.classifier.semantic_router.status != "configured".
-const semanticRouterNotConfiguredWarning = "Semantic Router is not installed on the gateway — run 'make deploy-semantic-router'. Until then this alias always uses its default route."
+const semanticRouterNotConfiguredWarning = "Semantic Router is not installed on the gateway — turn the semantic router on with 'darkplum init', then run 'darkplum deploy'. Until then this alias always uses its default route."
 
 // RoutingHandler serves the model-alias and routing-policy admin endpoints.
 type RoutingHandler struct {

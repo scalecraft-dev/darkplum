@@ -214,7 +214,7 @@ type Record struct {
 	// SemanticRouter is whether the install runs the optional in-cluster intent
 	// classifier. It is a setting of the install, not of Terraform: `darkplum
 	// deploy` applies the router when it is true and removes it when it is false.
-	// Off by default, as `make deploy-semantic-router` was opt-in.
+	// Off by default: the router was always opt-in.
 	SemanticRouter bool `json:"semantic_router,omitempty"`
 }
 
