@@ -179,3 +179,15 @@ func TestReRunNeverTreatsTheInstallsOwnResourcesAsACollision(t *testing.T) {
 	}
 	sameRecord(t, in, rec)
 }
+
+// An adopted install can record several accounts. Start over cannot tell it is
+// the same install then, and the refusal says that, not "account X, not Y".
+func TestLockedFieldsMultiAccountSaysWhy(t *testing.T) {
+	old := install.Record{ClusterName: "c", Region: "us-east-2", AccountIDs: []string{"111111111111", "222222222222"},
+		Backend: install.Backend{Bucket: "b", Key: "k", Region: "us-east-2"}}
+	s := &settings{cluster: "c", region: "us-east-2", account: "111111111111"}
+	err := lockedFields(old, s, backendSpec{Bucket: "b", Key: "k", Region: "us-east-2"})
+	if err == nil || !strings.Contains(err.Error(), "records 2 AWS accounts (111111111111, 222222222222)") || !strings.Contains(err.Error(), "Start over answers for exactly one") {
+		t.Errorf("err = %v", err)
+	}
+}

@@ -999,7 +999,10 @@ func lockedFields(old install.Record, s *settings, spec backendSpec) error {
 		return fmt.Errorf("the cluster is %s, not %s", old.ClusterName, s.cluster)
 	case s.region != old.Region:
 		return fmt.Errorf("the install is in %s, not %s", old.Region, s.region)
-	case len(old.AccountIDs) != 1 || old.AccountIDs[0] != s.account:
+	case len(old.AccountIDs) != 1:
+		return fmt.Errorf("the install records %d AWS accounts (%s), and Start over answers for exactly one, so it cannot confirm it is the same install; leave its settings, or change them from the other choices in this menu",
+			len(old.AccountIDs), strings.Join(old.AccountIDs, ", "))
+	case old.AccountIDs[0] != s.account:
 		return fmt.Errorf("the install is in account %s, not %s", strings.Join(old.AccountIDs, ", "), s.account)
 	case spec.Bucket != old.Backend.Bucket || spec.Key != old.Backend.Key || spec.Region != old.Backend.Region:
 		return fmt.Errorf("the install keeps its state at s3://%s/%s (%s), not s3://%s/%s (%s)",
