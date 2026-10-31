@@ -40,6 +40,7 @@ type fakeTF struct {
 	outputsErr  error
 	initErr     error
 	importErr   error
+	rmErr       error
 	streamErr   map[string]error // by first arg
 	streamText  map[string]string
 	streamDelay time.Duration
@@ -63,6 +64,9 @@ func (f *fakeTF) Capture(args ...string) ([]byte, error) {
 	f.record(args...)
 	switch args[0] {
 	case "state":
+		if len(args) > 1 && args[1] == "rm" {
+			return nil, f.rmErr
+		}
 		if f.stateErr != nil {
 			return nil, f.stateErr
 		}
@@ -347,6 +351,7 @@ func (h *deployHarness) script(gpu int) {
 		return nil, errors.New("no selector")
 	})
 	k.on("get svc vllm-inference", "None", nil)
+	k.on("patch secret postgres-credentials", "", nil)
 	k.on("annotate", "", nil)
 	k.on("apply", "", nil)
 }

@@ -68,6 +68,9 @@ type secretOutcome struct {
 	Created     bool
 	Added       []string // keys added to a Secret that already existed
 	Overwritten []string // keys replaced because the caller asked for it
+	// StrippedAnnotation is set when a last-applied-configuration annotation (a
+	// clear-text copy of the values) was removed from an existing Secret.
+	StrippedAnnotation bool
 }
 
 // kubeNotFound reports a kubectl "NotFound" that names this very object. A bare
@@ -115,6 +118,14 @@ func ensureSecret(kc *kube.Client, ns, name string, keys []secretKey) (secretOut
 	if err != nil {
 		return res, fmt.Errorf("secret %s: %w", name, err)
 	}
+	// A Secret written by an older flow with client-side apply carries its own
+	// values, in clear text, in the last-applied-configuration annotation.
+	if hasLastApplied(out) {
+		if err := stripLastApplied(kc, ns, name); err != nil {
+			return secretOutcome{}, err
+		}
+		res.StrippedAnnotation = true
+	}
 	patch := map[string]string{}
 	for _, k := range keys {
 		switch {
@@ -141,6 +152,31 @@ func ensureSecret(kc *kube.Client, ns, name string, keys []secretKey) (secretOut
 	sort.Strings(res.Added)
 	sort.Strings(res.Overwritten)
 	return res, nil
+}
+
+const lastAppliedAnnotation = "kubectl.kubernetes.io/last-applied-configuration"
+
+func hasLastApplied(secretJSON string) bool {
+	var s struct {
+		Metadata struct {
+			Annotations map[string]string `json:"annotations"`
+		} `json:"metadata"`
+	}
+	if json.Unmarshal([]byte(secretJSON), &s) != nil {
+		return false
+	}
+	_, ok := s.Metadata.Annotations[lastAppliedAnnotation]
+	return ok
+}
+
+// stripLastApplied removes the annotation and nothing else: a merge patch of one
+// metadata key, so the Secret's values are not touched.
+func stripLastApplied(kc *kube.Client, ns, name string) error {
+	body, _ := json.Marshal(map[string]any{"metadata": map[string]any{"annotations": map[string]any{lastAppliedAnnotation: nil}}})
+	if _, err := kc.Run(body, "-n", ns, "patch", "secret", name, "--type", "merge", "--patch-file", "/dev/stdin"); err != nil {
+		return fmt.Errorf("remove the clear-text last-applied annotation from secret %s: %w", name, err)
+	}
+	return nil
 }
 
 // secretKeysPresent reads the names of the keys with a non-empty value from a
@@ -212,5 +248,7 @@ func applyPostgresSecret(kc *kube.Client, ns, databaseURL string) error {
 	if _, err := kc.Run(body, "apply", "--server-side", "--force-conflicts", "--field-manager=darkplum-deploy", "-f", "-"); err != nil {
 		return fmt.Errorf("write secret %s: %w", postgresSecretName, err)
 	}
-	return nil
+	// An install made by the Makefile flow has the old URL in clear text in this
+	// annotation; server-side apply does not remove it.
+	return stripLastApplied(kc, ns, postgresSecretName)
 }

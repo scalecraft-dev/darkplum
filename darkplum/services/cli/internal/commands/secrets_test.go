@@ -201,7 +201,7 @@ func TestUserHMACRules(t *testing.T) {
 
 func TestPostgresSecretViaStdinServerSide(t *testing.T) {
 	const url = "postgres://u:p%40ss@db.example:5432/darkplum"
-	k := newScriptKube(t).on("apply --server-side", "", nil)
+	k := newScriptKube(t).on("apply --server-side", "", nil).on("patch secret", "", nil)
 	if err := applyPostgresSecret(k.client("darkplum-system"), "darkplum-system", url); err != nil {
 		t.Fatal(err)
 	}
@@ -241,5 +241,58 @@ func TestSSOApplyAbortsOnUnreadableSecret(t *testing.T) {
 	}
 	if len(k.matching("rollout")) != 0 {
 		t.Error("must not restart the api after a failed secret step")
+	}
+}
+
+func secretWithLastApplied(data map[string]string) string {
+	enc := map[string]string{}
+	for k, v := range data {
+		enc[k] = b64(v)
+	}
+	b, _ := json.Marshal(map[string]any{"data": enc, "metadata": map[string]any{"annotations": map[string]string{
+		"kubectl.kubernetes.io/last-applied-configuration": `{"data":{"SESSION_SIGNING_KEY":"clear-text-copy"}}`}}})
+	return string(b)
+}
+
+func TestClearTextLastAppliedAnnotationIsRemovedWithoutTouchingValues(t *testing.T) {
+	all := map[string]string{"SESSION_SIGNING_KEY": "a", "SERVICE_KEY_SECRET": "b"}
+	for _, k := range oidcKeys {
+		all[k] = "unconfigured"
+	}
+	for name, run := range map[string]func(k *scriptKube) error{
+		"auth": func(k *scriptKube) error {
+			k.on("get secret darkplum-auth", secretWithLastApplied(all), nil)
+			_, err := ensureAuthSecret(k.client("darkplum-system"), "darkplum-system", nil)
+			return err
+		},
+		"user-hmac": func(k *scriptKube) error {
+			k.on("get secret darkplum-user-hmac", secretWithLastApplied(map[string]string{"user-hmac-key": "x", "user-hmac-key-id": "k1"}), nil)
+			_, err := ensureUserHMAC(k.client("darkplum-system"), "darkplum-system")
+			return err
+		},
+		"postgres": func(k *scriptKube) error {
+			k.on("apply --server-side", "", nil)
+			return applyPostgresSecret(k.client("darkplum-system"), "darkplum-system", "postgres://u:p@h/d")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			k := newScriptKube(t).on("patch secret", "", nil)
+			if err := run(k); err != nil {
+				t.Fatal(err)
+			}
+			p := k.matching("patch secret")
+			if len(p) != 1 || !strings.Contains(string(p[0].stdin), `"kubectl.kubernetes.io/last-applied-configuration":null`) {
+				t.Fatalf("patches = %v", p)
+			}
+			if strings.Contains(string(p[0].stdin), "stringData") || strings.Contains(string(p[0].stdin), "\"data\"") {
+				t.Errorf("the strip patch touched values: %s", p[0].stdin)
+			}
+			k.assertClean("clear-text-copy")
+		})
+	}
+	// A Secret without the annotation is not patched at all.
+	k := newScriptKube(t).on("get secret darkplum-user-hmac", secretJSON(map[string]string{"user-hmac-key": "x", "user-hmac-key-id": "k1"}), nil)
+	if _, err := ensureUserHMAC(k.client("darkplum-system"), "darkplum-system"); err != nil || len(k.matching("patch")) != 0 {
+		t.Errorf("err=%v patches=%d", err, len(k.matching("patch")))
 	}
 }
