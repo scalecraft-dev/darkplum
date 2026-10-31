@@ -27,6 +27,22 @@ var ErrClusterNotFound = errors.New("cluster not found")
 // was interrupted is exactly in this state and must be able to continue.
 var ErrClusterNotReady = errors.New("cluster not ready")
 
+// NotReadyError is the typed form of ErrClusterNotReady (errors.Is matches both).
+// Status is the EKS cluster status as AWS reported it (CREATING, FAILED, ...);
+// callers decide on it, never on the display text. It is empty-valued only when
+// AWS reported none.
+type NotReadyError struct {
+	Cluster string
+	Status  string
+	Why     string
+}
+
+func (e *NotReadyError) Error() string {
+	return fmt.Sprintf("%s: %s %s", ErrClusterNotReady, e.Cluster, e.Why)
+}
+
+func (e *NotReadyError) Is(target error) bool { return target == ErrClusterNotReady }
+
 // Claim is what the install says its cluster is. Nothing in it is trusted until
 // Validate has checked it against AWS.
 type Claim struct {
@@ -309,7 +325,7 @@ func Validate(cl Claim, aws AWSFunc) (ValidatedCluster, error) {
 	// in ANOTHER account is a refusal, not "not ready".
 	notReady := func(why string) (ValidatedCluster, error) {
 		return refuse("cluster "+cl.Name+" "+why, "wait for the deploy to finish, then re-run",
-			fmt.Errorf("%w: %s %s", ErrClusterNotReady, cl.Name, why))
+			&NotReadyError{Cluster: cl.Name, Status: dc.Status, Why: why})
 	}
 	if dc.Status != "" && dc.Status != "ACTIVE" && dc.Status != "UPDATING" {
 		return notReady("is " + dc.Status)

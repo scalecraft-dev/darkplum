@@ -992,6 +992,15 @@ func TestDestroyClusterStillBeingCreatedOrFailed(t *testing.T) {
 		h.assertNothingDeleted()
 		h.contains("still changing state", "darkplum destroy")
 	})
+	t.Run("ACTIVE with no endpoint yet is not FAILED: nothing deleted", func(t *testing.T) {
+		h := newDestroyHarness(t)
+		h.aws.base.status = "ACTIVE"
+		h.aws.base.noEndpoint = true
+		if !IsReported(h.run()) {
+			t.Fatal("went on")
+		}
+		h.assertNothingDeleted()
+	})
 	t.Run("FAILED: Kubernetes skipped loudly, the infrastructure is destroyed", func(t *testing.T) {
 		h := newDestroyHarness(t)
 		h.aws.base.status = "FAILED"

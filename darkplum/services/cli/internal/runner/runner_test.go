@@ -158,6 +158,10 @@ func TestValidateNotReadyIsDistinctFromARefusal(t *testing.T) {
 			if v.Valid() || !errors.Is(err, ErrClusterNotReady) {
 				t.Fatalf("handle=%v err=%v, want ErrClusterNotReady and no handle", v.Valid(), err)
 			}
+			var nr *NotReadyError
+			if !errors.As(err, &nr) || nr.Status != a.status {
+				t.Fatalf("err=%v: want a *NotReadyError carrying the EKS status %q", err, a.status)
+			}
 		})
 	}
 	a := goodAWS()

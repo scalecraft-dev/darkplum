@@ -249,7 +249,8 @@ func (e *destroyEnv) run(ctx context.Context) (err error) {
 		// An interrupted first deploy leaves exactly this. FAILED never ran a workload
 		// and will not recover: nothing to clean in Kubernetes. Anything else is still
 		// moving, and deleting around it would race the creation.
-		if strings.Contains(row.detail, " is FAILED") {
+		var nr *runner.NotReadyError
+		if errors.As(cerr2, &nr) && nr.Status == "FAILED" {
 			e.row(checkResult{name: "cluster", status: checkWarn, detail: row.detail,
 				hint: "SKIPPING the Kubernetes phase: a FAILED cluster never ran Darkplum's workloads, so there are no load balancers or volumes of ours to clean up"})
 			break
