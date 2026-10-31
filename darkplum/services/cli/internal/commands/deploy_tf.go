@@ -29,7 +29,7 @@ type tfRunner interface {
 	Capture(args ...string) ([]byte, error)
 	// Stream runs a long command, writing its output to w as it is produced.
 	// Cancelling ctx interrupts it.
-	Stream(ctx context.Context, w io.Writer, args ...string) error
+	Stream(ctx context.Context, w io.Writer, opts runner.StreamOptions, args ...string) error
 	// K8s is the bundle's Kubernetes tree, re-verified against the hash shipped in
 	// this binary.
 	K8s() (fs.FS, error)
@@ -102,8 +102,8 @@ func (t *realTF) Capture(args ...string) ([]byte, error) {
 	return out, nil
 }
 
-func (t *realTF) Stream(ctx context.Context, w io.Writer, args ...string) error {
-	if err := runner.TerraformStream(ctx, t.v, t.dirs, t.env, w, args...); err != nil {
+func (t *realTF) Stream(ctx context.Context, w io.Writer, opts runner.StreamOptions, args ...string) error {
+	if err := runner.TerraformStream(ctx, t.v, t.dirs, t.env, w, opts, args...); err != nil {
 		return &tfFailure{Cmd: args[0], Err: err}
 	}
 	return nil

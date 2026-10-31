@@ -7,11 +7,9 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"sort"
 	"strings"
-	"syscall"
 	"time"
 
 	"golang.org/x/term"
@@ -76,14 +74,9 @@ func (c *DestroyCmd) Run(g *Globals) error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	sigs := make(chan os.Signal, 2)
-	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(sigs)
-	go func() {
-		<-sigs
-		fmt.Fprintln(e.out, "\n"+sWarn("! interrupted: stopping cleanly (Terraform releases its state lock)."))
-		cancel()
-	}()
+	force, stop := watchInterrupts(e.out, cancel)
+	defer stop()
+	e.force = force
 	return e.run(ctx)
 }
 
@@ -112,6 +105,7 @@ type destroyEnv struct {
 	// protectionOff is set once the database's deletion protection has been turned
 	// off, so a later failure can say so.
 	protectionOff bool
+	force         <-chan struct{}
 }
 
 var darkplumNamespaces = map[string]bool{platformNS: true, inferenceNS: true}
@@ -249,7 +243,7 @@ func (e *destroyEnv) run(ctx context.Context) (err error) {
 		}
 		mutated = true
 		e.printf("%s\n", sInfo("→ turning off the database's deletion protection (a targeted apply)"))
-		if _, _, err := streamTerraform(ctx, tf, e.out, e.now, e.heartbeat, "terraform apply (protection)",
+		if _, _, err := streamTerraform(ctx, tf, e.out, e.now, e.heartbeat, "terraform apply (protection)", e.force,
 			"apply", "-auto-approve", "-input=false", vf, "-var", "db_deletion_protection=false", "-target="+rdsAddr); err != nil {
 			return e.stop(checkResult{name: "deletion protection", status: checkFail, detail: firstLine(err.Error()),
 				hint: "the database is unchanged and Kubernetes was not touched. If the session lapsed: `" + login + "`"}, "cannot turn off deletion protection")
@@ -289,7 +283,7 @@ func (e *destroyEnv) run(ctx context.Context) (err error) {
 	}
 	mutated = true
 	e.printf("%s\n", sInfo("→ terraform destroy (10-15 minutes)"))
-	tl, _, derr := streamTerraform(ctx, tf, e.out, e.now, e.heartbeat, "terraform destroy", "destroy", "-auto-approve", "-input=false", vf)
+	tl, _, derr := streamTerraform(ctx, tf, e.out, e.now, e.heartbeat, "terraform destroy", e.force, "destroy", "-auto-approve", "-input=false", vf)
 	if derr != nil {
 		hint := "see the output above; the full log is " + e.logPath
 		if h := (&deployEnv{rec: rec}).loginHint(tl.String()); !strings.HasPrefix(h, "fix the above") {
@@ -388,7 +382,7 @@ func (e *destroyEnv) finalSnapshot(tf tfRunner) (string, error) {
 func (e *destroyEnv) sanityPlan(ctx context.Context, tf tfRunner, vf string, state map[string]bool) error {
 	planPath := filepath.Join(e.in.Dir(), "destroy-"+e.now().UTC().Format("20060102T150405Z")+".tfplan")
 	defer os.Remove(planPath)
-	if err := tf.Stream(ctx, io.Discard, "plan", "-destroy", "-input=false", "-out="+planPath, vf); err != nil {
+	if err := tf.Stream(ctx, io.Discard, runner.StreamOptions{Force: e.force}, "plan", "-destroy", "-input=false", "-out="+planPath, vf); err != nil {
 		return e.stop(checkResult{name: "plan -destroy", status: checkFail, detail: firstLine(err.Error()),
 			hint: "Terraform cannot plan the teardown; fix that first. Kubernetes was not touched"}, "the destroy does not plan")
 	}

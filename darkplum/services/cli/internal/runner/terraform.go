@@ -44,21 +44,85 @@ func Terraform(v bundle.Verified, d TerraformDirs, env []string, args ...string)
 	return out.Bytes(), errb.String(), err
 }
 
+// StreamOptions shape how a streamed Terraform run ends.
+type StreamOptions struct {
+	// Force, when closed, kills Terraform and everything it started (a second
+	// Ctrl-C). Nothing else kills a run that has been asked to stop.
+	Force <-chan struct{}
+	// Grace is the backstop for an interrupted run that never stops: after it,
+	// the run is killed. Zero means 30 minutes. It is far longer than any step
+	// Terraform cannot safely abandon (an EKS cluster or database create).
+	Grace time.Duration
+	// Waiting, if set, is called every WaitingEvery (30s when zero) while an
+	// interrupted run winds down, with the time since the interrupt.
+	Waiting      func(sinceInterrupt time.Duration)
+	WaitingEvery time.Duration
+}
+
 // TerraformStream is Terraform for the long commands (plan, apply, destroy): the
-// output of both streams, interleaved, goes to out as it is produced. Cancelling
-// ctx sends Terraform an interrupt (it stops gracefully and releases the state
-// lock) rather than killing it; it is killed only if it ignores that for two
-// minutes.
-func TerraformStream(ctx context.Context, v bundle.Verified, d TerraformDirs, env []string, out io.Writer, args ...string) error {
-	cmd, err := terraformCmd(ctx, v, d, env, args)
+// output of both streams, interleaved, goes to out as it is produced.
+//
+// Cancelling ctx sends Terraform exactly ONE interrupt and then waits for it. A
+// second interrupt tells Terraform to quit without releasing the state lock or
+// finishing the resource in flight, so it must not happen by accident:
+//   - Terraform runs in its own process group, so the terminal's Ctrl-C reaches
+//     the CLI alone and not Terraform as well;
+//   - the CLI signals Terraform's own process, not the group, so its providers
+//     are stopped by Terraform and not signalled twice;
+//   - nothing kills it on a timer short of Grace, and a kill otherwise comes only
+//     from opts.Force.
+func TerraformStream(ctx context.Context, v bundle.Verified, d TerraformDirs, env []string, out io.Writer, opts StreamOptions, args ...string) error {
+	cmd, err := terraformCmd(context.Background(), v, d, env, args)
 	if err != nil {
 		return err
 	}
 	w := &syncWriter{w: out}
 	cmd.Stdout, cmd.Stderr = w, w
-	cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
-	cmd.WaitDelay = 2 * time.Minute
-	return cmd.Run()
+	setProcessGroup(cmd)
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	grace := opts.Grace
+	if grace <= 0 {
+		grace = 30 * time.Minute
+	}
+	every := opts.WaitingEvery
+	if every <= 0 {
+		every = 30 * time.Second
+	}
+	var interrupted <-chan struct{} = ctx.Done()
+	var backstop <-chan time.Time
+	var tick <-chan time.Time
+	var since time.Time
+	for {
+		select {
+		case err := <-done:
+			return err
+		case <-interrupted:
+			interrupted = nil // exactly once
+			_ = cmd.Process.Signal(os.Interrupt)
+			since = time.Now()
+			bt := time.NewTimer(grace)
+			defer bt.Stop()
+			backstop = bt.C
+			tk := time.NewTicker(every)
+			defer tk.Stop()
+			tick = tk.C
+		case <-tick:
+			if opts.Waiting != nil {
+				opts.Waiting(time.Since(since))
+			}
+		case <-opts.Force:
+			_ = forceKillProcessGroup(cmd)
+			return <-done
+		case <-backstop:
+			_ = forceKillProcessGroup(cmd)
+			return <-done
+		}
+	}
 }
 
 // syncWriter serialises writes so the two streams cannot interleave mid-line

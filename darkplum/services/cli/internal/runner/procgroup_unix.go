@@ -23,3 +23,12 @@ func killProcessGroup(cmd *exec.Cmd) error {
 	}
 	return syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 }
+
+// forceKillProcessGroup kills the child and anything it started, without giving
+// them a chance to clean up. It is the second Ctrl-C's answer, never the first.
+func forceKillProcessGroup(cmd *exec.Cmd) error {
+	if cmd.Process == nil {
+		return nil
+	}
+	return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+}

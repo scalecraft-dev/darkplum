@@ -21,6 +21,7 @@ import (
 	"github.com/scalecraft-dev/darkplum/cli/internal/kube"
 	"github.com/scalecraft-dev/darkplum/cli/internal/mirror"
 	"github.com/scalecraft-dev/darkplum/cli/internal/release"
+	"github.com/scalecraft-dev/darkplum/cli/internal/runner"
 	"github.com/scalecraft-dev/darkplum/cli/internal/verify"
 )
 
@@ -97,7 +98,7 @@ func (f *fakeTF) Capture(args ...string) ([]byte, error) {
 	return nil, fmt.Errorf("unexpected terraform %v", args)
 }
 
-func (f *fakeTF) Stream(ctx context.Context, w io.Writer, args ...string) error {
+func (f *fakeTF) Stream(ctx context.Context, w io.Writer, _ runner.StreamOptions, args ...string) error {
 	f.record(args...)
 	if txt := f.streamText[args[0]]; txt != "" {
 		fmt.Fprintln(w, txt)

@@ -8,12 +8,10 @@ import (
 	"io"
 	"io/fs"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"golang.org/x/term"
@@ -119,30 +117,9 @@ func (c *DeployCmd) Run(g *Globals) error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	sigs := make(chan os.Signal, 2)
-	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
-	defer signal.Stop(sigs)
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		n := 0
-		for {
-			select {
-			case <-sigs:
-				n++
-				if n == 1 {
-					fmt.Fprintln(e.out, "\n"+sWarn("! interrupted: stopping Terraform cleanly (it releases its state lock). Ctrl-C again to quit now."))
-					cancel()
-					continue
-				}
-				fmt.Fprintln(e.out, "\n"+sFail("✗ quit while Terraform may still hold the state lock.")+
-					"\n  If the next run reports a lock, it prints the lock id: `terraform force-unlock <id>` clears it (only when nothing else is running).")
-				os.Exit(130)
-			case <-done:
-				return
-			}
-		}
-	}()
+	force, stop := watchInterrupts(e.out, cancel)
+	defer stop()
+	e.force = force
 	return e.run(ctx)
 }
 
@@ -184,6 +161,8 @@ type deployEnv struct {
 	// mutated is set when the run first changes anything, so a failure before then
 	// can say nothing was touched.
 	mutated bool
+	// force is closed by a second Ctrl-C and kills a running Terraform.
+	force <-chan struct{}
 
 	interactive bool
 	confirm     func(question string) bool
@@ -728,13 +707,17 @@ func (e *deployEnv) adoptLogGroup(tf tfRunner) error {
 // tail keeps the last few KB of what Terraform printed, to recognise an expired
 // session in it after the fact.
 type tail struct {
-	mu  sync.Mutex
-	buf []byte
+	mu   sync.Mutex
+	buf  []byte
+	last time.Time
 }
+
+func (t *tail) lastWrite() time.Time { t.mu.Lock(); defer t.mu.Unlock(); return t.last }
 
 func (t *tail) Write(p []byte) (int, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.last = time.Now()
 	t.buf = append(t.buf, p...)
 	if len(t.buf) > 16<<10 {
 		t.buf = t.buf[len(t.buf)-8<<10:]
@@ -800,12 +783,13 @@ func (e *deployEnv) planAndApply(ctx context.Context, tf tfRunner) error {
 // Terraform printed (to recognise an expired session or a lock) and why its context ended
 // (nil, canceled or deadline exceeded), so the caller can tell a cancel or a
 // timeout from a failure.
-func streamTerraform(ctx context.Context, tf tfRunner, out io.Writer, now func() time.Time, heartbeat time.Duration, tag string, args ...string) (tl *tail, ctxErr error, err error) {
+func streamTerraform(ctx context.Context, tf tfRunner, out io.Writer, now func() time.Time, heartbeat time.Duration, tag string, force <-chan struct{}, args ...string) (tl *tail, ctxErr error, err error) {
 	ctx, cancel := context.WithTimeout(ctx, 45*time.Minute)
 	defer cancel()
 	start := now()
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
+	tl = &tail{}
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -814,6 +798,10 @@ func streamTerraform(ctx context.Context, tf tfRunner, out io.Writer, now func()
 		for {
 			select {
 			case <-t.C:
+				// Terraform's own output says it is alive; the heartbeat is for quiet stretches.
+				if time.Since(tl.lastWrite()) < heartbeat {
+					continue
+				}
 				el := now().Sub(start).Round(time.Second)
 				fmt.Fprintf(out, "%s\n", sDim(fmt.Sprintf("  %s %dm%02ds", tag, int(el.Minutes()), int(el.Seconds())%60)))
 			case <-stop:
@@ -821,8 +809,11 @@ func streamTerraform(ctx context.Context, tf tfRunner, out io.Writer, now func()
 			}
 		}
 	}()
-	tl = &tail{}
-	err = tf.Stream(ctx, io.MultiWriter(out, tl), args...)
+	opts := runner.StreamOptions{Force: force, Waiting: func(d time.Duration) {
+		fmt.Fprintf(out, "%s\n", sDim(fmt.Sprintf("  waiting for terraform to finish safely (%dm%02ds since the interrupt); it releases the state lock when it stops. Ctrl-C again to kill it.",
+			int(d.Minutes()), int(d.Seconds())%60)))
+	}}
+	err = tf.Stream(ctx, io.MultiWriter(out, tl), opts, args...)
 	close(stop)
 	wg.Wait()
 	return tl, ctx.Err(), err
@@ -831,7 +822,7 @@ func streamTerraform(ctx context.Context, tf tfRunner, out io.Writer, now func()
 // streamTF is streamTerraform for deploy, turning a failure into the row that
 // says what to do about it.
 func (e *deployEnv) streamTF(ctx context.Context, tf tfRunner, stepNo int, label string, args ...string) error {
-	tl, ctxErr, err := streamTerraform(ctx, tf, e.out, e.now, e.heartbeat, fmt.Sprintf("[%d/%d] terraform %s", stepNo, deploySteps, label), args...)
+	tl, ctxErr, err := streamTerraform(ctx, tf, e.out, e.now, e.heartbeat, fmt.Sprintf("[%d/%d] terraform %s", stepNo, deploySteps, label), e.force, args...)
 	if err == nil {
 		return nil
 	}

@@ -12,3 +12,5 @@ func killProcessGroup(cmd *exec.Cmd) error {
 	}
 	return cmd.Process.Kill()
 }
+
+func forceKillProcessGroup(cmd *exec.Cmd) error { return killProcessGroup(cmd) }
