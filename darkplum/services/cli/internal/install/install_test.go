@@ -199,6 +199,39 @@ func TestLoadRefusesBadRecords(t *testing.T) {
 	}
 }
 
+// A record with fields this darkplum does not know was written by a newer one: it
+// is named as such (with the version that wrote it), never reported as unreadable.
+func TestLoadNamesARecordFromANewerDarkplum(t *testing.T) {
+	h := Home(t.TempDir())
+	mk(t, h, "alpha")
+	a, _ := Open(h, "alpha")
+	for name, content := range map[string]string{
+		"new field":  `{"schema":1,"name":"alpha","bundle":"1.9.0","future_setting":true}`,
+		"new schema": `{"schema":2,"name":"alpha","bundle":"1.9.0"}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := os.WriteFile(a.RecordPath(), []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			_, err := a.Load()
+			var ne *NewerRecordError
+			if !errors.As(err, &ne) {
+				t.Fatalf("err = %v, want *NewerRecordError", err)
+			}
+			if ne.Version != "1.9.0" || !strings.Contains(err.Error(), "newer darkplum (v1.9.0)") || strings.Contains(err.Error(), "unreadable") {
+				t.Errorf("message = %q", err)
+			}
+		})
+	}
+	if err := os.WriteFile(a.RecordPath(), []byte(`nope`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var ne *NewerRecordError
+	if _, err := a.Load(); errors.As(err, &ne) || err == nil || !strings.Contains(err.Error(), "unreadable") {
+		t.Errorf("garbage is unreadable, not newer: %v", err)
+	}
+}
+
 func fixedNow() time.Time { return time.Date(2026, 10, 31, 12, 0, 0, 0, time.UTC) }
 
 func sampleBundle(t *testing.T, mainTF string) *bundle.Bundle {

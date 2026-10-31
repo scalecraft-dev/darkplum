@@ -262,7 +262,29 @@ func (r Record) Validate() error {
 	return nil
 }
 
-// Load reads and validates the record. A missing install is ErrNoInstall.
+// NewerRecordError means the record has fields (or a schema) this darkplum does
+// not know: a newer darkplum wrote it. Reading it with this one and saving it
+// back would silently drop what the newer one recorded, so it is refused, and
+// refused by name rather than as "unreadable".
+type NewerRecordError struct {
+	Path string
+	// Version is the release that last applied the install (the record's bundle
+	// version), when the record says.
+	Version string
+	Schema  int
+}
+
+func (e *NewerRecordError) Error() string {
+	by := "a newer darkplum"
+	if e.Version != "" {
+		by += " (v" + strings.TrimPrefix(e.Version, "v") + ")"
+	}
+	return fmt.Sprintf("%s was made by %s (record schema %d, this darkplum understands %d). Use that version or newer; this one cannot read it without losing settings",
+		e.Path, by, e.Schema, recordSchema)
+}
+
+// Load reads and validates the record. A missing install is ErrNoInstall. A
+// record written by a newer darkplum is a *NewerRecordError.
 func (i Install) Load() (Record, error) {
 	b, err := os.ReadFile(i.RecordPath())
 	if errors.Is(err, fs.ErrNotExist) {
@@ -275,7 +297,19 @@ func (i Install) Load() (Record, error) {
 	dec := json.NewDecoder(strings.NewReader(string(b)))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&r); err != nil {
+		if strings.HasPrefix(err.Error(), "json: unknown field") {
+			var head struct {
+				Schema int    `json:"schema"`
+				Bundle string `json:"bundle"`
+			}
+			if json.Unmarshal(b, &head) == nil {
+				return Record{}, &NewerRecordError{Path: i.RecordPath(), Version: head.Bundle, Schema: head.Schema}
+			}
+		}
 		return Record{}, fmt.Errorf("%s is unreadable: %w", i.RecordPath(), err)
+	}
+	if r.Schema > recordSchema {
+		return Record{}, &NewerRecordError{Path: i.RecordPath(), Version: r.Bundle, Schema: r.Schema}
 	}
 	if r.Name != i.Name {
 		return Record{}, fmt.Errorf("%s names install %q, not %q", i.RecordPath(), r.Name, i.Name)
