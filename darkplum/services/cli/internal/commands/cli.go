@@ -8,6 +8,7 @@ type CLI struct {
 	Admin      AdminCmd         `cmd:"" help:"Manage admin accounts."`
 	Sso        SSOCmd           `cmd:"" name:"sso" help:"Configure SSO / OIDC."`
 	Models     ModelsCmd        `cmd:"" help:"Self-hosted models: add, remove, list, test."`
+	Verify     VerifyCmd        `cmd:"" help:"Prove the gateway role can invoke only the Bedrock models this install allows (Layer 1 IAM evidence)."`
 	Keys       KeysCmd          `cmd:"" help:"Vendor API keys: set, remove, list."`
 	Status     StatusCmd        `cmd:"" help:"Show control-plane and inference health."`
 	Init       InitCmd          `cmd:"" help:"Prompt for install settings and write terraform.tfvars (run before make deploy)."`
