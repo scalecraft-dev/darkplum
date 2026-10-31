@@ -266,7 +266,10 @@ func (c *InitCmd) changeHosting(env *initEnv, dir string, tf tfvarsInfo) error {
 	if err != nil {
 		return err
 	}
-	text := rewriteTFVars(string(old), func(k string) bool { return drop[k] }, kvs)
+	text, err := rewriteTFVars(string(old), func(k string) bool { return drop[k] }, kvs)
+	if err != nil {
+		return env.fail("install settings", err.Error(), "choose Start over to answer the questions again", "cannot edit the install's settings safely")
+	}
 
 	fmt.Fprintln(w)
 	if tf.GPUDesired > 0 && !s.gpu {
@@ -297,20 +300,69 @@ func (c *InitCmd) changeHosting(env *initEnv, dir string, tf tfvarsInfo) error {
 }
 
 // rewriteTFVars removes the lines whose key drop reports, keeps every other line
-// (comments included) as it was, and appends kvs.
-func rewriteTFVars(text string, drop func(key string) bool, kvs []tfvarsKV) string {
+// (comments included) byte for byte, and appends kvs. It then reads the result
+// back: every untouched key must still have exactly the value it had, and every
+// replaced key must read back as written. Anything it cannot be sure of (a value
+// that spans lines, a heredoc, a line that is not `key = value`) is refused
+// rather than edited, because editing around a multi-line value corrupts it.
+func rewriteTFVars(text string, drop func(key string) bool, kvs []tfvarsKV) (string, error) {
+	before := parseTFVars(text)
 	var kept []string
-	for _, line := range strings.Split(strings.TrimRight(text, "\n"), "\n") {
-		if m := tfLineRe.FindStringSubmatch(line); m != nil && drop(m[1]) {
+	for n, line := range strings.Split(strings.TrimRight(text, "\n"), "\n") {
+		t := strings.TrimSpace(line)
+		if t == "" || strings.HasPrefix(t, "#") {
+			kept = append(kept, line)
+			continue
+		}
+		m := tfLineRe.FindStringSubmatch(line)
+		if m == nil || strings.Contains(m[2], "<<") || bracketDepth(m[2]) != 0 {
+			return "", fmt.Errorf("line %d is not a single-line setting; the settings cannot be edited safely", n+1)
+		}
+		if drop(m[1]) {
 			continue
 		}
 		kept = append(kept, line)
 	}
 	out := strings.Join(kept, "\n") + "\n"
+	replaced := map[string]bool{}
 	for _, kv := range kvs {
+		replaced[kv.Key] = true
 		out += fmt.Sprintf("%s = %s\n", kv.Key, hclValue(kv.Value))
 	}
-	return out
+	after := parseTFVars(out)
+	for k, v := range before {
+		if replaced[k] || drop(k) {
+			continue
+		}
+		if after[k] != v {
+			return "", fmt.Errorf("the setting %s would change; refusing to edit", k)
+		}
+	}
+	for _, kv := range kvs {
+		if after[kv.Key] != hclValue(kv.Value) {
+			return "", fmt.Errorf("the setting %s does not read back as written; refusing to edit", kv.Key)
+		}
+	}
+	return out, nil
+}
+
+// bracketDepth is the net count of unclosed [ and { outside quotes.
+func bracketDepth(v string) int {
+	depth, inStr := 0, false
+	for i := 0; i < len(v); i++ {
+		switch c := v[i]; {
+		case inStr && c == '\\':
+			i++
+		case c == '"':
+			inStr = !inStr
+		case inStr:
+		case c == '[' || c == '{':
+			depth++
+		case c == ']' || c == '}':
+			depth--
+		}
+	}
+	return depth
 }
 
 // webKeys are the settings of the private address.

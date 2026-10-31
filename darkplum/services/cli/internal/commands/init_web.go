@@ -685,7 +685,10 @@ func (c *InitCmd) mergeWeb(env *initEnv, dir string) error {
 		return err
 	}
 	// The address's own lines are replaced (a change), every other line is kept.
-	text := rewriteTFVars(string(b), func(k string) bool { return webKeys[k] }, s.web.kvs())
+	text, err := rewriteTFVars(string(b), func(k string) bool { return webKeys[k] }, s.web.kvs())
+	if err != nil {
+		return env.fail("install settings", err.Error(), "choose Start over to answer the questions again", "cannot edit the install's settings safely")
+	}
 	fmt.Fprintln(w)
 	if c.DryRun {
 		fmt.Fprintf(w, "%s\n%s\n", sHeader("terraform.tfvars (dry run — not written)"), text)

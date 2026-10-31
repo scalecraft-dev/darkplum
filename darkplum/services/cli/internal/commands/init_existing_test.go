@@ -263,11 +263,43 @@ func TestInitPicksAmongExistingInstalls(t *testing.T) {
 
 func TestRewriteTFVars(t *testing.T) {
 	in := "# c\na = 1\nb = \"x\"\n\nc = [\"y\"]\n"
-	got := rewriteTFVars(in, func(k string) bool { return k == "b" }, []tfvarsKV{{"d", 3}, {"b", "z"}})
-	if got != "# c\na = 1\n\nc = [\"y\"]\nd = 3\nb = \"z\"\n" {
-		t.Errorf("got %q", got)
+	got, err := rewriteTFVars(in, func(k string) bool { return k == "b" }, []tfvarsKV{{"d", 3}, {"b", "z"}})
+	if err != nil || got != "# c\na = 1\n\nc = [\"y\"]\nd = 3\nb = \"z\"\n" {
+		t.Errorf("got %q, %v", got, err)
 	}
-	if rewriteTFVars("a = 1", func(string) bool { return false }, nil) != "a = 1\n" {
-		t.Error("a missing final newline is not added")
+	if got, err := rewriteTFVars("a = 1", func(string) bool { return false }, nil); err != nil || got != "a = 1\n" {
+		t.Errorf("a missing final newline is not added: %q %v", got, err)
+	}
+}
+
+func TestRewriteTFVarsRefusesWhatItCannotEditSafely(t *testing.T) {
+	for name, in := range map[string]string{
+		"multi-line list": "a = 1\nweb_allowed_cidrs = [\n  \"10.0.0.0/16\",\n]\nb = 2\n",
+		"heredoc":         "a = <<EOT\nx\nEOT\n",
+		"stray line":      "a = 1\n  \"10.0.0.0/16\",\n",
+		"unclosed map":    "tags = {\n  k = \"v\"\n}\n",
+	} {
+		if _, err := rewriteTFVars(in, func(k string) bool { return k == "web_allowed_cidrs" }, []tfvarsKV{{"web_domain", "x.com"}}); err == nil {
+			t.Errorf("%s: edited", name)
+		}
+	}
+	// brackets inside a quoted value are not structure
+	if _, err := rewriteTFVars("a = \"x[\"\nb = 1\n", func(k string) bool { return k == "b" }, nil); err != nil {
+		t.Errorf("quoted bracket: %v", err)
+	}
+	// a value that does not survive its own rendering is caught on read-back
+	if _, err := rewriteTFVars("a = 1\n", func(string) bool { return false }, []tfvarsKV{{"bad key", "v"}}); err == nil {
+		t.Error("a key that cannot read back was written")
+	}
+}
+
+func TestChangeHostingRefusesAMultiLineSettingsFile(t *testing.T) {
+	dir, path := existingDir(t, bedrockInstallTF+"web_allowed_cidrs = [\n  \"10.0.0.0/16\",\n]\n")
+	env, out := testEnv(t, newFakeCloud(), nil, "3\n2\n1\n1\n\n")
+	if err := existingCmd(dir).execute(env); err == nil || !IsReported(err) {
+		t.Fatalf("err = %v\n%s", err, out)
+	}
+	if !strings.HasSuffix(readFile(t, path), "]\n") || strings.Contains(readFile(t, path), "gpu_desired_size = 1") {
+		t.Error("a multi-line file was edited")
 	}
 }
