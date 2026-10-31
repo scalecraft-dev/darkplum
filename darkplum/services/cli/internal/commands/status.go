@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/scalecraft-dev/darkplum/cli/internal/kube"
+	"github.com/scalecraft-dev/darkplum/cli/internal/release"
 )
 
 // StatusCmd is `darkplum status`.
@@ -24,6 +25,14 @@ func (s *StatusCmd) Run(g *Globals) error {
 		return err
 	}
 	e := &statusEnv{out: os.Stdout, kc: c, ns: g.Namespace}
+	if m, err := release.Current(); err == nil {
+		e.proof.version = m.Version
+		if s.Context == "" {
+			if _, rec, err := openInstall(g.Install); err == nil {
+				e.proof.want = wantImages(m, rec.AccountIDs[0]+".dkr.ecr."+rec.Region+".amazonaws.com", rec.ClusterName)
+			}
+		}
+	}
 	// The install's own settings tell which sections apply (web address, GPU). A
 	// cluster reached with --context has none; those sections are read live.
 	if s.Context == "" {
@@ -42,6 +51,10 @@ type statusEnv struct {
 	kc  *kube.Client
 	ns  string
 	tf  *tfvarsInfo // nil when there is no install record (--context)
+	// proof is what this build can confirm about the images; recorded is the
+	// release version the install's own record says it runs (read by release()).
+	proof    imageProof
+	recorded string
 }
 
 func (e *statusEnv) run() error {

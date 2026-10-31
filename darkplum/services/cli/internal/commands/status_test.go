@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+
+	"github.com/scalecraft-dev/darkplum/cli/internal/release"
 )
 
 func TestOIDCConfigured(t *testing.T) {
@@ -98,20 +100,50 @@ func (s *statusCluster) run(tf *tfvarsInfo) (string, error) {
 	return out.String(), err
 }
 
-func deployList(annotations map[string]map[string]string) string {
+// dep is a Deployment as status reads it: annotations and the image of its container.
+type dep struct {
+	ann   map[string]string
+	image string
+}
+
+func deployList(deps map[string]dep) string {
 	var items []string
-	for name, ann := range annotations {
-		a, _ := json.Marshal(ann)
-		items = append(items, fmt.Sprintf(`{"metadata":{"name":%q,"annotations":%s}}`, name, a))
+	for name, d := range deps {
+		a, _ := json.Marshal(d.ann)
+		items = append(items, fmt.Sprintf(`{"metadata":{"name":%q,"annotations":%s},"spec":{"template":{"spec":{"containers":[{"image":%q}]}}}}`, name, a, d.image))
 	}
 	return `{"items":[` + strings.Join(items, ",") + `]}`
 }
 
+const (
+	ecr     = "123456789012.dkr.ecr.us-east-2.amazonaws.com"
+	digestA = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	digestB = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+)
+
+func img(svc, digest string) string { return ecr + "/acme/darkplum-" + svc + "@" + digest }
+
+// releaseProof is the proof a build of v1.4.0 has for an install named acme.
+func releaseProof() imageProof {
+	want := map[string]string{}
+	for _, svc := range []string{"gateway", "api", "web"} {
+		want[svc] = img(svc, digestA)
+	}
+	return imageProof{want: want, version: "v1.4.0"}
+}
+
+func (s *statusCluster) runWith(proof imageProof, recorded string) (string, error) {
+	var out bytes.Buffer
+	e := &statusEnv{out: &out, kc: s.client(), ns: testNS, proof: proof, recorded: recorded}
+	err := e.run()
+	return out.String(), err
+}
+
 func TestStatusUnsignedImagesAreAFailure(t *testing.T) {
 	s := newStatusCluster()
-	s.deploys = deployList(map[string]map[string]string{
-		"darkplum-gateway": {"darkplum.ai/image-trust": "unsigned"},
-		"darkplum-api":     {"darkplum.ai/image-trust": "verified"},
+	s.deploys = deployList(map[string]dep{
+		"darkplum-gateway": {ann: map[string]string{"darkplum.ai/image-trust": "unsigned"}, image: img("gateway", digestB)},
+		"darkplum-api":     {ann: map[string]string{"darkplum.ai/image-trust": "verified"}, image: img("api", digestA)},
 		"postgres":         {},
 	})
 	out, err := s.run(nil)
@@ -119,52 +151,101 @@ func TestStatusUnsignedImagesAreAFailure(t *testing.T) {
 		t.Fatalf("pods are ready but unsigned images must fail the status: %v", err)
 	}
 	if !strings.Contains(out, "image-trust: unsigned") || !strings.Contains(out, "darkplum-gateway") ||
-		strings.Contains(out, "all pods ready") || strings.Contains(out, "verified release images") {
+		strings.Contains(out, "all pods ready") || strings.Contains(out, "✓ verified") {
 		t.Errorf("out:\n%s", out)
 	}
 }
 
-func TestStatusVerifiedReleaseAndRC(t *testing.T) {
+// Verified means the running digest is the release's digest. The annotation, which
+// anyone who can patch the Deployment can write, proves nothing.
+func TestStatusVerifiedNeedsADigestMatch(t *testing.T) {
+	good := map[string]dep{}
+	for _, svc := range []string{"gateway", "api", "web"} {
+		good["darkplum-"+svc] = dep{ann: map[string]string{"darkplum.ai/image-trust": "verified"}, image: img(svc, digestA)}
+	}
 	s := newStatusCluster()
 	s.release = `{"data":{"version":"v1.4.0","channel":"release","commit":"0123456789abcdef0123","time":"2026-10-31T12:00:00Z"}}`
-	s.deploys = deployList(map[string]map[string]string{
-		"darkplum-gateway": {"darkplum.ai/image-trust": "verified"},
-		"darkplum-api":     {"darkplum.ai/image-trust": "verified"},
-	})
-	out, err := s.run(nil)
-	if err != nil {
+	s.deploys = deployList(good)
+	out, err := s.runWith(releaseProof(), "")
+	if err != nil || !strings.Contains(out, "✓ verified: running the images v1.4.0 signed (digests match)") {
 		t.Fatalf("%v\n%s", err, out)
 	}
-	for _, want := range []string{"v1.4.0", "channel release", "commit 0123456789ab", "deployed 2026-10-31T12:00:00Z", "verified release images", "all pods ready"} {
+	for _, want := range []string{"v1.4.0", "channel release", "commit 0123456789ab", "deployed 2026-10-31T12:00:00Z", "all pods ready"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("lacks %q:\n%s", want, out)
 		}
 	}
-	if strings.Contains(out, "0123456789abcdef0123") {
-		t.Error("the commit is not shortened")
+
+	// the same annotations over a different image: not verified
+	forged := map[string]dep{}
+	for k, v := range good {
+		forged[k] = v
 	}
-	s.deploys = deployList(map[string]map[string]string{
-		"darkplum-gateway": {"darkplum.ai/image-trust": "verified", "darkplum.ai/release-channel": "rc"}})
-	out, err = s.run(nil)
-	if err != nil || !strings.Contains(out, "channel rc: a prerelease build") {
+	forged["darkplum-gateway"] = dep{ann: map[string]string{"darkplum.ai/image-trust": "verified"}, image: img("gateway", digestB)}
+	s.deploys = deployList(forged)
+	out, err = s.runWith(releaseProof(), "v1.4.0")
+	if err == nil || !IsReported(err) || !strings.Contains(out, "not this release's images") || strings.Contains(out, "✓ verified") {
+		t.Errorf("an install that claims v1.4.0 but runs other bytes must fail:\n%v\n%s", err, out)
+	}
+	// the right digest in another registry or repository is not it either
+	other := map[string]dep{}
+	for k, v := range good {
+		other[k] = v
+	}
+	other["darkplum-api"] = dep{image: "ghcr.io/evil/darkplum-api@" + digestA}
+	s.deploys = deployList(other)
+	if out, _ := s.runWith(releaseProof(), "v1.4.0"); strings.Contains(out, "✓ verified") || !strings.Contains(out, "darkplum-api") {
+		t.Errorf("a foreign registry passed:\n%s", out)
+	}
+	// an older release is running: not verified by this build, but not a tamper alarm
+	s.deploys = deployList(forged)
+	s.release = `{"data":{"version":"v1.3.0"}}`
+	out, err = s.runWith(releaseProof(), "")
+	if err != nil || !strings.Contains(out, "did not verify") || strings.Contains(out, "✓ verified") {
+		t.Errorf("%v\n%s", err, out)
+	}
+	// rc
+	good["darkplum-gateway"] = dep{ann: map[string]string{"darkplum.ai/image-trust": "verified", "darkplum.ai/release-channel": "rc"}, image: img("gateway", digestA)}
+	s.deploys = deployList(good)
+	if out, err := s.runWith(releaseProof(), ""); err != nil || !strings.Contains(out, "channel rc: a prerelease build") {
 		t.Errorf("rc must warn without failing: %v\n%s", err, out)
+	}
+}
+
+// A development build verified nothing, so it confirms nothing.
+func TestStatusDevBuildConfirmsNothing(t *testing.T) {
+	s := newStatusCluster()
+	s.deploys = deployList(map[string]dep{"darkplum-api": {ann: map[string]string{"darkplum.ai/image-trust": "verified"}, image: img("api", digestA)}})
+	out, err := s.run(nil)
+	if err != nil || !strings.Contains(out, "development build: it cannot confirm which images run") || strings.Contains(out, "✓ verified") {
+		t.Errorf("%v\n%s", err, out)
 	}
 }
 
 func TestStatusOldInstallWithoutRecords(t *testing.T) {
 	s := newStatusCluster() // no ConfigMap, no annotations
-	s.deploys = deployList(map[string]map[string]string{"darkplum-api": {}})
+	s.deploys = deployList(map[string]dep{"darkplum-api": {image: img("api", digestA)}})
 	out, err := s.run(nil)
 	if err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}
-	if strings.Contains(out, "release  ") || !strings.Contains(out, "image trust not recorded") {
+	if strings.Contains(out, "release  ") || strings.Contains(out, "✓ verified") {
 		t.Errorf("out:\n%s", out)
 	}
 	// a ConfigMap that cannot be read is shown, not hidden
 	s.releaseEr = errors.New("Unauthorized")
 	if out, _ := s.run(nil); !strings.Contains(out, "unavailable: Unauthorized") {
 		t.Errorf("out:\n%s", out)
+	}
+}
+
+func TestWantImages(t *testing.T) {
+	m := release.Manifest{Images: map[string]release.Image{"api": {Digest: digestA}}}
+	if got := wantImages(m, ecr, "acme")["api"]; got != img("api", digestA) {
+		t.Errorf("got %s", got)
+	}
+	if wantImages(release.Manifest{}, ecr, "acme") != nil {
+		t.Error("a build with no images wants some")
 	}
 }
 

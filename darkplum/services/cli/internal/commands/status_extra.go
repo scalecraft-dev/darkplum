@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/scalecraft-dev/darkplum/cli/internal/release"
 )
 
 // Annotations `darkplum deploy` puts on the Deployments it applies, and the
@@ -34,6 +36,7 @@ func (e *statusEnv) release() bool {
 	if json.Unmarshal([]byte(out), &cm) != nil || cm.Data["version"] == "" {
 		return false
 	}
+	e.recorded = cm.Data["version"]
 	line := sInfo(cm.Data["version"])
 	if ch := cm.Data["channel"]; ch != "" {
 		line += sDim(" · channel " + ch)
@@ -51,9 +54,32 @@ func (e *statusEnv) release() bool {
 	return false
 }
 
-// imageTrust reads the annotations on the platform Deployments. Unsigned images
-// are a failure for as long as they run: nothing is signed-or-else, so the row
-// stays until a release deploy replaces them. It returns true for that failure.
+// imageProof is what status can prove about the first-party images. An
+// annotation on a Deployment is a claim that anyone who can patch it can make, so
+// it never counts as proof: an image is verified when the image the Deployment's
+// pod template runs is exactly the one this build verified and mirrored, that is
+// <this install's registry>/<cluster>/darkplum-<service>@<the release's digest>.
+type imageProof struct {
+	want    map[string]string // service -> the full image reference this build deploys; empty for a dev build
+	version string            // the version of this build
+}
+
+// wantImages is the reference each first-party service must run to count as this
+// release: the install's own ECR repository (Terraform names it
+// <registry>/<cluster>/darkplum-<service>) at the digest in this binary's release
+// manifest.
+func wantImages(m release.Manifest, registry, cluster string) map[string]string {
+	if len(m.Images) == 0 {
+		return nil
+	}
+	out := map[string]string{}
+	for svc, img := range m.Images {
+		out[svc] = registry + "/" + cluster + "/darkplum-" + svc + "@" + img.Digest
+	}
+	return out
+}
+
+// imageTrust judges the platform Deployments. It returns true for a failure.
 func (e *statusEnv) imageTrust() (failed bool) {
 	out, err := e.kc.NS(nil, "get", "deploy", "-o", "json")
 	if err != nil {
@@ -66,29 +92,53 @@ func (e *statusEnv) imageTrust() (failed bool) {
 				Name        string            `json:"name"`
 				Annotations map[string]string `json:"annotations"`
 			} `json:"metadata"`
+			Spec struct {
+				Template struct {
+					Spec struct {
+						Containers []struct {
+							Image string `json:"image"`
+						} `json:"containers"`
+					} `json:"spec"`
+				} `json:"template"`
+			} `json:"spec"`
 		} `json:"items"`
 	}
 	if json.Unmarshal([]byte(out), &dl) != nil {
 		return false
 	}
-	var unsigned, verified, unrecorded, rc []string
+	var unsigned, differ, rc []string
+	matched, seen := 0, 0
 	for _, it := range dl.Items {
-		if !strings.HasPrefix(it.Metadata.Name, "darkplum-") {
+		name := it.Metadata.Name
+		svc := strings.TrimPrefix(name, "darkplum-")
+		if !strings.HasPrefix(name, "darkplum-") {
 			continue
 		}
-		switch it.Metadata.Annotations[annImageTrust] {
-		case "unsigned":
-			unsigned = append(unsigned, it.Metadata.Name)
-		case "verified":
-			verified = append(verified, it.Metadata.Name)
-		default:
-			unrecorded = append(unrecorded, it.Metadata.Name)
+		seen++
+		if it.Metadata.Annotations[annImageTrust] == "unsigned" {
+			unsigned = append(unsigned, name)
 		}
 		if it.Metadata.Annotations[annChannel] == "rc" {
-			rc = append(rc, it.Metadata.Name)
+			rc = append(rc, name)
+		}
+		want, known := e.proof.want[svc]
+		if !known {
+			continue
+		}
+		ok := false
+		for _, c := range it.Spec.Template.Spec.Containers {
+			if strings.HasSuffix(strings.SplitN(strings.SplitN(c.Image, "@", 2)[0], ":", 2)[0], "/darkplum-"+svc) {
+				ok = c.Image == want
+			}
+		}
+		if ok {
+			matched++
+		} else {
+			differ = append(differ, name)
 		}
 	}
 	sort.Strings(unsigned)
+	sort.Strings(differ)
 	if len(unsigned) > 0 {
 		fmt.Fprintf(e.out, "%s  %s %s\n", sDim("images"), sFail("✗ image-trust: unsigned"), sDim("("+strings.Join(unsigned, ", ")+")"))
 		fmt.Fprintf(e.out, "        %s\n", sDim("These images were deployed without release signature verification (a development deploy). "+
@@ -96,10 +146,16 @@ func (e *statusEnv) imageTrust() (failed bool) {
 		failed = true
 	}
 	switch {
-	case len(verified) > 0 && len(unsigned) == 0 && len(unrecorded) == 0:
-		fmt.Fprintf(e.out, "%s  %s\n", sDim("images"), sSuccess("✓ verified release images"))
-	case len(unrecorded) > 0:
-		fmt.Fprintf(e.out, "%s  %s\n", sDim("images"), sDim("image trust not recorded for "+strings.Join(unrecorded, ", ")+" (deployed before releases were verified)"))
+	case len(e.proof.want) == 0 && seen > 0:
+		fmt.Fprintf(e.out, "%s  %s\n", sDim("images"), sWarn("! this darkplum is a development build: it cannot confirm which images run"))
+	case len(differ) > 0 && e.recorded != "" && e.recorded == e.proof.version:
+		// The install says it runs this very release, and the images are not its images.
+		fmt.Fprintf(e.out, "%s  %s %s\n", sDim("images"), sFail("✗ not this release's images"), sDim("("+strings.Join(differ, ", ")+" run a different image than "+e.proof.version+" verified)"))
+		failed = true
+	case len(differ) > 0:
+		fmt.Fprintf(e.out, "%s  %s\n", sDim("images"), sWarn("! "+strings.Join(differ, ", ")+" run images this darkplum ("+e.proof.version+") did not verify; run `darkplum deploy` to bring them to this release"))
+	case matched > 0 && len(unsigned) == 0:
+		fmt.Fprintf(e.out, "%s  %s\n", sDim("images"), sSuccess("✓ verified: running the images "+e.proof.version+" signed (digests match)"))
 	}
 	if len(rc) > 0 {
 		fmt.Fprintf(e.out, "%s  %s\n", sDim("images"), sWarn("! channel rc: a prerelease build, not for production"))
