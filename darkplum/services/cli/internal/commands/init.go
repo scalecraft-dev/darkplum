@@ -177,7 +177,8 @@ type settings struct {
 	gpuCount                          int
 	geo, bedrockRegion                string
 	throwaway                         bool
-	liveChecked                       string // cluster name the live-install lookup already ran for
+	liveChecked                       string          // cluster name the live-install lookup already ran for
+	locked                            *install.Record // the install's record, when it exists: cluster, region, account and state are fixed
 	web                               webSettings
 	checks                            []checkResult
 }
@@ -291,6 +292,20 @@ func (c *InitCmd) execute(env *initEnv) error {
 	}
 
 	s := &settings{throwaway: c.Throwaway, gpuCount: c.GPUCount}
+	// An install that exists is not re-decided: its cluster, region, account and
+	// state location are fixed (see lockedFields). A fresh install has none.
+	if in, oerr := install.OpenDir(dir, c.ClusterName); oerr == nil {
+		if rec, lerr := in.Load(); lerr == nil {
+			s.locked = &rec
+			if c.Region != "" && c.Region != rec.Region {
+				return env.fail("region", c.Region, "the install is in "+rec.Region+" and cannot move; create a new install for another region", "the region of an existing install cannot change")
+			}
+			c.Region = rec.Region
+			if c.Profile == "" {
+				c.Profile = rec.Profile
+			}
+		}
+	}
 	record := func(r checkResult) {
 		printCheckTo(w, r)
 		s.checks = append(s.checks, r)
@@ -329,6 +344,10 @@ func (c *InitCmd) execute(env *initEnv) error {
 		}
 		if err := validateAccountID(id.Account); err != nil {
 			return reportedErr("unexpected account id %q from sts", id.Account)
+		}
+		if s.locked != nil && !contains(s.locked.AccountIDs, id.Account) {
+			return env.fail("aws account", fmt.Sprintf("credentials are for %s, the install is in %s", id.Account, strings.Join(s.locked.AccountIDs, ", ")),
+				"use the install's profile; an install cannot move to another account", "the account of an existing install cannot change")
 		}
 		s.profile, s.account = profile, id.Account
 		fmt.Fprintf(w, "  Installing into account %s as %s\n", sInfo(id.Account), sInfo(id.Arn))
@@ -472,16 +491,19 @@ func (c *InitCmd) execute(env *initEnv) error {
 	// A fresh checkout of a live install: its state answers before the name
 	// check, which would otherwise call the install's own cluster a clash.
 	s.cluster = c.ClusterName
-	if err := c.preflightLiveInstall(env, s, dir, cloud); err != nil {
-		return err
-	}
+	if s.locked == nil {
+		if err := c.preflightLiveInstall(env, s, dir, cloud); err != nil {
+			return err
+		}
 
-	// Cluster name collisions.
-	cluster, err := chooseCluster(env, cloud, region, c.ClusterName, record)
-	if err != nil {
-		return err
+		// Cluster name collisions. An existing install's own cluster, bucket and
+		// state are not collisions, so none of this runs for one.
+		cluster, err := chooseCluster(env, cloud, region, c.ClusterName, record)
+		if err != nil {
+			return err
+		}
+		s.cluster = cluster
 	}
-	s.cluster = cluster
 
 	return c.finish(env, s, dir, cloud)
 }
@@ -760,6 +782,11 @@ func (c *InitCmd) finish(env *initEnv, s *settings, dir string, cloud initCloud)
 	if spec.KMSKeyARN == "" {
 		spec.KMSKeyARN = kmsKeyPlaceholder
 	}
+	if s.locked != nil {
+		if err := lockedFields(*s.locked, s, spec); err != nil {
+			return env.fail("existing install", err.Error(), "region, account, cluster name and the state location are fixed once an install exists; create a new install instead", "an existing install's identity cannot change")
+		}
+	}
 	localResources := localStateResources(dir)
 	_, backendExists := os.Stat(backendPath)
 
@@ -949,10 +976,34 @@ func (c *InitCmd) saveRecord(dir string, s *settings, spec backendSpec, now time
 		Backend: install.Backend{Type: "s3", Bucket: spec.Bucket, Key: spec.Key, Region: spec.Region, KMSKeyID: spec.KMSKeyARN, Encrypt: true, UseLockfile: true},
 	}
 	if old, err := in.Load(); err == nil {
+		// Whatever the flags, --force and --yes included, a live install's identity
+		// is not rewritten.
+		if err := lockedFields(old, s, spec); err != nil {
+			return err
+		}
 		rec.Created, rec.Bundle, rec.AdoptedFrom, rec.CreatedZoneID = old.Created, old.Bundle, old.AdoptedFrom, old.CreatedZoneID
 	}
 	if s.web.createZone {
 		rec.CreatedZoneID = s.web.zoneID
 	}
 	return in.Save(rec)
+}
+
+// lockedFields refuses any change to what makes an install this install: its
+// cluster, region, AWS account(s) and where its Terraform state lives. Changing
+// them is not an edit, it is a different install (a new cluster in a new place
+// with the old one orphaned), so no flag overrides it.
+func lockedFields(old install.Record, s *settings, spec backendSpec) error {
+	switch {
+	case s.cluster != old.ClusterName:
+		return fmt.Errorf("the cluster is %s, not %s", old.ClusterName, s.cluster)
+	case s.region != old.Region:
+		return fmt.Errorf("the install is in %s, not %s", old.Region, s.region)
+	case len(old.AccountIDs) != 1 || old.AccountIDs[0] != s.account:
+		return fmt.Errorf("the install is in account %s, not %s", strings.Join(old.AccountIDs, ", "), s.account)
+	case spec.Bucket != old.Backend.Bucket || spec.Key != old.Backend.Key || spec.Region != old.Backend.Region:
+		return fmt.Errorf("the install keeps its state at s3://%s/%s (%s), not s3://%s/%s (%s)",
+			old.Backend.Bucket, old.Backend.Key, old.Backend.Region, spec.Bucket, spec.Key, spec.Region)
+	}
+	return nil
 }

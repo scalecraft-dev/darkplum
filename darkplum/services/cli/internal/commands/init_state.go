@@ -215,7 +215,11 @@ func (c *InitCmd) planState(env *initEnv, s *settings, dir string, cloud initClo
 	freshCheckout := !hasBackendTF && cache == nil && !cacheExists(dir)
 
 	reused, note := false, ""
-	if eb, ek, er, ok := existingBackend(backendPath); ok && er == s.region && strings.HasPrefix(eb, "darkplum-tfstate-"+s.account+"-") {
+	if s.locked != nil {
+		// The install's record names its state; it is never searched for or replaced.
+		p.bucket, p.key, p.kept, reused = s.locked.Backend.Bucket, s.locked.Backend.Key, true, true
+		note = "the install's own state"
+	} else if eb, ek, er, ok := existingBackend(backendPath); ok && er == s.region && strings.HasPrefix(eb, "darkplum-tfstate-"+s.account+"-") {
 		p.bucket, p.key, p.kept, reused = eb, ek, true, true
 		note = "same bucket, key and region"
 	} else {
