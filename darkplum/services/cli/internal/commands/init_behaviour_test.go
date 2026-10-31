@@ -222,8 +222,8 @@ func TestInitDryRunNextLineAndPreChecks(t *testing.T) {
 			t.Errorf("missing %q", want)
 		}
 	}
-	if strings.Contains(out.String(), "Next: make deploy") {
-		t.Error("a dry run must not point at make deploy")
+	if strings.Contains(out.String(), "Next: darkplum deploy") {
+		t.Error("a dry run must not point at darkplum deploy")
 	}
 }
 
@@ -236,7 +236,7 @@ func TestInitModeChoicesAreAlignedWithCosts(t *testing.T) {
 	for _, want := range []string{
 		"1) Bedrock only     no GPU · ~US$10/day base · ~20 min · recommended for a trial",
 		"2) Self-hosted GPU  base + ~US$1/h per g5.xlarge · ~35-50 min",
-		"Switch later by re-running ./bin/darkplum init.",
+		"Switch later by re-running darkplum init.",
 		"✓ 10 passed",
 	} {
 		if !strings.Contains(out.String(), want) {

@@ -117,7 +117,7 @@ func (e *statusEnv) run() error {
 }
 
 // oidcConfigured reports whether a base64 OIDC_ISSUER from the auth secret
-// names a real issuer rather than being empty or make deploy's placeholder.
+// names a real issuer rather than being empty or deploy's placeholder.
 func oidcConfigured(b64 string) bool {
 	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(b64))
 	if err != nil {

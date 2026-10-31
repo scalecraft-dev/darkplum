@@ -22,7 +22,7 @@ import (
 
 // InitCmd is `darkplum init`: prompt for the few choices that shape an install,
 // check them against the operator's own cloud account, and write
-// terraform.tfvars (and the S3 backend settings in backend.hcl). It deploys nothing — `make deploy`
+// terraform.tfvars (and the S3 backend settings in backend.hcl). It deploys nothing — `darkplum deploy`
 // does that — and holds no credential: every cloud call is the operator's own
 // `aws` CLI.
 type InitCmd struct {
@@ -415,7 +415,7 @@ func (c *InitCmd) execute(env *initEnv) error {
 				return err
 			}
 			mode = []string{"bedrock", "gpu"}[i]
-			fmt.Fprintf(w, "  %s\n", sDim("Switch later by re-running ./bin/darkplum init."))
+			fmt.Fprintf(w, "  %s\n", sDim("Switch later by re-running darkplum init."))
 		} else {
 			mode = "bedrock"
 		}
@@ -483,7 +483,7 @@ func (c *InitCmd) execute(env *initEnv) error {
 				return err
 			}
 			if !ok {
-				return reportedErr("stopped: raise the GPU quota (or choose Bedrock only) and re-run ./bin/darkplum init")
+				return reportedErr("stopped: raise the GPU quota (or choose Bedrock only) and re-run darkplum init")
 			}
 		}
 	}
@@ -749,7 +749,7 @@ func localStateResources(dir string) int {
 // finish writes (or, with --dry-run, prints) the files and creates the state
 // backend. Read-only pre-checks run first; nothing is touched until the final
 // confirmation, and tfvars is written last so its presence means the install is
-// ready for make deploy.
+// ready for the deploy.
 func (c *InitCmd) finish(env *initEnv, s *settings, dir string, cloud initCloud) error {
 	w := env.out
 	tfvarsPath := filepath.Join(dir, "terraform.tfvars")
@@ -920,7 +920,7 @@ func (c *InitCmd) finish(env *initEnv, s *settings, dir string, cloud initCloud)
 	fmt.Fprintln(w)
 	fmt.Fprintf(w, "  %s %s\n", sWarn("!"), kmsWarning)
 	if plan.staleLive != nil {
-		fmt.Fprintf(w, "  %s before make deploy, move the earlier state: %s\n", sWarn("!"), sCmd(migrateCmd(dir, s.profile)))
+		fmt.Fprintf(w, "  %s before the deploy, move the earlier state: %s\n", sWarn("!"), sCmd(migrateCmd(dir, s.profile)))
 	}
 	c.summary(env, s, wrote, false)
 	return nil
@@ -951,7 +951,7 @@ func (c *InitCmd) summary(env *initEnv, s *settings, wrote []string, dry bool) {
 	}
 	fmt.Fprintln(w, line)
 	if len(wrote) > 0 {
-		fmt.Fprintf(w, "  Settings saved. %s\n", sDim("Change them by re-running ./bin/darkplum init."))
+		fmt.Fprintf(w, "  Settings saved. %s\n", sDim("Change them by re-running darkplum init."))
 	}
 	if s.web.domain != "" {
 		fmt.Fprintf(w, "  Your team's address after deploy: %s %s\n", sCmd("https://"+s.web.hostname), sDim("(from "+strings.Join(s.web.allowed, ", ")+")"))
@@ -960,7 +960,7 @@ func (c *InitCmd) summary(env *initEnv, s *settings, wrote []string, dry bool) {
 	if s.gpu {
 		eta = "~35-50 min"
 	}
-	fmt.Fprintf(w, "\n  Next: %s  %s, then %s\n", sCmd("make deploy"), sDim("("+eta+")"), sCmd("./bin/darkplum configure"))
+	fmt.Fprintf(w, "\n  Next: %s  %s, then %s\n", sCmd("darkplum deploy"), sDim("("+eta+")"), sCmd("darkplum configure"))
 }
 
 // saveRecord writes install.json beside the settings. A re-run keeps what the

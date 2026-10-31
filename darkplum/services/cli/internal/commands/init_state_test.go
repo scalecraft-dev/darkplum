@@ -608,7 +608,7 @@ func TestInitStateFinalLineSaysConfigure(t *testing.T) {
 	if err := s3Cmd(t.TempDir(), nil).execute(env); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out.String(), "then ./bin/darkplum configure") || strings.Contains(out.String(), "darkplum status") {
+	if !strings.Contains(out.String(), "then darkplum configure") || strings.Contains(out.String(), "darkplum status") {
 		t.Errorf("final line:\n%s", out)
 	}
 }

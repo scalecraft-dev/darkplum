@@ -176,7 +176,7 @@ func (a *awsCloud) NameCollisions(region, name string) []checkResult {
 		rows = append(rows, unknown("log group", err))
 	} else if out == "1" {
 		rows = append(rows, checkResult{name: "log group", status: checkWarn, detail: lg + " exists",
-			hint: "left from an earlier install; make deploy imports and reuses it"})
+			hint: "left from an earlier install; the deploy imports and reuses it"})
 	} else {
 		rows = append(rows, checkResult{name: "log group", status: checkPass})
 	}

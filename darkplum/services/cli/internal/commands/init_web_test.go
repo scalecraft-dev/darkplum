@@ -103,7 +103,7 @@ func TestInitWebAddressPaths(t *testing.T) {
 		env.now = func() time.Time { return clock }
 		env.sleep = func(d time.Duration) { clock = clock.Add(d) }
 		err := yesCmd(dir, nil).execute(env)
-		if err == nil || !IsReported(err) || !strings.Contains(out.String(), "re-run ./bin/darkplum init: it continues from here") {
+		if err == nil || !IsReported(err) || !strings.Contains(out.String(), "re-run darkplum init: it continues from here") {
 			t.Fatalf("want a reported timeout, got %v\n%s", err, out)
 		}
 		if _, serr := os.Stat(filepath.Join(dir, "terraform.tfvars")); serr == nil {

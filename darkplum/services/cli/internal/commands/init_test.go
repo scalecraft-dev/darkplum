@@ -432,7 +432,7 @@ func TestInitInteractiveGPUFlow(t *testing.T) {
 			t.Errorf("tfvars lacks %s:\n%s", want, got)
 		}
 	}
-	for _, want := range []string{"Installing into account " + testAccount, "make deploy", "Settings saved"} {
+	for _, want := range []string{"Installing into account " + testAccount, "darkplum deploy", "Settings saved"} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("output lacks %q", want)
 		}

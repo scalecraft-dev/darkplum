@@ -624,7 +624,7 @@ func (c *InitCmd) createAndDelegate(env *initEnv, s *settings, cloud initCloud) 
 		elapsed := env.now().Sub(start)
 		if elapsed >= timeout {
 			return env.fail("delegation", fmt.Sprintf("not visible after %s", minutes(timeout)),
-				"add the 4 NS records above at your DNS provider, then re-run ./bin/darkplum init: it continues from here. Nothing else was written", "delegation not visible")
+				"add the 4 NS records above at your DNS provider, then re-run darkplum init: it continues from here. Nothing else was written", "delegation not visible")
 		}
 		if i%4 == 0 {
 			fmt.Fprintf(w, "  %s waiting for the NS records %s\n", sDim("…"), sDim(fmt.Sprintf("(%d min)", int(elapsed.Minutes()))))
@@ -650,7 +650,7 @@ func (c *InitCmd) mergeWeb(env *initEnv, dir string) error {
 	path := filepath.Join(dir, "terraform.tfvars")
 	tf, err := readTFVars(path)
 	if err != nil {
-		return env.fail("install settings", firstLine(err.Error()), "re-run ./bin/darkplum init and choose Start over", "cannot read the install settings")
+		return env.fail("install settings", firstLine(err.Error()), "re-run darkplum init and choose Start over", "cannot read the install settings")
 	}
 	s := &settings{profile: tf.Profile, region: tf.Region}
 	record := func(r checkResult) {
@@ -658,7 +658,7 @@ func (c *InitCmd) mergeWeb(env *initEnv, dir string) error {
 		s.checks = append(s.checks, r)
 	}
 	if s.region == "" {
-		return env.fail("install settings", "no region", "re-run ./bin/darkplum init and choose Start over", "install settings name no region")
+		return env.fail("install settings", "no region", "re-run darkplum init and choose Start over", "install settings name no region")
 	}
 	cloud := env.newCloud(tf.Profile)
 	fmt.Fprintf(w, "%s resolving AWS identity…\n", sDim("…"))
@@ -722,6 +722,6 @@ func (c *InitCmd) mergeWeb(env *initEnv, dir string) error {
 	}
 	fmt.Fprintf(w, "\n%s\n", sSuccess("✓ private address added; every other setting is unchanged"))
 	fmt.Fprintf(w, "  Your team's address after deploy: %s %s\n", sCmd("https://"+s.web.hostname), sDim("(from "+strings.Join(s.web.allowed, ", ")+")"))
-	fmt.Fprintf(w, "\n  Next: %s, then %s\n", sCmd("make deploy"), sCmd("./bin/darkplum configure"))
+	fmt.Fprintf(w, "\n  Next: %s, then %s\n", sCmd("darkplum deploy"), sCmd("darkplum configure"))
 	return nil
 }

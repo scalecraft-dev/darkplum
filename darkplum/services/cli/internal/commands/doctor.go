@@ -25,10 +25,10 @@ type DoctorCmd struct {
 // missing prerequisite fails in seconds instead of minutes into a provision.
 type DoctorCheckCmd struct {
 	Cloud   string `help:"Target cloud provider." enum:"aws,gcp" default:"aws"`
-	Region  string `help:"Region to check GPU capacity in — must match aws_region in your terraform.tfvars. Defaults per cloud." default:""`
-	Profile string `help:"AWS profile to check against — must match aws_profile in terraform.tfvars, else the check hits the wrong account. Defaults to the standard AWS credential chain." default:""`
+	Region  string `help:"Region to check GPU capacity in — must match the install's region. Defaults per cloud." default:""`
+	Profile string `help:"AWS profile to check against — must match the install's profile, else the check hits the wrong account. Defaults to the standard AWS credential chain." default:""`
 
-	Tfvars     string `help:"Path to the terraform.tfvars written by 'darkplum init'. Takes profile, region, GPU type and AZs from it and checks the credentials belong to the account it names. 'make deploy' passes this." default:""`
+	Tfvars     string `help:"Path to the settings file written by 'darkplum init'. Takes profile, region, GPU type and AZs from it and checks the credentials belong to the account it names. The deploy passes this." default:""`
 	MinSession int    `help:"Fail when the AWS session expires within this many minutes (an SSO login that lapses mid-apply strands a half-built cluster). 0 only reports it." name:"min-session" default:"0"`
 }
 
@@ -54,7 +54,7 @@ func (d *DoctorCheckCmd) Run(_ *Globals) error {
 	if d.Tfvars != "" {
 		var err error
 		if tf, err = readTFVars(d.Tfvars); err != nil {
-			return fmt.Errorf("%w — run ./bin/darkplum init first", err)
+			return fmt.Errorf("%w — run darkplum init first", err)
 		}
 		if d.Profile == "" {
 			d.Profile = tf.Profile
@@ -248,7 +248,7 @@ func sessionResult(expiry func(string) (time.Time, error), profile string, minMi
 	detail := fmt.Sprintf("%d min remaining", int(left.Minutes()))
 	if minMinutes > 0 && left < time.Duration(minMinutes)*time.Minute {
 		return checkResult{name: "session lifetime", status: checkFail, detail: detail,
-			hint: fmt.Sprintf("the install needs about %d minutes — run `aws sso login` (add --profile <name>) and retry; to proceed with less, lower the bar: make deploy MIN_SESSION=<minutes> (or --min-session)", minMinutes)}
+			hint: fmt.Sprintf("the install needs about %d minutes — run `aws sso login` (add --profile <name>) and retry; to proceed with less, lower the bar with --min-session <minutes>", minMinutes)}
 	}
 	return checkResult{name: "session lifetime", status: checkPass, detail: detail}
 }
@@ -266,8 +266,8 @@ func checkAccountMatch(profile string, want []string) checkResult {
 
 func accountMatchResult(got string, want []string) checkResult {
 	if len(want) == 0 {
-		return checkResult{name: "account match", status: checkWarn, detail: "tfvars pins no account",
-			hint: "re-run ./bin/darkplum init so the install is pinned to one account"}
+		return checkResult{name: "account match", status: checkWarn, detail: "the install pins no account",
+			hint: "re-run darkplum init so the install is pinned to one account"}
 	}
 	for _, w := range want {
 		if w == got {
@@ -275,8 +275,8 @@ func accountMatchResult(got string, want []string) checkResult {
 		}
 	}
 	return checkResult{name: "account match", status: checkFail,
-		detail: fmt.Sprintf("credentials are for %s, tfvars pins %s", got, strings.Join(want, ",")),
-		hint:   "use the profile for the pinned account (aws_profile in terraform.tfvars) or re-run ./bin/darkplum init"}
+		detail: fmt.Sprintf("credentials are for %s, the install pins %s", got, strings.Join(want, ",")),
+		hint:   "use the profile for the pinned account (the install's profile) or re-run darkplum init"}
 }
 
 // checkOfferings re-verifies that every AZ in tfvars still offers the instance
@@ -299,7 +299,7 @@ func checkOfferings(a *awsCloud, region string, azs, types []string) checkResult
 	}
 	if len(missing) > 0 {
 		return checkResult{name: "instance offerings", status: checkFail, detail: strings.Join(missing, ", ") + " lack " + strings.Join(types, "+"),
-			hint: "re-run ./bin/darkplum init to pick zones that offer them"}
+			hint: "re-run darkplum init to pick zones that offer them"}
 	}
 	return checkResult{name: "instance offerings", status: checkPass, detail: strings.Join(types, ", ") + " in " + strings.Join(azs, ", ")}
 }
