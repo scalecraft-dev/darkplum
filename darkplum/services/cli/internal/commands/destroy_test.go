@@ -861,3 +861,26 @@ func TestDestroyStopsWorkloadsBeforeDeletingVolumeClaims(t *testing.T) {
 		t.Error("deleted workloads although there were no claims to release")
 	}
 }
+
+// The semantic router has no load balancer and no volume: destroy needs no
+// router-specific call, and its objects (cluster-scoped ones included) are never
+// mistaken for something foreign that would stop the run.
+func TestDestroyWithTheSemanticRouterOn(t *testing.T) {
+	h := newDestroyHarness(t)
+	h.env.rec.SemanticRouter = true
+	h.aws.extra["rds describe-db-snapshots"] = `[]`
+	h.aws.extra["logs describe-log-groups"] = "0"
+	if err := h.run(); err != nil {
+		t.Fatalf("%v\n%s\n%s", err, h.out.String(), h.tl)
+	}
+	for _, bad := range []string{"semantic-router", "helm", "set env", "delete"} {
+		if n := len(h.k.matching(bad)); n != 0 {
+			t.Errorf("destroy ran %d %q call(s) for the router: %v", n, bad, h.k.matching(bad)[0].args)
+		}
+	}
+	if h.tl.first("terraform destroy") < 0 {
+		t.Error("terraform destroy never ran")
+	}
+	h.contains("semantic router", "goes with the cluster", "Done")
+	h.k.assertClean()
+}

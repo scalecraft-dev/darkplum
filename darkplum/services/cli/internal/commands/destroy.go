@@ -559,6 +559,12 @@ func (e *destroyEnv) kubePhase(ctx context.Context, kc *kube.Client) error {
 		}
 		if len(left.Services)+len(left.Claims) == 0 {
 			e.row(checkResult{name: "kubernetes", status: checkPass, detail: fmt.Sprintf("%d load balancer service(s) and %d volume claim(s) are gone", len(s.Services), len(s.Claims))})
+			if e.rec.SemanticRouter {
+				// Nothing to wait for: the router has no load balancer and no volume, and
+				// its cluster-scoped objects go with the cluster. A router installed by helm
+				// goes with it too; destroy never needs helm.
+				e.row(checkResult{name: "semantic router", status: checkPass, detail: "goes with the cluster (no load balancer or volume to wait for)"})
+			}
 			return nil
 		}
 		if e.now().After(deadline) {
