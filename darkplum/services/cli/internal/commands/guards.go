@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/scalecraft-dev/darkplum/cli/internal/install"
+	"github.com/scalecraft-dev/darkplum/cli/internal/kube"
 )
 
 // ---- release ordering -------------------------------------------------------------
@@ -59,6 +60,40 @@ func versionGuard(recorded, current string, allowDowngrade bool) error {
 		return nil
 	}
 	return refuse("their order is unknown")
+}
+
+// clusterVersion is the release the cluster itself says last applied it: the
+// version in its darkplum-install ConfigMap. The local record (install.json) only
+// knows what THIS machine applied; a teammate's newer deploy is visible only here.
+// "" with no error means the cluster has no record (never deployed by a release).
+func clusterVersion(kc *kube.Client) (string, error) {
+	out, err := kc.NS(nil, "get", "configmap", installRecord, "-o", "json")
+	if err != nil {
+		if kubeNotFound(err, "configmaps", installRecord) {
+			return "", nil
+		}
+		return "", err
+	}
+	var cm struct {
+		Data map[string]string `json:"data"`
+	}
+	if json.Unmarshal([]byte(out), &cm) != nil {
+		return "", errors.New("unexpected answer reading the darkplum-install ConfigMap")
+	}
+	return cm.Data["version"], nil
+}
+
+// versionGuardCluster applies versionGuard against the cluster's own record as
+// well as the local one, so the guard holds against the newer of the two: a deploy
+// from another machine cannot be quietly undone from this one. Both must pass.
+func versionGuardCluster(clusterRecorded, current string, allowDowngrade bool) error {
+	if clusterRecorded == "" {
+		return nil
+	}
+	if err := versionGuard(clusterRecorded, current, allowDowngrade); err != nil {
+		return fmt.Errorf("the cluster's own record (darkplum-install) says: %w", err)
+	}
+	return nil
 }
 
 // ---- state ownership --------------------------------------------------------------

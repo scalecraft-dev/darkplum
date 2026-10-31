@@ -810,6 +810,18 @@ func (e *deployEnv) checkConflicts(kc *kube.Client) (reachable bool, err error) 
 			hint: "cannot tell how the web UI is exposed; nothing was changed"}, "cannot inspect the web service")
 	}
 
+	// The local record knows what this machine applied; the cluster knows what anyone did.
+	switch cv, err := clusterVersion(kc); {
+	case err == nil:
+		if err := versionGuardCluster(cv, e.manifest.Version, e.flags.AllowDowngrade); err != nil {
+			return true, e.stop(checkResult{name: "release", status: checkFail, detail: firstLine(err.Error())}, "refusing to downgrade")
+		}
+	case unreachable(err):
+		return false, nil
+	default:
+		e.row(checkResult{name: "release", status: checkWarn, detail: "the cluster's own release record could not be read: " + firstLine(err.Error()),
+			hint: "continuing on the local record only"})
+	}
 	return e.checkRouterTakeover(kc)
 }
 

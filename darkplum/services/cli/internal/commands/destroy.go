@@ -235,6 +235,14 @@ func (e *destroyEnv) run(ctx context.Context) (err error) {
 		if len(survey.Foreign) > 0 {
 			return e.foreignStop(survey)
 		}
+		switch cv, verr := clusterVersion(kc); {
+		case verr == nil:
+			if err := versionGuardCluster(cv, e.version, e.flags.AllowDowngrade); err != nil {
+				return e.stop(checkResult{name: "release", status: checkFail, detail: firstLine(err.Error())}, "refusing to act with an older darkplum")
+			}
+		default:
+			e.row(checkResult{name: "release", status: checkWarn, detail: "the cluster's own release record could not be read: " + firstLine(verr.Error()), hint: "continuing on the local record only"})
+		}
 		e.row(checkResult{name: "load balancers and volumes", status: checkPass,
 			detail: fmt.Sprintf("%d load balancer service(s) and %d volume claim(s) in the Darkplum namespaces", len(survey.Services), len(survey.Claims))})
 	case errors.Is(cerr2, errClusterNotReady):

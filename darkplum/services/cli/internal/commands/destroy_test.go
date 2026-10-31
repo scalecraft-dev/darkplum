@@ -96,6 +96,7 @@ func newDestroyHarness(t *testing.T) *destroyHarness {
 	h.k = newScriptKube(t)
 	h.k.tl = h.tl
 	h.k.on("delete deployments", "", nil)
+	h.k.on("get configmap darkplum-install", "", notFound("configmaps", "darkplum-install"))
 	h.k.onFn("get svc -A", func([]string, []byte) ([]byte, error) {
 		return h.listJSON("LoadBalancer", append(append([]objRef{}, h.svcs...), h.foreign...)), nil
 	})
@@ -1112,4 +1113,61 @@ func TestPrecreatePrivateRefusesWhatIsAlreadyThere(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(dir, "elsewhere")); err == nil {
 		t.Error("created the symlink's target")
 	}
+}
+
+// The local record only knows what this machine applied. A newer release applied
+// from elsewhere is in the cluster's darkplum-install ConfigMap, and both guards
+// hold against it.
+func TestDeployAndDestroyGuardAgainstTheClustersOwnRecord(t *testing.T) {
+	record := func(v string) []byte { return []byte(`{"data":{"version":"` + v + `"}}`) }
+	withVersion := func(k *scriptKube, v string) {
+		k.handlers = append([]skHandler{{"get configmap darkplum-install", func([]string, []byte) ([]byte, error) { return record(v), nil }}}, k.handlers...)
+	}
+	t.Run("deploy: the cluster ran a newer release", func(t *testing.T) {
+		h := newDeployHarness(t, 0)
+		liveCluster(h)
+		withVersion(h.k, "1.9.0") // this binary is 1.2.3, the local record is empty
+		if !IsReported(h.run()) {
+			t.Fatal("deployed an older release over a newer one")
+		}
+		if h.tl.count("terraform") != 0 || h.writes() != 0 {
+			t.Errorf("went on:\n%s", h.tl)
+		}
+		h.mustContain("cluster's own record", "--allow-downgrade", "Nothing was changed")
+	})
+	t.Run("deploy: --allow-downgrade, the same release and an older one pass", func(t *testing.T) {
+		for _, tc := range []struct {
+			v    string
+			flag bool
+		}{{"1.9.0", true}, {"1.2.3", false}, {"1.0.0", false}} {
+			h := newDeployHarness(t, 0)
+			liveCluster(h)
+			h.env.flags.AllowDowngrade = tc.flag
+			withVersion(h.k, tc.v)
+			if err := h.run(); err != nil {
+				t.Errorf("cluster %s, flag %v: %v\n%s", tc.v, tc.flag, err, h.out.String())
+			}
+		}
+	})
+	t.Run("deploy: an unreadable cluster record is said, not fatal", func(t *testing.T) {
+		h := newDeployHarness(t, 0)
+		liveCluster(h)
+		h.k.handlers = append([]skHandler{{"get configmap darkplum-install", func([]string, []byte) ([]byte, error) {
+			return nil, errors.New(`Error from server (Forbidden): configmaps "darkplum-install" is forbidden`)
+		}}}, h.k.handlers...)
+		if err := h.run(); err != nil {
+			t.Fatalf("%v\n%s", err, h.out.String())
+		}
+		h.mustContain("release record could not be read", "local record only")
+	})
+	t.Run("destroy: the cluster ran a newer release", func(t *testing.T) {
+		h := newDestroyHarness(t)
+		withVersion(h.k, "1.9.0")
+		h.env.version = "1.2.3"
+		if !IsReported(h.run()) {
+			t.Fatal("destroyed with an older darkplum")
+		}
+		h.assertNothingDeleted()
+		h.contains("cluster's own record", "--allow-downgrade")
+	})
 }
