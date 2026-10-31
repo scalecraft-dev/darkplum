@@ -57,7 +57,7 @@ func (h *BillingHandler) vendorParam(c *gin.Context) (string, bool) {
 
 func (h *BillingHandler) secureTransport(c *gin.Context) bool {
 	if !keyInstallTransportOK(h.secureCookies, c.Request.Host) {
-		errJSON(c, http.StatusForbidden, "insecure_transport", insecureTransportMessage)
+		errJSON(c, http.StatusForbidden, "insecure_transport", insecureBillingTransportMessage)
 		return false
 	}
 	return true

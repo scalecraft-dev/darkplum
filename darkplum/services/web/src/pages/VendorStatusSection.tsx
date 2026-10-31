@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import type { ProviderState, ProviderStatus, VendorName } from '../types'
-import { KeyTransportHelpText } from '../components/KeyTransportHelpText'
+import { KeyTransportCommands, KeyTransportHelpText } from '../components/KeyTransportHelpText'
 import { VENDORS, VENDOR_KEY_COMMAND, vendorLabel } from '../lib/modelRouting'
 import {
   WEB_PORT_FORWARD_COMMAND,
@@ -546,22 +546,15 @@ function VendorRow({
                   ? 'The gateway in this cluster is older than this page, so keys are installed from the command line here. Redeploy the platform to install them from Darkplum.'
                   : <KeyTransportHelpText kind={transportHelp ?? 'page_not_https'} />}
               </p>
-              {/* The port-forward first, because it is the remedy that takes
-                  ten seconds and needs no certificate. Copyable, like every
-                  other command on this surface — it is long enough to mistype
-                  and the namespace is not guessable. */}
-              {canInstall && (
-                <div className={styles.command}>
-                  <CodeBlock>
-                    <code>{WEB_PORT_FORWARD_COMMAND}</code>
-                  </CodeBlock>
-                </div>
-              )}
-              <div className={styles.command}>
-                <CodeBlock>
-                  <code>{VENDOR_KEY_COMMAND[p.name]}</code>
-                </CodeBlock>
-              </div>
+              {/* Copyable, like every other command on this surface, in the order
+                  the sentence above names them: the api fix (only when the api
+                  is the fault), the port-forward, then the terminal path. */}
+              <KeyTransportCommands
+                kind={transportHelp ?? 'page_not_https'}
+                keyCommand={VENDOR_KEY_COMMAND[p.name]}
+                withForward={canInstall}
+                wrapperClassName={styles.command}
+              />
             </>
           )}
 

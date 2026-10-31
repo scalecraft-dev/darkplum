@@ -364,7 +364,11 @@ func keyInstallTransportOK(secureCookies bool, host string) bool {
 // insecureTransportMessage is PUT key's and POST verify's (key-present)
 // exact 403 message when keyInstallTransportOK is false -- confirmed with
 // the web engineer and carla's runbook.
-const insecureTransportMessage = "Installing a key from here needs HTTPS, because the key would cross the network unencrypted. Open Darkplum at its HTTPS address (darkplum status prints it, if this install has a team address), reach it over a port-forward at http://localhost:8081 (darkplum kubeconfig, then kubectl port-forward -n darkplum-system svc/darkplum-web 8081:80), or use the darkplum keys set command."
+const insecureTransportMessage = "Installing a key from here needs HTTPS, because the key would cross the network unencrypted. Open Darkplum at its HTTPS address (darkplum status prints it, if this install has a team address), or over a port-forward at http://localhost:8081 (eval \"$(darkplum kubeconfig)\" && kubectl port-forward -n darkplum-system svc/darkplum-web 8081:80), or use the darkplum keys set command."
+
+// insecureBillingTransportMessage is the same refusal for a billing key, whose
+// CLI path needs --billing.
+const insecureBillingTransportMessage = "Installing a key from here needs HTTPS, because the key would cross the network unencrypted. Open Darkplum at its HTTPS address (darkplum status prints it, if this install has a team address), or over a port-forward at http://localhost:8081 (eval \"$(darkplum kubeconfig)\" && kubectl port-forward -n darkplum-system svc/darkplum-web 8081:80), or use the darkplum keys set command with --billing."
 
 // requireSecureTransport refuses 403 insecure_transport when
 // keyInstallTransportOK is false for this request. Callers: PutKey always;

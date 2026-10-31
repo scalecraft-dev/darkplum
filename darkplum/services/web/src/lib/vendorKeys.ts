@@ -772,13 +772,15 @@ export const INSECURE_TRANSPORT_HELP = helpPlainText(INSECURE_TRANSPORT_HELP_PAR
  *  here too, and for the same reason — the api takes the loopback exception
  *  whatever SECURE_COOKIES says. */
 export const API_NOT_HTTPS_HELP_PARTS: readonly HelpPart[] = [
-  "This page is HTTPS, but Darkplum's api is not configured as HTTPS-served, so it refuses a key. Set SECURE_COOKIES=true in the darkplum-auth Secret and restart the api: with the install's cluster selected, run ",
-  { code: `kubectl patch secret darkplum-auth -n darkplum-system -p '{"stringData":{"SECURE_COOKIES":"true"}}'` },
-  ' and then ',
-  { code: 'kubectl rollout restart deployment/darkplum-api -n darkplum-system' },
-  '. To install a key before that, reach Darkplum over a port-forward — run the first command below, then open http://localhost:8081 — or install it with the second command.',
+  "This page is HTTPS, but Darkplum's api is not configured as HTTPS-served, so it refuses a key. To fix it, run the first command below: it sets SECURE_COOKIES=true in the darkplum-auth Secret and restarts the api. To install a key before that, reach Darkplum over a port-forward — run the second command below, then open http://localhost:8081 — or install it with the third command.",
 ]
 export const API_NOT_HTTPS_HELP = helpPlainText(API_NOT_HTTPS_HELP_PARTS)
+
+/** The api-side fix for API_NOT_HTTPS_HELP. No CLI command sets SECURE_COOKIES,
+ *  so this is the whole of it; guarded like the port-forward so it can only act
+ *  on this install's cluster. */
+export const SECURE_COOKIES_FIX_COMMAND =
+  'eval "$(darkplum kubeconfig)" && \\\n  kubectl patch secret darkplum-auth -n darkplum-system -p \'{"stringData":{"SECURE_COOKIES":"true"}}\' && \\\n  kubectl rollout restart deployment/darkplum-api -n darkplum-system'
 
 /** Which of the two is true of this page. */
 export type KeyTransportHelp = 'page_not_https' | 'api_not_https'

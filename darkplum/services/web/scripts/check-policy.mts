@@ -74,6 +74,7 @@ import {
   API_NOT_HTTPS_HELP,
   INSECURE_TRANSPORT_HELP,
   INSTALL_WINDOW_MS,
+  SECURE_COOKIES_FIX_COMMAND,
   WEB_PORT_FORWARD_COMMAND,
   WEB_PORT_FORWARD_URL,
   admittedDiff,
@@ -1137,6 +1138,17 @@ for (const [name, message] of [
 }
 if (API_NOT_HTTPS_HELP.includes('darkplum deploy')) {
   failures.push('API_NOT_HTTPS_HELP must not send an administrator to a redeploy that does not set SECURE_COOKIES')
+}
+// The api-side fix is a command to copy, guarded like the port-forward, and it
+// really sets the setting the api reads and restarts the api that reads it.
+if (!SECURE_COOKIES_FIX_COMMAND.startsWith('eval "$(darkplum kubeconfig)" && \\\n')) {
+  failures.push('SECURE_COOKIES_FIX_COMMAND must select the install\'s cluster first')
+}
+for (const needle of ['patch secret darkplum-auth -n darkplum-system', '"SECURE_COOKIES":"true"', 'rollout restart deployment/darkplum-api -n darkplum-system']) {
+  if (!SECURE_COOKIES_FIX_COMMAND.includes(needle)) failures.push(`SECURE_COOKIES_FIX_COMMAND lacks ${needle}`)
+}
+if (!API_NOT_HTTPS_HELP.includes('first command below')) {
+  failures.push('API_NOT_HTTPS_HELP must point at the fix command, which is shown first')
 }
 const forwardedPort = new URL(WEB_PORT_FORWARD_URL).port
 if (!WEB_PORT_FORWARD_COMMAND.endsWith(`${forwardedPort}:80`)) {

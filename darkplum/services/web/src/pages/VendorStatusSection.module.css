@@ -88,7 +88,12 @@
   max-width: 76ch;
 }
 
-/* Wide enough for the longest command on this card — the port-forward, at 65
+.next code {
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
+/* Wide enough for the longest command on this card — the port-forward, at 66
    characters — so neither block is handed to the reader pre-scrolled. Still
    narrower than the prose above it (76ch), which keeps the code reading as an
    inset rather than as the body of the card. */
