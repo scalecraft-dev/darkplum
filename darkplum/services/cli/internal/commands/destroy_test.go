@@ -728,9 +728,8 @@ func TestDestroyNoInstallRunsNothing(t *testing.T) {
 
 func TestDestroyRefusesAStateThatIsNotThisInstalls(t *testing.T) {
 	cases := map[string]string{
-		"another cluster":      outputsJSON(0, func(v map[string]any) { v["cluster_name"] = "prod-eks" }),
-		"another region":       outputsJSON(0, func(v map[string]any) { v["provider_region"] = "eu-west-1" }),
-		"resources, no output": "{}",
+		"another cluster": outputsJSON(0, func(v map[string]any) { v["cluster_name"] = "prod-eks" }),
+		"another region":  outputsJSON(0, func(v map[string]any) { v["provider_region"] = "eu-west-1" }),
 	}
 	for name, out := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -883,4 +882,122 @@ func TestDestroyWithTheSemanticRouterOn(t *testing.T) {
 	}
 	h.contains("semantic router", "goes with the cluster", "Done")
 	h.k.assertClean()
+}
+
+// An interrupted first deploy: resources, no outputs. Refused by default and
+// under --confirm alone; destroyable under this cluster's exact state key and a
+// second confirmation; never under a key that is not the cluster's own.
+func TestDestroyUnfinishedInstall(t *testing.T) {
+	unfinished := func(t *testing.T) *destroyHarness {
+		h := newDestroyHarness(t)
+		h.tf.outputs = "{}"
+		h.aws.extra["rds describe-db-snapshots"] = `[]`
+		h.aws.extra["logs describe-log-groups"] = "0"
+		// No outputs means no final-snapshot setting to read: its own confirmation applies.
+		h.env.flags.ConfirmNoSnapshot = "dp-trial"
+		return h
+	}
+	t.Run("--confirm alone is refused and says how to go on", func(t *testing.T) {
+		h := unfinished(t)
+		h.env.interactive = false
+		if !IsReported(h.run()) {
+			t.Fatal("destroyed an unfinished install on --confirm alone")
+		}
+		h.assertNothingDeleted()
+		if h.tf.ran("plan") || h.tl.count("kubectl delete") != 0 {
+			t.Error("went on")
+		}
+		h.contains("--confirm-unfinished dp-trial", "darkplum deploy")
+	})
+	t.Run("--confirm-unfinished with --confirm destroys it", func(t *testing.T) {
+		h := unfinished(t)
+		h.env.flags.ConfirmUnfinished = "dp-trial"
+		if err := h.run(); err != nil {
+			t.Fatalf("%v\n%s", err, h.out.String())
+		}
+		if !h.tf.ran("destroy") {
+			t.Error("terraform destroy did not run")
+		}
+		h.contains("never finished deploying", "--confirm-unfinished dp-trial")
+		h.k.assertClean()
+	})
+	t.Run("--confirm-unfinished is not a --confirm", func(t *testing.T) {
+		h := unfinished(t)
+		h.env.flags.Confirm, h.env.flags.ConfirmUnfinished = "", "dp-trial"
+		h.env.interactive = false
+		if !IsReported(h.run()) {
+			t.Fatal("the cluster name was never confirmed")
+		}
+		h.assertNothingDeleted()
+	})
+	t.Run("the wrong cluster name for the second confirmation", func(t *testing.T) {
+		h := unfinished(t)
+		h.env.flags.ConfirmUnfinished = "prod"
+		if !IsReported(h.run()) {
+			t.Fatal("went on")
+		}
+		h.assertNothingDeleted()
+	})
+	t.Run("typed interactively, twice", func(t *testing.T) {
+		h := unfinished(t)
+		h.env.flags.Confirm = ""
+		h.prompts = []string{"dp-trial", "dp-trial"}
+		if err := h.run(); err != nil {
+			t.Fatalf("%v\n%s", err, h.out.String())
+		}
+		if len(h.asked) != 2 {
+			t.Errorf("asked %d questions: %v", len(h.asked), h.asked)
+		}
+	})
+	t.Run("typed once is not enough", func(t *testing.T) {
+		h := unfinished(t)
+		h.env.flags.Confirm = ""
+		h.prompts = []string{"dp-trial", "yes"}
+		if !IsReported(h.run()) {
+			t.Fatal("went on")
+		}
+		h.assertNothingDeleted()
+	})
+	t.Run("a key that is not this cluster's own stays refused, whatever the flags", func(t *testing.T) {
+		for _, key := range []string{"darkplum/aws/someone-else/terraform.tfstate", "darkplum/aws/x/dp-trial/terraform.tfstate", "darkplum/aws/terraform.tfstate"} {
+			h := unfinished(t)
+			h.env.rec.Backend.Key = key
+			h.env.flags.ConfirmUnfinished = "dp-trial"
+			if !IsReported(h.run()) {
+				t.Fatalf("destroyed under key %q", key)
+			}
+			h.assertNothingDeleted()
+			if h.tf.ran("plan") {
+				t.Errorf("planned under key %q", key)
+			}
+		}
+	})
+}
+
+func TestDestroyClusterStillBeingCreatedOrFailed(t *testing.T) {
+	t.Run("CREATING: wait and re-run, nothing deleted", func(t *testing.T) {
+		h := newDestroyHarness(t)
+		h.aws.base.status = "CREATING"
+		if !IsReported(h.run()) {
+			t.Fatal("went on")
+		}
+		h.assertNothingDeleted()
+		h.contains("still changing state", "darkplum destroy")
+	})
+	t.Run("FAILED: Kubernetes skipped loudly, the infrastructure is destroyed", func(t *testing.T) {
+		h := newDestroyHarness(t)
+		h.aws.base.status = "FAILED"
+		h.aws.extra["rds describe-db-snapshots"] = `[]`
+		h.aws.extra["logs describe-log-groups"] = "0"
+		if err := h.run(); err != nil {
+			t.Fatalf("%v\n%s", err, h.out.String())
+		}
+		if h.tl.count("kubectl") != 0 {
+			t.Errorf("kubectl ran against a FAILED cluster:\n%s", h.tl)
+		}
+		if !h.tf.ran("destroy") {
+			t.Error("terraform destroy did not run")
+		}
+		h.contains("SKIPPING the Kubernetes phase", "FAILED")
+	})
 }

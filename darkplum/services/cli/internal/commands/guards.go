@@ -73,6 +73,16 @@ func managedCount(state map[string]bool) int {
 	return n
 }
 
+// unfinishedStateError is a strict ownership check that found resources and no
+// outputs under the exact key init writes for this cluster: very likely an install
+// whose first apply was interrupted, which destroy may remove only on a separate,
+// explicit confirmation.
+type unfinishedStateError struct{}
+
+func (*unfinishedStateError) Error() string {
+	return "the state holds resources but no outputs (an unfinished first apply looks like this), under this cluster's own state key"
+}
+
 // checkStateOwnership makes sure the Terraform state this install points at is this
 // install's: its outputs must name the install's cluster and region. A state whose
 // outputs name another cluster is refused. A state that has resources but no
@@ -105,7 +115,13 @@ func checkStateOwnership(tf tfRunner, rec install.Record, state map[string]bool,
 	name, region := str("cluster_name"), str("provider_region")
 	if name == "" && region == "" {
 		if strict {
-			return "", errors.New("the state holds resources but no outputs, so it cannot be shown to belong to this install (an unfinished apply looks like this; so does someone else's state)")
+			// An interrupted first install looks like this, and so does someone else's
+			// state. Only the exact key init derives for this cluster is evidence enough
+			// to offer the former; destroy then asks for its own confirmation.
+			if rec.Backend.Key == stateKeyFor(rec.ClusterName) {
+				return "", &unfinishedStateError{}
+			}
+			return "", fmt.Errorf("the state holds resources but no outputs, so it cannot be shown to belong to this install (an unfinished apply looks like this; so does someone else's state), and its key %q is not the one init derives for cluster %s (%q)", rec.Backend.Key, rec.ClusterName, stateKeyFor(rec.ClusterName))
 		}
 		// The exact key init writes for this cluster, not a path that merely mentions
 		// it: "darkplum/aws/x/" + cluster + "/y/terraform.tfstate" is someone else's.

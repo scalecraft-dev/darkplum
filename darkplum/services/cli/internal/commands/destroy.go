@@ -51,6 +51,7 @@ type DestroyCmd struct {
 	Confirm           string `name:"confirm" help:"The cluster name, for scripts. Interactively you are asked to type it."`
 	ConfirmNoSnapshot string `name:"confirm-no-snapshot" help:"The cluster name again, to delete the database WITHOUT a final snapshot when the install is configured to take none. --confirm does not cover this."`
 	AllowDowngrade    bool   `name:"allow-downgrade" help:"Destroy even though this darkplum is older than (or cannot be ordered against) the release that last applied the install."`
+	ConfirmUnfinished string `name:"confirm-unfinished" help:"The cluster name once more, to destroy an install whose first deploy never finished (the state has resources but no outputs). Without it such a state is refused. You can also finish it with darkplum deploy first."`
 	MinSession        int    `name:"min-session" help:"Stop unless the AWS session outlasts this many minutes." default:"30"`
 }
 
@@ -202,11 +203,19 @@ func (e *destroyEnv) run(ctx context.Context) (err error) {
 		e.row(checkResult{name: "terraform state", status: checkPass, detail: "empty: nothing to destroy"})
 		return e.report(tf)
 	}
+	unfinished := false
 	if _, err := checkStateOwnership(tf, rec, state, true); err != nil {
-		return e.stop(checkResult{name: "terraform state", status: checkFail, detail: firstLine(err.Error()),
-			hint: "check backend.hcl: destroy will not delete resources it cannot show belong to " + rec.ClusterName + ". Nothing was deleted"}, "the state is not this install's")
+		var uf *unfinishedStateError
+		if !errors.As(err, &uf) {
+			return e.stop(checkResult{name: "terraform state", status: checkFail, detail: firstLine(err.Error()),
+				hint: "check backend.hcl: destroy will not delete resources it cannot show belong to " + rec.ClusterName + ". Nothing was deleted"}, "the state is not this install's")
+		}
+		unfinished = true
+		e.row(checkResult{name: "terraform state", status: checkWarn, detail: fmt.Sprintf("%d resources and no outputs: an install whose first deploy never finished", managed),
+			hint: "it can be destroyed on a second, separate confirmation (below), or finished with `darkplum deploy` first"})
+	} else {
+		e.row(checkResult{name: "terraform state", status: checkPass, detail: fmt.Sprintf("%d resources, belonging to %s", managed, rec.ClusterName)})
 	}
-	e.row(checkResult{name: "terraform state", status: checkPass, detail: fmt.Sprintf("%d resources, belonging to %s", managed, rec.ClusterName)})
 
 	var kc *kube.Client
 	var survey kubeSurvey
@@ -224,6 +233,17 @@ func (e *destroyEnv) run(ctx context.Context) (err error) {
 		}
 		e.row(checkResult{name: "load balancers and volumes", status: checkPass,
 			detail: fmt.Sprintf("%d load balancer service(s) and %d volume claim(s) in the Darkplum namespaces", len(survey.Services), len(survey.Claims))})
+	case errors.Is(cerr2, errClusterNotReady):
+		// An interrupted first deploy leaves exactly this. FAILED never ran a workload
+		// and will not recover: nothing to clean in Kubernetes. Anything else is still
+		// moving, and deleting around it would race the creation.
+		if strings.Contains(row.detail, " is FAILED") {
+			e.row(checkResult{name: "cluster", status: checkWarn, detail: row.detail,
+				hint: "SKIPPING the Kubernetes phase: a FAILED cluster never ran Darkplum's workloads, so there are no load balancers or volumes of ours to clean up"})
+			break
+		}
+		return e.stop(checkResult{name: "cluster", status: checkFail, detail: row.detail,
+			hint: "the cluster is still changing state (an earlier deploy was interrupted). Wait for it to become ACTIVE or FAILED, then re-run `darkplum destroy`, or `darkplum deploy` to finish it. Nothing was deleted"}, "the cluster is not ready")
 	case errors.Is(cerr2, errClusterNotFound):
 		e.row(checkResult{name: "cluster", status: checkWarn, detail: "gone: " + rec.ClusterName + " does not exist in " + rec.Region,
 			hint: "SKIPPING the Kubernetes phase. Load balancers and volumes its controllers created cannot be cleaned up and may block the VPC's deletion; check the console if the destroy stalls"})
@@ -237,6 +257,11 @@ func (e *destroyEnv) run(ctx context.Context) (err error) {
 		rec.ClusterName, rec.Region, caller)
 	if err := e.confirmName(); err != nil {
 		return err
+	}
+	if unfinished {
+		if err := e.confirmUnfinished(); err != nil {
+			return err
+		}
 	}
 
 	// ---- 4. terraform-side preparation, before any Kubernetes deletion ----------
@@ -345,6 +370,30 @@ func (e *destroyEnv) confirmName() error {
 	}
 	if got := strings.TrimSpace(e.prompt("\nType the cluster name (" + want + ") to destroy it")); got != want {
 		return e.stop(checkResult{name: "confirmation", status: checkFail, detail: "the name typed does not match", hint: "nothing was deleted"}, "not confirmed")
+	}
+	return nil
+}
+
+// confirmUnfinished is the extra, separate confirmation for a state that has
+// resources and no outputs. --confirm does not answer it.
+func (e *destroyEnv) confirmUnfinished() error {
+	want := e.rec.ClusterName
+	e.row(checkResult{name: "unfinished install", status: checkWarn, detail: "the state has resources but no outputs: this install never finished deploying. Destroy deletes what is in it"})
+	if e.flags.ConfirmUnfinished != "" {
+		if e.flags.ConfirmUnfinished != want {
+			return e.stop(checkResult{name: "confirmation", status: checkFail, detail: fmt.Sprintf("--confirm-unfinished %q is not this install's cluster (%s)", e.flags.ConfirmUnfinished, want),
+				hint: "nothing was deleted"}, "wrong --confirm-unfinished")
+		}
+		e.row(checkResult{name: "confirmation", status: checkPass, detail: "--confirm-unfinished " + want})
+		return nil
+	}
+	if !e.interactive {
+		return e.stop(checkResult{name: "confirmation", status: checkFail, detail: "this install never finished deploying; --confirm does not cover it",
+			hint: "pass --confirm-unfinished " + want + " as well, or finish it with `darkplum deploy` first. Nothing was deleted"}, "not confirmed")
+	}
+	if got := strings.TrimSpace(e.prompt("This install never finished deploying. Type the cluster name again (" + want + ") to destroy what it has")); got != want {
+		return e.stop(checkResult{name: "confirmation", status: checkFail, detail: "the name typed does not match",
+			hint: "nothing was deleted. Or finish the install with `darkplum deploy` first"}, "not confirmed")
 	}
 	return nil
 }
