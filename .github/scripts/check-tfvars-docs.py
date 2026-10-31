@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """Fail when documentation tells a user to copy or hand-edit terraform.tfvars.
 
-Configuration comes from `darkplum init`. Any README, docs/*.md or Makefile text
+Configuration comes from `darkplum init`. Any README or docs/*.md text
 that instructs copying or editing terraform.tfvars (cp, copy, edit, vi, vim,
 nano, "open ... terraform.tfvars", ...) is rejected, including when the sentence
 wraps across lines. The advanced/GitOps path stays documented, but only inside an
 explicit block:
 
-    <!-- tfvars-manual:begin -->   (any comment syntax; Makefile: # tfvars-manual:begin)
+    <!-- tfvars-manual:begin -->   (any comment syntax)
     ...
     <!-- tfvars-manual:end -->
 
-Usage: check-tfvars-docs.py [files...]   (default: every tracked *.md and Makefile)
+Usage: check-tfvars-docs.py [files...]   (default: every tracked *.md)
 """
 import re
 import subprocess
@@ -66,7 +66,7 @@ def main():
     files = sys.argv[1:]
     if not files:
         root = subprocess.check_output(["git", "rev-parse", "--show-toplevel"], text=True).strip()
-        out = subprocess.check_output(["git", "-C", root, "ls-files", "*.md", "*Makefile"], text=True)
+        out = subprocess.check_output(["git", "-C", root, "ls-files", "*.md"], text=True)
         files = [f"{root}/{f}" for f in out.split() if "node_modules" not in f]
     failed = False
     for path in files:
@@ -74,7 +74,7 @@ def main():
             failed = True
             print(f"{path}: tells the reader to copy/edit terraform.tfvars: {text!r}")
     if failed:
-        print("Use ./bin/darkplum init instead, or wrap a deliberate GitOps/advanced section in\n"
+        print("Use darkplum init instead, or wrap a deliberate GitOps/advanced section in\n"
               "tfvars-manual:begin / tfvars-manual:end markers.")
         sys.exit(1)
 

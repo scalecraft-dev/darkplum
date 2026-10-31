@@ -26,11 +26,6 @@ output "vpc_cidr" {
   value       = var.vpc_cidr
 }
 
-output "kube_config_command" {
-  description = "Deprecated, removed with the Makefile flow: it points the operator's own ~/.kube/config at the cluster. The darkplum CLI never does that; it writes a private kubeconfig per install."
-  value       = "aws eks update-kubeconfig --region ${var.aws_region} --name ${module.eks.cluster_name}"
-}
-
 output "container_registry" {
   description = "Container registry host the first-party image repositories live on."
   value       = "${data.aws_caller_identity.current.account_id}.dkr.ecr.${var.aws_region}.amazonaws.com"

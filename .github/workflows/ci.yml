@@ -244,23 +244,33 @@ jobs:
               -e "s|PLACEHOLDER_MODEL_REVISION|main|g" -e "s|PLACEHOLDER_SERVED_MODEL_NAME|ci|g" \
               -e "s|PLACEHOLDER_MAX_MODEL_LEN|8192|g" k8s/templates/vllm-model.yaml \
             | python3 -c 'import sys, yaml; docs = list(yaml.safe_load_all(sys.stdin)); assert {d["kind"] for d in docs} == {"Deployment", "Service"}, docs'
-      - name: Makefile parses
-        run: make -n help > /dev/null
-      # Configuration comes from `darkplum init`; no README, docs/*.md or Makefile
+      # Configuration comes from `darkplum init`; no README or docs/*.md
       # text may tell a user to copy or hand-edit terraform.tfvars (a deliberate
       # GitOps section sits inside tfvars-manual:begin/end markers).
       - name: docs do not say to copy or edit tfvars
         working-directory: .
         run: python3 -I .github/scripts/check-tfvars-docs.py
-      # make deploy must stop before doing any work when init has not run.
-      - name: make deploy refuses without terraform.tfvars
+      # darkplum deploy must stop before doing any work when init has not run: built
+      # from source, run in an empty directory with an empty home, it fails with the
+      # init hint and never reaches Terraform.
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: darkplum/services/cli/go.mod
+          cache-dependency-path: darkplum/services/cli/go.sum
+      - name: darkplum deploy refuses without an install
         run: |
-          empty=$(mktemp -d)
-          for target in deploy deploy-infra; do
-            if out=$(make "$target" TF_DIR="$empty" 2>&1); then echo "make $target succeeded without tfvars"; exit 1; fi
-            echo "$out" | grep -q 'Run ./bin/darkplum init first' || { echo "no init hint from make $target:"; echo "$out"; exit 1; }
-            if echo "$out" | grep -qE 'Initializing Terraform|Building darkplum CLI'; then echo "make $target did work before the guard"; exit 1; fi
+          (cd services/cli && go build -o "$RUNNER_TEMP/darkplum" ./cmd)
+          empty=$(mktemp -d); home=$(mktemp -d)
+          for cmd in deploy destroy; do
+            if out=$(cd "$empty" && DARKPLUM_HOME="$home" "$RUNNER_TEMP/darkplum" "$cmd" 2>&1); then echo "darkplum $cmd succeeded without an install"; exit 1; fi
+            echo "$out" | grep -q 'darkplum init' || { echo "no init hint from darkplum $cmd:"; echo "$out"; exit 1; }
+            if echo "$out" | grep -qE 'Initializing|terraform (init|apply|plan)'; then echo "darkplum $cmd did work before the guard:"; echo "$out"; exit 1; fi
           done
+      # No instruction to run make, and no Makefile, may come back (migrations and
+      # the router values snapshots are allowlisted in the script, with reasons).
+      - name: no make instructions and no Makefile
+        working-directory: .
+        run: python3 -I .github/scripts/check-no-make.py
       - name: API reference is generated from the golden
         working-directory: darkplum/services/api
         run: |
