@@ -59,7 +59,7 @@ func TestVersionShowsReleaseDigestsAndThirdPartyPins(t *testing.T) {
 
 func TestVersionLabelsDevAndRCBuilds(t *testing.T) {
 	dev := renderVersion(t, &VersionCmd{}, release.Manifest{Schema: 1, Channel: release.Dev, Version: "dev"})
-	if !strings.Contains(dev, "DEV BUILD") || strings.Contains(dev, "ghcr.io") {
+	if !strings.Contains(dev, "DEV BUILD") || strings.Contains(dev, "/darkplum-") {
 		t.Errorf("dev output:\n%s", dev)
 	}
 	rc := renderVersion(t, &VersionCmd{}, goldenManifest(t, "rc.golden.json"))

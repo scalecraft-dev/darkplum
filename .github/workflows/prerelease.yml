@@ -73,6 +73,11 @@ jobs:
         with:
           go-version-file: darkplum/services/cli/go.mod
           cache-dependency-path: darkplum/services/cli/go.sum
+      # The router's Kubernetes objects are rendered from its chart in CI, never on
+      # the customer's machine, and embedded in the CLI. The committed file must be
+      # exactly what the pinned chart and values render to, or the build stops.
+      - name: Semantic router render is current
+        run: bash .github/scripts/render-semantic-router.sh --check
       - name: Build
         env:
           DIGESTS: ${{ needs.images.outputs.digests }}

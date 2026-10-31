@@ -39,8 +39,27 @@ func (b *Bundle) Pins() ([]Pin, error) {
 			out = append(out, Pin{File: file, Ref: m[1], Chart: true})
 		}
 	})
+	// A chart's tag-only pin is the same image as the full reference its rendered
+	// objects carry; listing it twice would show one image as two.
+	kept := out[:0]
+	for _, p := range out {
+		if p.Chart && coveredByFullRef(p.Ref, out) {
+			continue
+		}
+		kept = append(kept, p)
+	}
+	out = kept
 	sortPins(out)
 	return out, err
+}
+
+func coveredByFullRef(tag string, pins []Pin) bool {
+	for _, q := range pins {
+		if !q.Chart && strings.HasSuffix(q.Ref, ":"+tag) {
+			return true
+		}
+	}
+	return false
 }
 
 // Unpinned lists image references that are neither Darkplum's own (darkplum-*,

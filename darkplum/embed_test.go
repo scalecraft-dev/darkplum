@@ -62,6 +62,11 @@ func TestEmbedHygiene(t *testing.T) {
 		"terraform/aws/modules/ecr/main.tf",
 		"k8s/base/kustomization.yaml",
 		"k8s/templates/vllm-model.yaml",
+		// The semantic router, rendered from its chart in CI (no helm on the
+		// operator's machine): the CLI applies these files.
+		"k8s/semantic-router/rendered.yaml",
+		"k8s/semantic-router/network-policies.yaml",
+		"k8s/semantic-router/values.yaml",
 	} {
 		if _, err := fs.Stat(Tree(), want); err != nil {
 			t.Errorf("bundle is missing %s: %v", want, err)

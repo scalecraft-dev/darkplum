@@ -63,3 +63,25 @@ func TestEmbeddedBundlePinsEveryThirdPartyImage(t *testing.T) {
 		}
 	}
 }
+
+// The router's rendered objects carry its full image reference and values.yaml
+// carries the tag alone: that is one pinned image, listed once, in full.
+func TestRouterImageIsListedOnce(t *testing.T) {
+	b, err := Embedded()
+	if err != nil {
+		t.Fatal(err)
+	}
+	pins, _ := b.Pins()
+	n := 0
+	for _, p := range pins {
+		if strings.Contains(p.Ref, "5c5a6421f7a1fc0596fc7e9053b35952fef4bc12564c01a3f7315c51e3602ae6") {
+			n++
+			if p.Chart || !strings.HasPrefix(p.Ref, "ghcr.io/vllm-project/semantic-router/extproc:v0.3.0@sha256:") {
+				t.Errorf("pin = %+v", p)
+			}
+		}
+	}
+	if n != 1 {
+		t.Errorf("the router image is listed %d times: %v", n, pins)
+	}
+}

@@ -194,6 +194,10 @@ jobs:
       # mix-ups, and the workflow files must at least parse.
       - run: python3 -I -m unittest discover -s .github/scripts -p 'test_*.py' -v
       - run: python3 -I .github/scripts/check-pinned-actions.py
+      # The router chart is rendered to plain objects in CI (helm is on the runner);
+      # the committed rendering must be what the pinned chart and values produce.
+      - name: Semantic router render is current
+        run: bash .github/scripts/render-semantic-router.sh --check
       # The CLI runs terraform with -lockfile=readonly on the customer's machine,
       # so the lock file must cover darwin/linux x arm64/amd64.
       - run: python3 -I .github/scripts/check-lock-platforms.py

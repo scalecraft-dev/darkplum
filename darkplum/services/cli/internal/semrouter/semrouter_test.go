@@ -328,3 +328,54 @@ func TestDecisionsFromTheRealValues(t *testing.T) {
 		t.Error("no decisions parsed from k8s/semantic-router/values.yaml")
 	}
 }
+
+// The rendering that ships is the one this package's pins describe. CI re-renders
+// the chart and compares byte for byte (render-semantic-router.sh --check); this
+// is the part a dev build can check without helm or a network.
+func TestShippedRenderingMatchesThePins(t *testing.T) {
+	k8s, _ := fs.Sub(darkplum.Tree(), "k8s")
+	objs, err := Objects(k8s, "darkplum-system")
+	if err != nil {
+		t.Fatalf("the embedded bundle carries no usable rendering: %v", err)
+	}
+	var values struct {
+		Image struct {
+			Tag string `json:"tag"`
+		} `json:"image"`
+	}
+	v, _ := DefaultValues(k8s)
+	if err := yaml.Unmarshal(v, &values); err != nil || !strings.Contains(values.Image.Tag, "@sha256:") {
+		t.Fatalf("values.yaml does not pin the image by digest: %v %q", err, values.Image.Tag)
+	}
+	raw, _ := fs.ReadFile(k8s, "semantic-router/rendered.yaml")
+	text := string(raw)
+	if !strings.Contains(text, "helm.sh/chart: semantic-router-"+ChartVersion) {
+		t.Errorf("rendered.yaml is not chart %s", ChartVersion)
+	}
+	if !strings.Contains(text, ":"+values.Image.Tag+`"`) {
+		t.Errorf("rendered.yaml does not run the image values.yaml pins (%s)", values.Image.Tag)
+	}
+	if strings.Contains(text, "helm.sh/hook") {
+		t.Error("a helm hook object cannot be applied without helm")
+	}
+	kinds := map[string]bool{}
+	for _, o := range objs {
+		kinds[o.Kind()] = true
+		if o.Kind() == "Deployment" && o.Name() != ReleaseName {
+			t.Errorf("deployment %q is not %q", o.Name(), ReleaseName)
+		}
+	}
+	for _, k := range []string{"Deployment", "Service", "ConfigMap", "ServiceAccount", "NetworkPolicy"} {
+		if !kinds[k] {
+			t.Errorf("no %s in the router objects: %v", k, kinds)
+		}
+	}
+	// The script and this package pin the same chart.
+	sh, err := os.ReadFile("../../../../../.github/scripts/render-semantic-router.sh")
+	if err != nil {
+		t.Skipf("not in a checkout: %v", err)
+	}
+	if !strings.Contains(string(sh), "VERSION="+ChartVersion+"\n") {
+		t.Errorf("render-semantic-router.sh pins a different chart than ChartVersion %s", ChartVersion)
+	}
+}
