@@ -225,6 +225,19 @@ jobs:
           for overlay in dev dev-aws; do
             kubectl kustomize k8s/overlays/$overlay > /dev/null || exit 1
           done
+      # scripts/dev.sh is contributor tooling; a full kind run stays manual. CI
+      # proves it parses, passes shellcheck, prints usage and refuses bad input
+      # before it touches docker, kind or kubectl.
+      - name: dev.sh lints and validates its arguments
+        run: |
+          bash -n scripts/dev.sh
+          shellcheck scripts/dev.sh
+          scripts/dev.sh help | grep -q 'scripts/dev.sh up'
+          if scripts/dev.sh nope >/dev/null 2>&1; then echo "dev.sh accepted an unknown command"; exit 1; fi
+          if scripts/dev.sh build nothing >/dev/null 2>&1; then echo "dev.sh build accepted an unknown service"; exit 1; fi
+          if DEV_PORT='8080;x' scripts/dev.sh up >/dev/null 2>&1; then echo "dev.sh up accepted a bad DEV_PORT"; exit 1; fi
+          if DEV_AWS_PROFILE='a|b' scripts/dev.sh up >/dev/null 2>&1; then echo "dev.sh up accepted a bad DEV_AWS_PROFILE"; exit 1; fi
+          if scripts/dev.sh eks-push --install ../x >/dev/null 2>&1; then echo "dev.sh eks-push accepted a path as an install name"; exit 1; fi
       - name: model template renders
         run: |
           sed -e "s|MODEL_INSTANCE|ci|g" -e "s|PLACEHOLDER_MODEL_NAME|org/model|g" \
