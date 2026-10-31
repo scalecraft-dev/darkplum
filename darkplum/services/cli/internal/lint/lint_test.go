@@ -51,8 +51,8 @@ func check(fset *token.FileSet, f *ast.File, rel string) []string {
 		case *ast.SelectorExpr:
 			// kube.ForTest takes a fake runner; in production code it would let a
 			// client skip the handle.
-			if id, ok := x.X.(*ast.Ident); ok && id.Name == "kube" && x.Sel.Name == "ForTest" {
-				out = append(out, pos(x)+": kube.ForTest is for _test.go files only")
+			if id, ok := x.X.(*ast.Ident); ok && (id.Name == "kube" || id.Name == "verify") && x.Sel.Name == "ForTest" {
+				out = append(out, pos(x)+": "+id.Name+".ForTest is for _test.go files only")
 			}
 		case *ast.AssignStmt:
 			// Swapping a client's runner after construction retargets it.

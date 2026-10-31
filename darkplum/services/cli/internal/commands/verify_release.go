@@ -55,7 +55,8 @@ func (c *VerifyReleaseCmd) run(ctx context.Context, w io.Writer, m release.Manif
 			hint: "needs https://tuf-repo-cdn.sigstore.dev; check the network and retry"})
 		return reportedError{"cannot establish the sigstore trust root"}
 	}
-	results, err := v.VerifyRelease(ctx, f, m)
+	vr, err := v.VerifyRelease(ctx, f, m)
+	results := vr.Results
 	failed := 0
 	for _, svc := range release.Services {
 		img := m.Images[svc]

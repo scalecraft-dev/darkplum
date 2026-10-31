@@ -216,22 +216,50 @@ func (v *Verifier) VerifyImage(ctx context.Context, f Fetcher, img release.Image
 	return Result{}, fmt.Errorf("%s: no signature matches the release identity (%s)", img.Ref(), strings.Join(why, "; "))
 }
 
+// Verified is the proof that every image of a release manifest carries a valid
+// signature by the manifest's own identity. Only VerifyRelease returns a valid
+// one, and the mirror takes nothing else: an image is never copied into the
+// customer's registry on the strength of its digest alone.
+type Verified struct {
+	manifest release.Manifest
+	// Results is what each verified image established (partial on failure).
+	Results map[string]Result
+	ok      bool
+}
+
+// Valid reports whether every image verified.
+func (v Verified) Valid() bool { return v.ok }
+
+// Manifest is the manifest that was verified.
+func (v Verified) Manifest() release.Manifest { return v.manifest }
+
+// ForTest returns a valid Verified for a manifest without checking any
+// signature. It is for _test.go files only; internal/lint fails the build on any
+// other use.
+func ForTest(m release.Manifest) Verified {
+	return Verified{manifest: m, Results: map[string]Result{}, ok: true}
+}
+
 // VerifyRelease verifies all three images of a manifest, each under its own
-// identity. Every image is checked and every failure reported.
-func (v *Verifier) VerifyRelease(ctx context.Context, f Fetcher, m release.Manifest) (map[string]Result, error) {
-	out := map[string]Result{}
+// identity. Every image is checked and every failure reported; the Verified it
+// returns is valid only when none failed.
+func (v *Verifier) VerifyRelease(ctx context.Context, f Fetcher, m release.Manifest) (Verified, error) {
+	out := Verified{manifest: m, Results: map[string]Result{}}
 	var errs []error
 	for _, svc := range release.Services {
 		id, err := m.Identity(svc)
 		if err != nil {
-			return nil, err
+			return out, err
 		}
 		res, err := v.VerifyImage(ctx, f, m.Images[svc], id)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", svc, err))
 			continue
 		}
-		out[svc] = res
+		out.Results[svc] = res
+	}
+	if len(errs) == 0 {
+		out.ok = true
 	}
 	return out, errors.Join(errs...)
 }
