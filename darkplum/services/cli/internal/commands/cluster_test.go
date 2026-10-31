@@ -10,6 +10,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/scalecraft-dev/darkplum/cli/internal/runner"
 )
 
 const (
@@ -236,5 +238,58 @@ esac
 	}
 	if out, err := capture(&KubeconfigCmd{Tfvars: tfvars, Write: true}); err != nil || out != "" {
 		t.Errorf("--write must be silent: %q %v", out, err)
+	}
+}
+
+// The target carries a validated handle only on success; kubectl is reachable
+// through nothing else.
+func TestInstallClusterHandsOutAValidatedHandleOnlyOnSuccess(t *testing.T) {
+	tfvars := installDir(t, pinnedTFVars)
+	tg, _, err := installCluster(tfvars, (&fakeAWS{arn: testARN, caller: "123456789012"}).run)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !tg.h.Valid() || tg.h.Kubeconfig() != tg.Kubeconfig || tg.h.Account() != "123456789012" {
+		t.Errorf("handle = %+v for target %+v", tg.h, tg)
+	}
+	k := tg.kube("darkplum-system")
+	if len(k.Flags()) != 4 || k.Flags()[1] != tg.Kubeconfig || k.Flags()[3] != installContext {
+		t.Errorf("client flags = %v", k.Flags())
+	}
+
+	// credentials for another account: no target, no handle, no private kubeconfig
+	bad, _, err := installCluster(tfvars, (&fakeAWS{arn: testARN, caller: "999999999999"}).run)
+	if err == nil || bad.h.Valid() {
+		t.Fatalf("credentials for another account produced a handle: %+v %v", bad, err)
+	}
+	if _, err := bad.kube("ns").NS(nil, "get", "pods"); err == nil {
+		t.Error("a refused target ran kubectl")
+	}
+	if _, serr := os.Stat(tg.Kubeconfig); serr == nil {
+		t.Error("a refused validation left the private kubeconfig behind")
+	}
+}
+
+// --context is the escape hatch for local kind clusters only; an install's
+// cluster, or any cluster that is not on this machine, is never reached with it.
+func TestContextEscapeIsRestrictedToLocalKind(t *testing.T) {
+	for _, ctx := range []string{"prod", "darkplum", "arn:aws:eks:us-east-2:123456789012:cluster/dp-trial", "kind-prod-but-remote"} {
+		t.Run(ctx, func(t *testing.T) {
+			old := newLocalKind
+			defer func() { newLocalKind = old }()
+			if ctx == "kind-prod-but-remote" { // named like kind, server is not local
+				newLocalKind = func(c string) (runner.LocalKind, error) {
+					return runner.LocalKind{}, errors.New("kind: its API server is not on this machine")
+				}
+			}
+			var buf bytes.Buffer
+			k, err := installKube(&buf, "darkplum-system", ctx)
+			if err == nil || k != nil {
+				t.Fatalf("--context %q was accepted: %v", ctx, err)
+			}
+			if !strings.Contains(buf.String(), "kind") {
+				t.Errorf("refusal does not explain the kind restriction: %q", buf.String())
+			}
+		})
 	}
 }

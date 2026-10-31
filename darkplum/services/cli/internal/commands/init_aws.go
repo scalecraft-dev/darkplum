@@ -1,15 +1,15 @@
 package commands
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/scalecraft-dev/darkplum/cli/internal/runner"
 )
 
 // cmdRunner runs an external command and returns trimmed stdout. On failure the
@@ -17,19 +17,9 @@ import (
 // such as ResourceNotFoundException.
 type cmdRunner func(name string, args ...string) (string, error)
 
-func runWithStderr(name string, args ...string) (string, error) {
-	cmd := exec.Command(name, args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &stdout, &stderr
-	err := cmd.Run()
-	out := strings.TrimSpace(stdout.String())
-	if err != nil {
-		if msg := strings.TrimSpace(stderr.String()); msg != "" {
-			return out, fmt.Errorf("%w: %s", err, msg)
-		}
-	}
-	return out, err
-}
+// runWithStderr is the real command runner: the runner package starts aws and
+// terraform and nothing else.
+func runWithStderr(name string, args ...string) (string, error) { return runner.Tool(name, args...) }
 
 // identity is who the AWS CLI resolved the session to.
 type identity struct {

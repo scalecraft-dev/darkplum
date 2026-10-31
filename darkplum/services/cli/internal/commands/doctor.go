@@ -5,10 +5,11 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/scalecraft-dev/darkplum/cli/internal/runner"
 )
 
 // DoctorCmd groups read-only environment and health diagnostics. It provisions
@@ -79,7 +80,7 @@ func (d *DoctorCheckCmd) Run(_ *Globals) error {
 	// Tools every install needs regardless of cloud.
 	checks := []checkResult{
 		checkTool("terraform"),
-		checkTool("kubectl"),
+		checkTool(runner.Kubectl),
 		checkTool("jq"),
 		checkTool("docker"),
 	}
@@ -146,13 +147,10 @@ func defaultRegion(cloud string) string {
 // run executes a command and returns its trimmed stdout. Stderr is deliberately
 // NOT merged in: callers parse this value (e.g. a quota number), and CLI
 // deprecation/SSO warnings on stderr would corrupt the parse.
-func run(name string, args ...string) (string, error) {
-	out, err := exec.Command(name, args...).Output()
-	return strings.TrimSpace(string(out)), err
-}
+func run(name string, args ...string) (string, error) { return runner.ToolStdout(name, args...) }
 
 func checkTool(name string) checkResult {
-	if path, err := exec.LookPath(name); err == nil {
+	if path, err := runner.Which(name); err == nil {
 		return checkResult{name: name, status: checkPass, detail: path}
 	}
 	return checkResult{name: name, status: checkFail, hint: "not on PATH — install it and retry"}
@@ -161,12 +159,7 @@ func checkTool(name string) checkResult {
 // awsArgs prefixes `--profile <p>` when a profile is set, so doctor checks the
 // same account the install will use (var.aws_profile) rather than whatever the
 // ambient default credential chain resolves to.
-func awsArgs(profile string, args ...string) []string {
-	if profile != "" {
-		return append([]string{"--profile", profile}, args...)
-	}
-	return args
-}
+func awsArgs(profile string, args ...string) []string { return runner.ProfileArgs(profile, args...) }
 
 func checkAWSCreds(profile string) checkResult {
 	out, err := run("aws", awsArgs(profile, "sts", "get-caller-identity", "--query", "Account", "--output", "text")...)

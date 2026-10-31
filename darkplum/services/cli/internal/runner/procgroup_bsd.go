@@ -1,6 +1,6 @@
 //go:build !linux && !windows
 
-package commands
+package runner
 
 import "syscall"
 

@@ -81,6 +81,24 @@ class ReleaseJSON(unittest.TestCase):
             self.assertEqual(raw, rj.canonical(rj.build(**good_release())))
             self.assertNotIn(" ", raw)
 
+    def test_matches_the_golden_manifests_the_go_cli_parses(self):
+        # services/cli/internal/release parses these same files; if either side's
+        # rules or field names drift, one of the two tests breaks.
+        golden = HERE / "testdata"
+        D = {s: "sha256:" + c * 64 for s, c in zip(("gateway", "api", "web"), "123")}
+        rel = rj.build("release", "1.2.3", "a" * 40, "42", "1", "scalecraft-dev/darkplum", "refs/tags/v1.2.3", D)
+        self.assertEqual((golden / "release.golden.json").read_text().strip(), rj.canonical(rel))
+        rc = rj.build("rc", "0.0.0-rc.7+abcdef0", "b" * 40, "43", "2", "scalecraft-dev/darkplum",
+                      "refs/heads/prerelease/makefile-removal", D)
+        self.assertEqual((golden / "rc.golden.json").read_text().strip(), rj.canonical(rc))
+
+    def test_trailing_newline_and_unicode_digits_are_not_accepted(self):
+        for over in (dict(version="1.2.3\n"), dict(commit=SHA + "\n"), dict(run_id="42\n"), dict(run_id="٤٢"),
+                     dict(ref="refs/tags/v1.2.3\n")):
+            with self.subTest(over):
+                with self.assertRaises(rj.Invalid):
+                    rj.build(**good_release(**over))
+
     def test_missing_digest_file_fails_closed(self):
         self.assertEqual(rj.main(["--channel", "release", "--version", "1.2.3", "--commit", SHA, "--run-id", "1",
                                   "--run-attempt", "1", "--repository", "scalecraft-dev/darkplum",

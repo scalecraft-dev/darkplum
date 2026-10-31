@@ -27,14 +27,14 @@ CHANNELS = {
     "release": (
         "release.yml",
         "darkplum",
-        re.compile(r"^refs/tags/v(\d+\.\d+\.\d+)$"),
-        re.compile(r"^\d+\.\d+\.\d+$"),
+        re.compile(r"^refs/tags/v([0-9]+\.[0-9]+\.[0-9]+)$"),
+        re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$"),
     ),
     "rc": (
         "prerelease.yml",
         "darkplum-rc",
         re.compile(r"^refs/heads/prerelease/[A-Za-z0-9._/-]+$"),
-        re.compile(r"^0\.0\.0-rc\.\d+\+[0-9a-f]{7}$"),
+        re.compile(r"^0\.0\.0-rc\.[0-9]+\+[0-9a-f]{7}$"),
     ),
 }
 
@@ -51,24 +51,24 @@ def build(channel, version, commit, run_id, run_attempt, repo, ref, digests):
     if channel not in CHANNELS:
         raise Invalid(f"channel {channel!r} is not one of {sorted(CHANNELS)}")
     workflow, prefix, ref_re, ver_re = CHANNELS[channel]
-    if not ver_re.match(version):
+    if not ver_re.fullmatch(version):
         raise Invalid(f"version {version!r} is not valid for the {channel} channel")
-    m = ref_re.match(ref)
+    m = ref_re.fullmatch(ref)
     if not m:
         raise Invalid(f"ref {ref!r} is not valid for the {channel} channel")
     if channel == "release" and m.group(1) != version:
         raise Invalid(f"tag {ref!r} does not match version {version!r}")
-    if not COMMIT.match(commit):
+    if not COMMIT.fullmatch(commit):
         raise Invalid(f"commit {commit!r} is not a 40-hex sha")
-    if not (run_id.isdigit() and run_attempt.isdigit()):
+    if not (re.fullmatch("[0-9]+", run_id) and re.fullmatch("[0-9]+", run_attempt)):
         raise Invalid("run id and attempt must be numeric")
-    if not REPO.match(repo) or repo.split("/")[0] != OWNER:
+    if not REPO.fullmatch(repo) or repo.split("/")[0] != OWNER:
         raise Invalid(f"repository {repo!r} is not owned by {OWNER}")
     if sorted(digests) != sorted(SERVICES):
         raise Invalid(f"digests must be exactly {sorted(SERVICES)}, got {sorted(digests)}")
     images = {}
     for svc in SERVICES:
-        if not DIGEST.match(digests[svc]):
+        if not DIGEST.fullmatch(digests[svc]):
             raise Invalid(f"digest for {svc} is not sha256:<64 hex>: {digests[svc]!r}")
         images[svc] = {"repository": f"{REGISTRY}/{OWNER}/{prefix}-{svc}", "digest": digests[svc]}
     return {

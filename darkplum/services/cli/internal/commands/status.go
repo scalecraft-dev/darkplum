@@ -9,7 +9,7 @@ import (
 
 // StatusCmd is `darkplum status`.
 type StatusCmd struct {
-	Context string `name:"context" help:"Kubeconfig context to read. Needed only where there are no install settings (run from darkplum/ after darkplum init)." default:""`
+	Context string `name:"context" help:"Local kind context (kind-*) to read, for a cluster Darkplum did not install. An install is found from its settings." default:""`
 }
 
 // Run executes `darkplum status`. Like every kube command it establishes and

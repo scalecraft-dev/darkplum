@@ -9,11 +9,11 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/scalecraft-dev/darkplum/cli/internal/runner"
 )
 
 // The install's private HTTPS address, as configure sees it. The settings come
@@ -64,16 +64,14 @@ func webAddressFrom(tf tfvarsInfo) webAddress {
 // terraformOutputs runs `terraform output -json` in the install's Terraform
 // root, under the install's AWS profile. It reads state; it changes nothing.
 func terraformOutputs(tfvarsPath, profile string) (map[string]json.RawMessage, error) {
-	cmd := exec.Command("terraform", "-chdir="+filepath.Dir(tfvarsPath), "output", "-json")
-	cmd.Env = os.Environ()
+	var env []string
 	if profile != "" {
-		cmd.Env = append(cmd.Env, "AWS_PROFILE="+profile)
+		env = append(env, "AWS_PROFILE="+profile)
 	}
-	out, err := cmd.Output()
+	out, stderr, err := runner.Terraform(filepath.Dir(tfvarsPath), env, "output", "-json")
 	if err != nil {
-		var ee *exec.ExitError
-		if errors.As(err, &ee) && len(ee.Stderr) > 0 {
-			return nil, errors.New(firstLine(strings.TrimSpace(string(ee.Stderr))))
+		if s := strings.TrimSpace(stderr); s != "" {
+			return nil, errors.New(firstLine(s))
 		}
 		return nil, err
 	}
