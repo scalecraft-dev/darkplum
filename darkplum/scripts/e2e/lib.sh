@@ -46,8 +46,8 @@ e2e_load_install() {
   E2E_REGION="$(jq -r '.region' "$rec")"
   E2E_PROFILE="$(jq -r '.profile // ""' "$rec")"
   E2E_ACCOUNTS="$(jq -r '.account_ids | join(",")' "$rec")"
-  [ -n "$E2E_CLUSTER" ] && [ "$E2E_CLUSTER" != null ] || e2e_die "$rec has no cluster_name"
-  [ -n "$E2E_REGION" ] && [ "$E2E_REGION" != null ] || e2e_die "$rec has no region"
+  if [ -z "$E2E_CLUSTER" ] || [ "$E2E_CLUSTER" = null ]; then e2e_die "$rec has no cluster_name"; fi
+  if [ -z "$E2E_REGION" ] || [ "$E2E_REGION" = null ]; then e2e_die "$rec has no region"; fi
 }
 
 # e2e_dp runs the darkplum under test against this install.
@@ -91,7 +91,7 @@ e2e_kubectl() {
 
 # e2e_decoy_kubectl is for a cluster the caller names with --decoy-context. Reads only.
 e2e_decoy_kubectl() {
-  [ -n "${E2E_DECOY_KUBECONFIG:-}" ] && [ -n "${E2E_DECOY_CONTEXT:-}" ] || e2e_die "no decoy context named"
+  if [ -z "${E2E_DECOY_KUBECONFIG:-}" ] || [ -z "${E2E_DECOY_CONTEXT:-}" ]; then e2e_die "no decoy context named"; fi
   case "${1:-}" in
     get | config) ;;
     *) e2e_die "the decoy cluster is read-only here (got: ${1:-nothing})" ;;

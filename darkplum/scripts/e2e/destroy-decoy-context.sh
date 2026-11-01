@@ -32,7 +32,7 @@ while [ $# -gt 0 ]; do
     *) e2e_die "unknown argument '$1'" ;;
   esac
 done
-[ -n "$install" ] && [ -n "$decoy_ctx" ] || e2e_die "usage: destroy-decoy-context.sh --install NAME --decoy-context CTX [--decoy-kubeconfig FILE] [-- destroy flags]"
+if [ -z "$install" ] || [ -z "$decoy_ctx" ]; then e2e_die "usage: destroy-decoy-context.sh --install NAME --decoy-context CTX [--decoy-kubeconfig FILE] [-- destroy flags]"; fi
 e2e_need darkplum kubectl jq
 e2e_tmpdir
 e2e_load_install "$install"
@@ -82,7 +82,7 @@ e2e_ok "the decoy cluster is byte-for-byte what it was (names and uids)"
 
 # Neither the screen nor the destroy log may name the decoy: it was never contacted.
 newest="$(e2e_newest_log "$logdir" destroy-)"
-[ -n "$newest" ] && [ "$newest" != "$before_log" ] || e2e_die "destroy wrote no new log in $logdir"
+if [ -z "$newest" ] || [ "$newest" = "$before_log" ]; then e2e_die "destroy wrote no new log in $logdir"; fi
 for needle in "$decoy_ctx" "$decoy_server"; do
   e2e_expect_not_in "$logdir/$newest" "$needle" "the destroy log names the decoy"
   e2e_expect_not_in "$E2E_TMP/destroy.txt" "$needle" "the destroy output names the decoy"
