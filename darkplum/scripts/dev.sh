@@ -250,7 +250,7 @@ cmd_eks_push() {
   cluster=$(jq -r '.cluster_name // empty' "$rec")
   region=$(jq -r '.region // empty' "$rec")
   profile=$(jq -r '.profile // empty' "$rec")
-  [ -n "$cluster" ] && [ -n "$region" ] || die "$rec has no cluster_name/region."
+  if [ -z "$cluster" ] || [ -z "$region" ]; then die "$rec has no cluster_name/region."; fi
 
   local -a awsargs=(--region "$region")
   [ -z "$profile" ] || awsargs+=(--profile "$profile")
