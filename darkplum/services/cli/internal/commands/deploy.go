@@ -891,7 +891,7 @@ func (e *deployEnv) checkConflicts(kc *kube.Client) (reachable bool, err error) 
 					"`eval \"$(darkplum kubeconfig)\"`, then `kubectl -n darkplum-system patch svc darkplum-web --type=merge -p '{\"spec\":{\"type\":\"ClusterIP\"}}'` " +
 					"and re-run deploy. To keep the public address, stay on the release that created it."}, "internet-facing web service")
 		}
-	case kubeNotFound(err, "services", "darkplum-web"):
+	case kubeNotFound(err, "services", "darkplum-web"), kubeNoNamespace(err, platformNS):
 	case unreachable(err):
 		return false, nil
 	default:
@@ -1400,11 +1400,11 @@ func (e *deployEnv) checkArch(ctx context.Context, v verify.Verified, nodes []no
 
 // carriedUpstreams reads VLLM_UPSTREAMS from the live gateway: `darkplum models`
 // owns that value, and a redeploy must not drop the models added since. No
-// gateway yet is "". Any other failure is an error: guessing "none" would drop them.
+// gateway yet (or no namespace yet) is "". Any other failure is an error: guessing "none" would drop them.
 func carriedUpstreams(kc *kube.Client) (string, error) {
 	out, err := kc.Run(nil, "-n", platformNS, "get", "deploy", "darkplum-gateway", "-o", "json")
 	if err != nil {
-		if kubeNotFound(err, "deployments", "darkplum-gateway") {
+		if kubeNotFound(err, "deployments", "darkplum-gateway") || kubeNoNamespace(err, platformNS) {
 			return "", nil
 		}
 		return "", err

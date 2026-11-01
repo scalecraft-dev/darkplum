@@ -25,7 +25,7 @@ const (
 func (e *statusEnv) release() bool {
 	out, err := e.kc.NS(nil, "get", "configmap", installRecord, "-o", "json")
 	if err != nil {
-		if !kubeNotFound(err, "configmaps", installRecord) {
+		if !kubeNotFound(err, "configmaps", installRecord) && !kubeNoNamespace(err, platformNS) {
 			fmt.Fprintf(e.out, "%s  %s\n", sDim("release"), sDim("(unavailable: "+firstLine(err.Error())+")"))
 		}
 		return false

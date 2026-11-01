@@ -169,7 +169,7 @@ func (e *modelsEnv) add(spec models.Spec) error {
 		return err
 	}
 	if _, err := e.kc.NS(nil, "get", "deploy", "darkplum-gateway", "-o", "name"); err != nil {
-		if kubeNotFound(err, "deployments", "darkplum-gateway") {
+		if kubeNotFound(err, "deployments", "darkplum-gateway") || kubeNoNamespace(err, platformNS) {
 			return errors.New("the gateway is not deployed. Run `darkplum deploy` first.")
 		}
 		return fmt.Errorf("read the gateway: %w", err)

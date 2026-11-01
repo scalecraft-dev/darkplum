@@ -84,6 +84,16 @@ func kubeNotFound(err error, resource, name string) bool {
 	return strings.Contains(m, "(NotFound)") && strings.Contains(m, resource) && strings.Contains(m, `"`+name+`"`)
 }
 
+// kubeNoNamespace reports a kubectl NotFound for the namespace ns itself. Before
+// the platform is first applied, a read in darkplum-system gets this answer, not
+// the object's NotFound. Only reads that can meet a never-deployed cluster accept
+// it: deploy's checks before the apply, destroy's release record, status and
+// `models add`. After the apply a missing namespace is a fault, and ensureSecret
+// still refuses it.
+func kubeNoNamespace(err error, ns string) bool {
+	return err != nil && strings.Contains(err.Error(), `(NotFound): namespaces "`+ns+`" not found`)
+}
+
 // ensureSecret makes sure the named Secret in ns holds keys, by the rules above.
 //
 // pair says the keys belong together (a key and the id that names it): a Secret

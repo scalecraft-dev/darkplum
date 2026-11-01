@@ -823,3 +823,19 @@ func TestOnlyARealServerNotFoundCounts(t *testing.T) {
 		t.Error("nil")
 	}
 }
+
+func TestOnlyThisNamespaceMissingCounts(t *testing.T) {
+	for msg, want := range map[string]bool{
+		`kubectl: Error from server (NotFound): namespaces "darkplum-system" not found`:    true,
+		`kubectl: Error from server (NotFound): namespaces "darkplum-inference" not found`: false,
+		`kubectl: Error from server (NotFound): services "darkplum-web" not found`:         false,
+		`kubectl: Error from server (Forbidden): namespaces "darkplum-system" not found`:   false,
+	} {
+		if kubeNoNamespace(errors.New(msg), "darkplum-system") != want {
+			t.Errorf("kubeNoNamespace(%q) != %v", msg, want)
+		}
+	}
+	if kubeNoNamespace(nil, "darkplum-system") {
+		t.Error("nil")
+	}
+}

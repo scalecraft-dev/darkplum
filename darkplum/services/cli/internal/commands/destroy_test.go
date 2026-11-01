@@ -250,6 +250,25 @@ func TestDestroyFullRunOrder(t *testing.T) {
 	}
 }
 
+// An install whose first deploy stopped before the platform was applied: the
+// cluster exists, darkplum-system does not. There is no release record to guard,
+// and that is not a warning.
+func TestDestroyClusterWithoutThePlatformNamespace(t *testing.T) {
+	h := newDestroyHarness(t)
+	h.k.handlers = append([]skHandler{{"get configmap darkplum-install", func([]string, []byte) ([]byte, error) {
+		return nil, errors.New(`kubectl: Error from server (NotFound): namespaces "darkplum-system" not found`)
+	}}}, h.k.handlers...)
+	if err := h.run(); err != nil {
+		t.Fatalf("%v\n%s\n%s", err, h.out.String(), h.tl)
+	}
+	if strings.Contains(h.out.String(), "could not be read") {
+		t.Errorf("warned about a record that cannot exist:\n%s", h.out.String())
+	}
+	if h.tl.count("terraform destroy") == 0 {
+		t.Errorf("did not destroy:\n%s", h.tl)
+	}
+}
+
 func TestDestroyExpiredSSODeletesNothing(t *testing.T) {
 	h := newDestroyHarness(t)
 	h.aws.callerErr = errors.New("The SSO session associated with this profile has expired or is otherwise invalid")

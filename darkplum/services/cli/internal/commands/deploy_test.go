@@ -553,6 +553,40 @@ func TestDeployCarriesTheLiveModelList(t *testing.T) {
 	}
 }
 
+// The harness default is a cluster with no darkplum-system namespace. This is the
+// other "nothing there yet": the namespace exists (a resume after the namespaces
+// phase) but the objects do not, and the server names each object instead.
+func TestDeployWithThePlatformNamespaceButNoObjects(t *testing.T) {
+	h := newDeployHarness(t, 0)
+	h.k.handlers = append([]skHandler{
+		{"get deploy darkplum-gateway", func([]string, []byte) ([]byte, error) {
+			return nil, errors.New(`kubectl: Error from server (NotFound): deployments.apps "darkplum-gateway" not found`)
+		}},
+		{"get svc darkplum-web", func([]string, []byte) ([]byte, error) {
+			return nil, errors.New(`kubectl: Error from server (NotFound): services "darkplum-web" not found`)
+		}},
+		{"get configmap darkplum-install", func([]string, []byte) ([]byte, error) {
+			return nil, notFound("configmaps", "darkplum-install")
+		}},
+	}, h.k.handlers...)
+	if err := h.run(); err != nil {
+		t.Fatalf("%v\n%s", err, h.tl)
+	}
+	if strings.Contains(h.out.String(), "could not be read") {
+		t.Errorf("treated a missing object as unreadable:\n%s", h.out.String())
+	}
+}
+
+func TestCarriedUpstreamsWithoutThePlatformNamespace(t *testing.T) {
+	k := newScriptKube(t).on("get deploy darkplum-gateway", "", errors.New(`kubectl: Error from server (NotFound): namespaces "darkplum-system" not found`))
+	if v, err := carriedUpstreams(k.client(platformNS)); err != nil || v != "" {
+		t.Fatalf("carriedUpstreams = %q, %v; want no models and no error", v, err)
+	}
+	if len(k.matching("get deploy darkplum-gateway")) != 1 {
+		t.Error("the gateway was not read")
+	}
+}
+
 func TestDeployUnreadableGatewayIsNotTreatedAsNoModels(t *testing.T) {
 	h := newDeployHarness(t, 0)
 	h.k.handlers = append([]skHandler{{"get deploy darkplum-gateway", func([]string, []byte) ([]byte, error) {

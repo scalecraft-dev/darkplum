@@ -371,9 +371,11 @@ func (h *deployHarness) script(gpu int) {
 		return []byte(`{"items":[]}`), nil
 	})
 	k.onFn("get nodes -o json", func([]string, []byte) ([]byte, error) { return []byte(h.nodesJSON(h.nodeArch, true)), nil })
-	k.on("get deploy darkplum-gateway", "", errors.New(`kubectl: Error from server (NotFound): deployments.apps "darkplum-gateway" not found`))
-	k.on("get svc darkplum-web", "", errors.New(`kubectl: Error from server (NotFound): services "darkplum-web" not found`))
-	k.on("get configmap darkplum-install", "", notFound("configmaps", "darkplum-install")) // never deployed by a release
+	// A fresh cluster: before the platform is applied the server names the missing
+	// namespace, not the object (seen on the first rc install).
+	k.on("get deploy darkplum-gateway", "", errors.New(`kubectl: Error from server (NotFound): namespaces "darkplum-system" not found`))
+	k.on("get svc darkplum-web", "", errors.New(`kubectl: Error from server (NotFound): namespaces "darkplum-system" not found`))
+	k.on("get configmap darkplum-install", "", errors.New(`kubectl: Error from server (NotFound): namespaces "darkplum-system" not found`))
 	k.on("owner=helm", `{"items":[]}`, nil)
 	k.on("darkplum.ai/component=semantic-router", "", nil) // none installed by Darkplum
 	k.on("get secret darkplum-auth", "", secretNotFound("darkplum-auth"))

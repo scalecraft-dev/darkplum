@@ -69,7 +69,7 @@ func versionGuard(recorded, current string, allowDowngrade bool) error {
 func clusterVersion(kc *kube.Client) (string, error) {
 	out, err := kc.NS(nil, "get", "configmap", installRecord, "-o", "json")
 	if err != nil {
-		if kubeNotFound(err, "configmaps", installRecord) {
+		if kubeNotFound(err, "configmaps", installRecord) || kubeNoNamespace(err, platformNS) {
 			return "", nil
 		}
 		return "", err
