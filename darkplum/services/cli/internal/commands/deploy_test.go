@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/go-containerregistry/pkg/v1/remote/transport"
 	"github.com/scalecraft-dev/darkplum/cli/internal/iamcheck"
+	"github.com/scalecraft-dev/darkplum/cli/internal/manifests"
 	"github.com/scalecraft-dev/darkplum/cli/internal/mirror"
 	"github.com/scalecraft-dev/darkplum/cli/internal/release"
 	"github.com/scalecraft-dev/darkplum/cli/internal/verify"
@@ -77,7 +78,7 @@ func TestDeployFreshBedrockOnlyInstallOrder(t *testing.T) {
 		t.Error("gateway rolled out before the api")
 	}
 	// Bedrock-only: nothing about GPUs.
-	if tl.count("nvidia") != 0 || tl.count("vllm-inference") != 0 {
+	if tl.count("nvidia") != 0 || tl.count("vllm-inference")-tl.count("get svc vllm-inference") != 0 {
 		t.Errorf("a Bedrock-only install touched the GPU model:\n%s", tl)
 	}
 	// The whole run is pinned and no secret value is in argv.
@@ -1444,6 +1445,83 @@ func TestDeployInterruptDuringARolloutStopsTheKubePhase(t *testing.T) {
 				}
 			} else if h.tl.count("apply -f -") != 0 {
 				t.Errorf("applied after an interrupted mirror:\n%s", h.tl)
+			}
+		})
+	}
+}
+
+// gatewayEnv is VLLM_UPSTREAM as the applied gateway Deployment carries it.
+func gatewayVLLMUpstream(t *testing.T, h *deployHarness) (string, bool) {
+	t.Helper()
+	for _, c := range h.k.matching("apply -f -") {
+		var list struct {
+			Items []manifests.Object `json:"items"`
+		}
+		if json.Unmarshal(c.stdin, &list) != nil {
+			continue
+		}
+		for _, o := range list.Items {
+			if o.Key() == "Deployment/darkplum-system/darkplum-gateway" {
+				return manifests.EnvValue(o, "VLLM_UPSTREAM")
+			}
+		}
+	}
+	t.Fatal("the gateway was not applied")
+	return "", false
+}
+
+func TestDeployBedrockOnlyWiresNoDefaultVLLM(t *testing.T) {
+	h := newDeployHarness(t, 0)
+	if err := h.run(); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := gatewayVLLMUpstream(t, h); !ok || v != "" {
+		t.Errorf("Bedrock-only gateway VLLM_UPSTREAM = %q (set=%v), want empty", v, ok)
+	}
+}
+
+// gpu_desired_size = 0 after an earlier deploy that installed the model: the
+// Service is still there, so the gateway keeps pointing at it.
+func TestDeployKeepsTheDefaultVLLMWhileItsServiceExists(t *testing.T) {
+	h := newDeployHarness(t, 0)
+	h.k.handlers = append([]skHandler{{"get svc vllm-inference", func([]string, []byte) ([]byte, error) { return []byte("service/vllm-inference"), nil }}}, h.k.handlers...)
+	if err := h.run(); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := gatewayVLLMUpstream(t, h); v != manifests.DefaultVLLMURL {
+		t.Errorf("VLLM_UPSTREAM = %q, want %q", v, manifests.DefaultVLLMURL)
+	}
+}
+
+func TestDeployUnreadableVLLMServiceIsNotTreatedAsAbsent(t *testing.T) {
+	h := newDeployHarness(t, 0)
+	h.k.handlers = append([]skHandler{{"get svc vllm-inference", func([]string, []byte) ([]byte, error) {
+		return nil, errors.New("kubectl: Unable to connect to the server: i/o timeout")
+	}}}, h.k.handlers...)
+	if !IsReported(h.run()) {
+		t.Fatal("applied the gateway without knowing whether the model runs")
+	}
+	if h.writes() != 0 {
+		t.Errorf("wrote to the cluster:\n%s", h.tl)
+	}
+}
+
+func TestLiveDefaultVLLMAnswers(t *testing.T) {
+	for name, tc := range map[string]struct {
+		err  error
+		want bool
+		bad  bool
+	}{
+		"exists":       {nil, true, false},
+		"no service":   {errors.New(`kubectl: Error from server (NotFound): services "vllm-inference" not found`), false, false},
+		"no namespace": {errors.New(`kubectl: Error from server (NotFound): namespaces "darkplum-inference" not found`), false, false},
+		"unreadable":   {errors.New("kubectl: Unable to connect to the server"), false, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			k := newScriptKube(t).on("get svc vllm-inference", "", tc.err)
+			got, err := liveDefaultVLLM(k.client(platformNS))
+			if got != tc.want || (err != nil) != tc.bad {
+				t.Errorf("got %v, %v", got, err)
 			}
 		})
 	}

@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/scalecraft-dev/darkplum/cli/internal/install"
 )
 
 var update = flag.Bool("update", false, "rewrite golden files")
@@ -619,5 +621,42 @@ func TestPrompter(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "nope") || !strings.Contains(out.String(), "1 to 2") {
 		t.Errorf("validation hints missing:\n%s", out.String())
+	}
+}
+
+// init keeps its run in the workspace's logs/ once it starts writing there,
+// including what it printed before that; a dry run writes nothing, log included.
+func TestInitWritesALogOnceItWrites(t *testing.T) {
+	dir := t.TempDir()
+	in, err := install.OpenDir(dir, "darkplum")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, out := testEnv(t, newFakeCloud(), nil, "-")
+	rl := newDeferredLog(out)
+	defer rl.Close()
+	env.out = rl
+	if err := yesCmd(dir, nil).execute(env); err != nil {
+		t.Fatal(err)
+	}
+	files, _ := filepath.Glob(filepath.Join(in.LogsDir(), "init-*.log"))
+	if len(files) != 1 {
+		t.Fatalf("want one init log, found %v", files)
+	}
+	log := readFile(t, files[0])
+	if !strings.Contains(log, "init · aws") || !strings.Contains(log, "Settings saved") {
+		t.Errorf("log lacks the start or the end of the run:\n%s", log)
+	}
+}
+
+func TestInitDryRunWritesNoLog(t *testing.T) {
+	dir := t.TempDir()
+	env, out := testEnv(t, newFakeCloud(), nil, "-")
+	env.out = newDeferredLog(out)
+	if err := yesCmd(dir, func(c *InitCmd) { c.DryRun = true }).execute(env); err != nil {
+		t.Fatal(err)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Errorf("dry run wrote %v", entries)
 	}
 }

@@ -1,3 +1,4 @@
+import { RETIRED_STATUS_HINT, isRetired } from '../lib/modelRetired'
 import { useEffect, useId, useMemo, useRef, useState } from 'react'
 import type {
   AdminModel,
@@ -466,6 +467,7 @@ function targetWarning(
   if (cls === 'unknown') return UNKNOWN_CLASS_HINT
   if (!residencyPermits(residency, cls)) return blockedHint(cls, residency)
   // Same precedence as the Models row: policy > AWS opt-in > reachability.
+  if (isRetired(model)) return RETIRED_STATUS_HINT
   if (needsAwsOptIn(model)) return awsOptInRouteWarning(model.model_id)
   if (!isReachable(model)) return route ? routeUnavailableHint('unreachable', route.outcome) : UNREACHABLE_HINT
   return null

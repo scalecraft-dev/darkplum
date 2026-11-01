@@ -267,8 +267,8 @@ export interface ModelRouteSummary {
  * the UI shows no badge for it rather than guessing either way.
  */
 export interface ModelAvailability {
-  state: 'ok' | 'needs_aws_opt_in' | 'unknown'
-  reason: 'data_retention'
+  state: 'ok' | 'needs_aws_opt_in' | 'retired' | 'unknown'
+  reason: 'data_retention' | 'end_of_life'
   /** The mode the account is in now, verbatim: default | none | inherit |
    *  aws_review | provider_data_share | unknown. */
   account_mode: string

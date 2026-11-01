@@ -517,3 +517,22 @@ func TestBuildModelsList_StaticAliasGetsAliasKind(t *testing.T) {
 		}
 	}
 }
+
+func TestModelRetiredState(t *testing.T) {
+	r, ok, none := "retired", "ok", ""
+	if !modelRetiredState(&r) || modelRetiredState(&ok) || modelRetiredState(&none) || modelRetiredState(nil) {
+		t.Error("only the retired state counts")
+	}
+}
+
+// The gateway's availability object passes through the sync untouched, whatever
+// its state: a retired model is stored as retired.
+func TestNormalizeGatewayModels_CarriesRetiredAvailability(t *testing.T) {
+	out := normalizeGatewayModels([]openAIModelEntry{{
+		ID: "us.anthropic.claude-3-haiku-20240307-v1:0", OwnedBy: "bedrock",
+		Availability: []byte(`{"state":"retired","reason":"end_of_life","account_mode":"default","required_mode":"aws_review"}`),
+	}})
+	if len(out) != 1 || out[0].AvailabilityState == nil || *out[0].AvailabilityState != "retired" {
+		t.Fatalf("got %+v", out)
+	}
+}

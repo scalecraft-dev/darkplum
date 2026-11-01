@@ -832,3 +832,30 @@ func TestTranslateStreamEvent_MetadataCapturesCacheTokens(t *testing.T) {
 		t.Errorf("prompt=%d read=%d create=%d, want 80/30/8 (input+read+write)", stats.PromptTokens, stats.CacheReadTokens, stats.CacheCreationTokens)
 	}
 }
+
+func TestTranslateBedrockError_EndOfLifeIsModelRetired(t *testing.T) {
+	code, body := TranslateBedrockError("ResourceNotFoundException",
+		"This model version has reached the end of its life. Please refer to the AWS documentation for more details.")
+	assertErrorResponse(t, code, body, http.StatusNotFound, "invalid_request_error")
+	var env struct {
+		Error struct{ Message, Code string }
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.Error.Code != "model_retired" {
+		t.Errorf("code = %q, want model_retired; body %s", env.Error.Code, body)
+	}
+	for _, want := range []string{"retired", "Models page"} {
+		if !strings.Contains(env.Error.Message, want) {
+			t.Errorf("message %q lacks %q", env.Error.Message, want)
+		}
+	}
+}
+
+func TestTranslateBedrockError_OtherNotFoundKeepsItsMessageAndNoRetiredCode(t *testing.T) {
+	_, body := TranslateBedrockError("ResourceNotFoundException", "Could not resolve the foundation model")
+	if strings.Contains(string(body), "model_retired") || !strings.Contains(string(body), "Could not resolve") {
+		t.Errorf("unexpected body %s", body)
+	}
+}

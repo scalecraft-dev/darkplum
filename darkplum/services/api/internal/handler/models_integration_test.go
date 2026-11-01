@@ -1228,3 +1228,103 @@ func TestAcceptClassAndSync_SerialisedByTheRoutingLock(t *testing.T) {
 		t.Fatalf("registered = %q", reg)
 	}
 }
+
+// Enabling a model AWS has retired is refused; disabling it, and enabling a
+// healthy one, still work.
+func TestToggleModel_RefusesToEnableARetiredModel(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	insertModel(t, ctx, pool, "old", backendClassCloudManaged, false)
+	insertModel(t, ctx, pool, "fine", backendClassCloudManaged, false)
+	if _, err := pool.Exec(ctx, `UPDATE models SET availability_state = 'retired', availability_detail = '{"state":"retired"}'::jsonb WHERE model_id = 'old'`); err != nil {
+		t.Fatal(err)
+	}
+	gin.SetMode(gin.TestMode)
+	h := NewModelHandler("http://unused.invalid", "unused", pool)
+	r := gin.New()
+	r.PATCH("/api/v1/models/:id", h.ToggleModel)
+	idOf := func(m string) string {
+		var id string
+		_ = pool.QueryRow(ctx, `SELECT id FROM models WHERE model_id = $1`, m).Scan(&id)
+		return id
+	}
+	resp := doJSON(t, r, http.MethodPatch, "/api/v1/models/"+idOf("old"), map[string]any{"enabled": true})
+	if resp.Code != http.StatusConflict || !strings.Contains(resp.Body.String(), "model_retired") {
+		t.Fatalf("enable retired: %d %s", resp.Code, resp.Body.String())
+	}
+	var enabled bool
+	_ = pool.QueryRow(ctx, `SELECT enabled FROM models WHERE model_id = 'old'`).Scan(&enabled)
+	if enabled {
+		t.Error("the retired model was enabled")
+	}
+	if resp := doJSON(t, r, http.MethodPatch, "/api/v1/models/"+idOf("fine"), map[string]any{"enabled": true}); resp.Code != http.StatusOK {
+		t.Fatalf("enable healthy: %d %s", resp.Code, resp.Body.String())
+	}
+	if resp := doJSON(t, r, http.MethodPatch, "/api/v1/models/"+idOf("old"), map[string]any{"enabled": false}); resp.Code != http.StatusOK {
+		t.Fatalf("disable retired: %d %s", resp.Code, resp.Body.String())
+	}
+}
+
+// The chat-facing list leaves out an enabled model AWS has retired, and an
+// alias that points at one; the admin list still shows it (with its state).
+func TestListModels_OmitsRetiredModelsAndTheirAliases(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	insertModel(t, ctx, pool, "old", backendClassCloudManaged, true)
+	insertModel(t, ctx, pool, "fine", backendClassCloudManaged, true)
+	if _, err := pool.Exec(ctx, `UPDATE models SET availability_state = 'retired', availability_detail = '{"state":"retired"}'::jsonb WHERE model_id = 'old'`); err != nil {
+		t.Fatal(err)
+	}
+	for alias, target := range map[string]string{"old-alias": "old", "fine-alias": "fine"} {
+		if _, err := pool.Exec(ctx, `INSERT INTO model_aliases (alias, target_model_id) VALUES ($1, $2)`, alias, target); err != nil {
+			t.Fatal(err)
+		}
+	}
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"object":"list","data":[{"id":"old"},{"id":"fine"}]}`))
+	}))
+	defer gw.Close()
+	h := NewModelHandler(gw.URL, "unused", pool)
+
+	ids := func(req *http.Request) map[string]bool {
+		resp := httptest.NewRecorder()
+		newModelsTestRouter(h).ServeHTTP(resp, req)
+		if resp.Code != http.StatusOK {
+			t.Fatalf("status = %d, body = %s", resp.Code, resp.Body.String())
+		}
+		var out struct {
+			Data []struct {
+				ID string `json:"id"`
+			} `json:"data"`
+		}
+		if err := json.Unmarshal(resp.Body.Bytes(), &out); err != nil {
+			t.Fatal(err)
+		}
+		got := map[string]bool{}
+		for _, d := range out.Data {
+			got[d.ID] = true
+		}
+		return got
+	}
+	bearer := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+	bearer.Header.Set("Authorization", "Bearer dp_whatever")
+	for name, req := range map[string]*http.Request{"session": httptest.NewRequest(http.MethodGet, "/v1/models", nil), "bearer": bearer} {
+		got := ids(req)
+		if got["old"] {
+			t.Errorf("%s: the retired model is in the chat-facing list: %v", name, got)
+		}
+		if got["old-alias"] {
+			t.Errorf("%s: an alias to the retired model is in the chat-facing list: %v", name, got)
+		}
+		if !got["fine"] || !got["fine-alias"] {
+			t.Errorf("%s: a healthy model or its alias went missing: %v", name, got)
+		}
+	}
+
+	adminRouter := gin.New()
+	adminRouter.GET("/api/v1/models", h.ListAdminModels)
+	resp := doJSON(t, adminRouter, http.MethodGet, "/api/v1/models", nil)
+	if !strings.Contains(resp.Body.String(), `"model_id":"old"`) || !strings.Contains(resp.Body.String(), "retired") {
+		t.Errorf("the admin list must still show the retired model: %s", resp.Body.String())
+	}
+}

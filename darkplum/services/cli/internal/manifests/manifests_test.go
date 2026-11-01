@@ -325,3 +325,30 @@ func TestGPUPlanRefusesBadInputs(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// A Bedrock-only install has no vllm-inference Service: the gateway gets no
+// default vLLM upstream. With the default model deployed it gets the Service.
+func TestDefaultVLLMUpstreamOnlyWhenDeployed(t *testing.T) {
+	gwEnv := func(in Inputs) (string, bool) {
+		phases, err := Platform(k8s(t), in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, o := range all(phases) {
+			if o.Key() == "Deployment/darkplum-system/darkplum-gateway" {
+				return EnvValue(o, "VLLM_UPSTREAM")
+			}
+		}
+		t.Fatal("no gateway Deployment")
+		return "", false
+	}
+	in := inputs()
+	in.DefaultVLLM = false
+	if v, ok := gwEnv(in); !ok || v != "" {
+		t.Errorf("Bedrock-only: VLLM_UPSTREAM = %q (set=%v), want set and empty", v, ok)
+	}
+	in.DefaultVLLM = true
+	if v, _ := gwEnv(in); v != DefaultVLLMURL {
+		t.Errorf("with the default model: VLLM_UPSTREAM = %q, want %q", v, DefaultVLLMURL)
+	}
+}

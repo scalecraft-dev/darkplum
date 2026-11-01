@@ -3,10 +3,10 @@
 // that supports Converse (Anthropic, Meta Llama, Mistral, Amazon Nova,
 // DeepSeek, ...) works through this provider — not just Anthropic Claude.
 // Credentials are sourced from the default AWS credential chain — in
-// production, IRSA via the gateway pod's service account token; in local dev,
+// production, EKS Pod Identity for the gateway's service account; in local dev,
 // environment variables.
 //
-// There are no static credentials anywhere in this package. The IRSA binding is
+// There are no static credentials anywhere in this package. The Pod Identity role is
 // the IAM Layer 1 enforcement boundary; OPA in the gateway is Layer 2.
 package bedrock
 
@@ -18,6 +18,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
@@ -37,10 +38,12 @@ type BedrockProvider struct {
 	controlClient controlAPI
 	region        string
 	retention     dataRetentionState
+	retired       retiredModels
+	now           func() time.Time // nil = time.Now
 }
 
 // New creates a BedrockProvider for the given AWS region, loading credentials
-// from the default AWS config chain (IRSA → env → instance profile). An empty
+// from the default AWS config chain (Pod Identity → env → instance profile). An empty
 // region is rejected immediately. Any config-load failure should be treated as
 // fatal at startup — if we cannot obtain credentials the provider is unusable.
 //
@@ -95,6 +98,7 @@ func (p *BedrockProvider) DiscoverModels(ctx context.Context) (map[string]bool, 
 	// Raw foundation model IDs (e.g. "anthropic.claude-...") cannot be used with
 	// on-demand throughput and must be invoked via a profile. We only return
 	// profile IDs so users see models they can actually call.
+	var profiles []bedrocktypes.InferenceProfileSummary
 	var nextToken *string
 	for {
 		profileResp, err := p.controlClient.ListInferenceProfiles(ctx, &bedrock.ListInferenceProfilesInput{
@@ -109,6 +113,7 @@ func (p *BedrockProvider) DiscoverModels(ctx context.Context) (map[string]bool, 
 		for _, profile := range profileResp.InferenceProfileSummaries {
 			if profile.InferenceProfileId != nil && profile.Status == bedrocktypes.InferenceProfileStatusActive {
 				models[*profile.InferenceProfileId] = true
+				profiles = append(profiles, profile)
 			}
 		}
 
@@ -118,6 +123,7 @@ func (p *BedrockProvider) DiscoverModels(ctx context.Context) (map[string]bool, 
 		nextToken = profileResp.NextToken
 	}
 
+	p.refreshLifecycles(ctx, profiles)
 	return models, nil
 }
 
@@ -293,6 +299,10 @@ func (p *BedrockProvider) wrapError(model string, err error, hadTools bool) erro
 		statusCode, body := TranslateBedrockError("ValidationException",
 			fmt.Sprintf("model %q does not support tool calling (tools / tool_choice); resend without tools or choose a tool-capable model", model))
 		return &BedrockAPIError{StatusCode: statusCode, Body: body, Cause: err}
+	}
+	if errors.As(err, &apiErr) && apiErr.ErrorCode() == "ResourceNotFoundException" && IsModelRetiredMessage(apiErr.ErrorMessage()) {
+		p.retired.markCalled(model)
+		slog.Warn("bedrock: model is retired by AWS (end of life)", "model", model)
 	}
 	return wrapBedrockError(err)
 }

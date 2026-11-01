@@ -37,6 +37,7 @@ import { ConversationList, type ListState } from './ConversationList'
 import { MessageList, type ChatFailure } from './MessageList'
 import { ChatComposer, type AttachedChip, type ComposerLibrary, type ComposerNotice } from './ChatComposer'
 import { ModelSelector } from './ModelSelector'
+import { MODEL_RETIRED_CODE } from '../lib/modelRetired'
 import { ModelAccessNotice } from './ModelAccessNotice'
 import styles from './ChatPage.module.css'
 
@@ -55,6 +56,8 @@ type ModelsState = 'loading' | 'error' | 'empty' | 'choose' | 'ready'
 const STALE_MODEL_CODES = new Set([
   'model_not_found',
   'model_not_enabled',
+  // AWS has retired the model; the gateway stops listing it, so re-read.
+  'model_retired',
   'model_residency_violation',
   // The list is already filtered by policy when it is read, so this refusal
   // means the policy was narrowed after the picker was filled. Re-reading is
@@ -695,7 +698,15 @@ export function ChatPage() {
           retryAfterSeconds: chatErr?.retryAfterSeconds ?? null,
           refusedModel: chatErr?.refusedModel ?? null,
           route: chatErr?.route ?? null,
+          // AWS retired it: it is still in the list, so the list will not say
+          // it is gone. The refusal is the evidence.
+          modelGone: code === MODEL_RETIRED_CODE ? true : undefined,
         })
+        if (code === MODEL_RETIRED_CODE) {
+          // Clear the selection now, never pick a replacement: which model sees
+          // this conversation is the person's decision.
+          setModel((prev) => (prev === sendModel ? '' : prev))
+        }
         setConversations((prev) =>
           prev.map((c) => (c.id === target.id ? { ...c, messages: messagesToSend } : c)),
         )

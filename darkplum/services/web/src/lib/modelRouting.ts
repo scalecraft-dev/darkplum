@@ -718,6 +718,7 @@ export const DENIAL_CODES = [
   'model_requires_data_retention',
   'route_target_unavailable',
   'model_class_downgraded',
+  'model_retired',
 ] as const
 
 const DENIAL_LABELS: Record<string, string> = {
@@ -731,6 +732,7 @@ const DENIAL_LABELS: Record<string, string> = {
   // Same phrase as the Models badge (lib/dataRetention AWS_OPT_IN_LABEL);
   // written out here because check-policy pins the two to each other.
   model_requires_data_retention: 'Needs AWS opt-in',
+  model_retired: 'Model retired',
   // Recorded on a refused request (gateway chat.go sets it before route
   // resolution) but deliberately NOT in DENIAL_CODES above: the api's
   // validDenialCodeFilter does not accept it, so offering it as a filter

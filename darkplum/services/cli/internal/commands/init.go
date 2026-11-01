@@ -130,8 +130,10 @@ func (c *InitCmd) Run(g *Globals) error {
 		return c.runAdopt(os.Stdout)
 	}
 	tty := term.IsTerminal(int(os.Stdin.Fd()))
+	rl := newDeferredLog(os.Stdout)
+	defer rl.Close()
 	env := &initEnv{
-		out:         os.Stdout,
+		out:         rl,
 		prompt:      newIOPrompter(os.Stdin, os.Stdout),
 		interactive: tty && !c.Yes,
 		newCloud:    func(p string) initCloud { return newAWSCloud(p, nil) },
@@ -147,8 +149,12 @@ func (c *InitCmd) Run(g *Globals) error {
 		return c.missingFlagsError()
 	}
 	err := c.execute(env)
+	rl.logError(err)
 	if errors.Is(err, errAborted) {
 		fmt.Fprintln(env.out, sDim("nothing was written"))
+	}
+	if p := rl.Path(); p != "" {
+		fmt.Fprintf(os.Stdout, "  %s\n", sDim("Log: "+p))
 	}
 	return err
 }
@@ -896,6 +902,12 @@ func (c *InitCmd) finish(env *initEnv, s *settings, dir string, cloud initCloud)
 	var wrote []string
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return reportedErr("could not create the install workspace %s: %v", dir, err)
+	}
+	// From here init writes to the workspace, so its output is kept there too.
+	if rl, ok := env.out.(*deferredLog); ok {
+		if lin, err := install.OpenDir(dir, s.cluster); err == nil {
+			rl.attach(lin, "init", env.now())
+		}
 	}
 	fmt.Fprintf(w, "%s preparing state bucket %s…\n", sDim("…"), bucket)
 	arn, err := cloud.CreateBackend(bucket, s.region, st)

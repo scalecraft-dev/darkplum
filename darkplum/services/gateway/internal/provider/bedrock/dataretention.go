@@ -171,6 +171,9 @@ func (p *BedrockProvider) ModelAvailability(model string) provider.Availability 
 	av := provider.Availability{AccountMode: mode, RequiredMode: provider.RequiredDataRetentionMode}
 	low := mode == "none" || mode == "default" || mode == "inherit"
 	switch {
+	case p.retired.profileRetired(model):
+		return provider.Availability{State: provider.AvailabilityRetired, Reason: provider.AvailabilityReasonRetired,
+			AccountMode: mode, RequiredMode: provider.RequiredDataRetentionMode}
 	case p.retention.isRefused(model):
 		av.State = provider.AvailabilityNeedsOptIn
 	case known && low && modelNeedsOptIn(model):
@@ -186,5 +189,6 @@ func (p *BedrockProvider) ModelAvailability(model string) provider.Availability 
 	return av
 }
 
+var _ provider.RetiredChecker = (*BedrockProvider)(nil)
 var _ provider.AvailabilityReporter = (*BedrockProvider)(nil)
 var _ provider.DataRetentionReporter = (*BedrockProvider)(nil)

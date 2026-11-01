@@ -29,8 +29,6 @@ spec:
           env:
             - name: GATEWAY_PORT
               value: "8080"
-            - name: VLLM_UPSTREAM
-              value: http://vllm-inference.darkplum-inference.svc.cluster.local:8000
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -45,6 +43,12 @@ spec:
             # bedrock_model_filter output so the catalog matches the IAM
             # allowlist. Empty = list every discovered inference profile.
             - name: BEDROCK_MODEL_FILTER
+              value: ""
+            # The default self-hosted vLLM (the "vllm-default" upstream). Empty =
+            # none: a Bedrock-only install lists and probes no vLLM at all.
+            # `darkplum deploy` sets it only when it deploys the default
+            # vllm-inference model (gpu_desired_size > 0).
+            - name: VLLM_UPSTREAM
               value: ""
             # Additional self-hosted vLLM backends as "name=url,name2=url2".
             # Managed by `darkplum models add` / `darkplum models remove`.

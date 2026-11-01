@@ -18,9 +18,15 @@ type Inputs struct {
 	BedrockRegion      string
 	BedrockModelFilter string
 	VLLMUpstreams      string
-	ServiceCIDR        string // the cluster's Kubernetes service CIDR
-	VPCCIDR            string
+	// DefaultVLLM wires the gateway to the default vllm-inference Service. It is
+	// false on a Bedrock-only install, where no such Service exists.
+	DefaultVLLM bool
+	ServiceCIDR string // the cluster's Kubernetes service CIDR
+	VPCCIDR     string
 }
+
+// DefaultVLLMURL is the in-cluster address of the default vllm-inference Service.
+const DefaultVLLMURL = "http://vllm-inference.darkplum-inference.svc.cluster.local:8000"
 
 // Phase is a group of objects applied together; Rollouts are the Deployments (in
 // darkplum-system) that must finish rolling out before the next phase starts.
@@ -146,9 +152,14 @@ func Platform(k8s fs.FS, in Inputs) ([]Phase, error) {
 		}
 	}
 	gd, _ := find(gwWork, "Deployment", "darkplum-gateway")
+	defaultVLLM := ""
+	if in.DefaultVLLM {
+		defaultVLLM = DefaultVLLMURL
+	}
 	for _, e := range []struct{ name, value string }{
 		{"BEDROCK_REGION", in.BedrockRegion},
 		{"BEDROCK_MODEL_FILTER", in.BedrockModelFilter},
+		{"VLLM_UPSTREAM", defaultVLLM},
 		{"VLLM_UPSTREAMS", in.VLLMUpstreams},
 	} {
 		if err := SetEnv(gd, e.name, e.value); err != nil {

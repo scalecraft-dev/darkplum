@@ -20,10 +20,41 @@ type fakeControlAPI struct {
 	calls          int
 	lastNextTokens []*string
 
+	// ListFoundationModels script.
+	fms   []bedrocktypes.FoundationModelSummary
+	fmErr error
+
+	// GetFoundationModel script: per model id; absent ids answer ResourceNotFound
+	// unless getErr has them. getCalls counts calls per id.
+	getErr   map[string]error
+	getCalls map[string]int
+
 	// GetAccountDataRetention script.
 	drMode  bedrocktypes.DataRetentionMode
 	drErr   error
 	drCalls int
+}
+
+func (f *fakeControlAPI) ListFoundationModels(_ context.Context, _ *bedrock.ListFoundationModelsInput, _ ...func(*bedrock.Options)) (*bedrock.ListFoundationModelsOutput, error) {
+	if f.fmErr != nil {
+		return nil, f.fmErr
+	}
+	return &bedrock.ListFoundationModelsOutput{ModelSummaries: f.fms}, nil
+}
+
+func (f *fakeControlAPI) GetFoundationModel(_ context.Context, in *bedrock.GetFoundationModelInput, _ ...func(*bedrock.Options)) (*bedrock.GetFoundationModelOutput, error) {
+	id := aws.ToString(in.ModelIdentifier)
+	if f.getCalls == nil {
+		f.getCalls = map[string]int{}
+	}
+	f.getCalls[id]++
+	if err := f.getErr[id]; err != nil {
+		return nil, err
+	}
+	return &bedrock.GetFoundationModelOutput{ModelDetails: &bedrocktypes.FoundationModelDetails{
+		ModelId:        aws.String(id),
+		ModelLifecycle: &bedrocktypes.FoundationModelLifecycle{Status: bedrocktypes.FoundationModelLifecycleStatus("ACTIVE")},
+	}}, nil
 }
 
 func (f *fakeControlAPI) GetAccountDataRetention(_ context.Context, _ *bedrock.GetAccountDataRetentionInput, _ ...func(*bedrock.Options)) (*bedrock.GetAccountDataRetentionOutput, error) {

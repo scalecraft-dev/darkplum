@@ -103,6 +103,13 @@ import {
   workspaceIdToSend,
   workspaceRequiredCopy,
 } from '../src/lib/vendorKeys.ts'
+import {
+  MODEL_RETIRED_CODE,
+  RETIRED_LABEL,
+  RETIRED_STATUS_HINT,
+  isRetired,
+  retiredFailureCopy,
+} from '../src/lib/modelRetired.ts'
 import { formatEventDetail } from '../src/lib/activityEvents.ts'
 import {
   AWS_OPT_IN_LABEL,
@@ -1243,6 +1250,42 @@ if (!joined(WEB_PORT_FORWARD_COMMAND).startsWith('eval "$(darkplum kubeconfig)" 
     formatEventDetail({ workspace_id_before: 'wrkspc_a', workspace_id_after: 'wrkspc_b' }),
     'workspace before: wrkspc_a, workspace after: wrkspc_b',
   )
+}
+
+// --- Model retired by AWS ----------------------------------------------------
+// Only an explicit 'retired' counts; the chat card says "the Models page" for an
+// administrator and never offers a retry into the same refusal's model.
+{
+  check('isRetired(retired)', isRetired({ availability: { state: 'retired' } }), true)
+  check('isRetired(ok)', isRetired({ availability: { state: 'ok' } }), false)
+  check('isRetired(needs_aws_opt_in)', isRetired({ availability: { state: 'needs_aws_opt_in' } }), false)
+  check('isRetired(unknown) says nothing', isRetired({ availability: { state: 'unknown' } }), false)
+  check('isRetired(null / absent / no model)', String([isRetired({ availability: null }), isRetired({}), isRetired(null)]), 'false,false,false')
+  check('MODEL_RETIRED_CODE matches the gateway', MODEL_RETIRED_CODE, 'model_retired')
+  check('RETIRED_LABEL', RETIRED_LABEL, 'Retired by AWS')
+  check('the row note is not the unreachable one', RETIRED_STATUS_HINT.includes('returns when its backend is back'), false)
+  check(
+    'retiredFailureCopy(admin)',
+    JSON.stringify(retiredFailureCopy(true)),
+    JSON.stringify({
+      title: 'That model has been retired',
+      hint: 'Pick another model, or enable a replacement on the Models page.',
+    }),
+  )
+  check(
+    'retiredFailureCopy(user)',
+    JSON.stringify(retiredFailureCopy(false)),
+    JSON.stringify({
+      title: 'That model has been retired',
+      hint: 'Pick another model from the list at the top of the page.',
+    }),
+  )
+  check(
+    'DENIAL_CODES offers model_retired (api accepts the filter)',
+    (DENIAL_CODES as readonly string[]).includes(MODEL_RETIRED_CODE),
+    true,
+  )
+  check('denialLabel(model_retired)', denialLabel(MODEL_RETIRED_CODE), 'Model retired')
 }
 
 // --- Bedrock data-retention opt-in -------------------------------------------

@@ -391,7 +391,12 @@ func (h *deployHarness) script(gpu int) {
 		}
 		return nil, errors.New("no selector")
 	})
-	k.on("get svc vllm-inference", "None", nil)
+	if gpu > 0 {
+		k.on("get svc vllm-inference", "None", nil)
+	} else {
+		// A Bedrock-only cluster has no darkplum-inference namespace.
+		k.on("get svc vllm-inference", "", errors.New(`kubectl: Error from server (NotFound): namespaces "darkplum-inference" not found`))
+	}
 	k.on("patch secret postgres-credentials", "", nil)
 	k.on("annotate", "", nil)
 	k.on("apply", "", nil)

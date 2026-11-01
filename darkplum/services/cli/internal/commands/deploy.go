@@ -526,9 +526,18 @@ func (e *deployEnv) run(ctx context.Context) (err error) {
 		return e.stop(checkResult{name: "gateway models", status: checkFail, detail: firstLine(err.Error()),
 			hint: "the live gateway's model list could not be read; applying without it would drop the models added with `darkplum models add`"}, "cannot read the live gateway")
 	}
+	defaultVLLM := out.GPUDesired > 0
+	if !defaultVLLM {
+		// Not asking for the self-hosted model now, but an earlier deploy may have
+		// installed it: the gateway keeps pointing at it until it is removed.
+		if defaultVLLM, err = liveDefaultVLLM(kc); err != nil {
+			return e.stop(checkResult{name: "self-hosted model", status: checkFail, detail: firstLine(err.Error()),
+				hint: "the live vllm-inference Service could not be read; applying without it could cut the gateway off from a model that is running"}, "cannot read the live cluster")
+		}
+	}
 	phases, err := manifests.Platform(fsys, manifests.Inputs{
 		Images: images, BedrockRegion: out.InferenceRegion, BedrockModelFilter: out.BedrockModelFilter,
-		VLLMUpstreams: upstreams, ServiceCIDR: out.ServiceCIDR, VPCCIDR: out.VPCCIDR,
+		VLLMUpstreams: upstreams, DefaultVLLM: defaultVLLM, ServiceCIDR: out.ServiceCIDR, VPCCIDR: out.VPCCIDR,
 	})
 	if err != nil {
 		return e.stop(checkResult{name: "manifests", status: checkFail, detail: firstLine(err.Error())}, "the platform manifests do not render")
@@ -1415,6 +1424,20 @@ func carriedUpstreams(kc *kube.Client) (string, error) {
 	}
 	v, _ := manifests.EnvValue(o, "VLLM_UPSTREAMS")
 	return v, nil
+}
+
+// liveDefaultVLLM says whether the default vllm-inference Service exists. No
+// Service (or no darkplum-inference namespace yet) is false; any other failure
+// is an error, as in carriedUpstreams: guessing "none" would unwire a running model.
+func liveDefaultVLLM(kc *kube.Client) (bool, error) {
+	_, err := kc.Run(nil, "-n", inferenceNS, "get", "svc", "vllm-inference", "-o", "name")
+	switch {
+	case err == nil:
+		return true, nil
+	case kubeNotFound(err, "services", "vllm-inference"), kubeNoNamespace(err, inferenceNS):
+		return false, nil
+	}
+	return false, err
 }
 
 // ---- platform --------------------------------------------------------------------------

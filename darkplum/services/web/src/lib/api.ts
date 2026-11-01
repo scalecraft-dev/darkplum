@@ -838,7 +838,7 @@ export function exportConversation(id: string): Promise<{ blob: Blob; filename: 
 /**
  * A chat failure carrying the gateway's OpenAI-style error code, so the
  * conversation UI can explain routing refusals (model_not_found,
- * model_not_enabled, model_residency_violation, policy_unavailable) and vendor
+ * model_not_enabled, model_retired, model_residency_violation, policy_unavailable) and vendor
  * failures (provider_rate_limited, provider_auth_failed, upstream_error,
  * upstream_timeout, unsupported_parameter) instead of showing a generic
  * failure.

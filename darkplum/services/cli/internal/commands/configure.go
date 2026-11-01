@@ -84,12 +84,15 @@ func (c *ConfigureCmd) Run(g *Globals) error {
 		printCheckTo(os.Stdout, noInstallRow(err))
 		return reportedError{"no install to configure"}
 	}
+	// The run is kept in <workspace>/logs/configure-<time>.log, like deploy's.
+	rl := newRunLog(in, "configure", os.Stdout, time.Now())
+	defer rl.Close()
 	var (
 		mu  sync.Mutex
 		fwd Forwarder
 	)
 	env := &configureEnv{
-		out:         os.Stdout,
+		out:         rl,
 		prompt:      newTermPrompter(),
 		interactive: !c.Yes,
 		namespace:   g.Namespace,
@@ -151,6 +154,10 @@ func (c *ConfigureCmd) Run(g *Globals) error {
 	}()
 	err = c.execute(ctx, env)
 	close(finished)
+	rl.logError(err)
+	if p := rl.Path(); p != "" {
+		fmt.Fprintf(os.Stdout, "  %s\n", sDim("Log: "+p))
+	}
 	return err
 }
 
@@ -547,9 +554,9 @@ func (r *configureRun) modelsAndChat(ctx context.Context) error {
 		if m, err = r.waitSelfHosted(ctx); err != nil {
 			return err
 		}
-		return r.chat(ctx, m)
+		return r.chatAny(ctx, ms, m)
 	}
-	if err := r.chat(ctx, m); err != nil {
+	if err := r.chatAny(ctx, ms, m); err != nil {
 		return err
 	}
 	if r.cmd.Wait && vs.present && !vs.broken && !hasReadySelfHosted(ms) {
@@ -557,7 +564,7 @@ func (r *configureRun) modelsAndChat(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		return r.chat(ctx, sm)
+		return r.chatAny(ctx, ms, sm)
 	}
 	return nil
 }
@@ -596,8 +603,19 @@ func chatModel(ms []adminModel) (adminModel, bool) {
 // ready one by default) and enables them. It never disables anything. It
 // returns the list with the new enabled flags.
 func (r *configureRun) enableModels(ctx context.Context, ms []adminModel, vs vllmState) ([]adminModel, error) {
-	var candidates []int
+	var candidates, retiredOffered []int
 	for i, m := range ms {
+		if m.retired() {
+			if m.Enabled {
+				// Enabled, so everyone who signs in can pick it, and it fails.
+				printCheckTo(r.out, checkResult{name: m.label(), status: checkWarn,
+					detail: m.kind() + " · enabled, but retired by AWS (end of life)",
+					hint:   "turn it off under Admin > Models in the web UI"})
+			} else {
+				retiredOffered = append(retiredOffered, i)
+			}
+			continue
+		}
 		if m.Enabled {
 			detail := m.kind() + " · enabled"
 			if !m.ready() {
@@ -607,6 +625,21 @@ func (r *configureRun) enableModels(ctx context.Context, ms []adminModel, vs vll
 			continue
 		}
 		candidates = append(candidates, i)
+	}
+
+	if len(retiredOffered) > 0 {
+		names := make([]string, 0, 3)
+		for _, i := range retiredOffered {
+			if len(names) < 3 {
+				names = append(names, ms[i].label())
+			}
+		}
+		more := ""
+		if len(retiredOffered) > len(names) {
+			more = fmt.Sprintf(" and %d more", len(retiredOffered)-len(names))
+		}
+		printCheckTo(r.out, checkResult{name: "retired models", status: checkWarn,
+			detail: fmt.Sprintf("%d retired by AWS, not offered: %s%s", len(retiredOffered), strings.Join(names, ", "), more)})
 	}
 
 	if vs.present && !hasListedReadySelfHosted(ms) {
@@ -726,12 +759,15 @@ func (r *configureRun) waitSelfHosted(ctx context.Context) (adminModel, error) {
 // chat sends one short chat through the same route as the web UI and names
 // the component when it fails. A model enabled seconds ago can be refused
 // until the gateway reloads its policy, so that refusal is retried briefly.
-func (r *configureRun) chat(ctx context.Context, m adminModel) error {
+//
+// retired is true when AWS has retired the model: nothing is printed for it, so
+// chatAny can try another enabled model instead.
+func (r *configureRun) chat(ctx context.Context, m adminModel) (retired bool, err error) {
 	for try := 1; ; try++ {
 		res, resp, err := r.api.chat(ctx, m.ModelID, r.now)
 		if err != nil {
 			r.problem("test chat", firstLine(err.Error()), "try a chat in the web UI; darkplum status checks the services")
-			return nil
+			return false, nil
 		}
 		if resp.status == http.StatusOK {
 			r.pass("test chat", fmt.Sprintf("%s answered in %.1fs", m.label(), res.latency.Seconds()))
@@ -743,18 +779,49 @@ func (r *configureRun) chat(ctx context.Context, m adminModel) error {
 				}
 				fmt.Fprintf(r.out, "      %s\n", sDim("“"+reply+"”"))
 			}
-			return nil
+			return false, nil
 		}
 		msg, code := resp.errMessage()
 		if resp.status == http.StatusForbidden && code == "model_not_enabled" && try < 6 {
 			if err := r.sleep(ctx, 3*time.Second); err != nil {
-				return reportedError{"stopped"}
+				return false, reportedError{"stopped"}
 			}
 			continue
 		}
+		if isRetiredFailure(code, msg) {
+			return true, nil
+		}
 		detail, hint := chatFailure(m, resp.status, code, msg)
 		r.problem("test chat", detail, hint)
-		return nil
+		return false, nil
+	}
+}
+
+// chatAny sends the test chat to m and, when AWS has retired it, to the next
+// enabled model that can answer: a retired model is no reason to send the user
+// away. Only when none is left does the run report it.
+func (r *configureRun) chatAny(ctx context.Context, ms []adminModel, m adminModel) error {
+	tried := map[string]bool{}
+	for {
+		tried[m.ID] = true
+		retired, err := r.chat(ctx, m)
+		if err != nil || !retired {
+			return err
+		}
+		for i := range ms {
+			if ms[i].ID == m.ID {
+				ms[i].Availability = &modelAvailability{State: "retired"}
+			}
+		}
+		next, ok := chatModel(ms)
+		if !ok || tried[next.ID] { // never ask a model twice
+			detail, hint := chatFailure(m, http.StatusNotFound, "model_retired", "")
+			r.problem("test chat", detail, hint)
+			return nil
+		}
+		printCheckTo(r.out, checkResult{name: "test chat", status: checkWarn,
+			detail: m.label() + " is retired by AWS; trying " + next.label()})
+		m = next
 	}
 }
 
@@ -763,8 +830,15 @@ func chatFailure(m adminModel, status int, code, msg string) (detail, hint strin
 	switch {
 	case code == "model_not_enabled":
 		return "the gateway has not picked up the newly enabled model yet", "try a chat in the web UI in a minute"
-	case status == http.StatusNotFound:
+	case isRetiredFailure(code, msg):
+		return m.label() + " is retired by AWS (end of life); waiting will not help",
+			"re-run darkplum configure: it asks which model to enable, and does not offer retired ones"
+	case code == "model_not_found":
 		return "the gateway does not list " + m.ModelID + " yet", "wait a minute, then re-run darkplum configure"
+	case status == http.StatusNotFound && m.Provider == "bedrock" && msg != "" && msg != http.StatusText(http.StatusNotFound):
+		// The gateway knows the model and Bedrock said no: waiting will not help.
+		return fmt.Sprintf("Bedrock could not find the model (404): %s", msg),
+			"re-run darkplum configure and pick another model, or check model access in the Bedrock console"
 	case m.selfHosted() && status >= 500:
 		return fmt.Sprintf("the self-hosted model did not answer (%d): it may still be loading", status),
 			"follow it: " + kubectlHint("-n "+inferenceNamespace+" logs -f deploy/vllm-inference -c vllm")
@@ -778,6 +852,12 @@ func chatFailure(m adminModel, status int, code, msg string) (detail, hint strin
 	default:
 		return fmt.Sprintf("refused (%d): %s", status, msg), "try a chat in the web UI; darkplum status checks the services"
 	}
+}
+
+// isRetiredFailure recognises the end-of-life refusal: the gateway's
+// model_retired code, or Bedrock's own text from an older gateway.
+func isRetiredFailure(code, msg string) bool {
+	return code == "model_retired" || strings.Contains(strings.ToLower(msg), "end of its life")
 }
 
 // minutes renders a wait bound the way people say it: "40 min".

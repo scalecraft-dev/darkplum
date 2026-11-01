@@ -18,6 +18,7 @@ import {
   vendorLabel,
 } from '../lib/modelRouting'
 import { DATA_RETENTION_CODE, dataRetentionFailureCopy } from '../lib/dataRetention'
+import { MODEL_RETIRED_CODE, retiredFailureCopy } from '../lib/modelRetired'
 import { CodeBlock } from '../components/ui/CodeBlock'
 import { CopyButton } from '../components/ui/CopyButton'
 import { EgressGlyph } from '../components/ui'
@@ -132,6 +133,8 @@ function failureCopy(
           ? 'Pick another model, or check that the gateway still discovers this one on the Models page.'
           : 'Pick another model from the list at the top of the page.',
       }
+    case MODEL_RETIRED_CODE:
+      return retiredFailureCopy(isAdmin)
     case 'model_not_enabled':
       return {
         title: 'That model is turned off',
@@ -254,7 +257,12 @@ const FailureNotice = ({
   const aliasRelated = isRouteTargetRefusal(failure.code, failure.message)
   const classDowngradedRelated = failure.code === MODEL_CLASS_DOWNGRADED_CODE
   const catalogueRelated =
-    !aliasRelated && (failure.code === 'model_not_found' || failure.code === 'model_not_enabled')
+    !aliasRelated &&
+    (failure.code === 'model_not_found' ||
+      failure.code === 'model_not_enabled' ||
+      failure.code === MODEL_RETIRED_CODE)
+  // Retrying sends the same message to the same retired model.
+  const retiredRelated = failure.code === MODEL_RETIRED_CODE
   // Fixed in the organisation's routing policy, which is its own tab on the
   // Models page — the model is enabled, the policy is what refuses it.
   const orgPolicyRelated = failure.code === 'model_residency_violation'
@@ -296,15 +304,15 @@ const FailureNotice = ({
           admin to enable a model the gateway no longer discovers is a dead end.
           Some refusals say everything in the gateway's own sentence above and
           have no next step to add; those print no hint rather than padding. */}
-      {(modelGone || hint) && (
+      {((modelGone && !retiredRelated) || hint) && (
         <p className={styles.failureHint}>
-          {modelGone
+          {modelGone && !retiredRelated
             ? 'This model is no longer available. Choose another model at the top of the page, then try again.'
             : hint}
         </p>
       )}
       <div className={styles.failureActions}>
-        {onRetry && !awsOptInRelated && (
+        {onRetry && !awsOptInRelated && !retiredRelated && (
           /* aria-disabled rather than disabled: pressing Try again into a rate
              limit refuses the send again and starts a fresh wait, and a real
              `disabled` at that moment would drop the focus the person was

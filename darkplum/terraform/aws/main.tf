@@ -10,6 +10,7 @@ provider "aws" {
 # normalized container_registry output so the platform-deploy step never has to
 # call `aws sts get-caller-identity` itself.
 data "aws_caller_identity" "current" {}
+data "aws_partition" "current" {}
 
 locals {
   # Bedrock is the inference backend on AWS. This value is surfaced as a
@@ -116,10 +117,24 @@ module "pod_identity_gateway" {
         ],
         [
           {
-            Sid      = "DiscoverModels"
-            Effect   = "Allow"
-            Action   = ["bedrock:ListInferenceProfiles"]
+            Sid    = "DiscoverModels"
+            Effect = "Allow"
+            # Read-only listings. ListFoundationModels carries each model's
+            # lifecycle (ACTIVE / LEGACY / end-of-life time), so a model AWS has
+            # retired is shown as retired instead of offered as ready.
+            Action   = ["bedrock:ListInferenceProfiles", "bedrock:ListFoundationModels"]
             Resource = "*"
+          },
+          {
+            # AWS omits a retired model from the list while its inference profile
+            # stays active; GetFoundationModel answers for it with the
+            # end-of-life error. Scoped to foundation-model ARNs (any region: a
+            # profile's models can be in other regions, and global.* profiles
+            # have an empty region in the ARN).
+            Sid      = "ReadModelLifecycle"
+            Effect   = "Allow"
+            Action   = ["bedrock:GetFoundationModel"]
+            Resource = "arn:${data.aws_partition.current.partition}:bedrock:*::foundation-model/*"
           },
           {
             # Read-only: lets the gateway tell an administrator, before anyone

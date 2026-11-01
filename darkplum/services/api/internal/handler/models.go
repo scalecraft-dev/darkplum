@@ -369,6 +369,7 @@ func (h *ModelHandler) ListModels(c *gin.Context) {
 		SELECT model_id, provider, backend_class, discovered_at, availability_detail
 		FROM models
 		WHERE enabled = true
+		  AND availability_state IS DISTINCT FROM 'retired' -- AWS ended its life: it can only fail a chat
 		ORDER BY provider, model_id
 	`)
 	if err != nil {
@@ -399,6 +400,7 @@ func (h *ModelHandler) ListModels(c *gin.Context) {
 		FROM model_aliases a
 		JOIN models m ON m.model_id = a.target_model_id
 		WHERE m.enabled = true
+		  AND m.availability_state IS DISTINCT FROM 'retired'
 		ORDER BY a.alias
 	`)
 	if err != nil {
@@ -850,6 +852,19 @@ func (h *ModelHandler) ToggleModel(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "acquire routing lock failed"})
 			return
 		}
+	}
+
+	// A model the cloud has retired cannot be turned on: every chat to it fails.
+	// Turning it off stays possible.
+	if req.Enabled != nil && *req.Enabled {
+		var state *string
+		err := tx.QueryRow(ctx, `SELECT availability_state FROM models WHERE id = $1`, id).Scan(&state)
+		if err == nil && modelRetiredState(state) {
+			c.JSON(http.StatusConflict, gin.H{"error": modelRetiredEnableMessage, "code": "model_retired"})
+			return
+		}
+		// A missing row falls through to the UPDATE's 404; a read error is not
+		// a reason to block the toggle.
 	}
 
 	// Each field is applied only when it was sent: COALESCE keeps the stored
@@ -1371,3 +1386,10 @@ func (h *ModelHandler) syncModelsPerRow(ctx context.Context, tx pgx.Tx, models [
 	}
 	return inserted, updated, discoveredIDs, nil
 }
+
+// modelRetiredEnableMessage is the 409 for enabling a model AWS has retired.
+const modelRetiredEnableMessage = "This model has been retired by AWS and cannot be enabled. Enable another model."
+
+// modelRetiredState is true for the availability state the gateway reports for
+// a model the cloud has retired.
+func modelRetiredState(state *string) bool { return state != nil && *state == "retired" }
