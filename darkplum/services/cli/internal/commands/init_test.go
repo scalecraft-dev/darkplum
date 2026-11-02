@@ -49,6 +49,8 @@ type fakeCloud struct {
 	objects     map[string]int
 	objectsFull map[string]stateContents // wins over objects (outputs, too)
 	objectErr   map[string]error
+	locks       map[string]bool // "bucket/key" whose .tflock exists
+	lockErr     error
 	reads       []string
 
 	// Route53 / ACM (init_web.go).
@@ -130,6 +132,9 @@ func (f *fakeCloud) ReadState(bucket, key, _ string) (stateContents, bool, error
 	}
 	n, ok := f.objects[k]
 	return stateContents{Resources: n}, ok, nil
+}
+func (f *fakeCloud) StateLocked(bucket, key, _ string) (bool, error) {
+	return f.locks[bucket+"/"+key], f.lockErr
 }
 func (f *fakeCloud) CreateBackend(_, _ string, st backendState) (string, error) {
 	f.createCalls++

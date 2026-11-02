@@ -153,7 +153,8 @@ func TestInitStateLiveInstallFailsClosed(t *testing.T) {
 		cloud := base()
 		cloud.buckets = []stateBucket{{Name: bucketN("ffffff")}}
 		cloud.prefixOnly = []string{live}
-		cloud.objects = map[string]int{bucketN("ffffff") + "/darkplum/aws/darkplum/terraform.tfstate": 0} // exists: forces a rename
+		cloud.objects = map[string]int{bucketN("ffffff") + "/darkplum/aws/darkplum/terraform.tfstate": 0}
+		cloud.locks = map[string]bool{bucketN("ffffff") + "/darkplum/aws/darkplum/terraform.tfstate": true} // empty and locked: forces a rename
 		cloud.objectsFull = map[string]stateContents{live + "/darkplum/aws/darkplum-2/terraform.tfstate": {Resources: 5}}
 		dir := t.TempDir()
 		env, out := testEnv(t, cloud, nil, "\n\ndarkplum-2\n\n")
@@ -498,16 +499,48 @@ func TestInitStateKeyCollision(t *testing.T) {
 		writeCache(t, dir, bucketN("000000"), legacyStateKey)
 		return dir
 	}
-	for _, n := range []int{42, 0} { // an existing object, even an empty one, is another install's
+	refused := func(t *testing.T, name string, cloud *fakeCloud, want string) {
+		t.Helper()
 		dir := notFresh(t)
-		cloud := taken(n)
 		env, out := testEnv(t, cloud, nil, "-")
 		err := s3Cmd(dir, nil).execute(env)
-		if err == nil || !strings.Contains(err.Error(), "another install named darkplum already keeps state here") {
-			t.Fatalf("%d resources: want collision refusal, got %v\n%s", n, err, out)
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("%s: want a refusal saying %q, got %v\n%s", name, want, err, out)
 		}
 		if _, err := os.Stat(filepath.Join(dir, "backend.hcl")); err == nil || cloud.createCalls != 0 {
-			t.Errorf("%d resources: wrote backend.hcl / created %d", n, cloud.createCalls)
+			t.Errorf("%s: wrote backend.hcl / created %d", name, cloud.createCalls)
+		}
+	}
+	refused(t, "resources", taken(42), "another install named darkplum already keeps state here")
+
+	// Outputs but no resources still belong to someone.
+	withOutputs := taken(0)
+	withOutputs.objectsFull = map[string]stateContents{ck: {Outputs: 1}}
+	refused(t, "outputs", withOutputs, "another install named darkplum already keeps state here")
+
+	// Empty and locked: another install's first apply has only just started.
+	locked := taken(0)
+	locked.locks = map[string]bool{ck: true}
+	refused(t, "empty and locked", locked, "another deploy of darkplum holds the lock on this empty state")
+
+	// The lock cannot be read: never assume it is free.
+	unreadable := taken(0)
+	unreadable.lockErr = errors.New("AccessDenied")
+	refused(t, "lock unreadable", unreadable, "cannot read the state lock")
+
+	// Empty and unlocked is what `darkplum destroy` leaves: a clean machine may
+	// install again under the same name, and says so.
+	{
+		dir := notFresh(t)
+		env, out := testEnv(t, taken(0), nil, "-")
+		if err := s3Cmd(dir, nil).execute(env); err != nil {
+			t.Fatalf("empty state from a destroyed install refused: %v\n%s", err, out)
+		}
+		if !strings.Contains(backendLine(t, dir, "key"), ck[strings.Index(ck, "/")+1:]) {
+			t.Errorf("did not take the key:\n%s", out)
+		}
+		if !strings.Contains(out.String(), "a destroyed install leaves one") {
+			t.Errorf("reusing the state was not reported:\n%s", out)
 		}
 	}
 

@@ -373,3 +373,37 @@ func TestTFVarsDocsGuard(t *testing.T) {
 		t.Errorf("repository docs fail the guard:\n%s", out)
 	}
 }
+
+func TestAWSStateLockedReadsTheLockFile(t *testing.T) {
+	const key = "darkplum/aws/darkplum/terraform.tfstate"
+	cases := []struct {
+		name    string
+		err     error
+		want    bool
+		wantErr bool
+	}{
+		{"present", nil, true, false},
+		{"absent", errors.New("An error occurred (404) when calling the HeadObject operation: Not Found"), false, false},
+		// Without s3:ListBucket a missing object answers 403: never read that as free.
+		{"forbidden", errors.New("An error occurred (403) when calling the HeadObject operation: Forbidden"), false, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			sr := &scriptRunner{rules: []rule{
+				{"sts get-caller-identity", `{"UserId":"X","Account":"123456789012","Arn":"x"}`, nil},
+				{"s3api head-object", "{}", c.err},
+			}}
+			a := newAWSCloud("scalecraft", sr.run)
+			if _, err := a.Identity(); err != nil {
+				t.Fatal(err)
+			}
+			got, err := a.StateLocked("b", key, "us-east-2")
+			if got != c.want || (err != nil) != c.wantErr {
+				t.Fatalf("got %v, %v", got, err)
+			}
+			if !strings.Contains(sr.calls[len(sr.calls)-1], "--key "+key+".tflock") {
+				t.Errorf("wrong object: %s", sr.calls[len(sr.calls)-1])
+			}
+		})
+	}
+}

@@ -79,6 +79,7 @@ type initCloud interface {
 	StateBuckets(region string) ([]stateBucket, error)
 	PrefixBuckets(region string) ([]string, error)
 	ReadState(bucket, key, region string) (sc stateContents, found bool, err error)
+	StateLocked(bucket, key, region string) (bool, error)
 	CreateBackend(bucket, region string, st backendState) (string, error)
 
 	// Private web address (init_web.go). Read-only except CreateWebZone.

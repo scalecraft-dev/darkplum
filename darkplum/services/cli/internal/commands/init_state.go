@@ -276,9 +276,13 @@ func (c *InitCmd) planState(env *initEnv, s *settings, dir string, cloud initClo
 			hint: "init turns it back on; state overwritten while it was off has no earlier versions"})
 	}
 
-	// A new install's key must not exist in a reused bucket: an object there,
-	// even an empty one, is another install's (perhaps initialised, not yet
-	// deployed). Only this checkout's own saved settings may claim it.
+	// A new install's key must not be in use in a reused bucket. An object with
+	// anything in it is another install's; only this checkout's own saved
+	// settings may claim it. An empty one holds nothing to lose: `darkplum destroy`
+	// leaves one, and a first apply killed before its first resource may. It is free
+	// unless it is locked, which is a first apply under way or one that was killed.
+	// (Only a lock file is looked for: backends init creates use one. A deploy running
+	// from an adopted backend with use_lockfile = false on this same key is not seen.)
 	for !p.kept && st.BucketExists {
 		if cache != nil && cache.Bucket == p.bucket && cache.Key == p.key {
 			break
@@ -293,8 +297,21 @@ func (c *InitCmd) planState(env *initEnv, s *settings, dir string, cloud initClo
 			break
 		}
 		msg := "another install named " + s.cluster + " already keeps state here"
-		printCheckTo(w, checkResult{name: "state key", status: checkFail, detail: fmt.Sprintf("%s at s3://%s/%s", sc, p.bucket, p.key),
-			hint: msg + "; choose another --cluster-name, or destroy that install first"})
+		hint := msg + "; choose another --cluster-name, or destroy that install first"
+		if sc.empty() {
+			locked, err := cloud.StateLocked(p.bucket, p.key, s.region)
+			if err != nil {
+				return p, env.fail("state key", "could not read the lock of s3://"+p.bucket+"/"+p.key+": "+firstLine(err.Error()),
+					"needs s3:GetObject and s3:ListBucket on the bucket", "cannot read the state lock")
+			}
+			if !locked {
+				record(checkResult{name: "state key", status: checkPass, detail: "empty state at s3://" + p.bucket + "/" + p.key + " (a destroyed install leaves one); reused"})
+				break
+			}
+			msg = "another deploy of " + s.cluster + " holds the lock on this empty state"
+			hint = msg + "; choose another --cluster-name, or wait for it. If none is running, a killed run left the lock: remove it with `aws s3 rm s3://" + p.bucket + "/" + p.key + ".tflock`"
+		}
+		printCheckTo(w, checkResult{name: "state key", status: checkFail, detail: fmt.Sprintf("%s at s3://%s/%s", sc, p.bucket, p.key), hint: hint})
 		if !env.interactive {
 			return p, reportedErr("%s", msg)
 		}

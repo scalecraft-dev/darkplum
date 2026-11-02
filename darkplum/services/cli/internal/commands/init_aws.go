@@ -491,6 +491,19 @@ func (a *awsCloud) ReadState(bucket, key, region string) (sc stateContents, foun
 	return sc, true, nil
 }
 
+// StateLocked reports whether Terraform's lock file sits beside a state object
+// (use_lockfile keeps it at <key>.tflock). Read-only.
+func (a *awsCloud) StateLocked(bucket, key, region string) (bool, error) {
+	_, err := a.aws("s3api", "head-object", "--bucket", bucket, "--key", key+".tflock", "--region", region, "--expected-bucket-owner", a.account)
+	if err != nil {
+		if isNotFound(err, "(404)", "Not Found", "NoSuchKey") {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
 // parseState counts a state's resources and outputs and finds the EKS cluster
 // it manages: the aws_eks_cluster resource's name, else the cluster_name output.
 func parseState(b []byte) (stateContents, error) {
