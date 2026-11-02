@@ -3,6 +3,8 @@ package commands
 import (
 	"bytes"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -60,7 +62,7 @@ func TestDeployFailureStillPrintsTheTotal(t *testing.T) {
 func TestDeployClockSurvivesAnInterruptedRunAndRestartsAfterACompleteOne(t *testing.T) {
 	h := newDeployHarness(t, 0)
 	start := h.clock.now()
-	h.resolveErr = errors.New("registry down")
+	h.tf.initErr = errors.New("registry down") // after the images verified
 	_ = h.run()
 	c, ok := loadDeployClock(h.in)
 	if !ok || !c.Started.Equal(start) || !c.Finished.IsZero() {
@@ -68,7 +70,7 @@ func TestDeployClockSurvivesAnInterruptedRunAndRestartsAfterACompleteOne(t *test
 	}
 	// An hour later the retry succeeds; the clock still counts from the first try.
 	h.clock.sleep(t.Context(), time.Hour)
-	h.resolveErr = nil
+	h.tf.initErr = nil
 	h.env.timing = stepClock{}
 	if err := h.run(); err != nil {
 		t.Fatalf("%v\n%s", err, h.out.String())
@@ -137,5 +139,40 @@ func TestConfigureWithoutADeployRecordSaysNothingAboutIt(t *testing.T) {
 	}
 	if strings.Contains(h.out.String(), "time to first chat") {
 		t.Errorf("no deploy record, so no time to report:\n%s", h.out.String())
+	}
+}
+
+// A deploy refused at image verification changed nothing: it writes no clock, and an
+// unfinished clock from an earlier interrupted deploy is left exactly as it was.
+func TestDeployRefusedAtVerificationLeavesTheClockAlone(t *testing.T) {
+	h := newDeployHarness(t, 0)
+	h.resolveErr = reportedError{"1 of 3 images failed verification"}
+	if err := h.run(); err == nil {
+		t.Fatal("deployed unverified images")
+	}
+	if c, ok := loadDeployClock(h.in); ok {
+		t.Fatalf("a verify-refused deploy wrote a clock: %+v", c)
+	}
+	if _, err := os.Stat(filepath.Join(h.in.Dir(), deployClockFile)); err == nil {
+		t.Error("deploy-clock.json exists")
+	}
+
+	// an earlier interrupted deploy's clock is not touched by a later refused one
+	h2 := newDeployHarness(t, 0)
+	started := h2.clock.now()
+	h2.tf.initErr = errors.New("interrupted")
+	_ = h2.run()
+	before, _ := os.ReadFile(filepath.Join(h2.in.Dir(), deployClockFile))
+	h2.clock.sleep(t.Context(), time.Hour)
+	h2.tf.initErr = nil
+	h2.resolveErr = reportedError{"1 of 3 images failed verification"}
+	h2.env.timing = stepClock{}
+	_ = h2.run()
+	after, _ := os.ReadFile(filepath.Join(h2.in.Dir(), deployClockFile))
+	if len(before) == 0 || string(before) != string(after) {
+		t.Errorf("the unfinished clock changed:\n%s\n%s", before, after)
+	}
+	if c, _ := loadDeployClock(h2.in); !c.Started.Equal(started) {
+		t.Errorf("start moved: %+v", c)
 	}
 }

@@ -162,6 +162,7 @@ type deployEnv struct {
 	flags    DeployCmd
 
 	now       func() time.Time
+	startedAt time.Time // when the preflight passed; written to the clock after verification
 	sleep     func(ctx context.Context, d time.Duration) error
 	heartbeat time.Duration // how often apply reports it is still running
 	poll      time.Duration // how often to look at a cluster that is changing
@@ -272,16 +273,28 @@ func (e *deployEnv) finishTiming() {
 	fmt.Fprintf(e.out, "\n%s\n", sDim("Total time: "+elapsed(e.timing.clock().Sub(e.timing.start))))
 }
 
-// markDeployStart records, in the workspace, when this deploy began, once the
-// preflight has passed (a refused preflight changed nothing and is not a deploy).
-// A deploy that never finished keeps its earlier start.
+// noteDeployStart notes the moment the preflight passed. Nothing is written yet:
+// a deploy refused at image verification (step 2) changes nothing, so it leaves no
+// clock either. markDeployStart writes the note once verification has passed.
+func (e *deployEnv) noteDeployStart() {
+	e.timing.now = e.now
+	e.startedAt = e.timing.clock().UTC()
+}
+
+// markDeployStart records, in the workspace, when this deploy began (the moment
+// noteDeployStart took, so the time spent verifying still counts), once the
+// preflight AND the image verification have passed: a refused deploy changed
+// nothing and is not a deploy. A deploy that never finished keeps its earlier start.
 func (e *deployEnv) markDeployStart() {
 	c, ok := loadDeployClock(e.in)
 	if ok && c.Finished.IsZero() {
 		return
 	}
-	e.timing.now = e.now
-	if err := saveDeployClock(e.in, deployClock{Started: e.timing.clock().UTC()}); err != nil {
+	started := e.startedAt
+	if started.IsZero() {
+		started = e.timing.clock().UTC()
+	}
+	if err := saveDeployClock(e.in, deployClock{Started: started}); err != nil {
 		e.printf("%s\n", sDim("(could not record the deploy start time: "+firstLine(err.Error())+")"))
 	}
 }
@@ -373,7 +386,7 @@ func (e *deployEnv) run(ctx context.Context) (err error) {
 		return err
 	}
 
-	e.markDeployStart()
+	e.noteDeployStart()
 
 	// ---- 2. verify the images before anything is written ------------------------
 	e.step(2, "Verify the release's images")
@@ -381,6 +394,7 @@ func (e *deployEnv) run(ctx context.Context) (err error) {
 	if err != nil {
 		return err
 	}
+	e.markDeployStart()
 
 	// ---- 3. terraform init and the audit log group ------------------------------
 	e.step(3, "Terraform init")
