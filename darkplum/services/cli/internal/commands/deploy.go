@@ -407,30 +407,34 @@ func (e *deployEnv) run(ctx context.Context) (err error) {
 		e.printf("%s\n", sWarn("! "+note))
 	}
 	if err := tf.Init(); err != nil {
+		printTFDiagnostic(e.out, err)
 		return e.stop(checkResult{name: "terraform init", status: checkFail, detail: firstLine(err.Error()),
-			hint: e.loginHint(err.Error())}, "terraform init failed")
+			hint: e.loginHint(tfErrorText(err))}, "terraform init failed")
 	}
 	state, err := stateList(tf)
 	if err != nil {
+		printTFDiagnostic(e.out, err)
 		return e.stop(checkResult{name: "terraform state", status: checkFail, detail: firstLine(err.Error()),
-			hint: e.loginHint(err.Error()) + ". Nothing was applied"}, "cannot read the state")
+			hint: e.loginHint(tfErrorText(err)) + ". Nothing was applied"}, "cannot read the state")
 	}
 	warn, err := checkStateOwnership(tf, e.rec, state, false)
 	if err != nil {
+		printTFDiagnostic(e.out, err)
 		return e.stop(checkResult{name: "terraform state", status: checkFail, detail: firstLine(err.Error()),
 			hint: "check backend.hcl; nothing was applied"}, "the state is not this install's")
 	}
 	if warn != "" {
 		e.row(checkResult{name: "terraform state", status: checkWarn, detail: warn})
 	}
-	if err := e.adoptLogGroup(tf, state); err != nil {
+	adopt, err := e.adoptLogGroup(state)
+	if err != nil {
 		return e.stop(checkResult{name: "audit log group", status: checkFail, detail: firstLine(err.Error()),
 			hint: "nothing was applied; fix the above and re-run"}, "cannot check the audit log group")
 	}
 
 	// ---- 4. plan, confirm, apply ------------------------------------------------
 	e.step(4, "Terraform plan and apply")
-	if err := e.planAndApply(ctx, tf); err != nil {
+	if err := e.planAndApply(ctx, tf, adopt); err != nil {
 		return err
 	}
 
@@ -438,6 +442,7 @@ func (e *deployEnv) run(ctx context.Context) (err error) {
 	e.step(5, "Read the infrastructure's outputs")
 	raw, err := tf.Capture("output", "-json")
 	if err != nil {
+		printTFDiagnostic(e.out, err)
 		return e.stop(checkResult{name: "terraform output", status: checkFail, detail: firstLine(err.Error())}, "cannot read the outputs")
 	}
 	out, err := parseOutputs(raw)
@@ -1067,31 +1072,30 @@ func (e *deployEnv) srcOpts() []remote.Option {
 
 const logGroupAddr = "module.eks.module.eks.aws_cloudwatch_log_group.this[0]"
 
-// adoptLogGroup brings the EKS control-plane log group into the state when it
-// exists but is not managed: destroy keeps it on purpose (it holds the Kubernetes
-// API audit logs), and a reinstall would otherwise fail creating it. Every status
-// is checked; a failing read is an error, never "not there".
-func (e *deployEnv) adoptLogGroup(tf tfRunner, state map[string]bool) error {
+// adoptLogGroup says whether the plan must import the EKS control-plane log group:
+// it exists but is not managed, because destroy keeps it on purpose (it holds the
+// Kubernetes API audit logs), and a reinstall would otherwise fail creating it. The
+// import is an import block in the shipped Terraform, gated by adopt_eks_log_group:
+// the `terraform import` command evaluates the whole configuration against the
+// state and fails on an empty one. Every status is checked; a failing read is an
+// error, never "not there".
+func (e *deployEnv) adoptLogGroup(state map[string]bool) (bool, error) {
 	lg := "/aws/eks/" + e.rec.ClusterName + "/cluster"
 	if state[logGroupAddr] {
 		e.row(checkResult{name: "audit log group", status: checkPass, detail: lg + " (in the state)"})
-		return nil
+		return false, nil
 	}
 	out, err := e.aws("aws", runner.ProfileArgs(e.rec.Profile, "logs", "describe-log-groups", "--log-group-name-prefix", lg,
 		"--region", e.rec.Region, "--query", "length(logGroups[?logGroupName=='"+lg+"'])", "--output", "text")...)
 	if err != nil {
-		return fmt.Errorf("cannot look for the log group %s: %w", lg, err)
+		return false, fmt.Errorf("cannot look for the log group %s: %w", lg, err)
 	}
 	if strings.TrimSpace(out) != "1" {
 		e.row(checkResult{name: "audit log group", status: checkPass, detail: "none to adopt"})
-		return nil
+		return false, nil
 	}
-	e.mutated = true
-	if _, err := tf.Capture("import", "-input=false", "-var-file="+tf.VarFile(), logGroupAddr, lg); err != nil {
-		return fmt.Errorf("cannot adopt the log group %s kept from a previous install: %w", lg, err)
-	}
-	e.row(checkResult{name: "audit log group", status: checkPass, detail: "adopted " + lg + " (kept from a previous install)"})
-	return nil
+	e.row(checkResult{name: "audit log group", status: checkPass, detail: "the plan adopts " + lg + " (kept from a previous install)"})
+	return true, nil
 }
 
 // tail keeps the last few KB of what Terraform printed, to recognise an expired
@@ -1117,7 +1121,7 @@ func (t *tail) Write(p []byte) (int, error) {
 
 func (t *tail) String() string { t.mu.Lock(); defer t.mu.Unlock(); return string(t.buf) }
 
-func (e *deployEnv) planAndApply(ctx context.Context, tf tfRunner) error {
+func (e *deployEnv) planAndApply(ctx context.Context, tf tfRunner, adoptLogGroup bool) error {
 	sweepStalePlans(e.in.Dir())
 	planPath := filepath.Join(e.in.Dir(), "plan-"+e.now().UTC().Format("20060102T150405Z")+".tfplan")
 	defer os.Remove(planPath)
@@ -1131,11 +1135,16 @@ func (e *deployEnv) planAndApply(ctx context.Context, tf tfRunner) error {
 		return e.stop(checkResult{name: "plan file", status: checkFail, detail: firstLine(err.Error())}, "cannot protect the plan file")
 	}
 	e.printf("%s\n", sInfo("→ terraform plan"))
-	if err := e.streamTF(ctx, tf, 4, "plan", "plan", "-input=false", "-out="+planPath, vf); err != nil {
+	planArgs := []string{"plan", "-input=false", "-out=" + planPath, vf}
+	if adoptLogGroup {
+		planArgs = append(planArgs, "-var", "adopt_eks_log_group=true")
+	}
+	if err := e.streamTF(ctx, tf, 4, "plan", planArgs...); err != nil {
 		return err
 	}
 	js, err := tf.Capture("show", "-json", planPath)
 	if err != nil {
+		printTFDiagnostic(e.out, err)
 		return e.stop(checkResult{name: "terraform show", status: checkFail, detail: firstLine(err.Error())}, "cannot read the plan")
 	}
 	if n, err := changeCount(js); err == nil && n == 0 {
@@ -1150,6 +1159,16 @@ func (e *deployEnv) planAndApply(ctx context.Context, tf tfRunner) error {
 	dangerous, err := destructiveChanges(js)
 	if err != nil {
 		return e.stop(checkResult{name: "plan", status: checkFail, detail: err.Error()}, "cannot read the plan")
+	}
+	if adoptLogGroup {
+		// Replacing the group while adopting it deletes the audit logs destroy kept,
+		// so --confirm-plan does not approve this.
+		for _, c := range dangerous {
+			if c.Address == logGroupAddr {
+				return e.stop(checkResult{name: "audit log group", status: checkFail, detail: "the plan would delete the log group kept from a previous install, and the Kubernetes audit logs in it",
+					hint: "see the plan above for what forces the replacement. To start without those logs, export what you need and delete the log group, then re-run. Nothing was applied"}, "the plan would delete the audit logs")
+			}
+		}
 	}
 	if len(dangerous) > 0 {
 		e.printf("\n%s\n", sWarn(fmt.Sprintf("! This plan deletes or replaces %d resource(s):", len(dangerous))))

@@ -293,3 +293,14 @@ variable "web_allowed_cidrs" {
     error_message = "web_allowed_cidrs needs web_domain; each entry must be an IPv4 network in canonical form (10.8.0.0/16, not 10.8.1.0/16) inside 10.0.0.0/8, 172.16.0.0/12 or 192.168.0.0/16: the address is private."
   }
 }
+
+variable "adopt_eks_log_group" {
+  description = <<-EOT
+    Set by `darkplum deploy` (never in terraform.tfvars) when the EKS control-plane
+    log group /aws/eks/<cluster_name>/cluster exists in the account but is not in
+    the state: `darkplum destroy` keeps it on purpose (it holds the Kubernetes API
+    audit logs). The plan then imports it instead of failing to create it.
+  EOT
+  type        = bool
+  default     = false
+}

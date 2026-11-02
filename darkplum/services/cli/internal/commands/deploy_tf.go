@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -46,12 +47,69 @@ type tfFailure struct {
 }
 
 func (e *tfFailure) Error() string {
-	if s := strings.TrimSpace(e.Stderr); s != "" {
-		return "terraform " + e.Cmd + ": " + firstLine(s)
+	if d := e.diagnostic(); len(d) > 0 {
+		return "terraform " + e.Cmd + ": " + d[tfSummaryLine(d)]
 	}
 	return "terraform " + e.Cmd + ": " + e.Err.Error()
 }
 func (e *tfFailure) Unwrap() error { return e.Err }
+
+// tfBoxRe is the box Terraform draws around a diagnostic.
+var tfBoxRe = regexp.MustCompile(`^\s*[╷│╵]\s?`)
+
+// diagnostic is what Terraform printed without its colours and box, blank lines
+// dropped, so a diagnostic never reads as its opening "╷".
+func (e *tfFailure) diagnostic() []string {
+	var lines []string
+	for _, l := range strings.Split(e.Stderr, "\n") {
+		l = tfBoxRe.ReplaceAllString(ansiRe.ReplaceAllString(l, ""), "")
+		if l = strings.TrimRight(l, " \t\r"); strings.TrimSpace(l) != "" {
+			lines = append(lines, l)
+		}
+	}
+	return lines
+}
+
+// tfSummaryLine picks the line that says what failed: a warning printed ahead of
+// the error (a deprecated backend setting, say) is not why the command failed.
+func tfSummaryLine(d []string) int {
+	for i, l := range d {
+		if strings.HasPrefix(l, "Error:") {
+			return i
+		}
+	}
+	return 0
+}
+
+// tfErrorText is all of what a failed command said, for recognising a cause (an
+// expired session) that need not be on the line the failure row shows.
+func tfErrorText(err error) string {
+	var f *tfFailure
+	if errors.As(err, &f) && f.Stderr != "" {
+		return f.Stderr
+	}
+	return err.Error()
+}
+
+// printTFDiagnostic shows the rest of what a failed Terraform command said, on the
+// screen and in the run's log; the failure row that follows carries its summary line.
+func printTFDiagnostic(w io.Writer, err error) {
+	var f *tfFailure
+	if !errors.As(err, &f) {
+		return
+	}
+	d := f.diagnostic()
+	if len(d) < 2 {
+		return
+	}
+	fmt.Fprintf(w, "      %s\n", sDim("┌ terraform "+f.Cmd))
+	summary := tfSummaryLine(d)
+	for i, l := range d {
+		if i != summary {
+			fmt.Fprintf(w, "      %s\n", sDim("│ "+l))
+		}
+	}
+}
 
 type realTF struct {
 	v    bundle.Verified
@@ -256,6 +314,9 @@ func changeCount(planJSON []byte) (int, error) {
 		ResourceChanges []struct {
 			Change struct {
 				Actions []string `json:"actions"`
+				// An import with nothing to change is the action no-op, and it
+				// still has to be applied to reach the state.
+				Importing *struct{} `json:"importing"`
 			} `json:"change"`
 		} `json:"resource_changes"`
 	}
@@ -265,7 +326,7 @@ func changeCount(planJSON []byte) (int, error) {
 	n := 0
 	for _, rc := range p.ResourceChanges {
 		a := rc.Change.Actions
-		if len(a) == 1 && (a[0] == "no-op" || a[0] == "read") {
+		if len(a) == 1 && (a[0] == "no-op" || a[0] == "read") && rc.Change.Importing == nil {
 			continue
 		}
 		n++

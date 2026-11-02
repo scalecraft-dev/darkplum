@@ -68,6 +68,16 @@ module "eks" {
   tags            = local.tags
 }
 
+# A reinstall finds the log group `darkplum destroy` kept. The import happens in the
+# normal plan and apply (the plan shows "1 to import"), not in a separate
+# `terraform import`, which evaluates the whole configuration against an empty state
+# and fails on any for_each that depends on a resource not yet created.
+import {
+  for_each = var.adopt_eks_log_group ? toset(["eks"]) : toset([])
+  to       = module.eks.module.eks.aws_cloudwatch_log_group.this[0]
+  id       = "/aws/eks/${var.cluster_name}/cluster"
+}
+
 module "node_groups" {
   source = "./modules/node-groups"
 

@@ -54,7 +54,7 @@ that they fail when they should; it does not prove Darkplum.
 | 7c | Destroy when the cluster is already gone | Delete the cluster in the console, then `E2E_CONFIRM_DESTROY=<cluster> destroy-cluster-gone.sh --install NAME` | script output: loud skip of the Kubernetes phase, finishes |
 | 7d | Destroy with the wrong account | `E2E_CONFIRM_DESTROY=<cluster> destroy-account-mismatch.sh --install NAME` (it works on a copy of the record) | script output: refused before Terraform, cluster unchanged |
 | 7e | Full destroy | `darkplum destroy`: finishes; the leftover report lists the snapshot, the audit log group, the state bucket and KMS key; the orphan query (load balancers, ENIs, EBS, security groups tagged for the cluster) returns none; `terraform state list` is empty | the output, the empty state list |
-| 8 | Reinstall after destroy | `init` + `deploy` on the same account: log group adopted, the final snapshot untouched, install succeeds. This is the real test that leftovers are harmless | logs |
+| 8 | Reinstall after destroy | `init` + `deploy` on the same account: the log group row says "the plan adopts", the plan says "1 to import", the final snapshot untouched, install succeeds. This is the real test that leftovers are harmless | logs |
 | 9 | Teardown with the private load balancer | Destroy an install with a web address (`modules/web-access`): the NLB does not block VPC deletion | the destroy log |
 | 10 | Timings | Collect each step's time and the total from `deploy` and `configure`, the `ExpiredToken` behaviour from 4b, and the time to first chat from `configure` | the numbers, in the PR; use them to set ETAs and timeouts |
 

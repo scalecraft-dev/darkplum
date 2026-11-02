@@ -429,27 +429,30 @@ func TestDeployLogGroupAdoption(t *testing.T) {
 		if err := h.run(); err != nil {
 			t.Fatal(err)
 		}
-		if h.tf.ran("import") || h.tl.count("logs describe-log-groups") != 0 {
+		if planAdopts(h) || h.tl.count("logs describe-log-groups") != 0 {
 			t.Error("looked for or imported a log group that is already managed")
 		}
 	})
-	t.Run("kept from a previous install: imported", func(t *testing.T) {
+	t.Run("kept from a previous install: the plan imports it", func(t *testing.T) {
 		h := newDeployHarness(t, 0)
 		h.awsf.logGroups = "1\n"
 		if err := h.run(); err != nil {
 			t.Fatal(err)
 		}
-		var imp []string
-		for _, c := range h.tf.cmds {
-			if c[0] == "import" {
-				imp = c
-			}
+		if h.tf.ran("import") {
+			t.Error("ran `terraform import`, which fails on an empty state")
 		}
-		if len(imp) == 0 || imp[len(imp)-2] != logGroupAddr || imp[len(imp)-1] != "/aws/eks/dp-trial/cluster" || !strings.Contains(strings.Join(imp, " "), "-var-file=") {
-			t.Errorf("import = %v", imp)
+		if !planAdopts(h) {
+			t.Errorf("the plan does not adopt the log group: %v", h.tf.cmds)
 		}
-		if h.tl.first("terraform import") > h.tl.first("terraform plan") {
-			t.Error("the log group must be adopted before the plan")
+	})
+	t.Run("nothing to adopt: the plan is not told to", func(t *testing.T) {
+		h := newDeployHarness(t, 0)
+		if err := h.run(); err != nil {
+			t.Fatal(err)
+		}
+		if planAdopts(h) {
+			t.Error("asked the plan to import a log group that does not exist")
 		}
 	})
 	t.Run("describe fails: abort", func(t *testing.T) {
@@ -459,14 +462,135 @@ func TestDeployLogGroupAdoption(t *testing.T) {
 			t.Fatal("a failed lookup was read as 'not there'")
 		}
 	})
-	t.Run("import fails: abort", func(t *testing.T) {
+	t.Run("the plan with the import fails: abort", func(t *testing.T) {
 		h := newDeployHarness(t, 0)
 		h.awsf.logGroups = "1"
-		h.tf.importErr = errors.New("boom")
+		h.tf.streamErr["plan"] = errors.New("boom")
 		if !IsReported(h.run()) || h.tf.ran("apply") {
-			t.Fatal("applied after a failed import")
+			t.Fatal("applied after a failed plan")
 		}
 	})
+	t.Run("the plan would replace the kept group: refused even with --confirm-plan", func(t *testing.T) {
+		h := newDeployHarness(t, 0)
+		h.awsf.logGroups = "1"
+		h.env.flags.ConfirmPlan = true
+		h.tf.planJSON = `{"resource_changes":[{"address":"` + logGroupAddr + `","change":{"actions":["delete","create"],"importing":{"id":"/aws/eks/dp-trial/cluster"}}}]}`
+		if !IsReported(h.run()) || h.tf.ran("apply") {
+			t.Fatalf("applied a plan that deletes the audit logs:\n%s", h.out.String())
+		}
+		if !strings.Contains(h.out.String(), "audit logs") {
+			t.Errorf("the refusal does not say why:\n%s", h.out.String())
+		}
+	})
+	t.Run("the group is already managed: a replacement still goes through the plan gate", func(t *testing.T) {
+		h := newDeployHarness(t, 0)
+		h.tf.stateOut = "module.vpc.aws_vpc.this\n" + logGroupAddr + "\n"
+		h.env.flags.ConfirmPlan = true
+		h.tf.planJSON = `{"resource_changes":[{"address":"` + logGroupAddr + `","change":{"actions":["delete","create"]}}]}`
+		if err := h.run(); err != nil {
+			t.Fatalf("%v\n%s", err, h.out.String())
+		}
+		if !h.tf.ran("apply") {
+			t.Error("--confirm-plan did not approve a change outside adoption")
+		}
+	})
+	t.Run("the import is the only change: it is applied", func(t *testing.T) {
+		h := newDeployHarness(t, 0)
+		h.awsf.logGroups = "1"
+		h.tf.planJSON = `{"resource_changes":[{"address":"` + logGroupAddr + `","change":{"actions":["no-op"],"importing":{"id":"/aws/eks/dp-trial/cluster"}}}]}`
+		if err := h.run(); err != nil {
+			t.Fatal(err)
+		}
+		if !h.tf.ran("apply") {
+			t.Fatal("an import with nothing to change was read as no changes and never reached the state")
+		}
+	})
+}
+
+// planAdopts says whether the plan was asked to import the kept log group.
+func planAdopts(h *deployHarness) bool {
+	for _, c := range h.tf.cmds {
+		if c[0] == "plan" && strings.Contains(strings.Join(c, " "), "-var adopt_eks_log_group=true") {
+			return true
+		}
+	}
+	return false
+}
+
+const boxedTFError = "\x1b[31m╷\x1b[0m\n\x1b[31m│\x1b[0m \x1b[1m\x1b[31mError: \x1b[0mInvalid for_each argument\n\x1b[31m│\x1b[0m \n\x1b[31m│\x1b[0m   on modules/ecr/main.tf line 30\n\x1b[31m╵\x1b[0m\n"
+
+func TestTFFailureSaysWhatTerraformSaid(t *testing.T) {
+	f := &tfFailure{Cmd: "output", Stderr: boxedTFError, Err: errors.New("exit status 1")}
+	if got, want := firstLine(f.Error()), "terraform output: Error: Invalid for_each argument"; got != want {
+		t.Errorf("error = %q, want %q", got, want)
+	}
+	var b strings.Builder
+	printTFDiagnostic(&b, fmt.Errorf("wrapped: %w", f))
+	if !strings.Contains(b.String(), "on modules/ecr/main.tf line 30") {
+		t.Errorf("diagnostic lacks the rest of the message:\n%s", b.String())
+	}
+	if strings.Contains(b.String(), "Invalid for_each") {
+		t.Errorf("diagnostic repeats the line the failure row shows:\n%s", b.String())
+	}
+	if strings.ContainsAny(b.String(), "╷╵") {
+		t.Errorf("diagnostic keeps the box:\n%s", b.String())
+	}
+	warned := &tfFailure{Cmd: "init", Stderr: "╷\n│ Warning: Deprecated Parameter\n╵\n╷\n│ Error: Backend configuration changed\n╵\n", Err: errors.New("exit status 1")}
+	if got, want := firstLine(warned.Error()), "terraform init: Error: Backend configuration changed"; got != want {
+		t.Errorf("a warning ahead of the error: %q, want %q", got, want)
+	}
+	b.Reset()
+	printTFDiagnostic(&b, errors.New("not terraform"))
+	printTFDiagnostic(&b, &tfFailure{Cmd: "init", Stderr: "one line", Err: errors.New("x")})
+	if b.Len() != 0 {
+		t.Errorf("nothing more to show, printed:\n%s", b.String())
+	}
+}
+
+func TestDeployNamesAnExpiredSessionAnywhereInTheDiagnostic(t *testing.T) {
+	h := newDeployHarness(t, 0)
+	h.tf.stateErr = &tfFailure{Cmd: "state", Stderr: "╷\n│ Error: Error acquiring the state lock\n│\n│ operation error S3: ExpiredToken: The security token included in the request is expired\n╵\n", Err: errors.New("exit status 1")}
+	if !IsReported(h.run()) {
+		t.Fatal("an unreadable state was treated as empty")
+	}
+	if !strings.Contains(h.out.String(), "aws sso login") {
+		t.Errorf("no login hint for an expired session:\n%s", h.out.String())
+	}
+}
+
+// The Go side and the shipped Terraform must name the same address: the state check
+// and the plan gate read logGroupAddr, the import block writes to its own copy.
+// `terraform test` cannot see this: a mocked plan cannot assert a planned import.
+func TestImportBlockAdoptsTheLogGroupDeployChecks(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join(terraformDir, "main.tf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`(?ms)^import \{\n(.*?)^\}`).FindAllSubmatch(b, -1)
+	if len(m) != 1 {
+		t.Fatalf("want exactly one import block in main.tf, found %d", len(m))
+	}
+	block := string(m[0][1])
+	for _, want := range []string{
+		`(?m)^\s*for_each\s*=\s*var\.adopt_eks_log_group\b`,
+		`(?m)^\s*to\s*=\s*` + regexp.QuoteMeta(logGroupAddr) + `\s*$`,
+		`(?m)^\s*id\s*=\s*"/aws/eks/\$\{var\.cluster_name\}/cluster"\s*$`,
+	} {
+		if !regexp.MustCompile(want).MatchString(block) {
+			t.Errorf("the import block does not match %s:\n%s", want, block)
+		}
+	}
+}
+
+func TestDeployShowsTheWholeTerraformDiagnostic(t *testing.T) {
+	h := newDeployHarness(t, 0)
+	h.tf.stateErr = &tfFailure{Cmd: "state", Stderr: boxedTFError, Err: errors.New("exit status 1")}
+	if !IsReported(h.run()) {
+		t.Fatal("an unreadable state was treated as empty")
+	}
+	if !strings.Contains(h.out.String(), "on modules/ecr/main.tf line 30") {
+		t.Errorf("the diagnostic did not reach the output:\n%s", h.out.String())
+	}
 }
 
 func TestDeployApplyHeartbeatAndLogTee(t *testing.T) {

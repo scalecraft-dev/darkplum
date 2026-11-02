@@ -41,7 +41,6 @@ type fakeTF struct {
 	outputs     string
 	outputsErr  error
 	initErr     error
-	importErr   error
 	rmErr       error
 	streamErr   map[string]error // by first arg
 	streamText  map[string]string
@@ -90,8 +89,6 @@ func (f *fakeTF) Capture(args ...string) ([]byte, error) {
 			return []byte(`{"resource_changes":[{"address":"module.vpc.aws_vpc.this","change":{"actions":["create"]}}]}`), nil
 		}
 		return []byte(f.planJSON), nil
-	case "import":
-		return nil, f.importErr
 	case "output":
 		f.mu.Lock()
 		applied := f.applied

@@ -195,10 +195,12 @@ func (e *destroyEnv) run(ctx context.Context) (err error) {
 		e.printf("%s\n", sWarn("! "+note))
 	}
 	if err := tf.Init(); err != nil {
+		printTFDiagnostic(e.out, err)
 		return e.stop(checkResult{name: "terraform init", status: checkFail, detail: firstLine(err.Error()), hint: "run `" + login + "` if the session lapsed"}, "terraform init failed")
 	}
 	state, err := stateList(tf)
 	if err != nil {
+		printTFDiagnostic(e.out, err)
 		return e.stop(checkResult{name: "terraform state", status: checkFail, detail: firstLine(err.Error()),
 			hint: "the state could not be read, so what exists is unknown (an expired session looks like this). If it is the session: `" + login + "`. Nothing was deleted"}, "cannot read the state")
 	}
@@ -211,6 +213,7 @@ func (e *destroyEnv) run(ctx context.Context) (err error) {
 	if _, err := checkStateOwnership(tf, rec, state, true); err != nil {
 		var uf *unfinishedStateError
 		if !errors.As(err, &uf) {
+			printTFDiagnostic(e.out, err)
 			return e.stop(checkResult{name: "terraform state", status: checkFail, detail: firstLine(err.Error()),
 				hint: "check backend.hcl: destroy will not delete resources it cannot show belong to " + rec.ClusterName + ". Nothing was deleted"}, "the state is not this install's")
 		}
@@ -289,6 +292,7 @@ func (e *destroyEnv) run(ctx context.Context) (err error) {
 	if state[rdsAddr] {
 		snap, err := e.finalSnapshot(tf)
 		if err != nil {
+			printTFDiagnostic(e.out, err)
 			return e.stop(checkResult{name: "database snapshot", status: checkFail, detail: firstLine(err.Error()),
 				hint: "cannot tell whether a final snapshot is configured. Nothing was deleted"}, "cannot read the snapshot setting")
 		}
@@ -314,6 +318,7 @@ func (e *destroyEnv) run(ctx context.Context) (err error) {
 	if state[logGroupAddr] {
 		mutated = true
 		if _, err := tf.Capture("state", "rm", logGroupAddr); err != nil {
+			printTFDiagnostic(e.out, err)
 			return e.stop(checkResult{name: "audit log group", status: checkFail, detail: firstLine(err.Error()),
 				hint: "it must leave the state or the destroy would delete the Kubernetes audit logs. Kubernetes was not touched"}, "cannot keep the audit log group")
 		}
@@ -492,6 +497,7 @@ func (e *destroyEnv) sanityPlan(ctx context.Context, tf tfRunner, vf string, sta
 	}
 	js, err := tf.Capture("show", "-json", planPath)
 	if err != nil {
+		printTFDiagnostic(e.out, err)
 		return e.stop(checkResult{name: "plan -destroy", status: checkFail, detail: firstLine(err.Error())}, "cannot read the destroy plan")
 	}
 	var p struct {
