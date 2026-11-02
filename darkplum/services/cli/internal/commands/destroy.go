@@ -123,7 +123,11 @@ type destroyEnv struct {
 	// protectionOff is set once the database's deletion protection has been turned
 	// off, so a later failure can say so.
 	protectionOff bool
-	force         <-chan struct{}
+	// kubeSkipped is set when the Kubernetes phase was skipped because the cluster
+	// rejects this identity (see run), so a failed destroy still looks for what the
+	// cluster's controllers left behind.
+	kubeSkipped bool
+	force       <-chan struct{}
 }
 
 var darkplumNamespaces = map[string]bool{platformNS: true, inferenceNS: true}
@@ -232,6 +236,42 @@ func (e *destroyEnv) run(ctx context.Context) (err error) {
 		e.row(row)
 		kc = e.kube(t)
 		if survey, err = surveyCluster(kc); err != nil {
+			// A cluster that rejects this identity (401). Whether that is the access entry
+			// that was never made, or one that is gone, is read from Terraform's state:
+			//
+			//   - The entry is in the state: the identity should have access and does not.
+			//     A stop.
+			//   - No entry, and the install never finished (resources, no outputs), or the
+			//     audit log group is no longer in the state: skip the Kubernetes phase. The
+			//     log group leaves the state in step 4 of a destroy, before the Kubernetes
+			//     phase, and the entry leaves it only through `terraform destroy`, so "log
+			//     group gone and entry gone" is an interrupted destroy whose Kubernetes
+			//     phase already ran. An install that never finished never got far enough to
+			//     put anything in Kubernetes.
+			//   - No entry, outputs present, log group still in the state: the shape of a
+			//     FINISHED-looking install, which is also what a first deploy interrupted
+			//     after its outputs but before the entry looks like. Not told apart from a
+			//     lost entry here, so a stop, and the way out is `darkplum deploy`.
+			if kubeUnauthorized(err) {
+				switch {
+				case state[creatorAccessEntryAddr]:
+					return e.stop(checkResult{name: "cluster survey", status: checkFail, detail: "the cluster rejected this identity's credentials: " + firstLine(err.Error()),
+						hint: "Terraform's state holds this install's access entry, so the identity has lost its access, or is not the one that installed it. " +
+							"Nothing was deleted; use the identity that installed the cluster"}, "the cluster rejects this identity")
+				case unfinished || !state[logGroupAddr]:
+					e.row(checkResult{name: "cluster survey", status: checkWarn, detail: "the cluster rejects this identity's credentials, and Terraform's state holds no access entry for it",
+						hint: "SKIPPING the Kubernetes phase, so these are NOT done: the check for load balancers and volumes outside the Darkplum namespaces that would keep the VPC from being deleted, " +
+							"the cluster's own release record (the downgrade guard), and the deletion of Darkplum's load balancer Services and volume claims. " +
+							"What the cluster's controllers made may therefore block the VPC's deletion; the check for what is left behind runs at the end, and also if the destroy fails"})
+					e.kubeSkipped = true
+					kc = nil
+				default:
+					return e.stop(checkResult{name: "cluster survey", status: checkFail, detail: "the cluster rejected this identity's credentials: " + firstLine(err.Error()),
+						hint: "Terraform's state holds no access entry for this identity, but this install has outputs and its audit log group is still in the state, so it is not an install being torn down or one that never finished. " +
+							"That is also the shape of a first deploy interrupted before it made the entry: `darkplum deploy` finishes it (it makes the entry), and then `darkplum destroy` can proceed. Nothing was deleted"}, "the cluster rejects this identity")
+				}
+				break
+			}
 			return e.stop(checkResult{name: "cluster survey", status: checkFail, detail: firstLine(err.Error()),
 				hint: "cannot list the cluster's load balancers and volumes. Nothing was deleted"}, "cannot survey the cluster")
 		}
@@ -356,6 +396,9 @@ func (e *destroyEnv) run(ctx context.Context) (err error) {
 		hint := "see the output above; the full log is " + e.logPath
 		if h := (&deployEnv{rec: rec}).loginHint(tl.String()); !strings.HasPrefix(h, "fix the above") {
 			hint = h
+		}
+		if e.kubeSkipped {
+			e.leftBehindAfterFailure()
 		}
 		return e.stop(checkResult{name: "terraform destroy", status: checkFail, detail: firstLine(derr.Error()), hint: hint}, "terraform destroy failed")
 	}
@@ -870,4 +913,25 @@ func (e *destroyEnv) orphans() (found, unverified []string) {
 		}
 	}
 	return uniq, unverified
+}
+
+// leftBehindAfterFailure is the check for what the cluster's controllers made, run
+// when the Kubernetes phase was skipped and the destroy then failed: a load balancer
+// or network interface they left is the usual reason a VPC will not delete, and the
+// report that normally names them only runs after a successful destroy.
+func (e *destroyEnv) leftBehindAfterFailure() {
+	e.phase("What the cluster's controllers may have left (the Kubernetes phase was skipped)")
+	found, unverified := e.orphans()
+	for _, o := range found {
+		e.printf("  %s %s\n", sFail("✗"), o)
+	}
+	if len(found) > 0 {
+		e.printf("\n  %s\n", sDim("These carry this cluster's tag; they are the usual reason a VPC will not delete. Delete them (or find what holds them), then re-run `darkplum destroy`."))
+	}
+	if len(unverified) > 0 {
+		e.printf("  %s\n", sWarn(fmt.Sprintf("! %d lookup(s) failed, so there may be more: %s", len(unverified), strings.Join(unverified, "; "))))
+	}
+	if len(found) == 0 && len(unverified) == 0 {
+		e.printf("  nothing tagged for the cluster was found\n")
+	}
 }
