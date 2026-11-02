@@ -430,16 +430,50 @@ func TestRecordAndDrain_FlushesBufferedEvents(t *testing.T) {
 	}
 	r.Drain()
 
-	deadline := time.Now().Add(5 * time.Second)
+	// No polling: the process exits straight after Drain, so they must be written by now.
 	var n int
-	for time.Now().Before(deadline) {
-		if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM inference_events`).Scan(&n); err != nil {
-			t.Fatalf("count: %v", err)
-		}
-		if n == 5 {
-			return
-		}
-		time.Sleep(50 * time.Millisecond)
+	if err := pool.QueryRow(ctx, `SELECT COUNT(*) FROM inference_events`).Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
 	}
-	t.Fatalf("expected 5 flushed events after Drain, got %d", n)
+	if n != 5 {
+		t.Fatalf("expected 5 flushed events when Drain returned, got %d", n)
+	}
+}
+
+func TestDrain_WaitsForFlushToFinish(t *testing.T) {
+	r := &Recorder{events: make(chan InferenceEvent, 1), done: make(chan struct{})} // no flush goroutine
+	returned := make(chan struct{})
+	go func() { r.Drain(); close(returned) }()
+	select {
+	case <-returned:
+		t.Fatal("Drain returned before the flush finished")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(r.done)
+	select {
+	case <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Drain did not return after the flush finished")
+	}
+}
+
+func TestDrain_GivesUpWhenTheFlushNeverFinishes(t *testing.T) {
+	defer func(d time.Duration) { drainWait = d }(drainWait)
+	drainWait = 50 * time.Millisecond
+	r := &Recorder{events: make(chan InferenceEvent, 1), done: make(chan struct{})} // a flush stuck on the database
+	returned := make(chan struct{})
+	go func() { r.Drain(); close(returned) }()
+	select {
+	case <-returned:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Drain hung on a flush that never finished")
+	}
+}
+
+func TestRecord_AfterDrainDropsTheEventInsteadOfPanicking(t *testing.T) {
+	r := &Recorder{events: make(chan InferenceEvent, 1), done: make(chan struct{})}
+	close(r.done)
+	r.Drain()
+	r.Record(InferenceEvent{RequestID: "late"}) // a send on the closed channel would panic
+	r.Drain()                                   // and a second Drain must not close it twice
 }
