@@ -438,7 +438,8 @@ func (h *ModelHandler) ListModels(c *gin.Context) {
 			(m.model_id IS NOT NULL) AS target_exists,
 			COALESCE(m.enabled, false) AS target_enabled,
 			COALESCE(m.provider, ''), COALESCE(m.backend_class, ''),
-			m.discovered_at, m.availability_detail
+			m.discovered_at, m.availability_detail,
+			COALESCE(m.availability_state = 'retired', false) AS target_retired
 		FROM model_aliases a
 		JOIN model_alias_routes r ON r.alias = a.alias
 		LEFT JOIN models m ON m.model_id = r.target_model_id
@@ -459,7 +460,7 @@ func (h *ModelHandler) ListModels(c *gin.Context) {
 		var rt routedAliasRouteDBRow
 		var discoveredAt *time.Time
 		if err := routedRows.Scan(&aliasName, &defaultRoute, &rt.RouteName, &rt.Description, &rt.TargetModelID,
-			&rt.TargetExists, &rt.TargetEnabled, &rt.TargetProvider, &rt.TargetBackendClass, &discoveredAt, &rt.TargetAvailability); err != nil {
+			&rt.TargetExists, &rt.TargetEnabled, &rt.TargetProvider, &rt.TargetBackendClass, &discoveredAt, &rt.TargetAvailability, &rt.TargetRetired); err != nil {
 			slog.ErrorContext(ctx, "scan routed model alias row failed", "err", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "scan models failed"})
 			return
@@ -679,7 +680,7 @@ func (h *ModelHandler) ListAdminModels(c *gin.Context) {
 	permitExternalAPI := requestPermitsExternalAPI(c.GetHeader(darkplumClassesHeader))
 
 	rows, err := h.pool.Query(c.Request.Context(), `
-		SELECT id, model_id, provider, display_name, enabled, backend_class, discovered_at, updated_at, availability_detail
+		SELECT id, model_id, provider, display_name, enabled, backend_class, discovered_at, updated_at, availability_detail, availability_state
 		FROM models
 		ORDER BY provider, model_id
 	`)
@@ -694,7 +695,8 @@ func (h *ModelHandler) ListAdminModels(c *gin.Context) {
 	models := make([]modelRow, 0)
 	for rows.Next() {
 		var m modelRow
-		if err := rows.Scan(&m.ID, &m.ModelID, &m.Provider, &m.DisplayName, &m.Enabled, &m.BackendClass, &m.DiscoveredAt, &m.UpdatedAt, &m.Availability); err != nil {
+		var state *string
+		if err := rows.Scan(&m.ID, &m.ModelID, &m.Provider, &m.DisplayName, &m.Enabled, &m.BackendClass, &m.DiscoveredAt, &m.UpdatedAt, &m.Availability, &state); err != nil {
 			slog.ErrorContext(c.Request.Context(), "scan admin model row failed", "err", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "scan models failed"})
 			return
@@ -702,7 +704,8 @@ func (h *ModelHandler) ListAdminModels(c *gin.Context) {
 		if m.BackendClass == backendClassExternalAPI && !permitExternalAPI {
 			continue
 		}
-		m.Available = modelIsAvailableWithin(m.DiscoveredAt, now, h.availabilityWindow)
+		m.Available = modelRowAvailable(m.DiscoveredAt, now, h.availabilityWindow, state)
+		m.Availability = adminAvailability(m.Availability, state)
 		models = append(models, m)
 	}
 	if err := rows.Err(); err != nil {
@@ -908,15 +911,17 @@ func (h *ModelHandler) ToggleModel(c *gin.Context) {
 	// Fetch and return the updated row so the frontend can refresh without a
 	// separate GET.
 	var m modelRow
+	var state *string
 	if err := h.pool.QueryRow(c.Request.Context(), `
-		SELECT id, model_id, provider, display_name, enabled, backend_class, discovered_at, updated_at, availability_detail
+		SELECT id, model_id, provider, display_name, enabled, backend_class, discovered_at, updated_at, availability_detail, availability_state
 		FROM models WHERE id = $1
-	`, id).Scan(&m.ID, &m.ModelID, &m.Provider, &m.DisplayName, &m.Enabled, &m.BackendClass, &m.DiscoveredAt, &m.UpdatedAt, &m.Availability); err != nil {
+	`, id).Scan(&m.ID, &m.ModelID, &m.Provider, &m.DisplayName, &m.Enabled, &m.BackendClass, &m.DiscoveredAt, &m.UpdatedAt, &m.Availability, &state); err != nil {
 		slog.ErrorContext(c.Request.Context(), "fetch updated model failed", "id", id, "err", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "fetch updated model failed"})
 		return
 	}
-	m.Available = modelIsAvailableWithin(m.DiscoveredAt, time.Now(), h.availabilityWindow)
+	m.Available = modelRowAvailable(m.DiscoveredAt, time.Now(), h.availabilityWindow, state)
+	m.Availability = adminAvailability(m.Availability, state)
 
 	c.JSON(http.StatusOK, m)
 }

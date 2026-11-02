@@ -3,6 +3,7 @@ package handler
 import (
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -534,5 +535,88 @@ func TestNormalizeGatewayModels_CarriesRetiredAvailability(t *testing.T) {
 	}})
 	if len(out) != 1 || out[0].AvailabilityState == nil || *out[0].AvailabilityState != "retired" {
 		t.Fatalf("got %+v", out)
+	}
+}
+
+// A retired model is still discovered (fresh discovered_at) but is refused by
+// ToggleModel and the gateway, so the admin row's `available` must be false.
+func TestModelRowAvailable_RetiredIsNotAvailable(t *testing.T) {
+	now := time.Now()
+	fresh := now.Add(-time.Second)
+	stale := now.Add(-time.Hour)
+	w := modelAvailabilityWindow
+	str := func(v string) *string { return &v }
+	for name, tc := range map[string]struct {
+		disc  time.Time
+		state *string
+		want  bool
+	}{
+		"retired, freshly discovered":  {fresh, str("retired"), false},
+		"needs opt-in stays available": {fresh, str("needs_aws_opt_in"), true},
+		"ok":                           {fresh, str("ok"), true},
+		"no availability":              {fresh, nil, true},
+		"ok but stale":                 {stale, str("ok"), false},
+	} {
+		if got := modelRowAvailable(tc.disc, now, w, tc.state); got != tc.want {
+			t.Errorf("%s: got %v, want %v", name, got, tc.want)
+		}
+	}
+	// a LEFT JOINed target: a missing model, or a retired one, is not available
+	if targetAvailable(nil, nil, now, w) || targetAvailable(&fresh, str("retired"), now, w) || !targetAvailable(&fresh, str("ok"), now, w) {
+		t.Error("targetAvailable")
+	}
+}
+
+// A retired row never shows required_mode, whatever an older gateway stored.
+func TestAdminAvailability_StripsRequiredModeFromRetired(t *testing.T) {
+	retired, ok := "retired", "needs_aws_opt_in"
+	raw := json.RawMessage(`{"state":"retired","reason":"end_of_life","account_mode":"inherit","required_mode":"aws_review"}`)
+	var got map[string]any
+	if err := json.Unmarshal(adminAvailability(raw, &retired), &got); err != nil {
+		t.Fatal(err)
+	}
+	if _, has := got["required_mode"]; has || got["state"] != "retired" || got["account_mode"] != "inherit" {
+		t.Errorf("got %v", got)
+	}
+	optIn := json.RawMessage(`{"state":"needs_aws_opt_in","required_mode":"aws_review"}`)
+	if string(adminAvailability(optIn, &ok)) != string(optIn) || string(adminAvailability(nil, &retired)) != "" {
+		t.Error("only retired rows are rewritten")
+	}
+}
+
+// A routed alias whose only target is retired is not viable.
+func TestBuildModelsList_RoutedAliasWithOnlyRetiredTargetIsOmitted(t *testing.T) {
+	ra := routedAliasDBRow{Alias: "smart", DefaultRoute: "a", Routes: []routedAliasRouteDBRow{
+		{RouteName: "a", TargetModelID: "m", TargetExists: true, TargetEnabled: true, TargetBackendClass: "cloud_managed", TargetDiscoveredAt: time.Now(), TargetRetired: true},
+	}}
+	now := time.Now()
+	list := func() []openAIModelEntry {
+		return buildModelsList(nil, nil, []routedAliasDBRow{ra}, residencyAny, true, now, modelAvailabilityWindow, nil)
+	}
+	if got := list(); len(got) != 0 {
+		t.Errorf("retired-only routed alias listed: %+v", got)
+	}
+	ra.Routes[0].TargetRetired = false
+	if got := list(); len(got) != 1 {
+		t.Errorf("control: a live target should list the alias: %+v", got)
+	}
+}
+
+// A routed alias whose default route's target is retired but which another route
+// can still answer does not carry the retired availability.
+func TestBuildModelsList_RoutedAliasWithRetiredDefaultReportsALiveRoute(t *testing.T) {
+	now := time.Now()
+	ra := routedAliasDBRow{Alias: "smart", DefaultRoute: "old", Routes: []routedAliasRouteDBRow{
+		{RouteName: "old", TargetModelID: "old-m", TargetExists: true, TargetEnabled: true, TargetBackendClass: "cloud_managed", TargetDiscoveredAt: now, TargetRetired: true,
+			TargetAvailability: json.RawMessage(`{"state":"retired","reason":"end_of_life"}`)},
+		{RouteName: "new", TargetModelID: "new-m", TargetExists: true, TargetEnabled: true, TargetBackendClass: "cloud_managed", TargetDiscoveredAt: now,
+			TargetAvailability: json.RawMessage(`{"state":"ok"}`)},
+	}}
+	got := buildModelsList(nil, nil, []routedAliasDBRow{ra}, residencyAny, true, now, modelAvailabilityWindow, nil)
+	if len(got) != 1 || strings.Contains(string(got[0].Availability), "retired") || !strings.Contains(string(got[0].Availability), `"ok"`) {
+		t.Fatalf("got %+v", got)
+	}
+	if got[0].AliasOf == nil || *got[0].AliasOf != "old-m" {
+		t.Errorf("alias_of must still name the default route's target: %+v", got[0].AliasOf)
 	}
 }

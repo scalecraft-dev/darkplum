@@ -34,7 +34,7 @@ A model's `backend_class` is one of `self_hosted` (inside the customer's cluster
 
 ### Model availability
 
-Each model row (`GET /api/v1/models`, `GET /v1/models`) carries `availability`: `null`, or for Bedrock models the gateway's verbatim object `{"state": "ok"|"needs_aws_opt_in"|"unknown", "reason": "data_retention", "account_mode", "required_mode"}`. `needs_aws_opt_in` means chat will be refused with `model_requires_data_retention` until the AWS account's Bedrock data-retention mode is raised. `retired` (`reason: "end_of_life"`) means AWS has retired the model: chat is refused with `model_retired` (404) before any call to AWS, and enabling it (`PATCH /api/v1/models/{id}`) is refused with 409 `model_retired`. It is refreshed on every model sync (cleared when the gateway omits it).
+Each model row (`GET /api/v1/models`, `GET /v1/models`) carries `availability`: `null`, or for Bedrock models the gateway's verbatim object `{"state": "ok"|"needs_aws_opt_in"|"unknown", "reason": "data_retention", "account_mode", "required_mode"}`. `needs_aws_opt_in` means chat will be refused with `model_requires_data_retention` until the AWS account's Bedrock data-retention mode is raised. `retired` (`reason: "end_of_life"`) means AWS has retired the model: chat is refused with `model_retired` (404) before any call to AWS, and enabling it (`PATCH /api/v1/models/{id}`) is refused with 409 `model_retired`. A retired row has no `required_mode`, and its `available` is always `false` (a retired model is never usable, however recently the gateway saw it). It is refreshed on every model sync (cleared when the gateway omits it).
 
 ### Vendor key install (admin UI)
 

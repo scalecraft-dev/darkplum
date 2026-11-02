@@ -146,6 +146,46 @@ func modelIsAvailableWithin(discoveredAt, now time.Time, window time.Duration) b
 	return discoveredAt.After(now.Add(-window))
 }
 
+// modelRowAvailable is the admin rows' `available`: seen by the gateway within
+// the window AND not reported retired. A retired model is still discovered (it
+// stays in the catalogue) but ToggleModel and the gateway both refuse it, so it
+// must not read as usable to a client that checks `available` alone. state is
+// the models.availability_state column.
+func modelRowAvailable(discoveredAt, now time.Time, window time.Duration, state *string) bool {
+	if modelRetiredState(state) {
+		return false
+	}
+	return modelIsAvailableWithin(discoveredAt, now, window)
+}
+
+// targetAvailable is modelRowAvailable for a LEFT JOINed target: false when the
+// model row is missing (nil discoveredAt).
+func targetAvailable(discoveredAt *time.Time, state *string, now time.Time, window time.Duration) bool {
+	return discoveredAt != nil && modelRowAvailable(*discoveredAt, now, window, state)
+}
+
+// adminAvailability is the availability object as the admin rows show it. A
+// retired model has no data-retention requirement, so any required_mode left in
+// the stored object (written by a gateway that predates its removal) is dropped.
+func adminAvailability(raw json.RawMessage, state *string) json.RawMessage {
+	if !modelRetiredState(state) || len(raw) == 0 {
+		return raw
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(raw, &obj) != nil || obj == nil {
+		return raw
+	}
+	if _, ok := obj["required_mode"]; !ok {
+		return raw
+	}
+	delete(obj, "required_mode")
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return raw
+	}
+	return out
+}
+
 // modelRoutingAdvisoryLockKey is a fixed pg_advisory_xact_lock key shared by
 // RoutingHandler.PutAlias (routing.go) and ModelHandler.SyncModels (models.go)
 // to serialise the model-id/alias conflict check against a concurrent
@@ -218,6 +258,7 @@ type routedAliasRouteDBRow struct {
 	TargetBackendClass string
 	TargetDiscoveredAt time.Time
 	TargetAvailability json.RawMessage
+	TargetRetired      bool // the target's availability_state is 'retired'
 }
 
 // routedAliasDBRow is one routed model_aliases row plus its ordered routes,
@@ -317,7 +358,8 @@ func buildModelsList(models []modelDBRow, aliases []aliasDBRow, routedAliases []
 	for _, ra := range routedAliases {
 		var viable bool
 		var defaultTarget, defaultOwner, defaultBackendClass string
-		var defaultAvailability json.RawMessage
+		var defaultAvailability, liveAvailability json.RawMessage
+		var defaultRetired, haveLive bool
 		routes := make([]routeSummary, 0, len(ra.Routes))
 		for _, rt := range ra.Routes {
 			routes = append(routes, routeSummary{RouteName: rt.RouteName, Description: rt.Description, BackendClass: rt.TargetBackendClass})
@@ -326,8 +368,9 @@ func buildModelsList(models []modelDBRow, aliases []aliasDBRow, routedAliases []
 				defaultOwner = rt.TargetProvider
 				defaultBackendClass = rt.TargetBackendClass
 				defaultAvailability = rt.TargetAvailability
+				defaultRetired = rt.TargetRetired
 			}
-			if !rt.TargetExists || !rt.TargetEnabled {
+			if !rt.TargetExists || !rt.TargetEnabled || rt.TargetRetired {
 				continue
 			}
 			if !modelVisibleInList(residency, permitExternalAPI, rt.TargetBackendClass) {
@@ -339,7 +382,16 @@ func buildModelsList(models []modelDBRow, aliases []aliasDBRow, routedAliases []
 			if !modelIsAvailableWithin(rt.TargetDiscoveredAt, now, availabilityWindow) {
 				continue
 			}
+			if !viable {
+				liveAvailability, haveLive = rt.TargetAvailability, true
+			}
 			viable = true
+		}
+		// The alias reports its default route's availability, but a retired default
+		// target must not mark an alias that other routes can still answer as retired:
+		// it reports the first live route's instead.
+		if defaultRetired && haveLive {
+			defaultAvailability = liveAvailability
 		}
 		// A routed alias is omitted entirely when none of its routes'
 		// targets is currently enabled+available+residency-permitted — even

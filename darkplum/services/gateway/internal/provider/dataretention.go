@@ -54,7 +54,7 @@ type Availability struct {
 	State        string `json:"state"`
 	Reason       string `json:"reason,omitempty"`
 	AccountMode  string `json:"account_mode"`
-	RequiredMode string `json:"required_mode"`
+	RequiredMode string `json:"required_mode,omitempty"`
 }
 
 // AvailabilityReporter is implemented by a provider that can say, per model,

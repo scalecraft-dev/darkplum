@@ -272,7 +272,8 @@ export interface ModelAvailability {
   /** The mode the account is in now, verbatim: default | none | inherit |
    *  aws_review | provider_data_share | unknown. */
   account_mode: string
-  required_mode: 'aws_review'
+  /** Only on needs_aws_opt_in / ok / unknown rows; a retired row has none. */
+  required_mode?: 'aws_review'
 }
 
 export interface Model {

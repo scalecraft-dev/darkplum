@@ -1002,6 +1002,76 @@ func TestListModels_AndAdminList_CarryAvailability(t *testing.T) {
 	}
 }
 
+// A retired model: the admin list says available=false and drops required_mode,
+// an alias to it says target_available=false, and a routed alias whose only
+// target is retired is not in the chat-facing list.
+func TestRetiredModel_AdminListAliasesAndRoutedAlias(t *testing.T) {
+	pool := setupTestDB(t)
+	ctx := context.Background()
+	insertModel(t, ctx, pool, "old-haiku", backendClassCloudManaged, true)
+	insertModel(t, ctx, pool, "llama3", backendClassSelfHosted, true)
+	if _, err := pool.Exec(ctx, `UPDATE models SET availability_state = 'retired', availability_detail = $1::jsonb WHERE model_id = 'old-haiku'`,
+		`{"state":"retired","reason":"end_of_life","account_mode":"inherit","required_mode":"aws_review"}`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO model_aliases (alias, target_model_id) VALUES ('static-old', 'old-haiku')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO model_aliases (alias, kind, default_route, classifier_kind) VALUES ('routed-old', 'routed', 'a', 'rules')`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO model_alias_routes (alias, route_name, description, target_model_id, position) VALUES ('routed-old', 'a', 'd', 'old-haiku', 0)`); err != nil {
+		t.Fatal(err)
+	}
+
+	h := NewModelHandler("http://unused", "unused", pool)
+	r := gin.New()
+	r.GET("/api/v1/models", h.ListAdminModels)
+	resp := doJSON(t, r, http.MethodGet, "/api/v1/models", nil)
+	var rows []struct {
+		ModelID      string         `json:"model_id"`
+		Available    bool           `json:"available"`
+		Availability map[string]any `json:"availability"`
+	}
+	if err := json.Unmarshal(resp.Body.Bytes(), &rows); err != nil {
+		t.Fatalf("%v (%s)", err, resp.Body.String())
+	}
+	seen := false
+	for _, m := range rows {
+		switch m.ModelID {
+		case "old-haiku":
+			seen = true
+			if m.Available {
+				t.Error("a retired model reads available")
+			}
+			if _, has := m.Availability["required_mode"]; has || m.Availability["state"] != "retired" {
+				t.Errorf("availability = %v", m.Availability)
+			}
+		case "llama3":
+			if !m.Available {
+				t.Error("control: a live model should read available")
+			}
+		}
+	}
+	if !seen {
+		t.Fatal("retired row missing from the admin list")
+	}
+
+	rh := NewRoutingHandler(pool, nil, "http://unused", "unused")
+	rr := gin.New()
+	rr.GET("/api/v1/aliases", rh.ListAliases)
+	resp = doJSON(t, rr, http.MethodGet, "/api/v1/aliases", nil)
+	if !strings.Contains(resp.Body.String(), `"target_available":false`) || strings.Contains(resp.Body.String(), `"target_available":true`) {
+		t.Errorf("aliases: %s", resp.Body.String())
+	}
+
+	chat := httptest.NewRecorder()
+	newModelsTestRouter(h).ServeHTTP(chat, httptest.NewRequest(http.MethodGet, "/v1/models", nil))
+	if strings.Contains(chat.Body.String(), "routed-old") || strings.Contains(chat.Body.String(), "static-old") || strings.Contains(chat.Body.String(), "old-haiku") {
+		t.Errorf("a retired model or an alias to it is listed: %s", chat.Body.String())
+	}
+}
+
 func syncOnce(t *testing.T, ctx context.Context, h func(url string) *ModelHandler, class string) {
 	t.Helper()
 	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

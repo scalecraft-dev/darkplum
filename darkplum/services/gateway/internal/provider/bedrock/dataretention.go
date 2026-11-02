@@ -173,7 +173,7 @@ func (p *BedrockProvider) ModelAvailability(model string) provider.Availability 
 	switch {
 	case p.retired.profileRetired(model):
 		return provider.Availability{State: provider.AvailabilityRetired, Reason: provider.AvailabilityReasonRetired,
-			AccountMode: mode, RequiredMode: provider.RequiredDataRetentionMode}
+			AccountMode: mode}
 	case p.retention.isRefused(model):
 		av.State = provider.AvailabilityNeedsOptIn
 	case known && low && modelNeedsOptIn(model):

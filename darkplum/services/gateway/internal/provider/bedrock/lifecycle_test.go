@@ -95,6 +95,10 @@ func TestDiscoverModels_RetiredModelsStayListedAndAreReportedRetired(t *testing.
 	}
 	if av := p.ModelAvailability("us.a.absent-eol"); av.Reason != provider.AvailabilityReasonRetired {
 		t.Errorf("reason = %q", av.Reason)
+	} else if av.RequiredMode != "" {
+		// required_mode belongs to the data-retention opt-in; nothing is
+		// required of the account for a model AWS has retired.
+		t.Errorf("retired availability carries required_mode %q", av.RequiredMode)
 	}
 }
 
