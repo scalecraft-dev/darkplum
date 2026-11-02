@@ -34,8 +34,7 @@ func watchInterrupts(out io.Writer, cancel func()) (force <-chan struct{}, stop 
 					continue
 				}
 				once.Do(func() {
-					fmt.Fprintln(out, "\n"+sFail("✗ killing Terraform now.")+
-						" It may have left the state locked or a resource half-made. The next run reports a lock with its id;\n  `terraform force-unlock <id>` clears it, but only when nothing else is running. Re-run to continue.")
+					fmt.Fprintln(out, "\n"+sFail("✗ killing Terraform now.")+killedNote)
 					close(f)
 					go func() { time.Sleep(10 * time.Second); os.Exit(130) }()
 				})
@@ -46,3 +45,9 @@ func watchInterrupts(out io.Writer, cancel func()) (force <-chan struct{}, stop 
 	}()
 	return f, func() { signal.Stop(sigs); close(done) }
 }
+
+// killedNote is what a second Ctrl-C tells the person. The command that clears a lock
+// is not named here: `terraform force-unlock` run from anywhere but the install's
+// workspace and verified bundle does nothing, so the next run prints the real line,
+// with the lock's id.
+const killedNote = " It may have left the state locked or a resource half-made. The next run reports a lock with its id\n  and the exact command that clears it (only when nothing else is running). Re-run to continue."

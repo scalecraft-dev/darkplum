@@ -175,6 +175,52 @@ func terraformCmd(ctx context.Context, v bundle.Verified, d TerraformDirs, env [
 	return cmd, nil
 }
 
+// TerraformCommand is the command line that runs what Terraform(v, d, env, args...)
+// would run, for a person to paste when darkplum cannot do it for them: the same
+// working directory, -chdir (the verified bundle's root, which is not where anyone
+// would look for it), TF_DATA_DIR (which holds the backend the install initialised)
+// and the extra environment. It is built from terraformCmd, so the two cannot drift.
+// Terraform's own run does not inherit the TF_* variables of the person's shell
+// (TF_WORKSPACE, TF_CLI_ARGS, TF_VAR_* and the rest, see terraformBaseEnv), and a
+// pasted line would, so the line unsets every one that is set. Every part is
+// single-quoted.
+func TerraformCommand(v bundle.Verified, d TerraformDirs, env []string, args ...string) (string, error) {
+	cmd, err := terraformCmd(context.Background(), v, d, env, args)
+	if err != nil {
+		return "", err
+	}
+	q := func(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
+	parts := []string{"cd " + q(cmd.Dir) + " &&"}
+	// Only what the run adds to the inherited environment, in the order terraformCmd adds it.
+	base := map[string]bool{}
+	for _, kv := range terraformBaseEnv(os.Environ()) {
+		base[kv] = true
+	}
+	for _, kv := range cmd.Env {
+		if !base[kv] {
+			parts = append(parts, q(kv))
+		}
+	}
+	// A leading VAR='x' would be a quoted command word; env(1) takes them as arguments.
+	line := parts[0] + " env"
+	// What terraformBaseEnv removes from the person's environment, the pasted line
+	// must remove too.
+	for _, kv := range os.Environ() {
+		if !base[kv] {
+			name, _, _ := strings.Cut(kv, "=")
+			line += " -u " + q(name)
+		}
+	}
+	for _, kv := range parts[1:] {
+		line += " " + kv
+	}
+	line += " terraform"
+	for _, a := range cmd.Args[1:] {
+		line += " " + q(a)
+	}
+	return line, nil
+}
+
 // TerraformInit initialises the backend from the install's backend.hcl with the
 // lock file read-only: the providers are exactly the ones the shipped lock names,
 // for this platform, or init fails.

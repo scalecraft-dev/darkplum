@@ -176,6 +176,13 @@ type deployEnv struct {
 	// inspected is true once the existing cluster has been checked for conflicts
 	// (or there was none to check).
 	inspected bool
+	// deferKube is true only while the preflight inspects the live cluster: the one
+	// place a 401 may be postponed (see kubeRejected). deferredKube holds the refusal
+	// that was postponed, until Terraform's state confirms or overturns it.
+	deferKube    bool
+	deferredKube *deferredKube
+	// firstInstallInterrupted is interruptedFirstInstall's answer, taken at step 3.
+	firstInstallInterrupted bool
 	// srcAuth reads the image source when the images are unsigned (nil: anonymous).
 	srcAuth authn.Authenticator
 	ecrAuth func(region string) (authn.Authenticator, error)
@@ -426,6 +433,9 @@ func (e *deployEnv) run(ctx context.Context) (err error) {
 	if warn != "" {
 		e.row(checkResult{name: "terraform state", status: checkWarn, detail: warn})
 	}
+	if err := e.settleInterruptedInstall(ctx, tf, state); err != nil {
+		return err
+	}
 	adopt, err := e.adoptLogGroup(state)
 	if err != nil {
 		return e.stop(checkResult{name: "audit log group", status: checkFail, detail: firstLine(err.Error()),
@@ -473,8 +483,14 @@ func (e *deployEnv) run(ctx context.Context) (err error) {
 	// cancelled, and a running one (a rollout wait) is stopped, not waited out.
 	kc := e.kube(t).WithContext(ctx)
 	if !e.inspected {
-		// The cluster could not be read at preflight (it was still being created, or
-		// unreachable). It is up now; nothing has been applied to it yet.
+		// The cluster could not be read at preflight (it was still being created,
+		// unreachable, or rejecting this identity before its access entry existed). It
+		// is up now; nothing has been applied to it yet. A 401 is first given the short
+		// window EKS needs to honour an access entry made a moment ago.
+		e.waitForKubeAccess(ctx, func() error {
+			_, err := kc.Run(nil, "-n", platformNS, "get", "svc", "darkplum-web", "-o", "json")
+			return err
+		})
 		if reachable, err := e.checkConflicts(kc); err != nil {
 			return err
 		} else if !reachable {
@@ -873,6 +889,8 @@ const lbSchemeAnnotation = "service.beta.kubernetes.io/aws-load-balancer-scheme"
 // An ACTIVE cluster whose API cannot be reached also stops the run here. Only a
 // cluster still being created (ErrClusterNotReady) is carried past this point.
 func (e *deployEnv) inspectLive() error {
+	e.deferKube = true
+	defer func() { e.deferKube = false }()
 	t, row, err := e.cluster()
 	switch {
 	case errors.Is(err, errClusterNotFound):
@@ -891,6 +909,11 @@ func (e *deployEnv) inspectLive() error {
 	}
 	e.row(row)
 	reachable, err := e.checkConflicts(e.kube(t))
+	if errors.Is(err, errKubeDeferred) {
+		// The cluster rejects this identity because the apply never made its access
+		// entry (see kubeRejected). Left uninspected: step 6 reads it once it is up.
+		return nil
+	}
 	if err != nil {
 		return err
 	}
@@ -915,16 +938,18 @@ func (e *deployEnv) checkConflicts(kc *kube.Client) (reachable bool, err error) 
 		if ex := webExposure(svc); ex != "" {
 			return true, e.stop(checkResult{name: "web exposure", status: checkFail, detail: ex,
 				hint: "this release serves the web UI on a private load balancer and keeps the darkplum-web Service cluster-internal. " +
-					"Deploying would remove the address above without warning. Nothing was changed. To move to private: " +
+					"Deploying would remove the address above without warning. " + e.unchanged() + ". To move to private: " +
 					"`eval \"$(darkplum kubeconfig)\"`, then `kubectl -n darkplum-system patch svc darkplum-web --type=merge -p '{\"spec\":{\"type\":\"ClusterIP\"}}'` " +
 					"and re-run deploy. To keep the public address, stay on the release that created it."}, "internet-facing web service")
 		}
 	case kubeNotFound(err, "services", "darkplum-web"), kubeNoNamespace(err, platformNS):
 	case unreachable(err):
 		return false, nil
+	case kubeUnauthorized(err):
+		return true, e.kubeRejected(e.unauthorizedRow("web exposure", err), "cannot inspect the web service")
 	default:
 		return true, e.stop(checkResult{name: "web exposure", status: checkFail, detail: firstLine(err.Error()),
-			hint: "cannot tell how the web UI is exposed; nothing was changed"}, "cannot inspect the web service")
+			hint: "cannot tell how the web UI is exposed; " + strings.ToLower(e.unchanged())}, "cannot inspect the web service")
 	}
 
 	// The local record knows what this machine applied; the cluster knows what anyone did.
@@ -935,6 +960,8 @@ func (e *deployEnv) checkConflicts(kc *kube.Client) (reachable bool, err error) 
 		}
 	case unreachable(err):
 		return false, nil
+	case kubeUnauthorized(err):
+		return true, e.kubeRejected(e.unauthorizedRow("release", err), "cannot read the cluster's release record")
 	default:
 		e.row(checkResult{name: "release", status: checkWarn, detail: "the cluster's own release record could not be read: " + firstLine(err.Error()),
 			hint: "continuing on the local record only"})
@@ -954,8 +981,11 @@ func (e *deployEnv) checkRouterTakeover(kc *kube.Client) (reachable bool, err er
 		if unreachable(err) {
 			return false, nil
 		}
+		if kubeUnauthorized(err) {
+			return true, e.kubeRejected(e.unauthorizedRow("semantic router", err), "cannot inspect helm releases")
+		}
 		return true, e.stop(checkResult{name: "semantic router", status: checkFail, detail: firstLine(err.Error()),
-			hint: "cannot tell whether a helm-installed router exists; nothing was changed"}, "cannot inspect helm releases")
+			hint: "cannot tell whether a helm-installed router exists; " + strings.ToLower(e.unchanged())}, "cannot inspect helm releases")
 	}
 	if !rel.Found {
 		return true, nil
@@ -987,7 +1017,7 @@ func (e *deployEnv) takeover(rel semrouter.HelmRelease) (semrouter.Takeover, err
 	case errors.As(err, &cust):
 		return semrouter.Takeover{}, e.stop(checkResult{name: "semantic router", status: checkFail,
 			detail: "installed by helm with values that differ from the ones Darkplum ships: " + strings.Join(cust.Keys, ", "),
-			hint: "Nothing was changed. Taking it over replaces those values with the shipped decisions. Either pass --convert-router-defaults to accept that, " +
+			hint: e.unchanged() + ". Taking it over replaces those values with the shipped decisions. Either pass --convert-router-defaults to accept that, " +
 				"or keep your helm release and turn the router off in `darkplum init` (deploy then leaves it alone)"}, "customised helm-installed semantic router")
 	case err != nil:
 		return semrouter.Takeover{}, e.stop(checkResult{name: "semantic router", status: checkFail, detail: firstLine(err.Error())}, "cannot judge the helm-installed router")
@@ -1170,23 +1200,8 @@ func (e *deployEnv) planAndApply(ctx context.Context, tf tfRunner, adoptLogGroup
 			}
 		}
 	}
-	if len(dangerous) > 0 {
-		e.printf("\n%s\n", sWarn(fmt.Sprintf("! This plan deletes or replaces %d resource(s):", len(dangerous))))
-		for _, d := range dangerous {
-			what := "delete"
-			if d.Replace {
-				what = "replace"
-			}
-			e.printf("    %-8s %s\n", what, d.Address)
-		}
-		switch {
-		case e.flags.ConfirmPlan:
-			e.printf("%s\n", sDim("approved by --confirm-plan"))
-		case e.interactive && e.confirm("\nType 'yes' to apply this plan, anything else cancels: "):
-		default:
-			return e.stop(checkResult{name: "plan", status: checkFail, detail: "deletes or replaces resources and was not approved",
-				hint: "review the list above; re-run with --confirm-plan (or answer 'yes' at the prompt) to approve it. Nothing was applied"}, "plan not approved")
-		}
+	if err := e.confirmDestructive(tf, dangerous); err != nil {
+		return err
 	}
 
 	e.mutated = true
@@ -1284,9 +1299,9 @@ func (e *deployEnv) streamTF(ctx context.Context, tf tfRunner, stepNo int, label
 	hint := "see the output above; the full log is " + e.logPath
 	switch {
 	case errors.Is(ctxErr, context.Canceled):
-		hint = "interrupted; Terraform stopped cleanly. Re-run `darkplum deploy` to continue"
+		hint = e.interruptedHint()
 	case strings.Contains(tl.String(), "Error acquiring the state lock"):
-		hint = "another Terraform run holds the state lock (its id is printed above). If you are sure nothing else is running: `terraform force-unlock <id>`"
+		hint = lockHint(tf, tl.String())
 	default:
 		if h := e.loginHint(tl.String()); !strings.HasPrefix(h, "fix the above") {
 			hint = h

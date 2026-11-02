@@ -36,6 +36,10 @@ type tfRunner interface {
 	K8s() (fs.FS, error)
 	// VarFile is the install's variables file (absolute).
 	VarFile() string
+	// Command is the command line that runs this Terraform command by hand, for a
+	// hint a person can paste: the verified bundle is the root and its data directory
+	// is under the workspace, so a bare `terraform ...` anywhere else does nothing.
+	Command(args ...string) string
 }
 
 // tfFailure is a failed Terraform command: the error says what, Stderr is
@@ -144,6 +148,14 @@ func openTF(in install.Install, rec install.Record) (tfRunner, string, error) {
 
 func (t *realTF) VarFile() string { return t.dirs.TFVars }
 
+func (t *realTF) Command(args ...string) string {
+	line, err := runner.TerraformCommand(t.v, t.dirs, t.env, args...)
+	if err != nil {
+		return "terraform " + strings.Join(args, " ") + " (in this install's workspace; darkplum could not build the exact command: " + firstLine(err.Error()) + ")"
+	}
+	return line
+}
+
 func (t *realTF) Init() error {
 	stderr, err := runner.TerraformInit(t.v, t.dirs, t.prof, t.env)
 	if err != nil {
@@ -204,7 +216,19 @@ func stateList(tf tfRunner) (map[string]bool, error) {
 type planChange struct {
 	Address string
 	Replace bool // delete and create, rather than delete
+	// CreateFirst is a replacement whose new object is created BEFORE the old one is
+	// destroyed. That is create_before_destroy, set on an object or inherited by every
+	// object it depends on: the EKS module's node-group submodules and our database
+	// security group make the cluster and everything upstream of it create-first (see
+	// deploy_resume.go). Where the name is fixed, that order can never work.
+	CreateFirst bool
+	// Tainted is a replacement because an apply was interrupted or failed while
+	// creating the object, so Terraform no longer trusts it.
+	Tainted bool
 }
+
+// reasonTainted is the plan JSON's action_reason for a replacement of a tainted object.
+const reasonTainted = "replace_because_tainted"
 
 // destructiveChanges reads `terraform show -json <plan>` and lists every resource
 // the plan deletes or replaces, sorted. Anything else (create, update in place,
@@ -212,8 +236,9 @@ type planChange struct {
 func destructiveChanges(planJSON []byte) ([]planChange, error) {
 	var p struct {
 		ResourceChanges []struct {
-			Address string `json:"address"`
-			Change  struct {
+			Address      string `json:"address"`
+			ActionReason string `json:"action_reason"`
+			Change       struct {
 				Actions []string `json:"actions"`
 			} `json:"change"`
 		} `json:"resource_changes"`
@@ -229,10 +254,62 @@ func destructiveChanges(planJSON []byte) ([]planChange, error) {
 			create = create || a == "create"
 		}
 		if del {
-			out = append(out, planChange{Address: rc.Address, Replace: create})
+			out = append(out, planChange{Address: rc.Address, Replace: create,
+				CreateFirst: create && len(rc.Change.Actions) > 0 && rc.Change.Actions[0] == "create",
+				Tainted:     rc.ActionReason == reasonTainted})
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Address < out[j].Address })
+	return out, nil
+}
+
+// ---- tainted objects ---------------------------------------------------------
+
+// taintedInstances lists the addresses of the instances the state marks tainted,
+// from `terraform state pull`. That JSON is the one place every Terraform version
+// writes the status (instances[].status); `terraform show -json` exposes it only
+// on some. The state holds secrets (the database password): this reads the
+// addresses and nothing else, and the bytes are never printed or kept.
+func taintedInstances(statePull []byte) (map[string]bool, error) {
+	var st struct {
+		Resources []struct {
+			Module    string `json:"module"`
+			Mode      string `json:"mode"`
+			Type      string `json:"type"`
+			Name      string `json:"name"`
+			Instances []struct {
+				IndexKey any     `json:"index_key"`
+				Status   string  `json:"status"`
+				Deposed  *string `json:"deposed"`
+			} `json:"instances"`
+		} `json:"resources"`
+	}
+	if err := json.Unmarshal(statePull, &st); err != nil {
+		return nil, errors.New("terraform printed a state this darkplum cannot read")
+	}
+	out := map[string]bool{}
+	for _, r := range st.Resources {
+		if r.Mode != "managed" {
+			continue
+		}
+		for _, i := range r.Instances {
+			if i.Status != "tainted" || i.Deposed != nil {
+				continue
+			}
+			addr := r.Type + "." + r.Name
+			if r.Module != "" {
+				addr = r.Module + "." + addr
+			}
+			switch k := i.IndexKey.(type) {
+			case nil:
+			case float64:
+				addr += fmt.Sprintf("[%d]", int(k))
+			case string:
+				addr += fmt.Sprintf("[%q]", k)
+			}
+			out[addr] = true
+		}
+	}
 	return out, nil
 }
 

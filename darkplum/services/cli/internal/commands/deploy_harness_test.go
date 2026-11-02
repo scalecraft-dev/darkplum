@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -33,15 +34,19 @@ type fakeTF struct {
 	t  *testing.T
 	tl *timeline
 
-	mu          sync.Mutex
-	stateOut    string
-	stateErr    error
-	planJSON    string
-	showErr     error
-	outputs     string
-	outputsErr  error
-	initErr     error
-	rmErr       error
+	mu         sync.Mutex
+	stateOut   string
+	stateErr   error
+	planJSON   string
+	showErr    error
+	outputs    string
+	outputsErr error
+	initErr    error
+	rmErr      error
+	// tainted are the addresses `state pull` reports as tainted; untaint clears one.
+	tainted     []string
+	pullErr     error
+	untaintEr   error
 	streamErr   map[string]error // by first arg
 	streamText  map[string]string
 	streamDelay time.Duration
@@ -65,14 +70,38 @@ func (f *fakeTF) record(args ...string) {
 
 func (f *fakeTF) VarFile() string { return "/ws/terraform.tfvars" }
 
+func (f *fakeTF) Command(args ...string) string { return "TFCMD terraform " + strings.Join(args, " ") }
+
 func (f *fakeTF) Init() error { f.record("init"); return f.initErr }
 
 func (f *fakeTF) Capture(args ...string) ([]byte, error) {
 	f.record(args...)
 	switch args[0] {
+	case "untaint":
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		if f.untaintEr != nil {
+			return nil, f.untaintEr
+		}
+		var left []string
+		for _, a := range f.tainted {
+			if a != args[1] {
+				left = append(left, a)
+			}
+		}
+		f.tainted = left
+		return nil, nil
 	case "state":
 		if len(args) > 1 && args[1] == "rm" {
 			return nil, f.rmErr
+		}
+		if len(args) > 1 && args[1] == "pull" {
+			if f.pullErr != nil {
+				return nil, f.pullErr
+			}
+			f.mu.Lock()
+			defer f.mu.Unlock()
+			return statePullJSON(f.tainted), nil
 		}
 		if f.stateErr != nil {
 			return nil, f.stateErr
@@ -171,10 +200,26 @@ type deployAWS struct {
 	tl        *timeline
 	logGroups string
 	logErr    error
+	// eksStatus answers `describe-cluster --query cluster.status`; nil means the
+	// base fake's status, ACTIVE when it has none.
+	eksStatus func() (string, error)
 }
 
 func (a *deployAWS) run(name string, args ...string) (string, error) {
 	joined := strings.Join(args, " ")
+	if strings.Contains(joined, "eks describe-cluster") && strings.Contains(joined, "cluster.status") {
+		a.tl.add("aws " + joined)
+		if a.eksStatus != nil {
+			return a.eksStatus()
+		}
+		if a.base.describeErr != nil {
+			return "", a.base.describeErr
+		}
+		if a.base.status == "" {
+			return "ACTIVE\n", nil
+		}
+		return a.base.status + "\n", nil
+	}
 	if strings.Contains(joined, "eks describe-cluster") || strings.Contains(joined, "sts get-caller-identity") {
 		a.tl.add("aws " + joined)
 		return a.base.run(name, args...)
@@ -506,4 +551,48 @@ func (h *deployHarness) unsignedRepo(svc string) string {
 		host = h.unsignedHost
 	}
 	return host + "/dp-trial/darkplum-" + svc
+}
+
+// statePullJSON is what `terraform state pull` prints for a state whose instances at
+// the given addresses are tainted (the shape was captured from Terraform 1.14).
+func statePullJSON(tainted []string) []byte {
+	type inst struct {
+		IndexKey   any            `json:"index_key,omitempty"`
+		Status     string         `json:"status,omitempty"`
+		Attributes map[string]any `json:"attributes"`
+	}
+	type res struct {
+		Module    string `json:"module,omitempty"`
+		Mode      string `json:"mode"`
+		Type      string `json:"type"`
+		Name      string `json:"name"`
+		Instances []inst `json:"instances"`
+	}
+	out := struct {
+		Version   int   `json:"version"`
+		Resources []res `json:"resources"`
+	}{Version: 4}
+	// An unrelated, healthy resource carrying a secret the parser must not surface.
+	out.Resources = append(out.Resources, res{Mode: "managed", Type: "random_password", Name: "db",
+		Instances: []inst{{Attributes: map[string]any{"result": "s3cr3t-db-pw"}}}})
+	for _, a := range tainted {
+		idx := ""
+		if i := strings.Index(a, "["); i >= 0 && strings.HasSuffix(a, "]") {
+			a, idx = a[:i], a[i+1:len(a)-1]
+		}
+		parts := strings.Split(a, ".")
+		r := res{Mode: "managed", Type: parts[len(parts)-2], Name: parts[len(parts)-1], Module: strings.Join(parts[:len(parts)-2], ".")}
+		in := inst{Status: "tainted", Attributes: map[string]any{"id": "x"}}
+		if idx != "" {
+			if n, err := strconv.Atoi(idx); err == nil {
+				in.IndexKey = n
+			} else {
+				in.IndexKey = strings.Trim(idx, `"`)
+			}
+		}
+		r.Instances = []inst{in}
+		out.Resources = append(out.Resources, r)
+	}
+	b, _ := json.Marshal(out)
+	return b
 }

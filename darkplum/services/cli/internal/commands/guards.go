@@ -189,6 +189,23 @@ func unreachable(err error) bool {
 	return false
 }
 
+// kubeUnauthorized reports a kubectl failure that means "the API answered and does
+// not accept these credentials" (HTTP 401): not a network problem, and not a
+// permission the identity lacks on one object (that is Forbidden). It is what a
+// cluster says to an identity that has no access entry yet.
+func kubeUnauthorized(err error) bool {
+	if err == nil || unreachable(err) {
+		return false
+	}
+	m := strings.ToLower(err.Error())
+	for _, s := range []string{"provide credentials", "must be logged in to the server", "(unauthorized)"} {
+		if strings.Contains(m, s) {
+			return true
+		}
+	}
+	return false
+}
+
 // strictSession is checkAWSSession for the re-checks made mid-run: when the
 // expiry cannot be read it fails, where the preflight only warns. A re-check
 // exists to catch a session about to lapse; "unknown" must not pass it.

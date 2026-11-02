@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -200,5 +201,51 @@ func TestTerraformStreamGraceIsABackstop(t *testing.T) {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("a run that never stops was not killed after the grace period")
+	}
+}
+
+// The command darkplum prints for a person to run must do exactly what darkplum
+// would have run: same directory, same -chdir, same data directory, same
+// environment, same arguments. A fake terraform that reports all of those is run
+// both ways and the reports are compared.
+func TestTerraformCommandRunsWhatTerraformWouldRun(t *testing.T) {
+	script := "#!/bin/sh\npwd\necho \"data=$TF_DATA_DIR profile=$AWS_PROFILE ws=[$TF_WORKSPACE] cli=[$TF_CLI_ARGS] var=[$TF_VAR_x]\"\nfor a in \"$@\"; do echo \"arg=$a\"; done\n"
+	v, dirs := streamFixture(t, script)
+	// The person's shell has TF_* settings that darkplum's own run strips: the pasted
+	// line must strip them too, or it would run another workspace with other arguments.
+	t.Setenv("TF_WORKSPACE", "someone-elses")
+	t.Setenv("TF_CLI_ARGS", "-lock=false")
+	t.Setenv("TF_VAR_x", "1")
+	dirs.Data = filepath.Join(dirs.Workspace, "it's data", "k")
+	env := []string{"AWS_PROFILE=my prof"}
+	args := []string{"untaint", `module.eks.module.eks.aws_eks_access_entry.this["cluster_creator"]`}
+
+	out, _, err := Terraform(v, dirs, env, args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	line, err := TerraformCommand(v, dirs, env, args...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := exec.Command("sh", "-c", line).CombinedOutput()
+	if err != nil {
+		t.Fatalf("%v\n%s\n%s", err, line, got)
+	}
+	// pwd prints /private/var where the temp dir is spelled /var (macOS).
+	norm := func(b []byte) string { return strings.ReplaceAll(string(b), "/private/var/", "/var/") }
+	if norm(got) != norm(out) {
+		t.Errorf("the printed command does something else.\nprinted: %s\nit saw:\n%s\ndarkplum's run saw:\n%s", line, got, out)
+	}
+	for _, want := range []string{"-chdir=" + v.TerraformDir(), "TF_DATA_DIR=", "AWS_PROFILE=my prof"} {
+		if !strings.Contains(line, want) {
+			t.Errorf("command lacks %q: %s", want, line)
+		}
+	}
+	if !strings.Contains(string(out), "ws=[]") || !strings.Contains(string(out), "cli=[]") || !strings.Contains(string(out), "var=[]") {
+		t.Errorf("darkplum's own run inherited the shell's TF_* settings: %s", out)
+	}
+	if _, err := TerraformCommand(bundle.Verified{}, dirs, env, args...); err == nil {
+		t.Error("a command was printed without a verified bundle")
 	}
 }
