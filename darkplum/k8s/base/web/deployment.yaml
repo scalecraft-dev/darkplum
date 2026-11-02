@@ -34,10 +34,17 @@ spec:
                   - key: darkplum.ai/node-type
                     operator: NotIn
                     values: ["gpu-inference"]
+      # Hard on the node, counted per ReplicaSet: a roll must not put both new pods on
+      # one node, or removing the last old pod leaves the other node with none, and
+      # with externalTrafficPolicy Local its share of NLB traffic hangs until the
+      # health check notices. Measured: 20 timeouts in 6 restarts when soft, 0 in 8
+      # with this. nodeTaintsPolicy keeps a cordoned node from holding a pod Pending.
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: kubernetes.io/hostname
-          whenUnsatisfiable: ScheduleAnyway
+          whenUnsatisfiable: DoNotSchedule
+          matchLabelKeys: ["pod-template-hash"]
+          nodeTaintsPolicy: Honor
           labelSelector:
             matchLabels:
               app.kubernetes.io/name: darkplum-web
@@ -70,6 +77,13 @@ spec:
             - name: trusted-proxies
               mountPath: /etc/nginx/trusted-proxies
               readOnly: true
+          # Keep serving while the Service stops sending here; the listener otherwise
+          # closes on SIGTERM while traffic still arrives. Fits the 30s grace period,
+          # with nginx's graceful stop (the image's stop signal is SIGQUIT).
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
           readinessProbe:
             httpGet:
               path: /health

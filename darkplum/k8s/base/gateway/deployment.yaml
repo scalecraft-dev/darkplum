@@ -118,6 +118,13 @@ spec:
             - name: user-hmac
               mountPath: /var/run/darkplum/user-hmac
               readOnly: true
+          # Keep serving while the Service stops sending here; the listener otherwise
+          # closes on SIGTERM while traffic still arrives. Fits the 30s grace period,
+          # with the 10s the server takes to finish what it is doing.
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
           readinessProbe:
             httpGet:
               path: /health

@@ -173,9 +173,14 @@ resource "aws_lb_target_group" "web" {
   proxy_protocol_v2  = true
   preserve_client_ip = false
 
+  # With externalTrafficPolicy Local a node that has lost its last web pod drops new
+  # connections until this check notices: about 20s here, about 90s at the defaults.
   health_check {
-    protocol = "TCP"
-    port     = "traffic-port"
+    protocol            = "TCP"
+    port                = "traffic-port"
+    interval            = 10
+    healthy_threshold   = 2
+    unhealthy_threshold = 2
   }
 
   tags = var.tags
