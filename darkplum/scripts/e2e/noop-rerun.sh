@@ -77,6 +77,29 @@ snapshot() {
   } >"$1"
 }
 
+# The previous deploy's rollout can still be draining: an old ReplicaSet's pod is
+# Terminating (deletionTimestamp set) and vanishes between the two snapshots, which
+# reads as a change the re-run did not make. Wait for the namespace to settle first
+# rather than hide terminating pods from the comparison, which could hide a real one.
+terminating_pods() {
+  e2e_kubectl -n "$ns" get pods -o json | jq -r '.items[] | select(.metadata.deletionTimestamp != null) | .metadata.name'
+}
+wait_for_settled() {
+  local timeout="${E2E_TERMINATING_TIMEOUT:-300}" interval="${E2E_TERMINATING_INTERVAL:-5}" waited=0 names
+  names="$(terminating_pods)"
+  while [ -n "$names" ]; do
+    if [ "$waited" -ge "$timeout" ]; then
+      e2e_die "pods still Terminating in $ns after ${timeout}s ($(echo "$names" | tr '\n' ' ')): the previous deploy has not finished rolling, so a before/after comparison would be meaningless"
+    fi
+    e2e_note "waiting for terminating pods to go: $(echo "$names" | tr '\n' ' ')"
+    sleep "$interval"
+    waited=$((waited + interval))
+    names="$(terminating_pods)"
+  done
+  [ "$waited" = 0 ] || e2e_ok "no pod terminating in $ns (waited ${waited}s)"
+}
+wait_for_settled
+
 snapshot "$E2E_TMP/before"
 if [ "$expect_vllm" = 1 ] && [ -z "$(vllm_upstreams)" ]; then
   e2e_die "--expect-vllm: the gateway has no VLLM_UPSTREAMS before the re-run (run 'darkplum models add' first)"

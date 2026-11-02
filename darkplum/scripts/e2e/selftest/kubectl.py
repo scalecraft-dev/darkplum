@@ -55,7 +55,19 @@ elif rest[0] == "get":
     if not os.path.exists(p):
         print('Error from server (NotFound): %s not found' % rest[1:3], file=sys.stderr)
         sys.exit(1)
-    sys.stdout.write(open(p).read())
+    out = open(p).read()
+    # FAKE_TERMINATING_GETS=N: the first N `get pods` calls also list a pod that is
+    # still Terminating (the previous rollout draining); 999 means it never goes.
+    if rest[1] == "pods" and os.environ.get("FAKE_TERMINATING_GETS"):
+        counter = os.path.join(state, ".podgets")
+        n = int(open(counter).read()) if os.path.exists(counter) else 0
+        open(counter, "w").write(str(n + 1))
+        if n < int(os.environ["FAKE_TERMINATING_GETS"]):
+            doc = json.loads(out)
+            doc["items"].append({"metadata": {"name": "gw-old", "uid": "u0", "deletionTimestamp": "2026-01-01T00:00:00Z"},
+                                 "status": {"containerStatuses": [{"restartCount": 0, "imageID": "sha256:old"}]}})
+            out = json.dumps(doc)
+    sys.stdout.write(out)
 else:
     print("fake kubectl: unsupported: %s" % rest, file=sys.stderr)
     sys.exit(98)

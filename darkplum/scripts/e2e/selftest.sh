@@ -56,6 +56,8 @@ reset; FAKE_DEPLOY_RC=1 check "a failed deploy fails" nonzero "failed with exit 
 reset; echo '{"spec":{"template":{"spec":{"containers":[{"env":[]}]}}}}' >"$FAKE_STATE/install/deploy-darkplum-gateway.json"
 check "--expect-vllm without VLLM_UPSTREAMS fails" nonzero "no VLLM_UPSTREAMS" -- "$here/noop-rerun.sh" --install t --expect-vllm
 reset; check "--expect-oidc with unconfigured OIDC fails" nonzero "OIDC is not configured" -- "$here/noop-rerun.sh" --install t --expect-oidc
+reset; FAKE_TERMINATING_GETS=2 E2E_TERMINATING_INTERVAL=0 check "a pod still Terminating from the last roll is waited out" zero -- "$here/noop-rerun.sh" --install t
+reset; FAKE_TERMINATING_GETS=999 E2E_TERMINATING_TIMEOUT=2 E2E_TERMINATING_INTERVAL=1 check "a pod that never finishes terminating fails" nonzero "still Terminating" -- "$here/noop-rerun.sh" --install t
 reset; check "a path as install name fails" nonzero "not a valid workspace name" -- "$here/noop-rerun.sh" --install ../t
 
 echo "-- destroy scripts refuse without E2E_CONFIRM_DESTROY"
