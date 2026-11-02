@@ -176,12 +176,17 @@ func Apply(kc *kube.Client, tok Takeover, objs []manifests.Object, progress io.W
 // objects to take kinds from.
 var defaultKinds = []string{"deployment", "service", "configmap", "serviceaccount", "networkpolicy", "role", "rolebinding", "clusterrole", "clusterrolebinding"}
 
-// Remove takes the router out: the gateway's setting first (so it stops calling
-// it), then every labelled object. A missing gateway or setting is fine; any
-// other error is not. objs, when known, adds their kinds to the removal.
+// Remove takes the router out: the gateway's setting first, then waits for that roll,
+// so no gateway pod is still calling it, then every labelled object. A missing gateway
+// or setting is fine; any other error is not. objs, when known, adds their kinds to
+// the removal.
 func Remove(kc *kube.Client, objs []manifests.Object, progress io.Writer) error {
-	if _, err := kc.NS(nil, "set", "env", "deploy/darkplum-gateway", EnvName+"-"); err != nil && !notFound(err) {
-		return fmt.Errorf("unset %s: %w", EnvName, err)
+	if _, err := kc.NS(nil, "set", "env", "deploy/darkplum-gateway", EnvName+"-"); err != nil {
+		if !notFound(err) {
+			return fmt.Errorf("unset %s: %w", EnvName, err)
+		}
+	} else if _, err := kc.NS(nil, "rollout", "status", "deploy/darkplum-gateway", "--timeout=180s"); err != nil {
+		return fmt.Errorf("the gateway did not become ready, so the router was left in place: %w", err)
 	}
 	kinds := map[string]bool{}
 	for _, k := range defaultKinds {

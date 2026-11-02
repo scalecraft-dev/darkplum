@@ -132,7 +132,7 @@ func TestRemoveDeletesTheClusterScopedKindsOfTheRenderedObjects(t *testing.T) {
 	if err := Remove(f.client(), objs, &bytes.Buffer{}); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(f.calls[1], "clusterrole") {
+	if !strings.Contains(f.calls[len(f.calls)-1], "clusterrole") {
 		t.Errorf("clusterrole is not in the delete: %v", f.calls)
 	}
 }
@@ -174,6 +174,30 @@ func TestApplyStopsBeforePointingTheGatewayAtAnUnreadyRouter(t *testing.T) {
 	f = &fakeKube{fail: map[string]error{"get deploy darkplum-gateway": errors.New("NotFound")}}
 	if err := Apply(f.client(), checked, objs, &bytes.Buffer{}); err == nil || len(f.calls) != 1 {
 		t.Errorf("applied without a gateway: %v %v", err, f.calls)
+	}
+}
+
+// Turning the router off rolls the gateway. Deleting the router before that roll is
+// done leaves a pod calling it, and a deploy that returned mid-roll failed the no-op
+// check of the run after it on a real cluster.
+func TestRemoveWaitsForTheGatewayBeforeDeletingTheRouter(t *testing.T) {
+	f := &fakeKube{}
+	if err := Remove(f.client(), nil, &bytes.Buffer{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.calls) != 3 || !strings.Contains(f.calls[0], "set env") ||
+		!strings.Contains(f.calls[1], "rollout status deploy/darkplum-gateway") || !strings.Contains(f.calls[2], "delete ") {
+		t.Errorf("calls = %v", f.calls)
+	}
+	f = &fakeKube{fail: map[string]error{"rollout status": errors.New("timed out")}}
+	err := Remove(f.client(), nil, &bytes.Buffer{})
+	if err == nil || !strings.Contains(err.Error(), "gateway did not become ready") {
+		t.Fatalf("got %v", err)
+	}
+	for _, c := range f.calls {
+		if strings.Contains(c, "delete ") {
+			t.Errorf("deleted the router with the gateway not rolled: %v", f.calls)
+		}
 	}
 }
 

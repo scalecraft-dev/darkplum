@@ -662,7 +662,7 @@ func (e *deployEnv) run(ctx context.Context) (err error) {
 // Off: remove what Darkplum applied (selected by its label), and nothing else.
 func (e *deployEnv) routerStep(ctx context.Context, kc *kube.Client, fsys fs.FS) error {
 	if !e.rec.SemanticRouter {
-		return e.routerOff(kc, fsys)
+		return e.routerOff(ctx, kc, fsys)
 	}
 	if r := e.sessionOK(35); r.status == checkFail {
 		return e.stop(r, "the AWS session is about to expire; the router can take up to 30 minutes to become ready")
@@ -707,7 +707,7 @@ func (e *deployEnv) routerStep(ctx context.Context, kc *kube.Client, fsys fs.FS)
 // routerOff removes the router Darkplum applied, when there is one. It never
 // touches a helm-installed router (no Darkplum label), nor the gateway's setting
 // that points at it.
-func (e *deployEnv) routerOff(kc *kube.Client, fsys fs.FS) error {
+func (e *deployEnv) routerOff(ctx context.Context, kc *kube.Client, fsys fs.FS) error {
 	out, err := kc.NS(nil, "get", "deploy", "-l", semrouter.ComponentLabel+"="+semrouter.Component, "-o", "name")
 	if err != nil {
 		return e.stop(checkResult{name: "semantic router", status: checkFail, detail: firstLine(err.Error()),
@@ -719,6 +719,9 @@ func (e *deployEnv) routerOff(kc *kube.Client, fsys fs.FS) error {
 	}
 	objs, _ := semrouter.Objects(fsys, platformNS) // kinds only; the label selects what is removed
 	if err := semrouter.Remove(kc, objs, e.out); err != nil {
+		if ierr := e.checkInterrupt(ctx); ierr != nil {
+			return ierr
+		}
 		return e.stop(checkResult{name: "semantic router", status: checkFail, detail: err.Error(),
 			hint: "re-run `darkplum deploy`"}, "cannot remove the semantic router")
 	}
