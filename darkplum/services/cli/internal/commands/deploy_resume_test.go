@@ -142,9 +142,8 @@ func TestDeployRefusesA401WhenTerraformsStateHoldsOurAccessEntry(t *testing.T) {
 	h.mustContain("rejected this identity's credentials", "not the case of an access entry that was never made", "Nothing was changed")
 }
 
-func TestDeployRefusesA401WhenNoClusterIsInTheState(t *testing.T) {
-	// A cluster that is not this install's Terraform's (nothing of it in the state) is
-	// not the expected 401.
+// What a second Ctrl-C during CREATING leaves: AWS has the cluster, the state does not.
+func TestDeployNamesAClusterOutsideTheStateOnA401(t *testing.T) {
 	h := newDeployHarness(t, 0)
 	h.activeCluster()
 	h.markUnfinished()
@@ -153,7 +152,136 @@ func TestDeployRefusesA401WhenNoClusterIsInTheState(t *testing.T) {
 	if !IsReported(h.run()) || h.tf.ran("plan") {
 		t.Fatalf("went on:\n%s", h.out.String())
 	}
-	h.mustContain("rejected this identity's credentials", "not explained by an interrupted first install")
+	h.mustContain("exists in AWS", "state does not hold it", "describe-cluster --name", "delete-cluster --name", "-web", "Importing the cluster does not work", "someone else's", "Nothing was changed")
+}
+
+func TestDeployStopsAPlanThatCreatesAClusterAWSAlreadyHas(t *testing.T) {
+	// CREATING: no 401 yet, so only the plan can show it. --confirm-plan does not help.
+	h := newDeployHarness(t, 0)
+	h.activeCluster()
+	h.markUnfinished()
+	h.env.flags.ConfirmPlan = true
+	h.tf.stateOut = "module.vpc.module.vpc.aws_vpc.this[0]\n"
+	h.tf.planJSON = `{"resource_changes":[{"address":"` + clusterAddr + `","change":{"actions":["create"]}}]}`
+	if !IsReported(h.run()) {
+		t.Fatalf("went on:\n%s", h.out.String())
+	}
+	if h.tf.ran("apply") {
+		t.Errorf("applied a plan that can only end in 409:\n%s", h.tl)
+	}
+	h.mustContain("exists in AWS", "state does not hold it")
+}
+
+func TestDeploySaysWaitForAClusterThatIsBeingDeleted(t *testing.T) {
+	h := newDeployHarness(t, 0)
+	h.activeCluster()
+	h.markUnfinished()
+	h.awsf.eksStatus = func() (string, error) { return "DELETING\n", nil }
+	h.tf.stateOut = "module.vpc.module.vpc.aws_vpc.this[0]\n"
+	h.tf.planJSON = `{"resource_changes":[{"address":"` + clusterAddr + `","change":{"actions":["create"]}}]}`
+	if !IsReported(h.run()) || h.tf.ran("apply") {
+		t.Fatalf("went on:\n%s", h.out.String())
+	}
+	h.mustContain("is being deleted", "wait for it to go")
+	if strings.Contains(h.out.String(), "delete-cluster") {
+		t.Errorf("told to delete a cluster already going:\n%s", h.out)
+	}
+}
+
+func TestDeployStopsWhenItCannotReadTheClusterAPlanWouldCreate(t *testing.T) {
+	h := newDeployHarness(t, 0)
+	h.activeCluster()
+	h.markUnfinished()
+	h.awsf.eksStatus = func() (string, error) { return "", errors.New("AccessDeniedException: no") }
+	h.tf.stateOut = "module.vpc.module.vpc.aws_vpc.this[0]\n"
+	h.tf.planJSON = `{"resource_changes":[{"address":"` + clusterAddr + `","change":{"actions":["create"]}}]}`
+	if !IsReported(h.run()) || h.tf.ran("apply") {
+		t.Fatalf("went on:\n%s", h.out.String())
+	}
+	h.mustContain("could not read cluster", "AccessDeniedException", "eks:DescribeCluster")
+}
+
+func TestDoomedClusterOffersStateRmOnlyToAnInstallThatNeverFinished(t *testing.T) {
+	const forced = `{"resource_changes":[{"address":"` + clusterAddr + `","action_reason":"replace_because_cannot_update","change":{"actions":["create","delete"]}}]}`
+	run := func(mark func(*deployHarness)) string {
+		h := newDeployHarness(t, 0)
+		h.activeCluster()
+		mark(h)
+		h.tf.stateOut = finishedState
+		h.tf.planJSON = forced
+		if !IsReported(h.run()) || h.tf.ran("apply") {
+			t.Fatalf("went on:\n%s", h.out.String())
+		}
+		return h.out.String()
+	}
+	if out := run((*deployHarness).markUnfinished); !strings.Contains(out, "state rm") {
+		t.Errorf("no way out for a hand import on an install that never finished:\n%s", out)
+	}
+	// Re-deploy of a finished install: the marker is carried, and a live cluster is
+	// never offered to be un-tracked.
+	redeploy := func(h *deployHarness) {
+		now := h.clock.now()
+		if err := saveDeployClock(h.in, deployClock{Started: now, EverFinished: now.Add(-time.Hour)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if out := run(redeploy); strings.Contains(out, "state rm") {
+		t.Errorf("offered to un-track a cluster on an install that has finished:\n%s", out)
+	}
+}
+
+func TestReDeployCarriesThatADeployOnceFinished(t *testing.T) {
+	h := newDeployHarness(t, 0)
+	h.markFinished()
+	before, _ := loadDeployClock(h.in)
+	h.env.markDeployStart()
+	c, ok := loadDeployClock(h.in)
+	if !ok || !c.Finished.IsZero() {
+		t.Fatalf("a re-deploy starts a new clock: %+v", c)
+	}
+	if !c.EverFinished.Equal(before.Finished) {
+		t.Errorf("EverFinished = %v, want %v", c.EverFinished, before.Finished)
+	}
+	if firstDeployNeverFinished(h.in) {
+		t.Error("a re-deploy of a finished install counts as a first deploy")
+	}
+	// And it survives a further interrupted start.
+	h.env.markDeployStart()
+	if firstDeployNeverFinished(h.in) {
+		t.Error("lost across a second start")
+	}
+}
+
+func TestDeployCreatesTheClusterWhenAWSHasNone(t *testing.T) {
+	h := newDeployHarness(t, 0)
+	h.tf.planJSON = `{"resource_changes":[{"address":"` + clusterAddr + `","change":{"actions":["create"]}}]}`
+	_ = h.run()
+	if !h.tf.ran("apply") {
+		t.Fatalf("a fresh install's plan creates the cluster and must apply:\n%s", h.out.String())
+	}
+}
+
+func TestWebLoadBalancerNameMatchesTheModule(t *testing.T) {
+	if got := webLoadBalancerName("darkplum"); got != "darkplum-web" {
+		t.Error(got)
+	}
+	if got := webLoadBalancerName("a-cluster-name-of-thirty-chars"); got != "a-cluster-name-of-thirty-web" {
+		t.Error(got)
+	}
+}
+
+func TestPlansToCreateIsOnlyAnOutrightCreate(t *testing.T) {
+	plan := func(actions string) []byte {
+		return []byte(`{"resource_changes":[{"address":"` + clusterAddr + `","change":{"actions":[` + actions + `]}}]}`)
+	}
+	for actions, want := range map[string]bool{`"create"`: true, `"create","delete"`: false, `"delete","create"`: false, `"no-op"`: false, `"update"`: false} {
+		if got := plansToCreate(plan(actions), clusterAddr); got != want {
+			t.Errorf("%s: got %v", actions, got)
+		}
+	}
+	if plansToCreate(plan(`"create"`), "module.other") || plansToCreate([]byte("nope"), clusterAddr) {
+		t.Error("another address, or an unreadable plan, is not a create")
+	}
 }
 
 func TestDeployWithNoDeployClockKeepsTheHardStopOn401(t *testing.T) {

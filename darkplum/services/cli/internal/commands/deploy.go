@@ -301,7 +301,11 @@ func (e *deployEnv) markDeployStart() {
 	if started.IsZero() {
 		started = e.timing.clock().UTC()
 	}
-	if err := saveDeployClock(e.in, deployClock{Started: started}); err != nil {
+	ever := c.EverFinished
+	if ever.IsZero() {
+		ever = c.Finished
+	}
+	if err := saveDeployClock(e.in, deployClock{Started: started, EverFinished: ever}); err != nil {
 		e.printf("%s\n", sDim("(could not record the deploy start time: "+firstLine(err.Error())+")"))
 	}
 }
@@ -1198,6 +1202,14 @@ func (e *deployEnv) planAndApply(ctx context.Context, tf tfRunner, adoptLogGroup
 				return e.stop(checkResult{name: "audit log group", status: checkFail, detail: "the plan would delete the log group kept from a previous install, and the Kubernetes audit logs in it",
 					hint: "see the plan above for what forces the replacement. To start without those logs, export what you need and delete the log group, then re-run. Nothing was applied"}, "the plan would delete the audit logs")
 			}
+		}
+	}
+	// A plan that creates the cluster while AWS already has one of that name can only
+	// end in 409, partway through an apply, and nothing later stops it: while the
+	// cluster is still CREATING it does not answer the Kubernetes checks with a 401.
+	if plansToCreate(js, clusterAddr) {
+		if err := e.stopForClusterOutsideState(); err != nil {
+			return err
 		}
 	}
 	if err := e.confirmDestructive(tf, dangerous); err != nil {

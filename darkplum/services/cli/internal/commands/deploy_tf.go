@@ -230,6 +230,29 @@ type planChange struct {
 // reasonTainted is the plan JSON's action_reason for a replacement of a tainted object.
 const reasonTainted = "replace_because_tainted"
 
+// plansToCreate says whether the plan creates addr outright (not a replacement: there
+// is then no object of it in the state). An unreadable plan says no; the caller's
+// next step reads it and reports that.
+func plansToCreate(planJSON []byte, addr string) bool {
+	var p struct {
+		ResourceChanges []struct {
+			Address string `json:"address"`
+			Change  struct {
+				Actions []string `json:"actions"`
+			} `json:"change"`
+		} `json:"resource_changes"`
+	}
+	if json.Unmarshal(planJSON, &p) != nil {
+		return false
+	}
+	for _, rc := range p.ResourceChanges {
+		if rc.Address == addr && len(rc.Change.Actions) == 1 && rc.Change.Actions[0] == "create" {
+			return true
+		}
+	}
+	return false
+}
+
 // destructiveChanges reads `terraform show -json <plan>` and lists every resource
 // the plan deletes or replaces, sorted. Anything else (create, update in place,
 // read, no-op) is not in the list.

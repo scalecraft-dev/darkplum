@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/scalecraft-dev/darkplum/cli/internal/install"
 	"github.com/scalecraft-dev/darkplum/cli/internal/runner"
 )
 
@@ -133,6 +134,14 @@ func firstInstallInProgress(e *deployEnv) bool {
 	return ok && c.Finished.IsZero()
 }
 
+// firstDeployNeverFinished is stronger: this workspace began a deploy, and no deploy
+// of this install has ever completed. A re-deploy of a finished install is not this,
+// whatever its state looks like.
+func firstDeployNeverFinished(in install.Install) bool {
+	c, ok := loadDeployClock(in)
+	return ok && c.Finished.IsZero() && c.EverFinished.IsZero()
+}
+
 // interruptedFirstInstall is true when a deploy is unfinished AND Terraform's state
 // holds the cluster but not the access entry the apply makes right after it: the
 // apply stopped in that window. A finished install always has the entry, so for it
@@ -176,6 +185,51 @@ func (e *deployEnv) unauthorizedRow(name string, err error) checkResult {
 			"(`aws eks list-access-entries --cluster-name <cluster>` shows who has one). " + e.unchanged()}
 }
 
+// webLoadBalancerName is modules/web-access's NLB name: its 32-character limit cuts
+// the install's name to 24 first.
+func webLoadBalancerName(cluster string) string {
+	if len(cluster) > 24 {
+		cluster = cluster[:24]
+	}
+	return cluster + "-web"
+}
+
+// stopForClusterOutsideState stops when AWS has a cluster of this name, for a caller
+// that has seen the state does not. Nothing darkplum can do from here is right: an
+// apply would be answered 409, the cluster may be someone else's (same name, same
+// account), and an import does not help, because it cannot carry
+// bootstrap_self_managed_addons and the plan then replaces the cluster. So it says
+// what the case is and leaves the decision. nil means AWS has no such cluster. An
+// answer it cannot read is a stop too: the alternative is a 409 partway through an apply.
+func (e *deployEnv) stopForClusterOutsideState() error {
+	const msg = "the cluster exists in AWS but not in Terraform's state"
+	status, found, err := e.eksStatus()
+	if err != nil {
+		return e.stop(checkResult{name: "cluster", status: checkFail,
+			detail: "could not read cluster " + e.rec.ClusterName + " from AWS: " + firstLine(err.Error()),
+			hint:   "Terraform's state does not hold it, so darkplum must know whether AWS does before it goes on. Needs eks:DescribeCluster. " + e.unchanged()}, "cannot read the cluster")
+	}
+	if !found {
+		return nil
+	}
+	if status == "DELETING" {
+		return e.stop(checkResult{name: "cluster", status: checkFail,
+			detail: "cluster " + e.rec.ClusterName + " is being deleted in AWS",
+			hint:   "wait for it to go and re-run. " + e.unchanged()}, "the cluster is being deleted")
+	}
+	aws := func(args ...string) string {
+		return "aws " + strings.Join(runner.ProfileArgs(e.rec.Profile, append(args, "--region", e.rec.Region)...), " ")
+	}
+	return e.stop(checkResult{name: "cluster", status: checkFail,
+		detail: fmt.Sprintf("cluster %s exists in AWS (%s) but Terraform's state does not hold it", e.rec.ClusterName, status),
+		hint: "a deploy killed while creating it (a second Ctrl-C, a lost machine) leaves this, and so does another install of the same name in this account; darkplum cannot tell which and will not touch it. " +
+			"Read what it is: `" + aws("eks", "describe-cluster", "--name", e.rec.ClusterName) + "`. " +
+			"If it came from this install's interrupted deploy, delete it (`" + aws("eks", "delete-cluster", "--name", e.rec.ClusterName) + "`) and wait for it to go. " +
+			"The same kill can leave the load balancer outside the state: look for it with `" + aws("elbv2", "describe-load-balancers", "--names", webLoadBalancerName(e.rec.ClusterName)) + "`. " +
+			"Importing the cluster does not work: an import cannot carry every setting, and the plan then replaces it. " +
+			"If it is someone else's, leave it and install under another name. " + e.unchanged()}, msg)
+}
+
 // settleInterruptedInstall runs after Terraform's state has been read and before
 // anything is planned. It confirms a postponed refusal, and makes an interrupted
 // first install's cluster usable again.
@@ -184,6 +238,11 @@ func (e *deployEnv) settleInterruptedInstall(ctx context.Context, tf tfRunner, s
 	e.firstInstallInterrupted = interrupted
 	if d := e.deferredKube; d != nil {
 		if !interrupted {
+			if firstInstallInProgress(e) && !state[clusterAddr] {
+				if err := e.stopForClusterOutsideState(); err != nil {
+					return err
+				}
+			}
 			why := "Terraform's state does not show a cluster created without this identity's access entry (no cluster in the state, or no unfinished deploy), so the rejection is not explained by an interrupted first install"
 			if state[creatorAccessEntryAddr] {
 				why = "Terraform's state already holds this install's access entry, so this is not the case of an access entry that was never made"
@@ -404,7 +463,13 @@ func (e *deployEnv) refuseDoomedReplacement(tf tfRunner, d planChange, why strin
 	case d.Tainted:
 		hint = "It is tainted: an apply was interrupted while creating it. If it is healthy in AWS, clear the taint and re-run: " + untaint
 	default:
-		hint = "Something in the configuration forces a new one: see the plan above for what changed, undo that change, and re-run"
+		hint = "Something forces a new one: the plan above marks it `# forces replacement`. If a setting changed, undo that change and re-run"
+		if d.Address == clusterAddr {
+			// Never offered to an install that has finished: that un-tracks a live cluster.
+			if firstDeployNeverFinished(e.in) {
+				hint += ". If nothing changed and this cluster was imported into the state by hand, an import cannot carry every setting: take it out again (" + tf.Command("state", "rm", d.Address) + ") and re-run, which says what to do with a cluster outside the state"
+			}
+		}
 	}
 	return e.stop(checkResult{name: "plan", status: checkFail,
 		detail: "replacing " + d.Address + " cannot work: " + why + ", and Terraform creates the new one before it destroys the old one, so AWS refuses the second",

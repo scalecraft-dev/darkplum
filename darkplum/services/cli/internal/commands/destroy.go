@@ -222,8 +222,8 @@ func (e *destroyEnv) run(ctx context.Context) (err error) {
 				hint: "check backend.hcl: destroy will not delete resources it cannot show belong to " + rec.ClusterName + ". Nothing was deleted"}, "the state is not this install's")
 		}
 		unfinished = true
-		e.row(checkResult{name: "terraform state", status: checkWarn, detail: fmt.Sprintf("%d resources and no outputs: an install whose first deploy never finished", managed),
-			hint: "it can be destroyed on a second, separate confirmation (below), or finished with `darkplum deploy` first"})
+		e.row(checkResult{name: "terraform state", status: checkWarn, detail: fmt.Sprintf("%d resources and no outputs: an install whose first deploy never finished, or whose destroy failed partway", managed),
+			hint: "it can be destroyed on a second, separate confirmation (below); if it never finished deploying, `darkplum deploy` can finish it first"})
 	} else {
 		e.row(checkResult{name: "terraform state", status: checkPass, detail: fmt.Sprintf("%d resources, belonging to %s", managed, rec.ClusterName)})
 	}
@@ -248,21 +248,30 @@ func (e *destroyEnv) run(ctx context.Context) (err error) {
 			//     group gone and entry gone" is an interrupted destroy whose Kubernetes
 			//     phase already ran. An install that never finished never got far enough to
 			//     put anything in Kubernetes.
-			//   - No entry, outputs present, log group still in the state: the shape of a
-			//     FINISHED-looking install, which is also what a first deploy interrupted
-			//     after its outputs but before the entry looks like. Not told apart from a
-			//     lost entry here, so a stop, and the way out is `darkplum deploy`.
+			//   - No entry, and this workspace's deploy clock says no deploy of this install
+			//     has ever completed: a first deploy interrupted before the entry, so nothing
+			//     reached Kubernetes. "No outputs" alone does not catch that: the outputs that
+			//     depend on nothing still to be built are written with the first resources, so
+			//     a real one has them. An interrupted re-deploy of a finished install is NOT
+			//     this: its cluster holds workloads, and it stops below.
+			//   - No entry, outputs present, log group still in the state, and no such
+			//     record here (another machine, or a deploy that has completed): the shape
+			//     of a finished install that lost its entry. A stop, and the way out is
+			//     `darkplum deploy`.
 			if kubeUnauthorized(err) {
 				switch {
 				case state[creatorAccessEntryAddr]:
 					return e.stop(checkResult{name: "cluster survey", status: checkFail, detail: "the cluster rejected this identity's credentials: " + firstLine(err.Error()),
 						hint: "Terraform's state holds this install's access entry, so the identity has lost its access, or is not the one that installed it. " +
 							"Nothing was deleted; use the identity that installed the cluster"}, "the cluster rejects this identity")
-				case unfinished || !state[logGroupAddr]:
-					e.row(checkResult{name: "cluster survey", status: checkWarn, detail: "the cluster rejects this identity's credentials, and Terraform's state holds no access entry for it",
-						hint: "SKIPPING the Kubernetes phase, so these are NOT done: the check for load balancers and volumes outside the Darkplum namespaces that would keep the VPC from being deleted, " +
-							"the cluster's own release record (the downgrade guard), and the deletion of Darkplum's load balancer Services and volume claims. " +
-							"What the cluster's controllers made may therefore block the VPC's deletion; the check for what is left behind runs at the end, and also if the destroy fails"})
+				case unfinished || !state[logGroupAddr] || firstDeployNeverFinished(e.in):
+					hint := "SKIPPING the Kubernetes phase, so these are NOT done: the check for load balancers and volumes outside the Darkplum namespaces that would keep the VPC from being deleted, " +
+						"the cluster's own release record (the downgrade guard), and the deletion of Darkplum's load balancer Services and volume claims. " +
+						"What the cluster's controllers made may therefore block the VPC's deletion; the check for what is left behind runs at the end, and also if the destroy fails"
+					if !state[clusterAddr] {
+						hint += ". The cluster itself is not in Terraform's state, so this destroy does not delete it and it will keep the VPC from being deleted: read what it is (`aws eks describe-cluster`) and, if it is this install's, delete it first. The load balancer " + webLoadBalancerName(rec.ClusterName) + " can be outside the state in the same way"
+					}
+					e.row(checkResult{name: "cluster survey", status: checkWarn, detail: "the cluster rejects this identity's credentials, and Terraform's state holds no access entry for it", hint: hint})
 					e.kubeSkipped = true
 					kc = nil
 				default:
@@ -303,6 +312,7 @@ func (e *destroyEnv) run(ctx context.Context) (err error) {
 	case errors.Is(cerr2, errClusterNotFound):
 		e.row(checkResult{name: "cluster", status: checkWarn, detail: "gone: " + rec.ClusterName + " does not exist in " + rec.Region,
 			hint: "SKIPPING the Kubernetes phase. Load balancers and volumes its controllers created cannot be cleaned up and may block the VPC's deletion; check the console if the destroy stalls"})
+		e.kubeSkipped = true
 	default:
 		return e.stop(row, "cannot validate the cluster; nothing was deleted")
 	}
@@ -445,7 +455,7 @@ func (e *destroyEnv) confirmName() error {
 // resources and no outputs. --confirm does not answer it.
 func (e *destroyEnv) confirmUnfinished() error {
 	want := e.rec.ClusterName
-	e.row(checkResult{name: "unfinished install", status: checkWarn, detail: "the state has resources but no outputs: this install never finished deploying. Destroy deletes what is in it"})
+	e.row(checkResult{name: "unfinished install", status: checkWarn, detail: "the state has resources but no outputs: this install never finished deploying, or an earlier destroy failed partway. Destroy deletes what is in it"})
 	if e.flags.ConfirmUnfinished != "" {
 		if e.flags.ConfirmUnfinished != want {
 			return e.stop(checkResult{name: "confirmation", status: checkFail, detail: fmt.Sprintf("--confirm-unfinished %q is not this install's cluster (%s)", e.flags.ConfirmUnfinished, want),
@@ -455,10 +465,10 @@ func (e *destroyEnv) confirmUnfinished() error {
 		return nil
 	}
 	if !e.interactive {
-		return e.stop(checkResult{name: "confirmation", status: checkFail, detail: "this install never finished deploying; --confirm does not cover it",
-			hint: "pass --confirm-unfinished " + want + " as well, or finish it with `darkplum deploy` first. Nothing was deleted"}, "not confirmed")
+		return e.stop(checkResult{name: "confirmation", status: checkFail, detail: "this install is unfinished (it never finished deploying, or an earlier destroy failed partway); --confirm does not cover it",
+			hint: "pass --confirm-unfinished " + want + " as well; if it never finished deploying, `darkplum deploy` can finish it first. Nothing was deleted"}, "not confirmed")
 	}
-	if got := strings.TrimSpace(e.prompt("This install never finished deploying. Type the cluster name again (" + want + ") to destroy what it has")); got != want {
+	if got := strings.TrimSpace(e.prompt("This install is unfinished. Type the cluster name again (" + want + ") to destroy what it has")); got != want {
 		return e.stop(checkResult{name: "confirmation", status: checkFail, detail: "the name typed does not match",
 			hint: "nothing was deleted. Or finish the install with `darkplum deploy` first"}, "not confirmed")
 	}
@@ -723,6 +733,10 @@ func (e *destroyEnv) kubePhase(ctx context.Context, kc *kube.Client) error {
 // the command that deletes each. It deletes nothing.
 func (e *destroyEnv) report(tf tfRunner) error {
 	rec := e.rec
+	// The install is gone: a later deploy here is a first deploy again.
+	if err := os.Remove(filepath.Join(e.in.Dir(), deployClockFile)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		e.row(checkResult{name: "deploy clock", status: checkWarn, detail: firstLine(err.Error())})
+	}
 	e.phase("Left behind on purpose (Darkplum deletes none of these)")
 	any := false
 	item := func(what, detail string, cmds ...string) {
@@ -931,7 +945,22 @@ func (e *destroyEnv) leftBehindAfterFailure() {
 	if len(unverified) > 0 {
 		e.printf("  %s\n", sWarn(fmt.Sprintf("! %d lookup(s) failed, so there may be more: %s", len(unverified), strings.Join(unverified, "; "))))
 	}
-	if len(found) == 0 && len(unverified) == 0 {
+	// The install's own web load balancer has none of those tags. It is out of Terraform's
+	// reach when a killed apply left it outside the state, and then nothing else names it.
+	rec := e.rec
+	web := webLoadBalancerName(rec.ClusterName)
+	lb, err := e.aws("aws", runner.ProfileArgs(rec.Profile, "elbv2", "describe-load-balancers", "--names", web, "--region", rec.Region, "--query", "LoadBalancers[].LoadBalancerName", "--output", "text")...)
+	webFound := false
+	switch {
+	case err == nil && strings.TrimSpace(lb) == web:
+		webFound = true
+		e.printf("  %s load balancer %s\n", sFail("✗"), web)
+		e.printf("\n  %s\n", sDim("The install's web load balancer still exists, and it holds subnets and a security group. If `terraform state list` does not show it, Terraform cannot delete it: delete it yourself, then re-run `darkplum destroy`."))
+	case err != nil && !strings.Contains(err.Error(), "LoadBalancerNotFound"):
+		e.printf("  %s\n", sWarn("! could not check for load balancer "+web+": "+firstLine(err.Error())))
+		unverified = append(unverified, web)
+	}
+	if len(found) == 0 && len(unverified) == 0 && !webFound {
 		e.printf("  nothing tagged for the cluster was found\n")
 	}
 }

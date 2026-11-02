@@ -38,6 +38,9 @@ type deployClock struct {
 	Started   time.Time `json:"started"`
 	Finished  time.Time `json:"finished,omitzero"`
 	FirstChat time.Time `json:"first_chat,omitzero"`
+	// EverFinished is when a deploy of this install first completed. Finished alone
+	// cannot say: every re-deploy clears it. It lives until destroy removes the clock.
+	EverFinished time.Time `json:"ever_finished,omitzero"`
 }
 
 const deployClockFile = "deploy-clock.json"
