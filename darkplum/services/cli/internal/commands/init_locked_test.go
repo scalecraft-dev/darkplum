@@ -71,7 +71,7 @@ func TestLockedFields(t *testing.T) {
 // Path 1: Start over, interactively, asking for another region.
 func TestExistingInstallRegionCannotChangeOnStartOver(t *testing.T) {
 	dir, in, rec := liveInstall(t)
-	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Region: "eu-west-1", Mode: "bedrock", Domain: "acme.com"}
+	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", Region: "eu-west-1", Mode: "bedrock", Domain: "acme.com"}
 	cloud := newFakeCloud()
 	env, out := testEnv(t, cloud, nil, "2\n\n\n\n")
 	err := c.execute(env)
@@ -163,7 +163,7 @@ func TestReRunNeverTreatsTheInstallsOwnResourcesAsACollision(t *testing.T) {
 	cloud.objects = map[string]int{lockedBucket + "/" + rec.Backend.Key: 40}
 	cloud.buckets = []stateBucket{{Name: lockedBucket}}
 	// Start over, interactively. Any rename prompt would eat the next answers.
-	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Mode: "bedrock", Domain: "acme.com", Force: false}
+	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", Mode: "bedrock", Domain: "acme.com", Force: false}
 	env, out := testEnv(t, cloud, nil, "2\n\n\n\n\n")
 	err := c.execute(env)
 	if strings.Contains(out.String(), "Cluster name") || strings.Contains(out.String(), "already keeps state here") {

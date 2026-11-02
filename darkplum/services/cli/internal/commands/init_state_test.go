@@ -63,7 +63,7 @@ func TestInitStateLiveInstallBeatsNameCollision(t *testing.T) {
 	for _, answers := range []string{"-", "\n\n"} { // --yes, and interactive (networks default, router default; a rename prompt would hit EOF)
 		dir := t.TempDir()
 		env, out := testEnv(t, cloud, nil, answers)
-		c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Region: "us-east-2", Mode: "bedrock", Profile: "acme", Domain: "acme.com", Yes: answers == "-"}
+		c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", Region: "us-east-2", Mode: "bedrock", Profile: "acme", Domain: "acme.com", Yes: answers == "-"}
 		err := c.execute(env)
 		if err == nil || errors.Is(err, errAborted) || !strings.Contains(err.Error(), "an install already keeps state at s3://"+bucketN("bf3057")+"/"+legacyStateKey) {
 			t.Fatalf("%q: want restore stop, got %v\n%s", answers, err, out)
@@ -157,7 +157,7 @@ func TestInitStateLiveInstallFailsClosed(t *testing.T) {
 		cloud.objectsFull = map[string]stateContents{live + "/darkplum/aws/darkplum-2/terraform.tfstate": {Resources: 5}}
 		dir := t.TempDir()
 		env, out := testEnv(t, cloud, nil, "\n\ndarkplum-2\n\n")
-		c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Region: "us-east-2", Mode: "bedrock", Profile: "acme", Domain: "acme.com"}
+		c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", Region: "us-east-2", Mode: "bedrock", Profile: "acme", Domain: "acme.com"}
 		err := c.execute(env)
 		if err == nil || !strings.Contains(err.Error(), "an install already keeps state at s3://"+live+"/darkplum/aws/darkplum-2/terraform.tfstate") {
 			t.Fatalf("renamed cluster's live install missed: %v\n%s", err, out)
@@ -369,7 +369,7 @@ func TestInitStateSeveralBuckets(t *testing.T) {
 		dir := t.TempDir()
 		// networks (default), bucket 2, final confirm
 		env, out := testEnv(t, several(), nil, "\n\n2\n\n")
-		c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Region: "us-east-2", Mode: "bedrock", Profile: "acme", Domain: "acme.com"}
+		c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", Region: "us-east-2", Mode: "bedrock", Profile: "acme", Domain: "acme.com"}
 		if err := c.execute(env); err != nil {
 			t.Fatalf("%v\n%s", err, out)
 		}
@@ -522,7 +522,7 @@ func TestInitStateKeyCollision(t *testing.T) {
 	// Interactive: another name is asked for and lands in both files.
 	dir = notFresh(t)
 	env, out = testEnv(t, taken(42), nil, "\n\ndarkplum-2\n\n")
-	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Region: "us-east-2", Mode: "bedrock", Profile: "acme", Domain: "acme.com"}
+	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", Region: "us-east-2", Mode: "bedrock", Profile: "acme", Domain: "acme.com"}
 	if err := c.execute(env); err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}

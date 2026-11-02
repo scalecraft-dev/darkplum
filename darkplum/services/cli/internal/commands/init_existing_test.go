@@ -30,7 +30,7 @@ func existingDir(t *testing.T, tf string) (dir, path string) {
 }
 
 func existingCmd(dir string) *InitCmd {
-	return &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1}
+	return &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum"}
 }
 
 // The words a user must never be pointed at.
@@ -185,7 +185,7 @@ func TestInitChangeTheAddressReplacesIt(t *testing.T) {
 
 func TestInitStartOverStillAsksEverything(t *testing.T) {
 	dir, path := existingDir(t, bedrockInstallTF)
-	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Region: "us-east-2", Mode: "bedrock", Profile: "acme", Domain: "acme.com"}
+	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", Region: "us-east-2", Mode: "bedrock", Profile: "acme", Domain: "acme.com"}
 	env, _ := testEnv(t, newFakeCloud(), nil, "2\n\n\n") // Start over, networks, the overwrite question defaults to No
 	if err := c.execute(env); !errors.Is(err, errAborted) {
 		t.Fatalf("err = %v", err)
@@ -225,7 +225,7 @@ func TestInitPicksAmongExistingInstalls(t *testing.T) {
 
 	t.Run("review the existing one", func(t *testing.T) {
 		env, out := testEnv(t, newFakeCloud(), nil, "1\n\n") // Review and change acme, then Nothing
-		c := &InitCmd{Cloud: "aws", ClusterName: "darkplum", GPUCount: 1}
+		c := &InitCmd{Cloud: "aws", ClusterName: "darkplum"}
 		if err := c.execute(env); err != nil {
 			t.Fatalf("%v\n%s", err, out)
 		}
@@ -237,7 +237,7 @@ func TestInitPicksAmongExistingInstalls(t *testing.T) {
 	})
 	t.Run("create another", func(t *testing.T) {
 		env, _ := testEnv(t, newFakeCloud(), nil, "2\n") // Create another install, then the input ends
-		c := &InitCmd{Cloud: "aws", ClusterName: "second", GPUCount: 1, Profile: "acme"}
+		c := &InitCmd{Cloud: "aws", ClusterName: "second", Profile: "acme"}
 		if err := c.execute(env); !errors.Is(err, errAborted) {
 			t.Fatalf("err = %v", err)
 		}
@@ -247,14 +247,14 @@ func TestInitPicksAmongExistingInstalls(t *testing.T) {
 	})
 	t.Run("--install names it", func(t *testing.T) {
 		env, out := testEnv(t, newFakeCloud(), nil, "\n") // straight to the settings, then Nothing
-		c := &InitCmd{Cloud: "aws", ClusterName: "darkplum", GPUCount: 1, installName: "acme"}
+		c := &InitCmd{Cloud: "aws", ClusterName: "darkplum", installName: "acme"}
 		if err := c.execute(env); err != nil || !strings.Contains(out.String(), "This install, as it is now") {
 			t.Fatalf("%v\n%s", err, out)
 		}
 	})
 	t.Run("the cluster name is an install", func(t *testing.T) {
 		env, out := testEnv(t, newFakeCloud(), nil, "\n")
-		c := &InitCmd{Cloud: "aws", ClusterName: "acme", GPUCount: 1}
+		c := &InitCmd{Cloud: "aws", ClusterName: "acme"}
 		if err := c.execute(env); err != nil || strings.Contains(out.String(), "You already have an install") {
 			t.Fatalf("%v\n%s", err, out)
 		}

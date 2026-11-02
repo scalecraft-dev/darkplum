@@ -194,7 +194,7 @@ func TestInitAddsWebAddressToExistingInstall(t *testing.T) {
 	cloud := newFakeCloud()
 	// Add one (1), domain, networks (default = the install's VPC), confirm.
 	env, out := testEnv(t, cloud, nil, "1\nAcme.com.\n\n\n")
-	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1}
+	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum"}
 	if err := c.execute(env); err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}
@@ -276,7 +276,7 @@ func TestInitReRunKeepsTheWebAddress(t *testing.T) {
 					// Domain (Enter keeps it), networks (Enter keeps them), save.
 					env, o := testEnv(t, cloud, nil, "\n\n\n\n")
 					env.now = time.Now
-					c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Profile: "acme", Region: "us-east-2", Mode: "bedrock", Force: true}
+					c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", Profile: "acme", Region: "us-east-2", Mode: "bedrock", Force: true}
 					err = c.execute(env)
 					out = o.String()
 				}
@@ -308,7 +308,7 @@ func TestInitAddingTheAddressRecordsAZoneItCreated(t *testing.T) {
 	// Add one (1), domain, networks, confirm the zone creation
 	env, out := testEnv(t, cloud, nil, "1\nacme.com\n\n\n")
 	env.lookupNS = func(string) ([]string, error) { return cloud.hzones["darkplum.acme.com"].NameServers, nil }
-	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1}
+	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum"}
 	if err := c.execute(env); err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}
@@ -330,7 +330,7 @@ func TestInitAddingTheAddressRecordsAZoneItCreated(t *testing.T) {
 func TestInitAddingTheAddressDoesNotRecordASuppliedZone(t *testing.T) {
 	dir, in, _ := liveInstall(t)
 	env, out := testEnv(t, newFakeCloud(), nil, "1\nacme.com\n\n\n")
-	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1}
+	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum"}
 	if err := c.execute(env); err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}

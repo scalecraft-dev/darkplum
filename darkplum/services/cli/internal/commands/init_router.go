@@ -2,6 +2,7 @@ package commands
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/scalecraft-dev/darkplum/cli/internal/install"
 )
@@ -41,13 +42,27 @@ func (c *InitCmd) changeRouter(env *initEnv, dir string, rec install.Record) err
 	}
 	if rec.Name == "" {
 		if rec, err = in.Load(); err != nil {
-			return env.fail("install settings", firstLine(err.Error()), "choose Start over to answer the questions again", "cannot read the install record")
+			return env.fail("install settings", firstLine(err.Error()), restartHint(env), "cannot read the install record")
 		}
 	}
 	on := rec.SemanticRouter
 	switch c.SemanticRouter {
 	case "on":
 		on = true
+		switch {
+		case rec.SemanticRouter:
+		case env.interactive:
+			// At a terminal the flag only sets the default: the question carries the
+			// disclosure about prompt text and egress, and is still asked.
+			if on, err = env.prompt.Confirm(routerPitch, true); err != nil {
+				return err
+			}
+		default:
+			// Under --yes the flag is the consent: it names the setting, the help and
+			// README say what it does, and a fresh install takes it the same way. The
+			// disclosure is printed, so it is in the log of whoever ran it.
+			fmt.Fprintf(w, "  %s\n", sDim("Semantic router: "+strings.TrimPrefix(routerPitch, "Install the semantic router? ")+"."))
+		}
 	case "off":
 		on = false
 	default:
@@ -70,6 +85,9 @@ func (c *InitCmd) changeRouter(env *initEnv, dir string, rec install.Record) err
 	word := "off; deploy removes it"
 	if on {
 		word = "on; deploy installs it"
+	}
+	if c.batch {
+		return nil
 	}
 	fmt.Fprintf(w, "\n%s\n", sSuccess("✓ semantic router "+word+"; every other setting is unchanged"))
 	fmt.Fprintf(w, "  Next: %s to apply it\n", sCmd("darkplum deploy"))

@@ -29,11 +29,11 @@ type InitCmd struct {
 	Cloud         string `help:"Target cloud provider." enum:"aws,gcp" default:"aws"`
 	Profile       string `help:"AWS profile to install with. Prompted when omitted; leave empty for the default credential chain." default:""`
 	Region        string `help:"AWS region for the cluster. Defaults to the profile's region." default:""`
-	Mode          string `help:"How models run: bedrock (cloud-managed models only, no GPU) or gpu (adds a self-hosted model)." enum:"bedrock,gpu," default:""`
+	Mode          string `help:"How models run: bedrock (cloud-managed models only, no GPU) or gpu (adds a self-hosted model). On an existing install, --mode bedrock removes its GPU nodes and self-hosted model when deployed, even with --yes." enum:"bedrock,gpu," default:""`
 	Model         string `help:"Self-hosted Hugging Face model id (gpu mode). Catalog ids use a reviewed pinned revision." default:""`
 	ModelRevision string `help:"Full 40-character commit SHA of --model. Required with --offline for a model outside the catalog." name:"model-revision" default:""`
 	GPUInstance   string `help:"GPU instance type (gpu mode). Defaults to the one the model needs." name:"gpu-instance" default:""`
-	GPUCount      int    `help:"Number of GPU nodes (gpu mode); each self-hosted model takes one." name:"gpu-count" default:"1"`
+	GPUCount      int    `help:"Number of GPU nodes, 1 to 8 (gpu mode; default 1); each self-hosted model takes one. An existing install keeps its count unless this is given." name:"gpu-count"`
 	ClusterName   string `help:"EKS cluster name; prefix of related resources." name:"cluster-name" default:"darkplum"`
 	Throwaway     bool   `help:"Test install: one-day backups, no deletion protection, no final snapshot. Never for real data."`
 	Offline       bool   `help:"Make no Hugging Face call. A model outside the catalog then needs --model-revision."`
@@ -45,6 +45,15 @@ type InitCmd struct {
 
 	// installName is the workspace --adopt creates: the global --install, else the cluster name.
 	installName string
+	// gpuCountSet says --gpu-count was given (set by validateLocal), so an existing
+	// install's node count is kept unless it was asked for.
+	gpuCountSet bool
+	// keepModel: an existing install's self-hosted model is reused as pinned (a
+	// change of count or instance only), with no catalog or Hugging Face lookup.
+	keepModel bool
+	// batch is set while several flag changes apply together: each step then
+	// leaves the closing summary to applyFlagChanges.
+	batch bool
 
 	Domain         string `help:"A domain you control. The team reaches Darkplum privately at https://darkplum.<domain> (the name is public, its address is not). Required with --yes." default:""`
 	Hostname       string `help:"Name the team opens instead of darkplum.<domain>; must be inside --domain." default:""`
@@ -52,7 +61,7 @@ type InitCmd struct {
 	CertificateARN string `name:"certificate-arn" help:"Use this existing ACM certificate (this account and region) instead of issuing one." default:""`
 	AllowedCIDRs   string `name:"allowed-cidrs" help:"Comma-separated IPv4 networks allowed to reach the address (VPN, office). Default: the VPC." default:""`
 
-	SemanticRouter string `name:"semantic-router" enum:"on,off," help:"Run the optional in-cluster intent classifier (the vLLM Semantic Router) that routed aliases can use: on or off. Asked when omitted; an install keeps its current setting under --yes. Applied by darkplum deploy." default:""`
+	SemanticRouter string `name:"semantic-router" enum:"on,off," help:"Run the optional in-cluster intent classifier (the vLLM Semantic Router) that routed aliases can use: on or off. Asked when omitted; on an existing install the flag changes just this setting (no --force); without it, --yes keeps the current setting. Applied by darkplum deploy." default:""`
 }
 
 // initCloud is the per-cloud half of init: identity, zones, quota, name
@@ -201,6 +210,13 @@ func (c *InitCmd) validateLocal(env *initEnv) error {
 	if err := validateClusterName(c.ClusterName); err != nil {
 		return env.fail("cluster name", c.ClusterName, "use 2-40 lowercase letters, digits and single hyphens, starting with a letter (e.g. darkplum-trial)", "invalid --cluster-name")
 	}
+	// 0 is the unset value (it is not a legal count): the default is 1, and an
+	// existing install keeps its own count unless the flag was given.
+	if c.GPUCount == 0 {
+		c.GPUCount = 1
+	} else {
+		c.gpuCountSet = true
+	}
 	if c.GPUCount < 1 || c.GPUCount > 8 {
 		return env.fail("gpu count", strconv.Itoa(c.GPUCount), "--gpu-count takes 1 to 8", "invalid --gpu-count")
 	}
@@ -293,12 +309,20 @@ func (c *InitCmd) execute(env *initEnv) error {
 		}
 	}
 
-	// Running init again on an install shows its settings and asks what to change.
-	// Interactive only: a script re-running init (--yes) keeps today's behaviour, a
-	// full rewrite guarded by --force.
-	if raw := existingTFVars(filepath.Join(dir, "terraform.tfvars")); env.interactive && raw != nil && !c.Force {
-		if done, err := c.existingInstall(env, dir, raw); done {
-			return err
+	// Running init again on an install: a setting flag changes that one setting
+	// (interactive or --yes, no --force, every other setting kept); otherwise it
+	// shows the settings and asks what to change. The menu is interactive only: a
+	// script re-running init (--yes) with no setting flag keeps today's behaviour, a
+	// full rewrite guarded by --force. --force always means the full interview.
+	if raw := existingTFVars(filepath.Join(dir, "terraform.tfvars")); raw != nil && !c.Force {
+		c.dropRestatedFlags(raw)
+		if c.changesSettings(raw) {
+			return c.applyFlagChanges(env, dir, raw)
+		}
+		if env.interactive {
+			if done, err := c.existingInstall(env, dir, raw); done {
+				return err
+			}
 		}
 	}
 

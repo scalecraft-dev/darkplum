@@ -18,7 +18,7 @@ func TestFreshInitCreatesTheWorkspaceNotCheckoutFiles(t *testing.T) {
 	t.Chdir(cwd)
 	cloud := newFakeCloud()
 	env, out := testEnv(t, cloud, nil, "-")
-	c := &InitCmd{Cloud: "aws", Yes: true, ClusterName: "acme", GPUCount: 1, Domain: "acme.com", Profile: "acme"}
+	c := &InitCmd{Cloud: "aws", Yes: true, ClusterName: "acme", Domain: "acme.com", Profile: "acme"}
 	if err := c.execute(env); err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}
@@ -62,7 +62,7 @@ func TestInitRerunKeepsTheRecordsHistory(t *testing.T) {
 	t.Chdir(t.TempDir())
 	run := func(extra func(*InitCmd)) {
 		env, out := testEnv(t, newFakeCloud(), nil, "-")
-		c := &InitCmd{Cloud: "aws", Yes: true, ClusterName: "acme", GPUCount: 1, Domain: "acme.com", Profile: "acme", Force: true}
+		c := &InitCmd{Cloud: "aws", Yes: true, ClusterName: "acme", Domain: "acme.com", Profile: "acme", Force: true}
 		if extra != nil {
 			extra(c)
 		}
@@ -102,7 +102,7 @@ func TestInitInACheckoutWithAMakefileEraRootAsksForAdopt(t *testing.T) {
 			t.Chdir(cwd)
 			cloud := newFakeCloud()
 			env, out := testEnv(t, cloud, nil, "-")
-			c := &InitCmd{Cloud: "aws", Yes: true, ClusterName: "acme", GPUCount: 1, Domain: "acme.com", Profile: "acme"}
+			c := &InitCmd{Cloud: "aws", Yes: true, ClusterName: "acme", Domain: "acme.com", Profile: "acme"}
 			if err := c.execute(env); err == nil || !strings.Contains(out.String(), "init --adopt") {
 				t.Fatalf("want a refusal pointing at --adopt, got %v\n%s", err, out)
 			}

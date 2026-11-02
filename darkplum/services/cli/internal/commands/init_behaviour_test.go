@@ -73,7 +73,7 @@ func TestInitLocalStateBlocksBackendUnderYes(t *testing.T) {
 	}
 	// Interactive and confirmed: proceeds. Answers: networks (default), confirm local state (y), final confirm.
 	env, _ = testEnv(t, newFakeCloud(), nil, "\n\ny\n\n")
-	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Region: "us-east-2", Mode: "bedrock", Profile: "acme", Domain: "acme.com"}
+	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", Region: "us-east-2", Mode: "bedrock", Profile: "acme", Domain: "acme.com"}
 	if err := c.execute(env); err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +128,7 @@ func TestInitRegionRows(t *testing.T) {
 	// Interactive: re-asks the region and carries on.
 	cloud2 := &regionFlaky{fakeCloud: newFakeCloud(), bad: "af-south-1"}
 	env, out = testEnv(t, cloud2, nil, "af-south-1\nus-east-2\n1\n\n\n\n")
-	c := &InitCmd{Cloud: "aws", Dir: t.TempDir(), ClusterName: "darkplum", GPUCount: 1, Profile: "acme", Domain: "acme.com"}
+	c := &InitCmd{Cloud: "aws", Dir: t.TempDir(), ClusterName: "darkplum", Profile: "acme", Domain: "acme.com"}
 	if err := c.execute(env); err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}
@@ -151,7 +151,7 @@ func (r *regionFlaky) CheckRegion(region string) error {
 
 func TestInitRegionNoteOnlyWhenDefaultAccepted(t *testing.T) {
 	env, out := testEnv(t, newFakeCloud(), nil, "\n1\n\n\n\n") // Enter accepts the profile region
-	c := &InitCmd{Cloud: "aws", Dir: t.TempDir(), ClusterName: "darkplum", GPUCount: 1, Profile: "acme", Domain: "acme.com"}
+	c := &InitCmd{Cloud: "aws", Dir: t.TempDir(), ClusterName: "darkplum", Profile: "acme", Domain: "acme.com"}
 	if err := c.execute(env); err != nil {
 		t.Fatal(err)
 	}
@@ -160,7 +160,7 @@ func TestInitRegionNoteOnlyWhenDefaultAccepted(t *testing.T) {
 	}
 	cloud := newFakeCloud()
 	env, out = testEnv(t, cloud, nil, "eu-west-1\n1\n\n\n\n")
-	c = &InitCmd{Cloud: "aws", Dir: t.TempDir(), ClusterName: "darkplum", GPUCount: 1, Profile: "acme", Domain: "acme.com"}
+	c = &InitCmd{Cloud: "aws", Dir: t.TempDir(), ClusterName: "darkplum", Profile: "acme", Domain: "acme.com"}
 	cloud.zones = []string{"eu-west-1a", "eu-west-1b"}
 	if err := c.execute(env); err != nil {
 		t.Fatal(err)
@@ -229,7 +229,7 @@ func TestInitDryRunNextLineAndPreChecks(t *testing.T) {
 
 func TestInitModeChoicesAreAlignedWithCosts(t *testing.T) {
 	env, out := testEnv(t, newFakeCloud(), nil, "1\n\n\n\n")
-	c := &InitCmd{Cloud: "aws", Dir: t.TempDir(), ClusterName: "darkplum", GPUCount: 1, Profile: "acme", Region: "us-east-2", Domain: "acme.com"}
+	c := &InitCmd{Cloud: "aws", Dir: t.TempDir(), ClusterName: "darkplum", Profile: "acme", Region: "us-east-2", Domain: "acme.com"}
 	if err := c.execute(env); err != nil {
 		t.Fatal(err)
 	}
@@ -250,7 +250,7 @@ func TestInitAbortIsReportedOnce(t *testing.T) {
 		t.Error("errAborted must be silent in main")
 	}
 	env, out := testEnv(t, newFakeCloud(), nil, "")
-	c := &InitCmd{Cloud: "aws", Dir: t.TempDir(), ClusterName: "darkplum", GPUCount: 1, Profile: "acme"}
+	c := &InitCmd{Cloud: "aws", Dir: t.TempDir(), ClusterName: "darkplum", Profile: "acme"}
 	_ = c.execute(env)
 	if strings.Count(out.String(), "nothing was written") != 0 {
 		t.Error("execute must leave the abort line to Run")

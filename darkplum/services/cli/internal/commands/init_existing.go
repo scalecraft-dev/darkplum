@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 
@@ -71,7 +72,7 @@ func (c *InitCmd) existingInstall(env *initEnv, dir string, raw map[string]strin
 	w := env.out
 	tf, err := readTFVars(filepath.Join(dir, "terraform.tfvars"))
 	if err != nil {
-		return true, env.fail("install settings", firstLine(err.Error()), "choose Start over to answer the questions again", "cannot read the install's settings")
+		return true, env.fail("install settings", firstLine(err.Error()), restartHint(env), "cannot read the install's settings")
 	}
 	var rec install.Record
 	if in, oerr := install.OpenDir(dir, c.ClusterName); oerr == nil {
@@ -156,6 +157,15 @@ func describeInstall(w interface{ Write([]byte) (int, error) }, name string, tf 
 	fmt.Fprintln(w)
 }
 
+// restartHint says how to answer the questions again: a menu choice at a
+// terminal, --force for a script.
+func restartHint(env *initEnv) string {
+	if env.interactive {
+		return "choose Start over to answer the questions again"
+	}
+	return "run `darkplum init` at a terminal and choose Start over (--force re-asks everything with fresh defaults, a GPU install included: restate every setting, e.g. --mode gpu --model … --gpu-count …)"
+}
+
 func orDefault(v, d string) string {
 	if v == "" {
 		return d
@@ -170,9 +180,12 @@ func orDefault(v, d string) string {
 func (c *InitCmd) changeHosting(env *initEnv, dir string, tf tfvarsInfo) error {
 	w := env.out
 	if tf.Region == "" || len(tf.AccountIDs) == 0 {
-		return env.fail("install settings", "no region or account", "choose Start over to answer the questions again", "the install's settings are incomplete")
+		return env.fail("install settings", "no region or account", restartHint(env), "the install's settings are incomplete")
 	}
 	s := &settings{profile: tf.Profile, region: tf.Region, gpuCount: c.GPUCount}
+	if !c.gpuCountSet && tf.GPUDesired > 0 && !env.interactive {
+		s.gpuCount = tf.GPUDesired // a script that did not name a count keeps the install's
+	}
 	record := func(r checkResult) {
 		printCheckTo(w, r)
 		s.checks = append(s.checks, r)
@@ -198,6 +211,9 @@ func (c *InitCmd) changeHosting(env *initEnv, dir string, tf tfvarsInfo) error {
 	if mode == "" && c.Model != "" {
 		mode = "gpu"
 	}
+	if mode == "" && (c.gpuCountSet || c.GPUInstance != "" || c.ModelRevision != "") {
+		mode = []string{"bedrock", "gpu"}[current] // a hosting flag with no mode keeps the current one
+	}
 	if mode == "" {
 		i, err := env.prompt.Select("How should Darkplum run models?", []Option{
 			{"Bedrock only", "no GPU"},
@@ -214,11 +230,23 @@ func (c *InitCmd) changeHosting(env *initEnv, dir string, tf tfvarsInfo) error {
 	var kvs []tfvarsKV
 	drop := map[string]bool{"gpu_desired_size": true, "gpu_instance_types": true, "model_name": true, "model_revision": true, "served_model_name": true}
 	if s.gpu {
-		if err := c.chooseModel(env, s, record); err != nil {
+		if c.keepModel {
+			// Only the count or the instance changes: the model stays as pinned, with no
+			// catalog or Hugging Face lookup (which could refuse a gated or offline one).
+			id, rev := firstVal(tf.Raw, "model_name"), firstVal(tf.Raw, "model_revision")
+			served := firstVal(tf.Raw, "served_model_name")
+			if served == "" {
+				served = servedNameFor(id)
+			}
+			s.model = catalogModel{ID: id, Revision: rev, Served: served}
+			s.gpuInstance = orDefault(c.GPUInstance, currentGPUInstance(tf.Raw))
+			record(checkResult{name: "model", status: checkPass, detail: fmt.Sprintf("%s @ %s (unchanged)", id, shortSHA(rev))})
+			record(checkResult{name: "gpu instance", status: checkPass, detail: s.gpuInstance})
+		} else if err := c.chooseModel(env, s, record); err != nil {
 			return err
 		}
 		count := s.gpuCount
-		if env.interactive && c.GPUCount == 1 {
+		if env.interactive && !c.gpuCountSet {
 			def := tf.GPUDesired
 			if def < 1 {
 				def = 1
@@ -276,7 +304,7 @@ func (c *InitCmd) changeHosting(env *initEnv, dir string, tf tfvarsInfo) error {
 	}
 	text, err := rewriteTFVars(string(old), func(k string) bool { return drop[k] }, kvs)
 	if err != nil {
-		return env.fail("install settings", err.Error(), "choose Start over to answer the questions again", "cannot edit the install's settings safely")
+		return env.fail("install settings", err.Error(), restartHint(env), "cannot edit the install's settings safely")
 	}
 
 	fmt.Fprintln(w)
@@ -301,6 +329,9 @@ func (c *InitCmd) changeHosting(env *initEnv, dir string, tf tfvarsInfo) error {
 	}
 	if err := writeFileAtomic(path, []byte(text)); err != nil {
 		return err
+	}
+	if c.batch {
+		return nil
 	}
 	fmt.Fprintf(w, "\n%s\n", sSuccess("✓ model hosting changed; every other setting is unchanged"))
 	fmt.Fprintf(w, "  Next: %s to apply it\n", sCmd("darkplum deploy"))
@@ -375,3 +406,277 @@ func bracketDepth(v string) int {
 
 // webKeys are the settings of the private address.
 var webKeys = map[string]bool{"web_domain": true, "web_hostname": true, "web_zone_id": true, "web_certificate_arn": true, "web_allowed_cidrs": true}
+
+// firstVal is the first element of the list-or-string tfvars value at key.
+func firstVal(raw map[string]string, key string) string {
+	if v := tfStrings(raw[key]); len(v) > 0 {
+		return v[0]
+	}
+	return ""
+}
+
+// currentWeb is the address the install has now, as chooseWeb reads it.
+func currentWeb(raw map[string]string) (domain, host string) {
+	domain, host = firstVal(raw, "web_domain"), firstVal(raw, "web_hostname")
+	if host == "" && domain != "" {
+		host = "darkplum." + domain
+	}
+	return domain, host
+}
+
+// changesSettings: on an existing install, does a flag ask for a change to one
+// setting? The flags that merely restate the install (--domain, --mode, --model
+// equal to what it has) do not, so a script that passes them on every run keeps
+// the old behaviour.
+func (c *InitCmd) changesSettings(raw map[string]string) bool {
+	return c.SemanticRouter != "" || c.changesHosting(raw) || c.changesWeb(raw)
+}
+
+// currentGPUInstance is the GPU type the install has: its own, else the default of
+// its model.
+func currentGPUInstance(raw map[string]string) string {
+	if v := firstVal(raw, "gpu_instance_types"); v != "" {
+		return v
+	}
+	if m, ok := catalogFor(firstVal(raw, "model_name")); ok {
+		return m.GPUType
+	}
+	return defaultGPUInstance
+}
+
+// dropRestatedFlags clears the web flags that only repeat what the install has, so
+// they are neither a change nor re-checked (a --zone-id equal to the install's would
+// otherwise be looked up as a name to claim, against its own record).
+func (c *InitCmd) dropRestatedFlags(raw map[string]string) {
+	domain, host := currentWeb(raw)
+	if c.Hostname != "" && normalizeDNSName(c.Hostname) == host && domain != "" {
+		c.Hostname = ""
+	}
+	if c.ZoneID != "" && c.ZoneID == firstVal(raw, "web_zone_id") {
+		c.ZoneID = ""
+	}
+	if c.CertificateARN != "" && c.CertificateARN == firstVal(raw, "web_certificate_arn") {
+		c.CertificateARN = ""
+	}
+}
+
+func (c *InitCmd) changesHosting(raw map[string]string) bool {
+	n, _ := strconv.Atoi(strings.TrimSpace(raw["gpu_desired_size"]))
+	gpu := n > 0
+	if c.Mode == "bedrock" {
+		return gpu
+	}
+	if c.Mode == "gpu" && !gpu {
+		return true
+	}
+	if !gpu && c.Model != "" {
+		return true // adds a self-hosted model
+	}
+	if !gpu {
+		return false // --gpu-count, --gpu-instance, --model-revision mean nothing without one
+	}
+	if c.Model != "" && (c.Model != firstVal(raw, "model_name") || (c.ModelRevision != "" && c.ModelRevision != firstVal(raw, "model_revision"))) {
+		return true
+	}
+	if c.Model == "" && c.ModelRevision != "" && c.ModelRevision != firstVal(raw, "model_revision") {
+		return true
+	}
+	if c.GPUInstance != "" && c.GPUInstance != currentGPUInstance(raw) {
+		return true
+	}
+	return c.gpuCountSet && c.GPUCount != n
+}
+
+func (c *InitCmd) changesWeb(raw map[string]string) bool {
+	if c.AllowedCIDRs != "" || c.Hostname != "" || c.ZoneID != "" || c.CertificateARN != "" {
+		return true // (dropRestatedFlags already cleared the ones that repeat the install)
+	}
+	// --domain alone is also what a fresh install and "Start over" take (and what
+	// --yes requires), so it counts only when it moves an address the install has.
+	prev, _ := currentWeb(raw)
+	return c.Domain != "" && prev != "" && normalizeDNSName(c.Domain) != prev
+}
+
+// movesAddress: would the web flags change the name, zone or certificate the
+// install already has (or give it one)? That creates or abandons DNS and
+// certificates, so a script may not do it as a side effect of a flag.
+func (c *InitCmd) movesAddress(raw map[string]string) bool {
+	prevDomain, prevHost := currentWeb(raw)
+	domain := normalizeDNSName(c.Domain)
+	if domain == "" {
+		domain = prevDomain
+	}
+	host := deriveWebHost(c.Hostname, domain, prevDomain, prevHost)
+	return domain != prevDomain || host != prevHost ||
+		(c.ZoneID != "" && c.ZoneID != firstVal(raw, "web_zone_id")) ||
+		(c.CertificateARN != "" && c.CertificateARN != firstVal(raw, "web_certificate_arn"))
+}
+
+// ignoredFlags names each flag that was given on an existing install and was not
+// applied, with why; none is dropped silently.
+func (c *InitCmd) ignoredFlags(raw map[string]string, tf tfvarsInfo, hosting, web bool) []string {
+	var out []string
+	add := func(f, why string) { out = append(out, f+": "+why) }
+	gpu := tf.GPUDesired > 0
+	if c.Profile != "" && c.Profile != tf.Profile {
+		add("--profile", "ignored; the install uses "+orDefault(tf.Profile, "the default credential chain"))
+	}
+	if c.Throwaway {
+		add("--throwaway", "ignored; it is decided when the install is made")
+	}
+	if c.Domain != "" && !web {
+		prev, _ := currentWeb(raw)
+		if prev == "" {
+			add("--domain", "ignored; the install has no private address yet (add one from the menu of `darkplum init` at a terminal)")
+		}
+	}
+	if !hosting && !gpu {
+		if c.gpuCountSet {
+			add("--gpu-count", "ignored; the install has no self-hosted model (add one with --mode gpu)")
+		}
+		if c.GPUInstance != "" {
+			add("--gpu-instance", "ignored; the install has no self-hosted model (add one with --mode gpu)")
+		}
+		if c.ModelRevision != "" {
+			add("--model-revision", "ignored; the install has no self-hosted model (add one with --mode gpu)")
+		}
+	}
+	return out
+}
+
+// applyFlagChanges applies each setting a flag names to the existing install, and
+// nothing else. A flag is the operator's explicit choice, so it is not asked about
+// again (the same as a fresh install, where --semantic-router on asks nothing);
+// at a terminal, turning the router on keeps its y/N. Every refusal is decided
+// before anything is written; if a later step fails the earlier ones are put back.
+func (c *InitCmd) applyFlagChanges(env *initEnv, dir string, raw map[string]string) error {
+	w := env.out
+	path := filepath.Join(dir, "terraform.tfvars")
+	tf, err := readTFVars(path)
+	if err != nil {
+		return env.fail("install settings", firstLine(err.Error()), restartHint(env), "cannot read the install's settings")
+	}
+	in, oerr := install.OpenDir(dir, c.ClusterName)
+	var rec install.Record
+	if oerr == nil {
+		rec, _ = in.Load()
+	}
+	if rec.Region != "" && c.Region != "" && c.Region != rec.Region {
+		return env.fail("region", c.Region, "the install is in "+rec.Region+" and cannot move; create a new install for another region", "the region of an existing install cannot change")
+	}
+
+	hosting, web, router := c.changesHosting(raw), c.changesWeb(raw), c.SemanticRouter != ""
+	if web && !env.interactive && c.movesAddress(raw) {
+		what, hint := "a flag would change the address this install has", "change it from the menu of `darkplum init` at a terminal"
+		if !hasWebAddress(raw) {
+			what, hint = "a flag would give this install a private address", "add it from the menu of `darkplum init` at a terminal"
+		}
+		return env.fail("private address", what,
+			"a script may not move the address as a side effect (it creates or abandons DNS and certificates); "+hint+". --force would redo ALL settings from fresh defaults",
+			"refusing to change the private address from a script")
+	}
+	if web && !hasWebAddress(raw) && c.Domain == "" && !env.interactive {
+		return env.fail("domain", "not given", "this install has no private address; add one from the menu of `darkplum init` at a terminal", "--domain is required")
+	}
+	for _, m := range c.ignoredFlags(raw, tf, hosting, web) {
+		fmt.Fprintf(w, "  %s %s\n", sWarn("!"), m)
+	}
+
+	n := 0
+	for _, b := range []bool{hosting, web, router} {
+		if b {
+			n++
+		}
+	}
+	c.batch = n > 1
+	defer func() { c.batch, c.keepModel = false, false }()
+
+	// Model-keeping: a hosting flag that does not name the model keeps the install's.
+	if hosting && tf.GPUDesired > 0 && c.Model == "" && c.ModelRevision == "" && c.Mode != "bedrock" {
+		c.keepModel = true
+	} else if hosting && tf.GPUDesired > 0 && c.Model == "" {
+		c.Model = firstVal(raw, "model_name")
+		if c.ModelRevision == "" {
+			c.ModelRevision = firstVal(raw, "model_revision")
+		}
+		if c.GPUInstance == "" {
+			c.GPUInstance = firstVal(raw, "gpu_instance_types")
+		}
+	}
+
+	oldTF, rerr := os.ReadFile(path)
+	if rerr != nil {
+		return rerr
+	}
+	oldRec := rec
+	var done []string
+	// restore puts the settings and the record back as they were. It says what it
+	// could not: what is still changed, never "nothing kept" when something stayed.
+	restore := func() (lines []string) {
+		if c.DryRun {
+			return nil
+		}
+		if oerr == nil {
+			if cur, err := in.Load(); err == nil && cur.CreatedZoneID != oldRec.CreatedZoneID {
+				// A hosted zone that was created is already recorded and cannot be un-made here.
+				return []string{sWarn("!") + " the hosted zone " + cur.CreatedZoneID + " was created and recorded, so the changes already made were left in place: " + strings.Join(done, ", ") + ". Run `darkplum init` to review them"}
+			}
+		}
+		if cur, err := os.ReadFile(path); err != nil || string(cur) != string(oldTF) {
+			if err := writeFileAtomic(path, oldTF); err != nil {
+				lines = append(lines, sWarn("!")+" could not put the install's settings back ("+firstLine(err.Error())+"): terraform.tfvars in the install's workspace still holds the changes made so far ("+strings.Join(done, ", ")+")")
+			}
+		}
+		if oerr == nil {
+			if cur, err := in.Load(); err == nil && !reflect.DeepEqual(cur, oldRec) {
+				if err := in.Save(oldRec); err != nil {
+					lines = append(lines, sWarn("!")+" could not put the install record back ("+firstLine(err.Error())+"): the semantic router setting is still changed")
+				}
+			}
+		}
+		if len(lines) == 0 && len(done) > 0 {
+			lines = append(lines, sDim("none of the requested changes was kept"))
+		}
+		return lines
+	}
+	fail := func(err error) error {
+		for _, l := range restore() {
+			fmt.Fprintf(w, "  %s\n", l)
+		}
+		return err
+	}
+
+	// The side-effect-free steps first; the address (which can create a zone) last.
+	if hosting {
+		if err := c.changeHosting(env, dir, tf); err != nil {
+			return fail(err)
+		}
+		done = append(done, "model hosting")
+	}
+	if router {
+		if err := c.changeRouter(env, dir, rec); err != nil {
+			return fail(err)
+		}
+		if oerr == nil {
+			if now, err := in.Load(); err == nil && now.SemanticRouter != rec.SemanticRouter {
+				done = append(done, "semantic router")
+			}
+		}
+	}
+	if web {
+		if err := c.mergeWeb(env, dir); err != nil {
+			return fail(err)
+		}
+		done = append(done, "private address")
+	}
+	if c.batch && !c.DryRun && len(done) > 0 {
+		fmt.Fprintf(w, "\n%s\n", sSuccess("✓ changed "+strings.Join(done, ", ")+"; every other setting is unchanged"))
+		fmt.Fprintf(w, "  Next: %s to apply it\n", sCmd("darkplum deploy"))
+	}
+	return nil
+}
+
+func hasWebAddress(raw map[string]string) bool {
+	d, _ := currentWeb(raw)
+	return d != ""
+}

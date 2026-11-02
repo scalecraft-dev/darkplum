@@ -177,7 +177,7 @@ func testEnv(t *testing.T, cloud initCloud, hf modelLookup, answers string) (*in
 }
 
 func yesCmd(dir string, extra func(*InitCmd)) *InitCmd {
-	c := &InitCmd{Cloud: "aws", Yes: true, Dir: dir, ClusterName: "darkplum", GPUCount: 1, Domain: "acme.com"}
+	c := &InitCmd{Cloud: "aws", Yes: true, Dir: dir, ClusterName: "darkplum", Domain: "acme.com"}
 	if extra != nil {
 		extra(c)
 	}
@@ -353,7 +353,7 @@ func TestInitNameCollision(t *testing.T) {
 	// Interactive: re-asks, and the second name is used. The fake flips to free.
 	dir := t.TempDir()
 	env, _ = testEnv(t, &collideOnce{fakeCloud: newFakeCloud()}, nil, "\n\ndarkplum-b\n\n")
-	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Region: "us-east-2", Mode: "bedrock", Profile: "acme", Domain: "acme.com"}
+	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", Region: "us-east-2", Mode: "bedrock", Profile: "acme", Domain: "acme.com"}
 	if err := c.execute(env); err != nil {
 		t.Fatal(err)
 	}
@@ -397,7 +397,7 @@ func TestInitConfirmOverwriteDefaultsToNo(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "terraform.tfvars")
 	_ = os.WriteFile(path, []byte("old\n"), 0o600)
-	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Region: "us-east-2", Mode: "bedrock", Profile: "acme", Domain: "acme.com"}
+	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", Region: "us-east-2", Mode: "bedrock", Profile: "acme", Domain: "acme.com"}
 	// Start over (not just add the address), default networks, then Enter at the overwrite question.
 	env, _ := testEnv(t, newFakeCloud(), nil, "2\n\n\n")
 	if err := c.execute(env); !errors.Is(err, errAborted) {
@@ -410,7 +410,7 @@ func TestInitConfirmOverwriteDefaultsToNo(t *testing.T) {
 
 func TestInitAbortOnEOFWritesNothing(t *testing.T) {
 	dir := t.TempDir()
-	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Profile: "acme"}
+	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", Profile: "acme"}
 	env, _ := testEnv(t, newFakeCloud(), nil, "us-east-2\n") // input ends at the mode question
 	if err := c.execute(env); !errors.Is(err, errAborted) {
 		t.Fatalf("got %v", err)
@@ -424,7 +424,7 @@ func TestInitInteractiveGPUFlow(t *testing.T) {
 	dir := t.TempDir()
 	// profile, region, mode 2 (gpu), model 2 (mistral), backend 2 (local), final confirm
 	env, out := testEnv(t, newFakeCloud(), nil, "acme\n\n2\n2\nacme.com\n\n\n2\n\n")
-	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1}
+	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum"}
 	if err := c.execute(env); err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}
@@ -506,7 +506,7 @@ func TestInitGatedConfirmed(t *testing.T) {
 	dir := t.TempDir()
 	// profile, region, mode(gpu), model: custom(3), id, gated confirm y, sha, networks, backend local, final confirm
 	env, _ := testEnv(t, newFakeCloud(), &fakeHF{err: errHFGated}, "acme\n\n2\n3\nmeta/Gated-1\ny\n"+sha+"\n\n\n2\n\n")
-	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Domain: "acme.com"}
+	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", Domain: "acme.com"}
 	if err := c.execute(env); err != nil {
 		t.Fatal(err)
 	}

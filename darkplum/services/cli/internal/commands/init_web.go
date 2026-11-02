@@ -389,6 +389,19 @@ func delegated(got, want []string) bool {
 // chooseWeb asks for (or takes from flags) the private address settings and
 // checks them read-only against the account. existing is the current tfvars
 // (nil on a fresh install), for defaults.
+// deriveWebHost is the name the team opens: --hostname if given, else the
+// install's own when the domain is unchanged, else darkplum.<domain>. One rule for
+// chooseWeb and for deciding whether a flag moves the address.
+func deriveWebHost(flag, domain, prevDomain, prevHost string) string {
+	if h := normalizeDNSName(flag); h != "" {
+		return h
+	}
+	if domain == prevDomain {
+		return prevHost
+	}
+	return "darkplum." + domain
+}
+
 func (c *InitCmd) chooseWeb(env *initEnv, s *settings, cloud initCloud, existing map[string]string, record func(checkResult)) error {
 	w := env.out
 	first := func(k string) string {
@@ -431,14 +444,7 @@ func (c *InitCmd) chooseWeb(env *initEnv, s *settings, cloud initCloud, existing
 	if err := validateTFWebDomain(domain); err != nil || domain == "" {
 		return env.fail("domain", domain, "use a lowercase DNS name you control, such as acme.com", "invalid --domain")
 	}
-	host := normalizeDNSName(c.Hostname)
-	switch {
-	case host != "":
-	case domain == prevDomain:
-		host = prevHost
-	default:
-		host = "darkplum." + domain
-	}
+	host := deriveWebHost(c.Hostname, domain, prevDomain, prevHost)
 	if err := validateTFWebHostname(domain, host); err != nil {
 		return env.fail("hostname", host, "--hostname "+err.Error(), "invalid --hostname")
 	}
@@ -652,7 +658,7 @@ func (c *InitCmd) mergeWeb(env *initEnv, dir string) error {
 	path := filepath.Join(dir, "terraform.tfvars")
 	tf, err := readTFVars(path)
 	if err != nil {
-		return env.fail("install settings", firstLine(err.Error()), "re-run darkplum init and choose Start over", "cannot read the install settings")
+		return env.fail("install settings", firstLine(err.Error()), restartHint(env), "cannot read the install settings")
 	}
 	s := &settings{profile: tf.Profile, region: tf.Region}
 	record := func(r checkResult) {
@@ -660,7 +666,7 @@ func (c *InitCmd) mergeWeb(env *initEnv, dir string) error {
 		s.checks = append(s.checks, r)
 	}
 	if s.region == "" {
-		return env.fail("install settings", "no region", "re-run darkplum init and choose Start over", "install settings name no region")
+		return env.fail("install settings", "no region", restartHint(env), "install settings name no region")
 	}
 	cloud := env.newCloud(tf.Profile)
 	fmt.Fprintf(w, "%s resolving AWS identity…\n", sDim("…"))
@@ -689,7 +695,7 @@ func (c *InitCmd) mergeWeb(env *initEnv, dir string) error {
 	// The address's own lines are replaced (a change), every other line is kept.
 	text, err := rewriteTFVars(string(b), func(k string) bool { return webKeys[k] }, s.web.kvs())
 	if err != nil {
-		return env.fail("install settings", err.Error(), "choose Start over to answer the questions again", "cannot edit the install's settings safely")
+		return env.fail("install settings", err.Error(), restartHint(env), "cannot edit the install's settings safely")
 	}
 	fmt.Fprintln(w)
 	if c.DryRun {
@@ -726,6 +732,9 @@ func (c *InitCmd) mergeWeb(env *initEnv, dir string) error {
 	}
 	if err := writeFileAtomic(path, []byte(text)); err != nil {
 		return err
+	}
+	if c.batch {
+		return nil
 	}
 	fmt.Fprintf(w, "\n%s\n", sSuccess("✓ private address added; every other setting is unchanged"))
 	fmt.Fprintf(w, "  Your team's address after deploy: %s %s\n", sCmd("https://"+s.web.hostname), sDim("(from "+strings.Join(s.web.allowed, ", ")+")"))
