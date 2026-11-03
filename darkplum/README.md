@@ -96,7 +96,7 @@ darkplum doctor check --profile <your-profile>
 # state). Nothing is deployed yet.
 darkplum init --profile <your-profile>
 
-# Deploy everything (takes 35-50 minutes). Shows the Terraform plan first and
+# Deploy everything (about 20 minutes; a GPU model loads for about 10 more). Shows the Terraform plan first and
 # never approves a delete on its own.
 darkplum deploy
 
@@ -215,11 +215,15 @@ See `terraform/aws/variables.tf` for the full list.
 
 | Phase | Duration |
 |-------|----------|
-| Terraform (VPC + EKS + nodes) | 15-20 min |
-| GPU node registration + driver | 5-10 min |
-| Model download from HF Hub | 10-20 min |
-| Model load into GPU memory | 2-5 min |
-| **Total** | **35-50 min** |
+| Terraform (VPC + EKS + nodes, GPU node included) | 16-18 min |
+| Platform (images, api, gateway, web) | about 1 min |
+| `configure` | under 1 min |
+| **Total, Bedrock only** | **about 20 min** |
+| Model download from HF Hub | about 2 min |
+| Model load into GPU memory | about 6 min |
+| **Total, self-hosted GPU** | **about 30 min** |
+
+Measured on one account with the default 7B model. A larger model takes longer to download and load.
 
 ## Commands
 

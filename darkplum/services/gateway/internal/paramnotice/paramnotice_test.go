@@ -50,12 +50,16 @@ func setup(t *testing.T, withTables bool) *pgxpool.Pool {
 }
 
 // drain waits until the queue is empty and the last write finished.
+// drain waits for the writer to finish. An empty queue is not enough, because the last
+// item has been taken but may still be writing: a fixed sleep after it failed on a busy
+// CI runner. So it also waits until the writer holds no database connection.
 func drain(n *Notifier) {
-	for i := 0; i < 200; i++ {
-		if len(n.q) == 0 {
-			time.Sleep(50 * time.Millisecond)
-			return
-		}
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) && len(n.q) > 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	for time.Now().Before(deadline) && n.pool != nil && n.pool.Stat().AcquiredConns() > 0 {
 		time.Sleep(10 * time.Millisecond)
 	}
 }

@@ -97,8 +97,8 @@ macOS; if you download by hand, verify it as above before you run it.
 
 `darkplum init` asks which account, region and model hosting you want, checks
 them against your account and records the answers, so there is no file to
-edit. Choosing a self-hosted GPU model takes 35 to 50 minutes; choosing Bedrock
-only takes about twenty minutes and is the cheapest path to a first chat.
+edit. Choosing a self-hosted GPU model takes about thirty minutes, longer for a larger
+model; choosing Bedrock only takes about twenty minutes and is the cheapest path to a first chat.
 Re-run `darkplum init` to change a choice, then `darkplum deploy` to apply it.
 It also asks for a domain you control: your team reaches Darkplum at a private
 `https://darkplum.<domain>`, from your VPC and the networks you allow.

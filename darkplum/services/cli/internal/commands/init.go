@@ -446,7 +446,7 @@ func (c *InitCmd) execute(env *initEnv) error {
 		if env.interactive {
 			i, err := env.prompt.Select("How should Darkplum run models?", []Option{
 				{"Bedrock only", fmt.Sprintf("no GPU · ~US$%d/day base · ~20 min · recommended for a trial", baseUSDPerDay)},
-				{"Self-hosted GPU", "base + ~US$1/h per g5.xlarge · ~35-50 min"},
+				{"Self-hosted GPU", "base + ~US$1/h per g5.xlarge · ~30 min"},
 			}, 0)
 			if err != nil {
 				return err
@@ -1009,7 +1009,7 @@ func (c *InitCmd) summary(env *initEnv, s *settings, wrote []string, dry bool) {
 	}
 	eta := "~20 min"
 	if s.gpu {
-		eta = "~35-50 min"
+		eta = "~30 min"
 	}
 	fmt.Fprintf(w, "\n  Next: %s  %s, then %s\n", sCmd("darkplum deploy"), sDim("("+eta+")"), sCmd("darkplum configure"))
 }

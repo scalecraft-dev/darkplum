@@ -259,7 +259,7 @@ func awsSessionExpiry(profile string) (time.Time, error) {
 }
 
 // checkAWSSession fails when the session would lapse inside an install
-// (~35-50 minutes of apply plus the platform deploy).
+// (~20 minutes of apply and the platform deploy, more with a GPU model).
 func checkAWSSession(profile string, minMinutes int) checkResult {
 	return sessionResult(awsSessionExpiry, profile, minMinutes, time.Now())
 }

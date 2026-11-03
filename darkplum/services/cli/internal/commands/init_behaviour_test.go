@@ -235,7 +235,7 @@ func TestInitModeChoicesAreAlignedWithCosts(t *testing.T) {
 	}
 	for _, want := range []string{
 		"1) Bedrock only     no GPU · ~US$10/day base · ~20 min · recommended for a trial",
-		"2) Self-hosted GPU  base + ~US$1/h per g5.xlarge · ~35-50 min",
+		"2) Self-hosted GPU  base + ~US$1/h per g5.xlarge · ~30 min",
 		"Switch later by re-running darkplum init.",
 		"✓ 10 passed",
 	} {
