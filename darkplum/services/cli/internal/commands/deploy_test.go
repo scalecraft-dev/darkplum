@@ -635,6 +635,47 @@ func TestDeployExpiredSessionDuringApply(t *testing.T) {
 	}
 }
 
+func TestGPULaunchFailureSaysWhyAndTheWayForward(t *testing.T) {
+	const prefix = "Error: waiting for EKS Node Group (x:x-gpu-inference) create: unexpected state 'CREATE_FAILED', wanted target 'ACTIVE'. last error: asg: AsgInstanceLaunchFailures: Could not launch On-Demand Instances. "
+	const with = "\n  with module.node_groups.aws_eks_node_group.gpu,\n"
+	for name, tc := range map[string]struct{ out, want string }{
+		"quota":          {prefix + "VcpuLimitExceeded - You have requested more vCPU capacity" + with, "GPU vCPU quota is too low"},
+		"old quota code": {prefix + "InstanceLimitExceeded - Your quota" + with, "GPU vCPU quota is too low"},
+		"capacity":       {prefix + "InsufficientInstanceCapacity - We currently do not have" + with, "no capacity for these GPU nodes"},
+		"other":          {prefix + "Something new" + with, "AWS would not launch the GPU nodes"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if !gpuLaunchFailed(tc.out) {
+				t.Fatal("not recognised")
+			}
+			got := gpuLaunchHint(tc.out)
+			for _, want := range []string{tc.want, "its later steps did not run", "`darkplum init --mode bedrock`, then `darkplum deploy --confirm-plan`", "approves replacing the failed node group"} {
+				if !strings.Contains(got, want) {
+					t.Errorf("hint lacks %q: %s", want, got)
+				}
+			}
+		})
+	}
+	// The system nodes host the platform: going to Bedrock would not help them.
+	if gpuLaunchFailed("AsgInstanceLaunchFailures\n  with module.node_groups.aws_eks_node_group.cpu,\n") {
+		t.Error("the CPU node group is not a GPU failure")
+	}
+	if gpuLaunchFailed("with module.node_groups.aws_eks_node_group.gpu, some other error") {
+		t.Error("another failure on the GPU node group is not a launch failure")
+	}
+}
+
+// A real failed apply takes this path: the row carries the hint, not "see the output above".
+func TestDeployGPULaunchFailureReachesTheRow(t *testing.T) {
+	h := newDeployHarness(t, 1)
+	h.tf.streamText["apply"] = "Error: waiting: AsgInstanceLaunchFailures: VcpuLimitExceeded\n  with module.node_groups.aws_eks_node_group.gpu,\n"
+	h.tf.streamErr["apply"] = errors.New("exit status 1")
+	if !IsReported(h.run()) {
+		t.Fatal("passed")
+	}
+	h.mustContain("GPU vCPU quota is too low", "darkplum init --mode bedrock")
+}
+
 func TestDeployStateLockHint(t *testing.T) {
 	h := newDeployHarness(t, 0)
 	h.tf.streamText["apply"] = "Error: Error acquiring the state lock\nLock Info:\n  ID: abc"

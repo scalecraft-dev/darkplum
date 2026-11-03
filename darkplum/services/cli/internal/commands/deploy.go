@@ -1317,6 +1317,8 @@ func (e *deployEnv) streamTF(ctx context.Context, tf tfRunner, stepNo int, label
 		hint = e.interruptedHint()
 	case strings.Contains(tl.String(), "Error acquiring the state lock"):
 		hint = lockHint(tf, tl.String())
+	case gpuLaunchFailed(tl.String()):
+		hint = gpuLaunchHint(tl.String())
 	default:
 		if h := e.loginHint(tl.String()); !strings.HasPrefix(h, "fix the above") {
 			hint = h
@@ -1324,6 +1326,30 @@ func (e *deployEnv) streamTF(ctx context.Context, tf tfRunner, stepNo int, label
 	}
 	e.tfFailureSummary(tl.String())
 	return e.stop(checkResult{name: "terraform " + label, status: checkFail, detail: firstLine(err.Error()), hint: hint}, "terraform "+label+" failed")
+}
+
+// gpuLaunchFailed says whether Terraform stopped because AWS would not launch the GPU
+// nodes: an EKS node group waits until it gives up, about 40 minutes, and the platform
+// comes after it. The other node group has a different remedy.
+func gpuLaunchFailed(output string) bool {
+	return strings.Contains(output, "AsgInstanceLaunchFailures") && strings.Contains(output, "aws_eks_node_group.gpu")
+}
+
+// gpuLaunchHint names the reason and the ways forward, one of which needs no GPU. The
+// failed node group is tainted, so each way forward replaces it and needs --confirm-plan.
+func gpuLaunchHint(output string) string {
+	reason := "AWS would not launch the GPU nodes"
+	remedy := "See the error above, fix it and re-run `darkplum deploy --confirm-plan`"
+	switch {
+	case strings.Contains(output, "VcpuLimitExceeded"), strings.Contains(output, "InstanceLimitExceeded"):
+		reason = "the account's GPU vCPU quota is too low for these GPU nodes"
+		remedy = "Ask AWS for more quota (Service Quotas, EC2, Running On-Demand G and VT instances) or choose a smaller type with `darkplum init --gpu-instance <type>`, then run `darkplum deploy --confirm-plan`"
+	case strings.Contains(output, "InsufficientInstanceCapacity"):
+		reason = "AWS has no capacity for these GPU nodes in this region right now"
+		remedy = "Run `darkplum deploy --confirm-plan` later, or choose another type with `darkplum init --gpu-instance <type>` and run it now"
+	}
+	return reason + ". The deploy stopped here, so its later steps did not run. " + remedy +
+		". To run on Bedrock models with no GPU instead: `darkplum init --mode bedrock`, then `darkplum deploy --confirm-plan`. --confirm-plan approves replacing the failed node group"
 }
 
 // tfWithRe finds the resource a Terraform error block names ("with aws_x.y,").
