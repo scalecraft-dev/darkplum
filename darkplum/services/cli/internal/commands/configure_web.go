@@ -266,11 +266,9 @@ func (r *configureRun) untrustProxies() {
 			return
 		}
 	}
-	if !r.restartWeb() {
-		return
-	}
 	printCheckTo(r.out, checkResult{name: "audit", status: checkWarn, detail: "the private address is gone: removed the old load balancer trust list and web-ingress policy",
 		hint: "client addresses are not recorded until the address is deployed again"})
+	r.restartWeb()
 }
 
 // probeHTTPS asks the team's address for /health from this machine.

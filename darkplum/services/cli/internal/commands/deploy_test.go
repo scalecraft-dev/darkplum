@@ -783,7 +783,7 @@ func TestDeployWebRolloutIsWaitedForAndFailureShowsPods(t *testing.T) {
 		return nil, errors.New("kubectl: error: timed out waiting for the condition")
 	}}}, h.k.handlers...)
 	h.k.on("get events", "0s Warning Failed pod/darkplum-web-1 Failed to pull image", nil)
-	h.k.on("logs deployment/darkplum-web", "nginx: [emerg] bad config", nil)
+	h.k.on("logs p-new", "nginx: [emerg] bad config", nil)
 	if !IsReported(h.run()) {
 		t.Fatal("a web rollout that timed out passed")
 	}
@@ -1380,6 +1380,45 @@ func TestDeployRolloutFailureShowsEventsAndStateOfThatDeploymentsPods(t *testing
 		t.Error("namespace-wide events are not scoped to the deployment")
 	}
 	h.mustContain("ImagePullBackOff", "FailedMount")
+}
+
+// During a roll, `logs deployment/x` picks one pod, usually the healthy old one, so the
+// failing pod's own reason is what each pod's log must show. Measured on a live install:
+// the old pod's health checks were printed and the database error never was.
+func TestDeployRolloutFailureShowsTheLogOfEachPod(t *testing.T) {
+	h := newDeployHarness(t, 0)
+	h.k.handlers = append([]skHandler{{"rollout status deployment/darkplum-api", func([]string, []byte) ([]byte, error) {
+		return nil, errors.New("kubectl: error: timed out waiting for the condition")
+	}}}, h.k.handlers...)
+	h.k.on("logs p-new --tail=30 --all-containers --previous", "panic: previous run of the new pod", nil)
+	h.k.on("logs p-new", "ping database: connection timed out", nil)
+	h.k.on("logs p-old", "GET /health 200 from the old pod", nil)
+	h.k.on("logs deployment/darkplum-api", "the one pod the deployment's log picked", nil)
+	if !IsReported(h.run()) {
+		t.Fatal("passed")
+	}
+	h.mustContain("log of p-new (previous container)", "panic: previous run of the new pod", "log of p-new", "ping database: connection timed out", "log of p-old", "from the old pod")
+	if strings.Contains(h.out.String(), "the one pod the deployment's log picked") {
+		t.Error("the deployment's log picks a pod, and here it hid the failing one")
+	}
+}
+
+// With no pod list there are no names, so the deployment's log is all there is.
+func TestDeployRolloutFailureFallsBackToTheDeploymentsLog(t *testing.T) {
+	h := newDeployHarness(t, 0)
+	h.k.handlers = append([]skHandler{
+		{"rollout status deployment/darkplum-api", func([]string, []byte) ([]byte, error) {
+			return nil, errors.New("kubectl: error: timed out waiting for the condition")
+		}},
+		{"get pods -l app.kubernetes.io/name=darkplum-api -o json", func([]string, []byte) ([]byte, error) {
+			return nil, errors.New("kubectl: error: cannot list")
+		}},
+	}, h.k.handlers...)
+	h.k.on("logs deployment/darkplum-api", "the deployment's log", nil)
+	if !IsReported(h.run()) {
+		t.Fatal("passed")
+	}
+	h.mustContain("the deployment's log")
 }
 
 func TestSessionExpiredMatchesOnlySessionMessages(t *testing.T) {

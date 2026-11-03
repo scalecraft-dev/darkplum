@@ -1686,6 +1686,7 @@ func (e *deployEnv) diagnose(kc *kube.Client, deployment string) {
 	sel := "app.kubernetes.io/name=" + deployment
 	e.diag("pods", kc, "-n", platformNS, "get", "pods", "-l", sel, "-o", "wide")
 	out, err := kc.Run(nil, "-n", platformNS, "get", "pods", "-l", sel, "-o", "json")
+	perPod := false
 	if err == nil {
 		var l struct {
 			Items []struct {
@@ -1693,14 +1694,21 @@ func (e *deployEnv) diagnose(kc *kube.Client, deployment string) {
 			} `json:"items"`
 		}
 		if jsonUnmarshal(out, &l) == nil {
+			perPod = len(l.Items) > 0
 			for _, p := range l.Items {
 				e.diag("events of "+p.Metadata.Name, kc, "-n", platformNS, "get", "events", "--field-selector", "involvedObject.name="+p.Metadata.Name, "--sort-by=.lastTimestamp")
 				e.diag("state of "+p.Metadata.Name, kc, "-n", platformNS, "describe", "pod", p.Metadata.Name)
+				// Per pod, because during a roll `logs deployment/x` picks one, usually the
+				// healthy old pod, which has nothing to say about why the new one fails.
+				e.diag("log of "+p.Metadata.Name+" (previous container)", kc, "-n", platformNS, "logs", p.Metadata.Name, "--tail=30", "--all-containers", "--previous")
+				e.diag("log of "+p.Metadata.Name, kc, "-n", platformNS, "logs", p.Metadata.Name, "--tail=30", "--all-containers")
 			}
 		}
 	}
-	e.diag("log (previous container)", kc, "-n", platformNS, "logs", "deployment/"+deployment, "--tail=30", "--all-containers", "--previous")
-	e.diag("log", kc, "-n", platformNS, "logs", "deployment/"+deployment, "--tail=30", "--all-containers")
+	if !perPod {
+		e.diag("log (previous container)", kc, "-n", platformNS, "logs", "deployment/"+deployment, "--tail=30", "--all-containers", "--previous")
+		e.diag("log", kc, "-n", platformNS, "logs", "deployment/"+deployment, "--tail=30", "--all-containers")
+	}
 }
 
 // recordInstall writes the darkplum-install ConfigMap: which release, which
