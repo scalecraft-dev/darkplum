@@ -1,4 +1,5 @@
 import type { User, ApiKey, ChatMessage, ActivityEvent, AliasRouteTest, BackendClass, InferenceEvent, InferencePurpose, UsageBucket, UsageSummary, UserUsageSummary, KeyUsageSummary, Model, AdminModel, AdminModelsResult, ModelAlias, ModelAliasInput, ProviderStatus, Residency, RoutingPolicy, PrincipalPolicy, EffectivePolicy, PolicyPreview, PolicyPrincipalsPage, ConversationSummary, ConversationFull, ConversationMessage, ConversationMessageInput, VendorName, SpendGroupBy, SpendReport, SpendTimelineGroupBy, ProviderBilling, ReconciliationGroupBy, ReconciliationReport, ModelPricesResult, ModelPrice, ModelPriceInput , SystemPromptSetting, LibraryItem, LibraryItemInput, LibraryItemUpdate, LibraryImportRequest, LibraryImportPreview, LibraryKind, LibraryVisibility, ToolEvent, ToolHostsSetting } from '../types'
+import { STREAM_CUT_OFF_CODE, STREAM_CUT_OFF_MESSAGE, readChatStream } from './chatStream'
 import { parseRetryAfter } from './modelRouting'
 import { ROUTES, buildPath, type QueryValue, type Route } from './routes'
 
@@ -1068,76 +1069,25 @@ export async function streamChat(
     return
   }
 
-  const decoder = new TextDecoder()
-  let buffer = ''
-
-  try {
-    while (true) {
-      const { done, value } = await reader.read()
-      if (done) break
-
-      buffer += decoder.decode(value, { stream: true })
-      const lines = buffer.split('\n')
-      buffer = lines.pop() ?? ''
-
-      for (const line of lines) {
-        const trimmed = line.trim()
-        if (!trimmed.startsWith('data:')) continue
-        const data = trimmed.slice(5).trim()
-        if (data === '[DONE]') {
-          onDone()
-          return
-        }
-        try {
-          const parsed = JSON.parse(data) as {
-            choices?: Array<{ delta: { content?: string } }>
-            /** The api's own frames while it runs a tool: no choices, one
-             *  event. An OpenAI SDK would ignore them; the chat shows them. */
-            darkplum?: ToolEvent
-            error?: {
-              message: string
-              code?: string
-              type?: string
-              param?: string
-              model?: unknown
-              route?: unknown
-            }
-          }
-          if (parsed.error) {
-            // No status and no Retry-After here: the response committed as a
-            // 200 before this frame, so a mid-stream rate limit carries no
-            // interval and the UI falls back to its own short wait.
-            onError(
-              new ChatError(parsed.error.message, {
-                code: parsed.error.code,
-                type: parsed.error.type,
-                param: typeof parsed.error.param === 'string' ? parsed.error.param : undefined,
-                refusedModel: stringOrUndefined(parsed.error.model),
-                route: stringOrUndefined(parsed.error.route),
-              }),
-            )
-            return
-          }
-          if (parsed.darkplum && (parsed.darkplum.type === 'tool_call' || parsed.darkplum.type === 'tool_result')) {
-            options.onToolEvent?.(parsed.darkplum)
-            continue
-          }
-          const token = parsed.choices?.[0]?.delta?.content
-          if (token) onToken(token)
-        } catch {
-          // Partial JSON or non-data line — skip
-        }
-      }
-    }
-  } catch (err) {
-    if ((err as Error).name === 'AbortError') return
-    onError(err instanceof Error ? err : new Error(String(err)))
-    return
-  } finally {
-    reader.releaseLock()
-  }
-
-  onDone()
+  await readChatStream(reader, {
+    onToken,
+    onToolEvent: options.onToolEvent,
+    onDone,
+    // No status and no Retry-After here: the response committed as a 200 before
+    // this frame, so a mid-stream rate limit carries no interval and the UI
+    // falls back to its own short wait.
+    onErrorFrame: (error) =>
+      onError(
+        new ChatError(error.message, {
+          code: error.code,
+          type: error.type,
+          param: typeof error.param === 'string' ? error.param : undefined,
+          refusedModel: stringOrUndefined(error.model),
+          route: stringOrUndefined(error.route),
+        }),
+      ),
+    onCutOff: () => onError(new ChatError(STREAM_CUT_OFF_MESSAGE, { code: STREAM_CUT_OFF_CODE })),
+  })
 }
 
 // ---------------------------------------------------------------------------

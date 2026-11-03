@@ -475,3 +475,41 @@ func TestStream_NoIncludeUsageHasNoUsageChunk(t *testing.T) {
 		t.Error("no usage-only chunk expected when include_usage was not asked for")
 	}
 }
+
+// Events that close with no MessageStop and no error are a reply cut short: Stream must
+// return an error, so the handler sends an error frame, and must not write [DONE].
+func TestStream_EndedWithNoMessageStopIsAnError(t *testing.T) {
+	events := []types.ConverseStreamOutput{
+		&types.ConverseStreamOutputMemberMessageStart{Value: types.MessageStartEvent{Role: types.ConversationRoleAssistant}},
+		&types.ConverseStreamOutputMemberContentBlockDelta{Value: types.ContentBlockDeltaEvent{Delta: &types.ContentBlockDeltaMemberText{Value: "Hel"}}},
+	}
+	p := newProviderWithFake(&fakeConverseAPI{stream: newFakeStream(events, nil)})
+
+	var buf bytes.Buffer
+	_, err := p.Stream(context.Background(), provider.ChatRequest{
+		Model:    "m",
+		Messages: []provider.Message{{Role: "user", Content: "hi"}},
+	}, &buf)
+	if err == nil {
+		t.Fatalf("a stream with no MessageStop returned success: %q", buf.String())
+	}
+	if strings.Contains(buf.String(), "[DONE]") {
+		t.Errorf("a cut reply must not end with [DONE]: %q", buf.String())
+	}
+}
+
+// The stop is what counts, not the words it came with: an empty reason is still a stop,
+// and by then the final chunk has gone out.
+func TestStream_MessageStopWithNoReasonIsNotACut(t *testing.T) {
+	events := []types.ConverseStreamOutput{
+		&types.ConverseStreamOutputMemberMessageStop{Value: types.MessageStopEvent{}},
+	}
+	p := newProviderWithFake(&fakeConverseAPI{stream: newFakeStream(events, nil)})
+	var buf bytes.Buffer
+	if _, err := p.Stream(context.Background(), provider.ChatRequest{Model: "m", Messages: []provider.Message{{Role: "user", Content: "hi"}}}, &buf); err != nil {
+		t.Fatalf("a stream that stopped was refused: %v", err)
+	}
+	if !strings.Contains(buf.String(), "[DONE]") {
+		t.Errorf("stream = %q", buf.String())
+	}
+}

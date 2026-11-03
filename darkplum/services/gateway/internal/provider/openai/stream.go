@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -92,6 +93,7 @@ func (p *Provider) Stream(ctx context.Context, req provider.ChatRequest, w io.Wr
 
 	stats := &provider.StreamStats{Model: req.Model}
 	completionID := ""
+	sawDone := false
 
 	for scanner.Scan() {
 		line := scanner.Text()
@@ -100,6 +102,7 @@ func (p *Provider) Stream(ctx context.Context, req provider.ChatRequest, w io.Wr
 		}
 		payload := strings.TrimPrefix(line, "data: ")
 		if payload == "[DONE]" {
+			sawDone = true
 			break
 		}
 
@@ -209,6 +212,12 @@ func (p *Provider) Stream(ctx context.Context, req provider.ChatRequest, w io.Wr
 	}
 
 	if stats.FinishReason == "" {
+		// A body that ended with neither is a reply cut short; a final "stop" here
+		// would present it as finished to everything downstream.
+		if !sawDone {
+			return nil, provider.NewVendorAPIError("openai", http.StatusBadGateway, "upstream_error", "upstream_error",
+				"the model provider ended the reply early", 0, errors.New("openai: stream ended with no finish_reason or [DONE]"))
+		}
 		stats.FinishReason = "stop"
 	}
 

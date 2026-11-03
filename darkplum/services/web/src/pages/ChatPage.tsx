@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 import { ChatError, exportConversation, listLibrary, streamChat } from '../lib/api'
+import { isCutOffReply } from '../lib/chatStream'
 import {
   CONVERSATION_PAGE,
   DRAFT_ID,
@@ -682,9 +683,14 @@ export function ChatPage() {
         if (code === 'library_item_not_found' && chatErr?.missing) {
           setMissingLibraryIds(chatErr.missing)
         }
+        const hasPartial = Boolean(result.text.trim()) || result.toolEvents.length > 0
         setFailure({
           message: err ? err.message : 'The message was not sent',
           code,
+          partial:
+            hasPartial && isCutOffReply(code, hasPartial)
+              ? { content: result.text, toolEvents: result.toolEvents }
+              : null,
           model: sendModel,
           // Who the gateway said served it, falling back to the owner of the
           // entry that was picked. A routed alias is owned by no vendor, and

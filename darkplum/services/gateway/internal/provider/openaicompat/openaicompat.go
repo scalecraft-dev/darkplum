@@ -402,6 +402,7 @@ func (p *OpenAICompatProvider) Stream(ctx context.Context, req provider.ChatRequ
 
 	completionID := ""
 	sawUsageChunk := false
+	sawDone := false
 
 	scanner := bufio.NewScanner(trackedBody)
 	// Increase scanner buffer for large chunks (some models emit large deltas).
@@ -421,7 +422,7 @@ func (p *OpenAICompatProvider) Stream(ctx context.Context, req provider.ChatRequ
 		// it just before the terminator, from whatever usage the upstream
 		// did report (zero counts when it reported none, as Bedrock does),
 		// so include_usage is never silently unanswered.
-		if req.IncludeUsage && !sawUsageChunk && line == "data: [DONE]" {
+		if req.IncludeUsage && !sawUsageChunk && strings.HasPrefix(line, "data:") && strings.TrimSpace(strings.TrimPrefix(line, "data:")) == "[DONE]" {
 			if completionID == "" {
 				completionID = fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 			}
@@ -450,12 +451,15 @@ func (p *OpenAICompatProvider) Stream(ctx context.Context, req provider.ChatRequ
 
 		// Parse data lines for stats extraction. We skip comment lines (": ..."),
 		// event-type lines ("event: ..."), and the [DONE] sentinel.
-		if !strings.HasPrefix(line, "data: ") {
+		// The space after "data:" is optional in SSE, and these bytes go on as the vendor
+		// sent them.
+		if !strings.HasPrefix(line, "data:") {
 			continue
 		}
 
-		payload := strings.TrimPrefix(line, "data: ")
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if payload == "[DONE]" {
+			sawDone = true
 			continue
 		}
 
@@ -500,6 +504,13 @@ func (p *OpenAICompatProvider) Stream(ctx context.Context, req provider.ChatRequ
 			return nil, fmt.Errorf("openaicompat(%s): stream idle timeout (%s): %w", p.name, idleTimeout, cause)
 		}
 		return nil, fmt.Errorf("openaicompat(%s): reading stream: %w", p.name, err)
+	}
+
+	// A body that ended with neither is a reply cut short: returning normally would
+	// send it on with nothing to say it stopped early. A vendor may leave out [DONE],
+	// so a finish_reason is enough.
+	if !sawDone && stats.FinishReason == "" {
+		return nil, fmt.Errorf("openaicompat(%s): stream ended with no finish_reason or [DONE]", p.name)
 	}
 
 	// Final flush after the stream ends.

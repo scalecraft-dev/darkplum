@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -384,5 +386,110 @@ func TestToolLoop_BrokenArgumentsAndRoundCap(t *testing.T) {
 	}
 	if strings.Count(out, `"type":"tool_result"`) != toolMaxRounds-1 {
 		t.Errorf("tool results = %d, want %d (none on the last round)", strings.Count(out, `"type":"tool_result"`), toolMaxRounds-1)
+	}
+}
+
+// runToolLoopAgainst drives one streaming turn with a tool attached against gw.
+func runToolLoopAgainst(t *testing.T, gw *httptest.Server, ctx context.Context) string {
+	t.Helper()
+	w := httptest.NewRecorder()
+	serveToolLoop(t, gw, ctx, w)
+	return w.Body.String()
+}
+
+func serveToolLoop(t *testing.T, gw *httptest.Server, ctx context.Context, w http.ResponseWriter) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	mcpSrv := fakeMCP(t)
+	t.Cleanup(mcpSrv.Close)
+	mcpHost, _ := url.Parse(mcpSrv.URL)
+	h := NewChatHandler(gw.URL, "service-key", nil)
+	tools := newToolService(nil, nil, nil, toolCredentialReader{})
+	tools.policyOverride = &mcp.HostPolicy{Allowed: []string{mcpHost.Hostname()}}
+	tools.rememberCredential("item-1", "tok-1")
+	h.WithTools(tools)
+	att := &attachments{tools: []attachedItem{{id: "item-1", kind: "tool", slug: "srv", name: "Server", cfg: toolConfig{ServerURL: mcpSrv.URL}, catalog: toolCatalog{Tools: []mcp.Tool{{Name: "echo"}}}}}}
+	defs, bindings, _ := buildWireTools(att.tools)
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil).WithContext(ctx)
+	h.proxyWithTools(c, []byte(`{"model":"m","stream":true,"messages":[{"role":"user","content":"x"}]}`), true, defs, bindings)
+}
+
+// The tool loop parses the gateway's stream rather than copying it, so it has its own
+// way to swallow a cut: it must end with an error whichever way the stream stopped.
+func TestToolLoop_CutOffStreamEndsWithAnError(t *testing.T) {
+	const words = `data: {"id":"c","model":"m","choices":[{"index":0,"delta":{"content":"partial"}}]}` + "\n\n"
+	t.Run("connection dropped", func(t *testing.T) {
+		gw := cutOffGateway(t, "text/event-stream", words, false, nil)
+		defer gw.Close()
+		out := runToolLoopAgainst(t, gw, context.Background())
+		if !strings.Contains(out, "partial") || !strings.Contains(out, streamInterruptedCode) || !strings.HasSuffix(strings.TrimSpace(out), "data: [DONE]") {
+			t.Errorf("stream = %s", out)
+		}
+	})
+	t.Run("ended with no finish", func(t *testing.T) {
+		gw := cutOffGateway(t, "text/event-stream", words, true, nil)
+		defer gw.Close()
+		if out := runToolLoopAgainst(t, gw, context.Background()); !strings.Contains(out, streamInterruptedCode) {
+			t.Errorf("stream = %s", out)
+		}
+	})
+}
+
+func TestToolLoop_StreamEndsWithoutAnAddedError(t *testing.T) {
+	const words = `data: {"id":"c","model":"m","choices":[{"index":0,"delta":{"content":"hi"}}]}` + "\n\n"
+	const finish = `data: {"id":"c","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n"
+	t.Run("finish_reason with no [DONE]", func(t *testing.T) {
+		gw := cutOffGateway(t, "text/event-stream", words+finish, true, nil)
+		defer gw.Close()
+		out := runToolLoopAgainst(t, gw, context.Background())
+		if strings.Contains(out, streamInterruptedCode) || !strings.HasSuffix(strings.TrimSpace(out), "data: [DONE]") {
+			t.Errorf("a vendor that leaves out [DONE] finished normally: %s", out)
+		}
+	})
+	t.Run("caller left", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		gw := cutOffGateway(t, "text/event-stream", words, false, func() { <-ctx.Done() })
+		defer gw.Close()
+		rec := httptest.NewRecorder()
+		serveToolLoop(t, gw, ctx, leavesOnFirstWrite{rec, cancel})
+		out := rec.Body.String()
+		if !strings.Contains(out, `"content":"hi"`) {
+			t.Fatalf("the caller left before the stream started, so this tests nothing: %s", out)
+		}
+		if strings.Contains(out, streamInterruptedCode) {
+			t.Errorf("nobody is left to tell: %s", out)
+		}
+	})
+}
+
+// A cut after a tool has run: the browser has already seen the tool's result, and must
+// still be told the reply did not finish.
+func TestToolLoop_CutOffAfterAToolRan(t *testing.T) {
+	var rounds atomic.Int32
+	gw := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		if rounds.Add(1) == 1 {
+			fmt.Fprint(w, `data: {"id":"c","model":"m","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_x","type":"function","function":{"name":"srv__echo","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}`+"\n\ndata: [DONE]\n\n")
+			return
+		}
+		fmt.Fprint(w, `data: {"id":"c","model":"m","choices":[{"index":0,"delta":{"content":"partial"}}]}`+"\n\n")
+		w.(http.Flusher).Flush()
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		_ = conn.Close()
+	}))
+	defer gw.Close()
+	out := runToolLoopAgainst(t, gw, context.Background())
+	if rounds.Load() != 2 || !strings.Contains(out, `"type":"tool_result"`) {
+		t.Fatalf("the tool did not run first (rounds %d): %s", rounds.Load(), out)
+	}
+	if !strings.Contains(out, streamInterruptedCode) || !strings.HasSuffix(strings.TrimSpace(out), "data: [DONE]") {
+		t.Errorf("stream = %s", out)
 	}
 }

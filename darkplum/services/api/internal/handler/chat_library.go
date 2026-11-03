@@ -562,6 +562,9 @@ func (l *toolLoop) runStream() {
 		resp.Body.Close()
 		if err != nil {
 			slog.WarnContext(ctx, "tool loop: stream interrupted", "round", round, "err", err)
+			if errors.Is(err, errStreamCut) && ctx.Err() == nil {
+				l.finishWithError(streamInterruptedCode, streamInterruptedMessage)
+			}
 			return
 		}
 		if finish != "tool_calls" || len(calls) == 0 {
@@ -589,6 +592,10 @@ func (l *toolLoop) runStream() {
 	}
 }
 
+// errStreamCut is a gateway stream that stopped before it finished. The other errors
+// relayStream returns mean the browser has gone, or has already been told.
+var errStreamCut = errors.New("gateway stream cut off")
+
 // relayStream reads one gateway SSE response: content frames go straight to
 // the browser; tool-call fragments are accumulated and withheld (the browser
 // does not run tools); the finishing frame is withheld when it says
@@ -596,6 +603,7 @@ func (l *toolLoop) runStream() {
 func (l *toolLoop) relayStream(r io.Reader) (calls []*accumulatedCall, finish string, finishFrame []byte, err error) {
 	byIndex := map[int]*accumulatedCall{}
 	var order []int
+	sawDone := false
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 2<<20)
 	for sc.Scan() {
@@ -605,6 +613,7 @@ func (l *toolLoop) relayStream(r io.Reader) (calls []*accumulatedCall, finish st
 		}
 		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
 		if data == "[DONE]" {
+			sawDone = true
 			break
 		}
 		var chunk struct {
@@ -679,7 +688,11 @@ func (l *toolLoop) relayStream(r io.Reader) (calls []*accumulatedCall, finish st
 		}
 	}
 	if err := sc.Err(); err != nil {
-		return nil, "", nil, err
+		return nil, "", nil, fmt.Errorf("%w: %v", errStreamCut, err)
+	}
+	// A vendor may leave out [DONE], so a finish_reason also counts as the end.
+	if !sawDone && finish == "" {
+		return nil, "", nil, fmt.Errorf("%w: ended with no finish_reason or [DONE]", errStreamCut)
 	}
 	for _, i := range order {
 		calls = append(calls, byIndex[i])

@@ -348,7 +348,7 @@ func TestComplete_SendsToolConfigAndReturnsToolCalls(t *testing.T) {
 }
 
 func TestStream_NoToolsSendsNoToolConfig(t *testing.T) {
-	fake := &fakeConverseAPI{stream: newFakeStream(nil, nil)}
+	fake := &fakeConverseAPI{stream: newFakeStream([]types.ConverseStreamOutput{&types.ConverseStreamOutputMemberMessageStop{Value: types.MessageStopEvent{StopReason: types.StopReasonEndTurn}}}, nil)}
 	p := newProviderWithFake(fake)
 	var buf bytes.Buffer
 	if _, err := p.Stream(context.Background(), provider.ChatRequest{Model: "m", Messages: []provider.Message{{Role: "user", Content: "hi"}}}, &buf); err != nil {
