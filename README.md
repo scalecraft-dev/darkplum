@@ -52,22 +52,6 @@ Sign-in is local accounts or your identity provider over OIDC
 
 ## Quick start
 
-> **Not yet released.** `brew install scalecraft-dev/tap/darkplum` and the
-> release downloads below do not exist until the first signed release is
-> published. Until then, build from source (needs Go, as in
-> `darkplum/services/cli/go.mod`, and Docker for the images):
->
-> ```bash
-> git clone https://github.com/scalecraft-dev/darkplum && cd darkplum/darkplum
-> (cd services/cli && go build -o ../../darkplum ./cmd)      # a development build
-> ./darkplum init --cluster-name demo   # a few questions; then build and push images:
-> scripts/dev.sh eks-push --install demo    # prints the exact `darkplum deploy --unsigned-images` line
-> ```
->
-> A development build trusts no signature and marks the install `image-trust:
-> unsigned` until a signed release is deployed over it. See
-> [CONTRIBUTING.md](CONTRIBUTING.md).
-
 **On AWS.** You need the AWS CLI (signed in to the account you will install
 into), Terraform 1.10 or newer, and kubectl. From a release, nothing else: no
 Docker, Go, make, jq or git.
