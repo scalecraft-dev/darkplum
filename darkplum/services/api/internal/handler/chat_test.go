@@ -562,3 +562,142 @@ func TestProxyChat_BearerWithLibraryHeaderRefused(t *testing.T) {
 		t.Errorf("a refused request reached the gateway: %s", got)
 	}
 }
+
+// cutOffGateway answers 200 with an SSE body, sends the given bytes, then either drops
+// the connection with the chunked body unfinished or, when clean, ends it properly.
+func cutOffGateway(t *testing.T, contentType string, sent string, clean bool, beforeClose func()) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", contentType)
+		if clean {
+			_, _ = io.WriteString(w, sent)
+			return
+		}
+		w.(http.Flusher).Flush()
+		_, _ = io.WriteString(w, sent)
+		w.(http.Flusher).Flush()
+		if beforeClose != nil {
+			beforeClose()
+		}
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		_ = conn.Close()
+	}))
+}
+
+// leavesOnFirstWrite is a caller that goes away once bytes have reached it, so the
+// break lands in the stream's read and not in the request that opened it.
+type leavesOnFirstWrite struct {
+	*httptest.ResponseRecorder
+	cancel context.CancelFunc
+}
+
+func (w leavesOnFirstWrite) Write(b []byte) (int, error) {
+	n, err := w.ResponseRecorder.Write(b)
+	w.cancel()
+	return n, err
+}
+
+// TestProxyChat_CutOffStreamEndsWithAnError: a gateway that goes away mid-reply must
+// not look like a reply that finished. The frame must survive a read that stopped
+// partway through a line.
+func TestProxyChat_CutOffStreamEndsWithAnError(t *testing.T) {
+	const whole = `data: {"choices":[{"delta":{"content":"partial"}}]}` + "\n\n"
+	for name, sent := range map[string]string{
+		"at a frame boundary":    whole,
+		"partway through a line": whole + `data: {"choices":[{"del`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			gw := cutOffGateway(t, "text/event-stream", sent, false, nil)
+			defer gw.Close()
+			gin.SetMode(gin.TestMode)
+			h := NewChatHandler(gw.URL, "dp_test_service_key_000000000000000000000", nil)
+			r := gin.New()
+			r.POST("/v1/chat/completions", h.ProxyChat)
+			req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"x","messages":[{"role":"user","content":"hi"}],"stream":true}`))
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, req)
+
+			out := rec.Body.String()
+			if !strings.Contains(out, "partial") {
+				t.Errorf("what arrived before the break was lost:\n%s", out)
+			}
+			// Parsed line by line, as a client does: a frame glued to the broken line fails.
+			var sawError, sawDone bool
+			for _, line := range strings.Split(out, "\n") {
+				data, ok := strings.CutPrefix(line, "data: ")
+				if !ok {
+					continue
+				}
+				if data == "[DONE]" {
+					sawDone = true
+					continue
+				}
+				var f struct {
+					Error struct {
+						Code string `json:"code"`
+					} `json:"error"`
+				}
+				if json.Unmarshal([]byte(data), &f) == nil && f.Error.Code == streamInterruptedCode {
+					sawError = true
+				}
+			}
+			if !sawError || !sawDone {
+				t.Errorf("error frame parsed = %v, [DONE] = %v:\n%s", sawError, sawDone, out)
+			}
+		})
+	}
+}
+
+// TestProxyChat_StreamEndsWithoutAnAddedError covers the cases that must not get the
+// frame: a stream that finished, a caller that left, and a body that is not SSE.
+func TestProxyChat_StreamEndsWithoutAnAddedError(t *testing.T) {
+	const reply = `data: {"choices":[{"delta":{"content":"hi"}}]}` + "\n\ndata: [DONE]\n\n"
+	serve := func(gwURL string, ctx context.Context, w http.ResponseWriter) {
+		gin.SetMode(gin.TestMode)
+		h := NewChatHandler(gwURL, "dp_test_service_key_000000000000000000000", nil)
+		r := gin.New()
+		r.POST("/v1/chat/completions", h.ProxyChat)
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"x","messages":[{"role":"user","content":"hi"}],"stream":true}`)).WithContext(ctx)
+		r.ServeHTTP(w, req)
+	}
+	run := func(t *testing.T, gwURL string, ctx context.Context) string {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		serve(gwURL, ctx, rec)
+		return rec.Body.String()
+	}
+	t.Run("finished", func(t *testing.T) {
+		gw := cutOffGateway(t, "text/event-stream", reply, true, nil)
+		defer gw.Close()
+		if out := run(t, gw.URL, context.Background()); out != reply {
+			t.Errorf("a finished stream must pass through unchanged:\n%s", out)
+		}
+	})
+	t.Run("caller left", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		gw := cutOffGateway(t, "text/event-stream", "data: {}\n\n", false, func() { <-ctx.Done() })
+		defer gw.Close()
+		rec := httptest.NewRecorder()
+		serve(gw.URL, ctx, leavesOnFirstWrite{rec, cancel})
+		out := rec.Body.String()
+		if !strings.Contains(out, "data: {}") {
+			t.Fatalf("the caller left before the stream started, so this tests nothing:\n%s", out)
+		}
+		if strings.Contains(out, streamInterruptedCode) {
+			t.Errorf("nobody is left to tell:\n%s", out)
+		}
+	})
+	t.Run("not SSE", func(t *testing.T) {
+		gw := cutOffGateway(t, "application/json", `{"id":"x"`, false, nil)
+		defer gw.Close()
+		if out := run(t, gw.URL, context.Background()); strings.Contains(out, streamInterruptedCode) {
+			t.Errorf("an SSE frame in a JSON body corrupts it:\n%s", out)
+		}
+	})
+}

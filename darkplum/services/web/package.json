@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "check:parity": "node --experimental-strip-types scripts/check-api-parity.mts",
-    "check:policy": "node --experimental-strip-types scripts/check-policy.mts"
+    "check:policy": "node --experimental-strip-types scripts/check-policy.mts",
+    "check:stream": "node --experimental-strip-types scripts/check-chat-stream.mts"
   },
   "dependencies": {
     "@fontsource-variable/inter": "^5.2.8",

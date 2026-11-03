@@ -1404,3 +1404,36 @@ func TestStream_IncludeUsageShape(t *testing.T) {
 		}
 	})
 }
+
+// A vendor body that closes cleanly with neither a finish_reason nor [DONE] is a reply
+// cut short, not one that stopped.
+func TestStream_EndedEarlyIsAnError(t *testing.T) {
+	const words = `data: {"id":"c","model":"m","choices":[{"index":0,"delta":{"content":"Hel"}}]}` + "\n\n"
+	for name, tc := range map[string]struct {
+		body    string
+		wantErr bool
+	}{
+		"neither":            {words, true},
+		"[DONE] only":        {words + "data: [DONE]\n\n", false},
+		"finish_reason only": {words + `data: {"id":"c","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"length"}]}` + "\n\n", false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := newFakeOpenAIServer(t)
+			srv.completionResponses = []func(w http.ResponseWriter, r *http.Request, body map[string]any){
+				func(w http.ResponseWriter, _ *http.Request, _ map[string]any) {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = io.WriteString(w, tc.body)
+				},
+			}
+			p := newTestProvider(t, srv, nil, Config{})
+			var buf bytes.Buffer
+			_, err := p.Stream(context.Background(), basicRequest("m"), &buf)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
+			}
+			if tc.wantErr && (strings.Contains(buf.String(), "[DONE]") || strings.Contains(buf.String(), "finish_reason\":\"stop")) {
+				t.Errorf("a cut reply must not look finished: %q", buf.String())
+			}
+		})
+	}
+}

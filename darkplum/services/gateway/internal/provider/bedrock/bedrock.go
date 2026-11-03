@@ -202,6 +202,7 @@ func (p *BedrockProvider) Stream(ctx context.Context, req provider.ChatRequest, 
 
 	toolState := toolStreamState{includeUsage: req.IncludeUsage}
 	var streamErr error
+	sawStop := false
 loop:
 	for {
 		select {
@@ -217,7 +218,8 @@ loop:
 			// Converse sends the trailing Metadata event (token usage) *after*
 			// MessageStop, and breaking early would silently drop streaming
 			// usage. The loop instead exits when the events channel closes.
-			_, err := translateStreamEvent(event, completionID, req.Model, stats, w, &toolState)
+			done, err := translateStreamEvent(event, completionID, req.Model, stats, w, &toolState)
+			sawStop = sawStop || done
 			if err != nil {
 				slog.Error("bedrock: error translating stream event", "err", err)
 				streamErr = err
@@ -238,6 +240,11 @@ loop:
 	}
 	if streamErr != nil {
 		return stats, fmt.Errorf("bedrock: translate error: %w", streamErr)
+	}
+	// The events closed with no MessageStop and no error: a reply cut short, which
+	// [DONE] below would present as finished.
+	if !sawStop {
+		return stats, errors.New("bedrock: stream ended with no MessageStop")
 	}
 
 	if req.IncludeUsage {

@@ -4,6 +4,7 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import rehypeHighlight from 'rehype-highlight'
 import type { BackendClass, ChatMessage, ToolEvent } from '../types'
+import { STREAM_CUT_OFF_CODE } from '../lib/chatStream'
 import { formatModelName } from '../lib/formatModelName'
 import {
   RETRY_AFTER_DEFAULT_SECONDS,
@@ -29,6 +30,10 @@ import styles from './MessageList.module.css'
 export interface ChatFailure {
   /** The gateway's own error.message — shown verbatim. */
   message: string
+  /** A reply cut off partway: what arrived, shown above the card so it can be read
+   *  and copied. It stays here because anything in the conversation is sent back to
+   *  the model as history. Empty replies leave this unset. */
+  partial?: { content: string; toolEvents: ToolEvent[] } | null
   /** OpenAI-style error code, e.g. model_residency_violation. */
   code?: string
   /** The model id the request was sent with. */
@@ -122,6 +127,19 @@ function failureCopy(
       hint: isAdmin
         ? 'Restore the backend, or accept the new class on the Models page.'
         : 'This is temporary. Try again in a moment, or pick another model from the list at the top of the page.',
+    }
+  }
+  // Before the switch because a partial can come with upstream_error, whose own title
+  // says the vendor did not answer. The model did get this one, so the default is
+  // untrue too. failure.message stays what the server said.
+  if (failure.partial || failure.code === STREAM_CUT_OFF_CODE) {
+    return {
+      title: 'The reply was cut off',
+      hint: !failure.partial
+        ? 'Try again.'
+        : failure.partial.toolEvents.length > 0
+          ? 'What is shown above is not saved, and the model will not see it. Trying again may run the same tools again.'
+          : 'What is shown above is not saved, and the model will not see it. Try again for the whole reply.',
     }
   }
   switch (failure.code) {
@@ -813,6 +831,14 @@ export function MessageList({
             </div>
           )
         })}
+        {failure?.partial && (
+          <AssistantBubble
+            content={failure.partial.content}
+            toolEvents={failure.partial.toolEvents}
+            isStreaming={false}
+            isLast={false}
+          />
+        )}
         {failure && (
           <FailureNotice failure={failure} isAdmin={isAdmin ?? false} onRetry={onRetry} />
         )}

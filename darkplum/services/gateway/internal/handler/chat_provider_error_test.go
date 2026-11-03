@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -275,5 +276,37 @@ func TestHandleChatCompletions_StreamErrorAfterPartialWriteEmitsScrubbedSSEFrame
 	}
 	if !strings.Contains(body, `"type":"upstream_error"`) {
 		t.Errorf("expected a scrubbed upstream_error SSE frame, got body=%s", body)
+	}
+}
+
+// usageThenErrorProvider writes pre (if any), then fails, having counted some usage.
+type usageThenErrorProvider struct{ pre string }
+
+func (p usageThenErrorProvider) Name() string { return "bedrock" }
+func (p usageThenErrorProvider) Complete(context.Context, provider.ChatRequest) (*provider.ChatResponse, error) {
+	return nil, errors.New("unused")
+}
+func (p usageThenErrorProvider) Stream(_ context.Context, _ provider.ChatRequest, w io.Writer) (*provider.StreamStats, error) {
+	if p.pre != "" {
+		_, _ = io.WriteString(w, p.pre)
+	}
+	return &provider.StreamStats{PromptTokens: 7, CompletionTokens: 4}, errors.New("cut")
+}
+
+// A reply that failed partway was still generated: its usage must reach the Recording
+// middleware. A request that failed before any byte keeps its columns NULL.
+func TestHandleStream_UsageOnAFailedStream(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	run := func(pre string) *gin.Context {
+		c, _ := gin.CreateTestContext(httptest.NewRecorder())
+		c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		(&ChatHandler{}).handleStream(c, usageThenErrorProvider{pre: pre}, provider.ChatRequest{})
+		return c
+	}
+	if c := run("data: {}\n\n"); c.GetInt("prompt_tokens") != 7 || c.GetInt("completion_tokens") != 4 {
+		t.Errorf("after bytes: tokens = %d/%d, want 7/4", c.GetInt("prompt_tokens"), c.GetInt("completion_tokens"))
+	}
+	if c := run(""); c.GetInt("prompt_tokens") != 0 {
+		t.Errorf("before any byte: prompt_tokens = %d, want unset", c.GetInt("prompt_tokens"))
 	}
 }

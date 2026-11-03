@@ -5,6 +5,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -48,5 +49,52 @@ func TestStream_PassesThroughCachedTokens(t *testing.T) {
 	}
 	if stats.PromptTokens != 50 || stats.CacheReadTokens != 40 || stats.CacheCreationTokens != 0 {
 		t.Errorf("prompt=%d read=%d create=%d, want 50/40/0", stats.PromptTokens, stats.CacheReadTokens, stats.CacheCreationTokens)
+	}
+}
+
+// A vendor body that closes cleanly with neither a finish_reason nor [DONE] is a reply
+// cut short. A vendor may leave out [DONE], so a finish_reason alone is a whole reply.
+func TestStream_EndedEarlyIsAnError(t *testing.T) {
+	const words = `data: {"id":"s","model":"m","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}` + "\n\n"
+	for name, tc := range map[string]struct {
+		body    string
+		wantErr bool
+	}{
+		"neither":            {words, true},
+		"[DONE] only":        {words + "data: [DONE]\n\n", false},
+		"finish_reason only": {words + `data: {"id":"s","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n", false},
+		"no space, [DONE]":   {"data:{}\n\ndata:[DONE]\n\n", false},
+		"no space, finish":   {`data:{"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}` + "\n\n", false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "text/event-stream")
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer srv.Close()
+			p := newTestProvider(t, srv.URL)
+			if _, err := p.Stream(context.Background(), testRequest(), io.Discard); (err != nil) != tc.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// include_usage is answered whichever way the vendor spells the terminator.
+func TestStream_IncludeUsageWithNoSpaceBeforeDone(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = io.WriteString(w, `data:{"id":"s","model":"m","choices":[{"index":0,"delta":{"content":"hi"}}]}`+"\n\ndata:[DONE]\n\n")
+	}))
+	defer srv.Close()
+	p := newTestProvider(t, srv.URL)
+	req := testRequest()
+	req.IncludeUsage = true
+	var buf strings.Builder
+	if _, err := p.Stream(context.Background(), req, &buf); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(buf.String(), `"usage"`) {
+		t.Errorf("no usage chunk: %q", buf.String())
 	}
 }

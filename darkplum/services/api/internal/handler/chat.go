@@ -36,6 +36,22 @@ func chatProxyError(message, typ, code string) gin.H {
 	return gin.H{"error": e}
 }
 
+// streamInterruptedCode names a reply that stopped because the connection to the
+// gateway broke, as opposed to the model finishing or refusing.
+const (
+	streamInterruptedCode    = "stream_interrupted"
+	streamInterruptedMessage = "The connection was lost before the reply finished."
+)
+
+// writeStreamInterrupted ends a committed SSE response with an error frame. The read
+// can fail partway through a line, so the blank lines come first: without them the
+// frame would join the broken line, the client would fail to parse the two together,
+// and the error would be lost with it.
+func writeStreamInterrupted(w io.Writer) {
+	frame, _ := json.Marshal(chatProxyError(streamInterruptedMessage, "server_error", streamInterruptedCode))
+	_, _ = fmt.Fprintf(w, "\n\ndata: %s\n\ndata: [DONE]\n\n", frame)
+}
+
 type ChatHandler struct {
 	gatewayURL string
 	serviceKey string
@@ -326,6 +342,12 @@ func (h *ChatHandler) ProxyChat(c *gin.Context) {
 			if readErr != nil {
 				if readErr != io.EOF {
 					slog.WarnContext(c.Request.Context(), "stream read interrupted", "err", readErr)
+					// Returning alone would end the response normally, and what
+					// the caller has so far would look like the whole reply.
+					if c.Request.Context().Err() == nil && strings.HasPrefix(resp.Header.Get("Content-Type"), "text/event-stream") {
+						writeStreamInterrupted(c.Writer)
+						flusher.Flush()
+					}
 				}
 				break
 			}

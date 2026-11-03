@@ -147,7 +147,7 @@ func TestModelAvailability_StateMachine(t *testing.T) {
 	// Clears on a successful stream too.
 	api.converseErr = validation(rawBedrockText)
 	_, _ = p.Complete(context.Background(), drReq(fable))
-	api.stream = newFakeStream(nil, nil)
+	api.stream = newFakeStream([]types.ConverseStreamOutput{&types.ConverseStreamOutputMemberMessageStop{Value: types.MessageStopEvent{StopReason: types.StopReasonEndTurn}}}, nil)
 	var sb strings.Builder
 	if _, err := p.Stream(context.Background(), drReq(fable), &sb); err != nil {
 		t.Fatal(err)

@@ -1548,16 +1548,25 @@ func (h *ChatHandler) handleStream(c *gin.Context, prov provider.Provider, chatR
 				c.Set("denial_code", provider.DenialModelRequiresDataRetention)
 			}
 			_ = writeStreamError(c.Writer, err, c.GetString("route_name"))
+			// A reply that failed partway was still generated, and may have reported
+			// its usage first (Bedrock's arrives after MessageStop).
+			setStreamUsage(c, stats)
 		}
 		return
 	}
 
-	if stats != nil {
-		c.Set("prompt_tokens", stats.PromptTokens)
-		c.Set("completion_tokens", stats.CompletionTokens)
-		c.Set("cache_read_tokens", stats.CacheReadTokens)
-		c.Set("cache_creation_tokens", stats.CacheCreationTokens)
+	setStreamUsage(c, stats)
+}
+
+// setStreamUsage hands a stream's token counts to the Recording middleware.
+func setStreamUsage(c *gin.Context, stats *provider.StreamStats) {
+	if stats == nil {
+		return
 	}
+	c.Set("prompt_tokens", stats.PromptTokens)
+	c.Set("completion_tokens", stats.CompletionTokens)
+	c.Set("cache_read_tokens", stats.CacheReadTokens)
+	c.Set("cache_creation_tokens", stats.CacheCreationTokens)
 }
 
 // handleComplete calls provider.Complete, serialises the result with

@@ -85,6 +85,7 @@ jobs:
       # golden against their live route tables.
       - run: pnpm run check:parity
       - run: pnpm run check:policy
+      - run: pnpm run check:stream
 
   terraform:
     name: Terraform
