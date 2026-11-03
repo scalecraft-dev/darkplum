@@ -297,15 +297,50 @@ func TestOfferingsCheck(t *testing.T) {
 	}
 }
 
-func TestGPUQuotaParameterisedByInstance(t *testing.T) {
-	if r := gpuQuotaResult("4", nil, "us-east-2", "g5.xlarge"); r.status != checkPass {
-		t.Errorf("%+v", r)
+func TestGPUQuotaUsesTheInstancesRealSize(t *testing.T) {
+	const gv, pq = "L-DB2E81BA", "L-417A185B"
+	type answer struct {
+		out string
+		err error
 	}
-	if r := gpuQuotaResult("4", nil, "us-east-2", "g5.2xlarge"); r.status != checkFail || !strings.Contains(r.detail, "8") {
-		t.Errorf("g5.2xlarge needs 8 vCPUs: %+v", r)
-	}
-	if r := gpuQuotaResult("", errors.New("x"), "us-east-2", "g5.xlarge"); r.status != checkWarn {
-		t.Errorf("%+v", r)
+	for name, tc := range map[string]struct {
+		instance  string
+		vcpus     answer
+		quota     answer
+		wantCode  string
+		want      checkStatus
+		wantInRow string
+	}{
+		"catalog type within quota":  {instance: "g5.xlarge", quota: answer{out: "4"}, wantCode: gv, want: checkPass},
+		"catalog type over quota":    {instance: "g5.2xlarge", quota: answer{out: "4"}, wantCode: gv, want: checkFail, wantInRow: "need 8"},
+		"other type over quota":      {instance: "g6e.48xlarge", vcpus: answer{out: "192"}, quota: answer{out: "64"}, wantCode: gv, want: checkFail, wantInRow: "need 192"},
+		"other type within quota":    {instance: "g6e.xlarge", vcpus: answer{out: "4"}, quota: answer{out: "64"}, wantCode: gv, want: checkPass},
+		"P family has its own quota": {instance: "p5.48xlarge", vcpus: answer{out: "192"}, quota: answer{out: "100"}, wantCode: pq, want: checkFail, wantInRow: "need 192"},
+		"size unreadable: no guess":  {instance: "g6e.48xlarge", vcpus: answer{err: errors.New("denied")}, quota: answer{out: "64"}, wantCode: gv, want: checkWarn, wantInRow: "could not read how many"},
+		"quota unreadable":           {instance: "g5.xlarge", quota: answer{err: errors.New("x")}, wantCode: gv, want: checkWarn},
+		"unknown family":             {instance: "inf2.xlarge", vcpus: answer{out: "4"}, want: checkWarn, wantInRow: "cannot tell which quota"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var code string
+			r := gpuQuota(func(args ...string) (string, error) {
+				joined := strings.Join(args, " ")
+				if strings.Contains(joined, "describe-instance-types") {
+					return tc.vcpus.out, tc.vcpus.err
+				}
+				for i, a := range args {
+					if a == "--quota-code" {
+						code = args[i+1]
+					}
+				}
+				return tc.quota.out, tc.quota.err
+			}, "us-east-2", tc.instance)
+			if r.status != tc.want || !strings.Contains(r.detail, tc.wantInRow) {
+				t.Errorf("row = %+v", r)
+			}
+			if code != tc.wantCode {
+				t.Errorf("quota code = %q, want %q", code, tc.wantCode)
+			}
+		})
 	}
 }
 

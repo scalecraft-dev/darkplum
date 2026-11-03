@@ -8,9 +8,12 @@ AWS account** with a clean `HOME`, before the change that touches the install
 path is merged, and again on the real release's draft (see
 [RELEASING.md](RELEASING.md)).
 
-A row is done when its evidence is attached to the pull request. "It worked" is
-not evidence: attach the log files from `~/.darkplum/installs/<name>/logs/`,
-timestamps, the script output, and hashes where the row says so.
+A row is done when the pull request says which rc it ran on and what it showed, in
+text, with no account IDs, email addresses or other details of the account it ran
+in. "It worked" is not a result: give the outcome the row asks for, with timings and
+exit statuses. Whoever ran it keeps the evidence the row names privately: the log
+files from `~/.darkplum/installs/<name>/logs/`, the script output, timestamps, and
+hashes where the row says so. Logs do not go on the pull request.
 
 ## Setup
 
@@ -70,7 +73,7 @@ that they fail when they should; it does not prove Darkplum.
 | 14 | vLLM downloads as non-root | The init container runs with the real `snapshot_download` | pod logs |
 | 15 | Connectivity right after the first apply and across a roll | api -> RDS and gateway -> api and Bedrock work immediately after the first apply (policies are applied before workloads). Then, through the real load balancer address from inside the VPC, a new connection per request, about 2 chats a second, a 5s client timeout and no retries: during an rc N to N+1 `deploy`, and across 6 restarts each of api, gateway and web. Expected: no 5xx and no timeouts. A clean run bounds the failure rate only roughly (0 in 500 is under about 0.6%). Long streams are row 15b, and node loss is out of scope | the probe's output, per restart |
 | 15b | A reply cut mid-stream is not presented as finished | A streamed reply of about 20s through the real load balancer from inside the VPC, with a pod force-killed under it (gateway, api, web), then rolled (`rollout restart`). Expected, as a client sees it: a kill of the gateway ends in a `stream_interrupted` frame, a kill of the api or web in a broken transfer (curl exit 18), a roll in a whole reply. Never a clean end with no `finish_reason` or `[DONE]`. Then in a real browser, through `darkplum configure`'s address, for the gateway and the api: the card reads "The reply was cut off", what arrived stays above it; Try again sends one user turn and no assistant turn; a reload shows the question and neither the partial nor the card. Web pods cannot be tested this way, since the port-forward dies with them | the curl results per case; a screenshot of the card |
-| 16 | GPU nodes that do not come | (a) Nodes that AWS will not launch, which `init` blocks for a quota it can see, so for this test only set `gpu_instance_types` in the workspace's variables by hand, to a type over the quota that the region offers: `deploy` stops at step 4 with exit 1, after about 40 minutes, naming the reason, `darkplum init --mode bedrock` and `--confirm-plan`. Restore the type and re-run with `--confirm-plan`, which replaces the failed node group: it converges. Never use a type the quota would allow unless you mean to pay for it. (b) A node group with no GPU yet: scale it to 0, then `deploy --gpu-wait 1s`: exit status 3, and `configure` still works with Bedrock | exit status, output |
+| 16 | GPU nodes that do not come | (a) `init` takes only its catalog types, so a type over the quota arrives by hand. For this test only, set `gpu_instance_types` in the workspace's variables to a type the region offers that needs more vCPUs than the account's quota: `deploy` stops at preflight naming the vCPUs it needs, before Terraform. Never use a type the quota would allow unless you mean to pay for it. (b) A launch AWS refuses after preflight (no capacity, or a quota lowered since) cannot be forced on demand. Seen once on rc.10 with preflight bypassed: step 4 failed with exit 1 after about 40 minutes, and the row must name the reason, `darkplum init --mode bedrock` and `--confirm-plan`; a re-run with `--confirm-plan` converged. (c) No GPU in time: scale the node group to 0, wait for the node to go, then `deploy --gpu-wait 1s`. Terraform restores the group, and the deploy looks before the new node has a GPU: exit status 3, and `configure` still works with Bedrock | exit status, output |
 | 17 | `inference_region` is always set | The fresh apply of row 1 prints the output non-empty, with and without a Bedrock model allowed | `terraform output inference_region` |
 | 18 | Providers on a customer machine | `init -lockfile=readonly` works on darwin/arm64, darwin/amd64 and linux/amd64 with a clean plugin cache | init logs |
 | 19 | The README path from nothing | Follow the README from a clean machine, once with Homebrew and once with the manual download and its attestation check | the transcript |
@@ -97,8 +100,9 @@ Copy into a pull request that changes `deploy`, `destroy`, `init`, `configure`,
 the bundle, the release workflows or the install path. It is also in
 `.github/pull_request_template.md`.
 
-- [ ] The rows of this list that the change can affect were run on an rc, and the
-      evidence is attached (rows 3 and 7a to 7d are the ones with scripts)
+- [ ] The rows of this list that the change can affect were run on an rc, and their
+      results are stated here, with the logs kept privately (rows 3 and 7a to 7d are
+      the ones with scripts)
 - [ ] `scripts/e2e/selftest.sh` passes, and any new assertion script has a case
       that proves it fails
 - [ ] Timings from rows 1 and 10 are in the description if a step got slower

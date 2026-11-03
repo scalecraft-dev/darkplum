@@ -175,37 +175,66 @@ func checkAWSCreds(profile string) checkResult {
 // which is the most common silent cause of a `terraform apply` that succeeds but
 // never schedules the GPU node.
 func checkAWSGPUQuota(region, profile, instance string) checkResult {
-	out, err := run("aws", awsArgs(profile, quotaArgs(region)...)...)
-	return gpuQuotaResult(out, err, region, instance)
+	return gpuQuota(func(args ...string) (string, error) { return run("aws", awsArgs(profile, args...)...) }, region, instance)
 }
 
-func quotaArgs(region string) []string {
-	return []string{"service-quotas", "get-service-quota",
-		"--service-code", "ec2", "--quota-code", "L-DB2E81BA",
-		"--region", region, "--query", "Quota.Value", "--output", "text"}
+// gpuQuotaBuckets are the EC2 on-demand quotas GPU instances draw on, by family prefix.
+var gpuQuotaBuckets = []struct{ prefix, code, name string }{
+	{"vt", "L-DB2E81BA", "Running On-Demand G and VT instances"},
+	{"g", "L-DB2E81BA", "Running On-Demand G and VT instances"},
+	{"p", "L-417A185B", "Running On-Demand P instances"},
 }
 
-func gpuQuotaResult(out string, err error, region, instance string) checkResult {
-	need := 4
+// gpuQuota compares the instance's vCPUs with the quota it draws on. A type outside the
+// catalog is looked up: assuming a small one passed a 192-vCPU type against a quota of
+// 64, and AWS then took about 40 minutes to refuse the node group. When either number
+// cannot be read the row warns rather than guesses.
+func gpuQuota(aws func(args ...string) (string, error), region, instance string) checkResult {
+	need := 0
 	if gi, ok := gpuInstances[instance]; ok {
 		need = gi.VCPU
+	} else if out, err := aws("ec2", "describe-instance-types", "--instance-types", instance, "--region", region,
+		"--query", "InstanceTypes[0].VCpuInfo.DefaultVCpus", "--output", "text"); err == nil {
+		if n, perr := strconv.Atoi(strings.TrimSpace(out)); perr == nil {
+			need = n
+		}
 	}
+	for _, b := range gpuQuotaBuckets {
+		if strings.HasPrefix(instance, b.prefix) {
+			out, err := aws("service-quotas", "get-service-quota", "--service-code", "ec2", "--quota-code", b.code,
+				"--region", region, "--query", "Quota.Value", "--output", "text")
+			return gpuQuotaResult(out, err, region, instance, b.name, need)
+		}
+	}
+	return checkResult{name: "GPU vCPU quota", status: checkWarn, detail: "cannot tell which quota " + instance + " draws on",
+		hint: "verify the account's on-demand quota for this instance family in " + region}
+}
+
+// gpuQuotaResult judges a quota reading. need 0 means the instance's vCPUs are unknown.
+func gpuQuotaResult(out string, err error, region, instance, quota string, need int) checkResult {
 	want := fmt.Sprintf("need %d for %s", need, instance)
+	if need == 0 {
+		want = "could not read how many " + instance + " needs"
+	}
 	if err != nil {
 		return checkResult{name: "GPU vCPU quota", status: checkWarn,
 			detail: "could not read",
-			hint:   "verify 'Running On-Demand G and VT instances' quota in " + region + " (" + want + ")"}
+			hint:   "verify '" + quota + "' quota in " + region + " (" + want + ")"}
 	}
 	v, perr := strconv.ParseFloat(out, 64)
 	if perr != nil {
 		return checkResult{name: "GPU vCPU quota", status: checkWarn,
 			detail: "unexpected value " + out,
-			hint:   "verify 'Running On-Demand G and VT instances' quota in " + region}
+			hint:   "verify '" + quota + "' quota in " + region}
 	}
 	detail := fmt.Sprintf("%g vCPUs (%s)", v, want)
+	if need == 0 {
+		return checkResult{name: "GPU vCPU quota", status: checkWarn, detail: detail,
+			hint: "verify that '" + quota + "' covers this instance type in " + region + "; reading its size needs ec2:DescribeInstanceTypes"}
+	}
 	if v < float64(need) {
 		return checkResult{name: "GPU vCPU quota", status: checkFail, detail: detail,
-			hint: "request an increase for 'Running On-Demand G and VT instances' — or, if you install into a different account, re-run with --profile/--region to match it"}
+			hint: "request an increase for '" + quota + "' — or, if you install into a different account, re-run with --profile/--region to match it"}
 	}
 	return checkResult{name: "GPU vCPU quota", status: checkPass, detail: detail}
 }

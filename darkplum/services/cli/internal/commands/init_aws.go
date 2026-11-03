@@ -655,8 +655,7 @@ func (a *awsCloud) CreateBackend(bucket, region string, st backendState) (string
 // GPUQuota is doctor's quota check, parameterised by the instance's vCPUs and
 // run under init's own runner.
 func (a *awsCloud) GPUQuota(region, instance string) checkResult {
-	out, err := a.aws(quotaArgs(region)...)
-	return gpuQuotaResult(out, err, region, instance)
+	return gpuQuota(a.aws, region, instance)
 }
 
 // CheckRegion probes the region with a read-only call. An opt-in region that is
