@@ -588,7 +588,7 @@ func (e *deployEnv) run(ctx context.Context) (err error) {
 	// ---- 11. install record ------------------------------------------------------------
 	e.step(12, "Record the install")
 	if err := e.recordInstall(kc, imgs, images); err != nil {
-		return e.stop(checkResult{name: "darkplum-install", status: checkFail, detail: firstLine(err.Error())}, "cannot write the install record")
+		return e.stop(checkResult{name: "darkplum-install", status: checkFail, detail: firstAndLastLine(err.Error())}, "cannot write the install record")
 	}
 	e.row(checkResult{name: "darkplum-install", status: checkPass, detail: m.Version + " · image-trust " + trustWord(imgs)})
 

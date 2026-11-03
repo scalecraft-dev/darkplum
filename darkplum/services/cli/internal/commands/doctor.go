@@ -163,7 +163,7 @@ func awsArgs(profile string, args ...string) []string { return runner.ProfileArg
 func checkAWSCreds(profile string) checkResult {
 	out, err := run("aws", awsArgs(profile, "sts", "get-caller-identity", "--query", "Account", "--output", "text")...)
 	if err != nil {
-		return checkResult{name: "aws credentials", status: checkFail,
+		return checkResult{name: "aws credentials", status: checkFail, detail: "the AWS CLI could not use them: logged out, expired or not set up",
 			hint: "run `aws configure` / `aws sso login`, set AWS_PROFILE, or pass --profile <name>"}
 	}
 	return checkResult{name: "aws credentials", status: checkPass, detail: "account " + out}
@@ -239,7 +239,7 @@ func sessionResult(expiry func(string) (time.Time, error), profile string, minMi
 	exp, err := expiry(profile)
 	if err != nil {
 		return checkResult{name: "session lifetime", status: checkWarn, detail: "could not read",
-			hint: "needs AWS CLI >= 2.9; make sure the session lasts the whole install (about 90 minutes)"}
+			hint: "needs a working AWS session and AWS CLI >= 2.9; make sure the session lasts the whole install (about 90 minutes)"}
 	}
 	if exp.IsZero() {
 		return checkResult{name: "session lifetime", status: checkPass, detail: "long-lived credentials"}

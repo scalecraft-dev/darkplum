@@ -183,6 +183,17 @@ func (a *awsCloud) NameCollisions(region, name string) []checkResult {
 	return rows
 }
 
+// firstAndLastLine is for errors that say what failed first and why last, as kubectl's
+// do: its first line alone is "error when retrieving current configuration of:".
+func firstAndLastLine(s string) string {
+	lines := strings.Split(strings.TrimSpace(s), "\n")
+	first, last := strings.TrimSpace(lines[0]), strings.TrimSpace(lines[len(lines)-1])
+	if len(lines) == 1 {
+		return first
+	}
+	return first + " … " + last
+}
+
 func firstLine(s string) string {
 	if i := strings.IndexByte(s, '\n'); i >= 0 {
 		return s[:i]

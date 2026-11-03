@@ -407,3 +407,29 @@ func TestAWSStateLockedReadsTheLockFile(t *testing.T) {
 		})
 	}
 }
+
+func TestFirstAndLastLine(t *testing.T) {
+	kubectl := "error: error when retrieving current configuration of:\nResource: \"/v1, Resource=configmaps\"\nfrom server for: \"STDIN\": Get \"https://x\": net/http: TLS handshake timeout\n"
+	want := `error: error when retrieving current configuration of: … from server for: "STDIN": Get "https://x": net/http: TLS handshake timeout`
+	if got := firstAndLastLine(kubectl); got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+	if got := firstAndLastLine("just one line\n"); got != "just one line" {
+		t.Errorf("one line: got %q", got)
+	}
+}
+
+// Logged out, the row must say what is wrong rather than show nothing, or the bare
+// "exit status 255" that is all the runner keeps of the failure.
+func TestCheckAWSCredsSaysWhatIsWrong(t *testing.T) {
+	dir := t.TempDir()
+	script := "#!/bin/sh\nprintf '\\nError loading SSO Token: Token for https://x does not exist\\n' >&2\nexit 255\n"
+	if err := os.WriteFile(filepath.Join(dir, "aws"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	r := checkAWSCreds("acme")
+	if r.status != checkFail || !strings.Contains(r.detail, "logged out") || strings.Contains(r.detail, "exit status") {
+		t.Errorf("row = %+v", r)
+	}
+}
