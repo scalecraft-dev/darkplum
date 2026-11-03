@@ -238,6 +238,7 @@ type fakeKube struct {
 	restarts     int
 	deleted      []string
 	oidcRedirect string
+	waitErr      error
 }
 
 func (k *fakeKube) Run(stdin []byte, _ string, args ...string) ([]byte, error) {
@@ -273,6 +274,10 @@ func (k *fakeKube) Run(stdin []byte, _ string, args ...string) ([]byte, error) {
 		return nil, nil
 	case strings.Contains(joined, "rollout status deployment/darkplum-web"):
 		return nil, nil
+	case strings.Contains(joined, "get pods -l app.kubernetes.io/name=darkplum-web"):
+		return []byte("pod/darkplum-web-old-a\npod/darkplum-web-old-b\n"), nil
+	case strings.Contains(joined, "wait --for=delete"):
+		return nil, k.waitErr
 	case strings.Contains(joined, "get secret darkplum-auth"):
 		return []byte(base64.StdEncoding.EncodeToString([]byte(k.oidcRedirect))), nil
 	case strings.Contains(joined, "get deploy"):
@@ -1051,6 +1056,13 @@ func TestConfigureAuditStepStates(t *testing.T) {
 			t.Errorf("deleted %v, restarts %d", h.kube.deleted, h.kube.restarts)
 		}
 		h.contains("removed the old load balancer trust list and web-ingress policy")
+		waited := false
+		for _, c := range h.kube.calls {
+			waited = waited || strings.Contains(strings.Join(c, " "), "wait --for=delete")
+		}
+		if !waited {
+			t.Error("the tunnel opened next could land on a web pod that is still stopping")
+		}
 	})
 }
 
@@ -1337,5 +1349,34 @@ func TestRunLogStripsColourAndKeepsTheUncaughtError(t *testing.T) {
 	}
 	if !strings.Contains(log, "error: kubectl: boom") || strings.Contains(log, "already shown") {
 		t.Errorf("log = %q", log)
+	}
+}
+
+// The tunnel opened after the restart must not land on a pod that is still stopping,
+// or the address printed for the person dies seconds later. Measured: it did, 4s in.
+func TestConfigureWaitsForTheOldWebPodsToGo(t *testing.T) {
+	for name, waitErr := range map[string]error{"gone in time": nil, "wait fails": errors.New("timed out waiting")} {
+		t.Run(name, func(t *testing.T) {
+			h := webHarness(t)
+			h.kube.waitErr = waitErr
+			if err := h.run(&ConfigureCmd{}, "a@acme.com\n", testPassword); err != nil {
+				t.Fatalf("a failed wait must not fail configure: %v\n%s", err, h.out.String())
+			}
+			find := func(want string) int {
+				for i, c := range h.kube.calls {
+					if strings.Contains(strings.Join(c, " "), want) {
+						return i
+					}
+				}
+				return -1
+			}
+			names, restart, status, wait := find("get pods -l app.kubernetes.io/name=darkplum-web"), find("rollout restart deployment/darkplum-web"), find("rollout status deployment/darkplum-web"), find("wait --for=delete --timeout=60s pod/darkplum-web-old-a pod/darkplum-web-old-b")
+			if names < 0 || !(names < restart && restart < status && status < wait) {
+				t.Errorf("order: names %d, restart %d, status %d, wait %d", names, restart, status, wait)
+			}
+			if name == "wait fails" {
+				h.contains("✓ audit")
+			}
+		})
 	}
 }

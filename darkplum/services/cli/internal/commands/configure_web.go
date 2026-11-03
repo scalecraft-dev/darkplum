@@ -230,16 +230,31 @@ func (r *configureRun) trustProxies() {
 			return
 		}
 		fmt.Fprintf(r.out, "%s restarting web to load the load balancer's addresses…\n", sDim("…"))
-		if _, err := r.kc.NS(nil, "rollout", "restart", "deployment/darkplum-web"); err != nil {
-			r.problem("audit", "could not restart web: "+firstLine(err.Error()), "re-run darkplum configure")
-			return
-		}
-		if _, err := r.kc.NS(nil, "rollout", "status", "deployment/darkplum-web", "--timeout=180s"); err != nil {
-			r.problem("audit", "web did not come back after the restart: "+firstLine(err.Error()), "see which pod is stuck: darkplum status")
+		if !r.restartWeb() {
 			return
 		}
 	}
 	r.pass("audit", "client addresses recorded (trusts only the load balancer at "+strings.Join(ips, ", ")+")")
+}
+
+// restartWeb rolls web and returns once the old pods have gone. The roll is done while
+// they are still stopping, and the tunnel opened next could attach to one and die seconds
+// later, taking the address printed for the person with it. Not knowing the old pods, or
+// a failed wait, costs only that: the tunnel reconnects. It reports a failure itself.
+func (r *configureRun) restartWeb() bool {
+	old, _ := r.kc.NS(nil, "get", "pods", "-l", "app.kubernetes.io/name=darkplum-web", "-o", "name")
+	if _, err := r.kc.NS(nil, "rollout", "restart", "deployment/darkplum-web"); err != nil {
+		r.problem("audit", "could not restart web: "+firstLine(err.Error()), "re-run darkplum configure")
+		return false
+	}
+	if _, err := r.kc.NS(nil, "rollout", "status", "deployment/darkplum-web", "--timeout=180s"); err != nil {
+		r.problem("audit", "web did not come back after the restart: "+firstLine(err.Error()), "see which pod is stuck: darkplum status")
+		return false
+	}
+	if names := strings.Fields(old); len(names) > 0 {
+		_, _ = r.kc.NS(nil, append([]string{"wait", "--for=delete", "--timeout=60s"}, names...)...)
+	}
+	return true
 }
 
 // untrustProxies removes the trust list and the web-ingress policy left from
@@ -251,8 +266,7 @@ func (r *configureRun) untrustProxies() {
 			return
 		}
 	}
-	if _, err := r.kc.NS(nil, "rollout", "restart", "deployment/darkplum-web"); err != nil {
-		r.problem("audit", "could not restart web: "+firstLine(err.Error()), "re-run darkplum configure")
+	if !r.restartWeb() {
 		return
 	}
 	printCheckTo(r.out, checkResult{name: "audit", status: checkWarn, detail: "the private address is gone: removed the old load balancer trust list and web-ingress policy",
