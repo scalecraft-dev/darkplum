@@ -6,22 +6,36 @@ locally, what the checks are, and what a change needs before it is merged.
 ## Local setup
 
 You need Docker, [kind](https://kind.sigs.k8s.io/), kubectl, Go (the version
-in each service's `go.mod`), Node 22 and pnpm 9.
+in each service's `go.mod`), Node 22 and pnpm 9. Contributors do not use the
+operator CLI to run the local stack; `scripts/dev.sh` does, and it only ever
+talks to the `kind-darkplum-dev` cluster, never to kubectl's current context.
 
 ```bash
 cd darkplum
-make dev-up                 # kind cluster with mocked inference at http://localhost:8080
-make dev-test               # smoke test
-make dev-build-api          # rebuild one service into the cluster (also dev-build-gateway, dev-build-web)
-make dev-logs               # tail the services
-make dev-down               # remove the cluster
+scripts/dev.sh up                 # kind cluster with mocked inference at http://localhost:8080
+scripts/dev.sh test               # smoke test
+scripts/dev.sh build api          # rebuild one service into the cluster (also gateway, web)
+scripts/dev.sh logs               # tail the services
+scripts/dev.sh down               # remove the cluster
+scripts/dev.sh cli keys list      # the CLI from this checkout, pointed at the kind cluster
 ```
 
-Port 8080 taken? `make dev-up DEV_PORT=5174`. To exercise Bedrock locally with
-your own AWS credentials, `make dev-up DEV_AWS=1`. LM Studio on port 1234 is
-picked up automatically on Docker Desktop; on Linux kind,
+Port 8080 taken? `DEV_PORT=5174 scripts/dev.sh up`. To exercise Bedrock locally
+with your own AWS credentials, `DEV_AWS=1 scripts/dev.sh up` (optionally
+`DEV_AWS_PROFILE=<profile>`). For the authenticated part of `test`, set
+`DEV_EMAIL` and `DEV_PASSWORD` after creating the first admin. LM Studio on
+port 1234 is picked up automatically on Docker Desktop; on Linux kind,
 `host.docker.internal` needs the extra host mapping described in
 `k8s/overlays/dev/patches/gateway-deployment.yaml`.
+
+The operator CLI builds with the Go toolchain alone. `go build -o darkplum ./cmd`
+in `darkplum/services/cli` gives a development build (channel `dev`): it embeds
+the checkout's Terraform and manifests, prints a development banner, and
+refuses to deploy images unless you give it `--release-images` or
+`--unsigned-images` (hidden flags that release binaries reject).
+`scripts/dev.sh eks-push --install <name>` builds amd64 images, pushes them to
+that install's registry and prints the `--unsigned-images` command; the install
+is then marked unsigned until a signed release is deployed over it.
 
 Each service also runs on its own:
 
@@ -51,7 +65,8 @@ Each test creates its own schema and drops it afterwards.
   the API-to-UI parity check and the policy truth-table check
   (`pnpm run check:policy`).
 - Kubernetes manifests and docs: every kustomize overlay builds, the vLLM
-  model template renders, the Makefile parses, and `go run ./cmd/apidoc`
+  model template renders, `scripts/dev.sh` passes shellcheck and argument
+  validation, the repository holds no instructions to run make, and `go run ./cmd/apidoc`
   must leave `docs/API.md` unchanged so the reference never drifts from the
   route inventory.
 - Terraform: `terraform fmt -check`, `terraform validate`, and the offline

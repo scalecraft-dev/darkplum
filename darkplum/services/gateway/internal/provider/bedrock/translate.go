@@ -627,6 +627,20 @@ func translateStreamEvent(
 	return false, nil
 }
 
+// ModelRetiredCode marks a chat that reached a model AWS has retired.
+const ModelRetiredCode = provider.DenialModelRetired
+
+// ModelRetiredMessage is what the caller sees instead of AWS's "Please refer
+// to the AWS documentation" text.
+const ModelRetiredMessage = provider.ModelRetiredMessage
+
+// IsModelRetiredMessage recognises Bedrock's end-of-life refusal, which comes
+// back as a ResourceNotFoundException whose text is "This model version has
+// reached the end of its life."
+func IsModelRetiredMessage(msg string) bool {
+	return strings.Contains(strings.ToLower(msg), "end of its life")
+}
+
 // TranslateBedrockError converts a Bedrock SDK error code to an HTTP status
 // and an OpenAI-compatible JSON error body. The errorCode parameter is the
 // smithy fault type name (e.g. "ThrottlingException"). rawMessage is forwarded
@@ -635,6 +649,7 @@ func TranslateBedrockError(errorCode string, rawMessage string) (statusCode int,
 	type errDetail struct {
 		Message string `json:"message"`
 		Type    string `json:"type"`
+		Code    string `json:"code,omitempty"`
 	}
 	type errEnvelope struct {
 		Error errDetail `json:"error"`
@@ -673,6 +688,10 @@ func TranslateBedrockError(errorCode string, rawMessage string) (statusCode int,
 		detail = errDetail{
 			Message: msg,
 			Type:    "invalid_request_error",
+		}
+		if IsModelRetiredMessage(rawMessage) {
+			detail.Code = ModelRetiredCode
+			detail.Message = ModelRetiredMessage
 		}
 	case "ModelNotReadyException", "ServiceUnavailableException":
 		statusCode = http.StatusServiceUnavailable

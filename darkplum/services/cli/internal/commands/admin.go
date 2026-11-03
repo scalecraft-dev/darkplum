@@ -22,7 +22,7 @@ type AdminCreateCmd struct {
 	Email         string `help:"Admin email address." required:""`
 	Name          string `help:"Admin display name." required:""`
 	PasswordStdin bool   `name:"password-stdin" help:"Read the password from stdin instead of prompting."`
-	Context       string `name:"context" help:"Kubeconfig context to act on. Needed only where there are no install settings (run from darkplum/ after darkplum init)." default:""`
+	Context       string `name:"context" help:"Local kind context (kind-*) to act on, for a cluster Darkplum did not install. An install is found from its settings. A loopback address can still be an ssh tunnel to a remote cluster: the flag cannot tell, so do not point it at one." default:""`
 }
 
 // waitForJob polls until the Job reaches Complete or Failed. We poll rather than
@@ -48,7 +48,7 @@ func waitForJob(c *kube.Client, name string, timeout time.Duration) error {
 // Run executes `darkplum admin create`.
 func (c *AdminCreateCmd) Run(g *Globals) error {
 	// Resolve the cluster first, so a wrong context fails before the prompt.
-	kc, err := installKube(os.Stdout, g.Namespace, c.Context)
+	kc, err := installKube(os.Stdout, g.Namespace, c.Context, g.Install)
 	if err != nil {
 		return err
 	}

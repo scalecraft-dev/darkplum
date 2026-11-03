@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# A stand-in for darkplum for selftest.sh.
+set -euo pipefail
+[ "$1" = --install ] && shift 2
+cmd="$1"; shift
+ws="$DARKPLUM_HOME/installs/t"
+case "$cmd" in
+  kubeconfig) echo "export KUBECONFIG='$ws/kubeconfig'" ;;
+  deploy)
+    [ "${FAKE_DEPLOY_NOTEXT:-}" = 1 ] || echo "  ✓ infrastructure  no infrastructure changes"
+    if [ "${FAKE_DEPLOY_MUTATE:-}" = 1 ]; then
+      echo '{"data":{"SESSION_SIGNING_KEY":"bmV3a2V5"}}' >"$FAKE_STATE/install/secret-darkplum-auth.json"
+    fi
+    exit "${FAKE_DEPLOY_RC:-0}" ;;
+  destroy)
+    mkdir -p "$ws/logs"
+    log="$ws/logs/destroy-$(date +%s%N 2>/dev/null || date +%s).log"
+    echo "destroy log (ambient KUBECONFIG=${KUBECONFIG:-unset})" >"$log"
+    if jq -e '.account_ids | index("000000000000")' "$ws/install.json" >/dev/null && [ "${FAKE_MISMATCH_IGNORED:-}" != 1 ]; then
+      echo "credentials are for account 123456789012, the install is in 000000000000"
+      echo "Nothing was deleted or changed."
+      exit 1
+    fi
+    [ "${FAKE_TOUCH_DECOY:-}" != 1 ] || echo '{"items":[]}' >"$FAKE_STATE/decoy/objects.json"
+    [ "${FAKE_LOG_DECOY:-}" != 1 ] || echo "using context decoy-ctx" >>"$log"
+    echo "✓ Done. Nothing tagged for the cluster is left in the account." ;;
+  *) echo "fake darkplum: unsupported $cmd" >&2; exit 98 ;;
+esac

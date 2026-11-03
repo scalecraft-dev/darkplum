@@ -1,7 +1,7 @@
 # NVIDIA device plugin: advertises nvidia.com/gpu on the GPU node so the vLLM
 # pod can be scheduled. The EKS AL2023_x86_64_NVIDIA AMI ships the driver and
 # container toolkit but not this plugin; without it the node is Ready but has
-# no allocatable GPU and `make deploy` waits forever.
+# no allocatable GPU and `darkplum deploy` waits forever.
 #
 # Upstream deployments/static/nvidia-device-plugin.yml at v0.20.1 (Apache-2.0,
 # github.com/NVIDIA/k8s-device-plugin), with a nodeSelector so it runs only on

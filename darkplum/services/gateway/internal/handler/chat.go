@@ -1402,6 +1402,20 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 		return
 	}
 
+	// A model the cloud has retired is refused here, before any call to it
+	// (the call can only fail with the cloud's end-of-life text). The admin UI
+	// and /v1/models show the same fact as availability "retired".
+	if rc, ok := prov.(provider.RetiredChecker); ok && rc.ModelRetired(resolvedModel) {
+		c.Set("denial_code", provider.DenialModelRetired)
+		logDenial(c, provider.DenialModelRetired, req.Model, resolvedModel, route.Class)
+		c.JSON(http.StatusNotFound, openAIError{Error: openAIErrorBody{
+			Message: provider.ModelRetiredMessage,
+			Type:    "invalid_request_error",
+			Code:    provider.DenialModelRetired,
+		}})
+		return
+	}
+
 	// Tool support is per backend. A request carrying tools (or a
 	// tool_choice other than "none") for a backend that cannot take them is
 	// refused here -- the one place the backend is known -- rather than

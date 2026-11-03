@@ -175,16 +175,19 @@ type authConfig struct {
 // adminModel is one row of GET /api/v1/models (the admin list, bare-array
 // shape: no X-Darkplum-Classes header is sent).
 type adminModel struct {
-	ID           string  `json:"id"`
-	ModelID      string  `json:"model_id"`
-	Provider     string  `json:"provider"`
-	DisplayName  *string `json:"display_name"`
-	Enabled      bool    `json:"enabled"`
-	BackendClass string  `json:"backend_class"`
-	Available    bool    `json:"available"`
-	Availability *struct {
-		State string `json:"state"`
-	} `json:"availability"`
+	ID           string             `json:"id"`
+	ModelID      string             `json:"model_id"`
+	Provider     string             `json:"provider"`
+	DisplayName  *string            `json:"display_name"`
+	Enabled      bool               `json:"enabled"`
+	BackendClass string             `json:"backend_class"`
+	Available    bool               `json:"available"`
+	Availability *modelAvailability `json:"availability"`
+}
+
+// modelAvailability is the gateway's availability object, relayed by the api.
+type modelAvailability struct {
+	State string `json:"state"`
 }
 
 func (m adminModel) label() string {
@@ -200,8 +203,13 @@ func (m adminModel) needsOptIn() bool {
 	return m.Availability != nil && m.Availability.State == "needs_aws_opt_in"
 }
 
+// retired: AWS has ended the model's life. Every chat to it fails.
+func (m adminModel) retired() bool {
+	return m.Availability != nil && m.Availability.State == "retired"
+}
+
 // ready: the gateway has seen it recently and nothing is known to block it.
-func (m adminModel) ready() bool { return m.Available && !m.needsOptIn() }
+func (m adminModel) ready() bool { return m.Available && !m.needsOptIn() && !m.retired() }
 
 func (m adminModel) kind() string {
 	switch {
@@ -216,6 +224,8 @@ func (m adminModel) kind() string {
 
 func (m adminModel) state() string {
 	switch {
+	case m.retired():
+		return "retired by AWS"
 	case m.needsOptIn():
 		return "needs AWS opt-in"
 	case !m.Available:

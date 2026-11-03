@@ -6,7 +6,7 @@ import { ROUTES, buildPath, type QueryValue, type Route } from './routes'
 /**
  * What this bundle can make sense of, declared on every request.
  *
- * Deploy order is not enforceable here — one repo, one `make deploy` — so the
+ * Deploy order is not enforceable here — one repo, one `darkplum deploy` — so the
  * server has to be able to tell an old bundle from a new one rather than assume
  * they moved together. Without this header the api leaves external_api models
  * out of every list it answers, which is what makes a stale cached bundle safe:
@@ -839,7 +839,7 @@ export function exportConversation(id: string): Promise<{ blob: Blob; filename: 
 /**
  * A chat failure carrying the gateway's OpenAI-style error code, so the
  * conversation UI can explain routing refusals (model_not_found,
- * model_not_enabled, model_residency_violation, policy_unavailable) and vendor
+ * model_not_enabled, model_retired, model_residency_violation, policy_unavailable) and vendor
  * failures (provider_rate_limited, provider_auth_failed, upstream_error,
  * upstream_timeout, unsupported_parameter) instead of showing a generic
  * failure.

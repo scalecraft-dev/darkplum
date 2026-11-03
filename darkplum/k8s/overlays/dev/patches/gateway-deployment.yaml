@@ -28,7 +28,7 @@ spec:
             - name: LMSTUDIO_UPSTREAM
               value: http://host.docker.internal:1234
             # Bedrock is off in the default dev stack: it needs the developer's AWS
-            # credentials inside the pod. `make dev-up DEV_AWS=1` applies the
+            # credentials inside the pod. `DEV_AWS=1 scripts/dev.sh up` applies the
             # dev-aws overlay, which mounts them and turns this back on.
             - name: BEDROCK_ENABLED
               value: "false"

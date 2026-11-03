@@ -121,7 +121,8 @@ export function VendorBillingKeyModal({ open, vendor, mode, transportOk, onClose
       setRefusedTransport(true)
       setModalError(err.message)
       clearKey()
-      setAnnouncement(err.message)
+      // What is on screen is the notice, not the api's sentence.
+      setAnnouncement(BILLING_TRANSPORT_HELP)
       return
     }
     const copy = billingVerifyErrorCopy(vendor, code, err.message, err.vendorError()?.status ?? null)
@@ -251,7 +252,8 @@ export function VendorBillingKeyModal({ open, vendor, mode, transportOk, onClose
           </div>
         )}
 
-        {modalError && <p className={styles.error} role="alert">{modalError}</p>}
+        {/* Not while the transport notice is up: it already says the remedy. */}
+        {modalError && !keyBlocked && <p className={styles.error} role="alert">{modalError}</p>}
 
         {needsKey && !keyBlocked && (
           <>

@@ -22,9 +22,21 @@ const (
 	// account mode could not be read.
 	DataRetentionModeUnknown = "unknown"
 
-	AvailabilityOK            = "ok"
-	AvailabilityNeedsOptIn    = "needs_aws_opt_in"
-	AvailabilityUnknown       = "unknown"
+	AvailabilityOK         = "ok"
+	AvailabilityNeedsOptIn = "needs_aws_opt_in"
+	AvailabilityUnknown    = "unknown"
+	// AvailabilityRetired: the cloud has retired the model (end of life). It
+	// stays in the catalogue, shown as retired, and chat is refused before any
+	// call to the cloud.
+	AvailabilityRetired       = "retired"
+	AvailabilityReasonRetired = "end_of_life"
+
+	// DenialModelRetired is the error code and denial_code for a chat to a
+	// retired model.
+	DenialModelRetired = "model_retired"
+	// ModelRetiredMessage is what the caller reads. The web UI says "the Models
+	// page"; the CLI words its own hint.
+	ModelRetiredMessage       = "This model has been retired by AWS and can no longer be used. An administrator can enable another model on the Models page."
 	AvailabilityReasonDataRet = "data_retention"
 )
 
@@ -42,13 +54,20 @@ type Availability struct {
 	State        string `json:"state"`
 	Reason       string `json:"reason,omitempty"`
 	AccountMode  string `json:"account_mode"`
-	RequiredMode string `json:"required_mode"`
+	RequiredMode string `json:"required_mode,omitempty"`
 }
 
 // AvailabilityReporter is implemented by a provider that can say, per model,
 // whether the account has opted in. Providers without it get no availability.
 type AvailabilityReporter interface {
 	ModelAvailability(model string) Availability
+}
+
+// RetiredChecker is implemented by a provider that knows a model is retired.
+// The handler asks it before dispatching, so a retired model is refused without
+// a call to the cloud.
+type RetiredChecker interface {
+	ModelRetired(model string) bool
 }
 
 // DataRetentionReporter exposes the cached account mode for /health. mode is

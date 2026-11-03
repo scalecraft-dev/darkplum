@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -87,6 +88,12 @@ type InferenceEvent struct {
 type Recorder struct {
 	pool   *pgxpool.Pool
 	events chan InferenceEvent
+	// done closes when flush has written everything and returned.
+	done chan struct{}
+	// mu and drained keep a Record that runs after Drain (a request still going when the
+	// server's shutdown timeout ended) from sending on the closed channel.
+	mu      sync.RWMutex
+	drained bool
 
 	// schemaLevel indexes into the package-level schemas slice: the column
 	// set writeBatch currently believes inference_events supports. 0 (the
@@ -108,6 +115,7 @@ func New(pool *pgxpool.Pool) *Recorder {
 	r := &Recorder{
 		pool:   pool,
 		events: make(chan InferenceEvent, 4096),
+		done:   make(chan struct{}),
 	}
 	go r.flush()
 	return r
@@ -115,6 +123,12 @@ func New(pool *pgxpool.Pool) *Recorder {
 
 // Record enqueues an InferenceEvent. It never blocks.
 func (r *Recorder) Record(evt InferenceEvent) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.drained {
+		slog.Warn("inference event after shutdown, dropping event", "request_id", evt.RequestID)
+		return
+	}
 	select {
 	case r.events <- evt:
 	default:
@@ -122,15 +136,32 @@ func (r *Recorder) Record(evt InferenceEvent) {
 	}
 }
 
-// Drain flushes all remaining events in the channel and returns.
+// drainWait bounds Drain. A pod has 30s from its preStop hook: 5s of that hook, up to
+// 10s of the server's shutdown, and this.
+var drainWait = 10 * time.Second
+
+// Drain flushes all remaining events in the channel and returns once they are
+// written, or drainWait has passed: the process exits right after it, and would
+// otherwise lose the last batch.
 // Call this during graceful shutdown after the HTTP server stops accepting requests.
 func (r *Recorder) Drain() {
-	close(r.events)
+	r.mu.Lock()
+	if !r.drained {
+		r.drained = true
+		close(r.events)
+	}
+	r.mu.Unlock()
+	select {
+	case <-r.done:
+	case <-time.After(drainWait):
+		slog.Warn("inference events not written before shutdown: the database did not answer in time", "buffered", len(r.events))
+	}
 }
 
 // flush drains the channel and writes batches every second or when 100 events
 // have accumulated. It exits when the channel is closed (via Drain).
 func (r *Recorder) flush() {
+	defer close(r.done)
 	batch := make([]InferenceEvent, 0, 100)
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()

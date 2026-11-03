@@ -33,3 +33,8 @@ output "node_security_group_id" {
 output "cluster_primary_security_group_id" {
   value = module.eks.cluster_primary_security_group_id
 }
+
+output "cluster_service_cidr" {
+  description = "The cluster's Kubernetes service CIDR (assigned by EKS)."
+  value       = module.eks.cluster_service_cidr
+}

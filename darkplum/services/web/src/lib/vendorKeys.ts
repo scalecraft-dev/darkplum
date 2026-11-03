@@ -734,11 +734,21 @@ export function canInstallKeyOverTransport(
  * is not the one to leave somebody stuck behind at 2am.
  */
 export const WEB_PORT_FORWARD_COMMAND =
-  'kubectl port-forward -n darkplum-system svc/darkplum-web 8081:80'
+  'eval "$(darkplum kubeconfig)" && \\\n  kubectl port-forward -n darkplum-system \\\n    svc/darkplum-web 8081:80'
 
 /** Where that port-forward puts Darkplum. Named in the copy so nobody has to
  *  infer the scheme from the port mapping. */
 export const WEB_PORT_FORWARD_URL = 'http://localhost:8081'
+
+/** Copy that mixes prose with commands. The commands are rendered as inline
+ *  code, never as markdown backticks in the string, which would show up
+ *  literally on screen. */
+export type HelpPart = string | { code: string }
+
+/** The same copy as one plain string, for tests and for aria text. */
+export function helpPlainText(parts: readonly HelpPart[]): string {
+  return parts.map((p) => (typeof p === 'string' ? p : p.code)).join('')
+}
 
 /**
  * Why the key form is not on screen, and what to do instead.
@@ -749,15 +759,41 @@ export const WEB_PORT_FORWARD_URL = 'http://localhost:8081'
  * wrong thing — the api's answer comes from its own SECURE_COOKIES setting,
  * not from the scheme in the address bar.
  */
-export const INSECURE_TRANSPORT_HELP =
-  'Installing a key from here needs HTTPS. Darkplum is not served over HTTPS here, so a key typed into this page would cross the network readable, and Darkplum refuses it. Reach Darkplum over a port-forward instead — run the first command below, then open http://localhost:8081 and install the key there — or serve it over HTTPS (make expose-web CERT_ARN=…), or install the key with the second command.'
+export const INSECURE_TRANSPORT_HELP_PARTS: readonly HelpPart[] = [
+  'Installing a key from here needs HTTPS. Darkplum is not served over HTTPS here, so a key typed into this page would cross the network readable, and Darkplum refuses it. Reach Darkplum over a port-forward instead — run the first command below, then open http://localhost:8081 and install the key there — or open Darkplum at its HTTPS address (',
+  { code: 'darkplum status' },
+  ' prints it, if this install has a team address), or install the key with the second command.',
+]
+export const INSECURE_TRANSPORT_HELP = helpPlainText(INSECURE_TRANSPORT_HELP_PARTS)
 
 /** The same refusal from a page that IS HTTPS: the api is the half that is
- *  not configured for it, so the remedy is on the api, not on this page. The
- *  port-forward works here too, and for the same reason — the api takes the
- *  loopback exception whatever SECURE_COOKIES says. */
-export const API_NOT_HTTPS_HELP =
-  "This page is HTTPS, but Darkplum's api is not configured as HTTPS-served, so it refuses a key. Re-run make expose-web CERT_ARN=…, or set SECURE_COOKIES=true in the darkplum-auth Secret and restart the api. To install a key before either of those, reach Darkplum over a port-forward — run the first command below, then open http://localhost:8081 — or install it with the second command."
+ *  not configured for it, so the remedy is on the api, not on this page. No
+ *  CLI command sets this, so the steps are spelled out. The port-forward works
+ *  here too, and for the same reason — the api takes the loopback exception
+ *  whatever SECURE_COOKIES says. */
+export const API_NOT_HTTPS_HELP_PARTS: readonly HelpPart[] = [
+  "This page is HTTPS, but Darkplum's api is not configured as HTTPS-served, so it refuses a key. To fix it, run the first command below: it sets SECURE_COOKIES=true in the darkplum-auth Secret and restarts the api. To install a key before that, reach Darkplum over a port-forward — run the second command below, then open http://localhost:8081 — or install it with the third command.",
+]
+export const API_NOT_HTTPS_HELP = helpPlainText(API_NOT_HTTPS_HELP_PARTS)
+
+/** The api-side fix for API_NOT_HTTPS_HELP. No CLI command sets SECURE_COOKIES,
+ *  so this is the whole of it; guarded like the port-forward so it can only act
+ *  on this install's cluster. */
+export const SECURE_COOKIES_FIX_COMMAND =
+  'eval "$(darkplum kubeconfig)" && \\\n  kubectl patch secret darkplum-auth -n darkplum-system \\\n    -p \'{"stringData":{"SECURE_COOKIES":"true"}}\' && \\\n  kubectl rollout restart -n darkplum-system \\\n    deployment/darkplum-api'
+
+export type TransportCommandRole = 'fix' | 'forward' | 'key'
+
+/** Which command blocks go under the transport copy, in the order the copy
+ *  names them. The api fix only when the copy about the api is showing: with an
+ *  older gateway (no forward either) the page is not offering a UI install. */
+export function transportCommandRoles(kind: KeyTransportHelp, withForward: boolean): TransportCommandRole[] {
+  const roles: TransportCommandRole[] = []
+  if (withForward && kind === 'api_not_https') roles.push('fix')
+  if (withForward) roles.push('forward')
+  roles.push('key')
+  return roles
+}
 
 /** Which of the two is true of this page. */
 export type KeyTransportHelp = 'page_not_https' | 'api_not_https'
@@ -765,6 +801,11 @@ export type KeyTransportHelp = 'page_not_https' | 'api_not_https'
 export const KEY_TRANSPORT_HELP_TEXT: Record<KeyTransportHelp, string> = {
   page_not_https: INSECURE_TRANSPORT_HELP,
   api_not_https: API_NOT_HTTPS_HELP,
+}
+
+export const KEY_TRANSPORT_HELP_PARTS: Record<KeyTransportHelp, readonly HelpPart[]> = {
+  page_not_https: INSECURE_TRANSPORT_HELP_PARTS,
+  api_not_https: API_NOT_HTTPS_HELP_PARTS,
 }
 
 /** The api's loopback exception, in the browser's terms. `window.location

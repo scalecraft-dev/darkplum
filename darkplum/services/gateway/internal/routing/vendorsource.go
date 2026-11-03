@@ -139,7 +139,7 @@ func sameGlobSet(a, b []string) bool {
 // when the DB and env stamps are EXACTLY equal but the filter values differ
 // — this can only happen if a ConfigMap was hand-edited to copy a
 // filter_set_at without copying the filter itself, since every real writer
-// (the UI's PUT, and `make set-*-key`) stamps the pair it wrote together.
+// (the UI's PUT, and `darkplum keys set`) stamps the pair it wrote together.
 func NewVendorFilterFunc(vendor string, envFilter []string, envSetAt time.Time, envWorkspaceID string, polStore vendorFilterPolicySource) vendorFilterFunc {
 	var warnMu sync.Mutex
 	var lastWarnKey string

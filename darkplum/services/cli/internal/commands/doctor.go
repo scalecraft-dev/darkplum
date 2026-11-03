@@ -5,10 +5,11 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/scalecraft-dev/darkplum/cli/internal/runner"
 )
 
 // DoctorCmd groups read-only environment and health diagnostics. It provisions
@@ -24,10 +25,10 @@ type DoctorCmd struct {
 // missing prerequisite fails in seconds instead of minutes into a provision.
 type DoctorCheckCmd struct {
 	Cloud   string `help:"Target cloud provider." enum:"aws,gcp" default:"aws"`
-	Region  string `help:"Region to check GPU capacity in — must match aws_region in your terraform.tfvars. Defaults per cloud." default:""`
-	Profile string `help:"AWS profile to check against — must match aws_profile in terraform.tfvars, else the check hits the wrong account. Defaults to the standard AWS credential chain." default:""`
+	Region  string `help:"Region to check GPU capacity in — must match the install's region. Defaults per cloud." default:""`
+	Profile string `help:"AWS profile to check against — must match the install's profile, else the check hits the wrong account. Defaults to the standard AWS credential chain." default:""`
 
-	Tfvars     string `help:"Path to the terraform.tfvars written by 'darkplum init'. Takes profile, region, GPU type and AZs from it and checks the credentials belong to the account it names. 'make deploy' passes this." default:""`
+	Tfvars     string `help:"Path to the settings file written by 'darkplum init'. Takes profile, region, GPU type and AZs from it and checks the credentials belong to the account it names. The deploy passes this." default:""`
 	MinSession int    `help:"Fail when the AWS session expires within this many minutes (an SSO login that lapses mid-apply strands a half-built cluster). 0 only reports it." name:"min-session" default:"0"`
 }
 
@@ -53,7 +54,7 @@ func (d *DoctorCheckCmd) Run(_ *Globals) error {
 	if d.Tfvars != "" {
 		var err error
 		if tf, err = readTFVars(d.Tfvars); err != nil {
-			return fmt.Errorf("%w — run ./bin/darkplum init first", err)
+			return fmt.Errorf("%w — run darkplum init first", err)
 		}
 		if d.Profile == "" {
 			d.Profile = tf.Profile
@@ -76,12 +77,11 @@ func (d *DoctorCheckCmd) Run(_ *Globals) error {
 	}
 	fmt.Printf("%s\n\n", header)
 
-	// Tools every install needs regardless of cloud.
+	// Tools every install needs regardless of cloud: Terraform and kubectl. (jq and
+	// docker were the previous flow's; images are copied by darkplum itself now.)
 	checks := []checkResult{
 		checkTool("terraform"),
-		checkTool("kubectl"),
-		checkTool("jq"),
-		checkTool("docker"),
+		checkTool(runner.Kubectl),
 	}
 
 	switch d.Cloud {
@@ -146,13 +146,10 @@ func defaultRegion(cloud string) string {
 // run executes a command and returns its trimmed stdout. Stderr is deliberately
 // NOT merged in: callers parse this value (e.g. a quota number), and CLI
 // deprecation/SSO warnings on stderr would corrupt the parse.
-func run(name string, args ...string) (string, error) {
-	out, err := exec.Command(name, args...).Output()
-	return strings.TrimSpace(string(out)), err
-}
+func run(name string, args ...string) (string, error) { return runner.ToolStdout(name, args...) }
 
 func checkTool(name string) checkResult {
-	if path, err := exec.LookPath(name); err == nil {
+	if path, err := runner.Which(name); err == nil {
 		return checkResult{name: name, status: checkPass, detail: path}
 	}
 	return checkResult{name: name, status: checkFail, hint: "not on PATH — install it and retry"}
@@ -161,17 +158,12 @@ func checkTool(name string) checkResult {
 // awsArgs prefixes `--profile <p>` when a profile is set, so doctor checks the
 // same account the install will use (var.aws_profile) rather than whatever the
 // ambient default credential chain resolves to.
-func awsArgs(profile string, args ...string) []string {
-	if profile != "" {
-		return append([]string{"--profile", profile}, args...)
-	}
-	return args
-}
+func awsArgs(profile string, args ...string) []string { return runner.ProfileArgs(profile, args...) }
 
 func checkAWSCreds(profile string) checkResult {
 	out, err := run("aws", awsArgs(profile, "sts", "get-caller-identity", "--query", "Account", "--output", "text")...)
 	if err != nil {
-		return checkResult{name: "aws credentials", status: checkFail,
+		return checkResult{name: "aws credentials", status: checkFail, detail: "the AWS CLI could not use them: logged out, expired or not set up",
 			hint: "run `aws configure` / `aws sso login`, set AWS_PROFILE, or pass --profile <name>"}
 	}
 	return checkResult{name: "aws credentials", status: checkPass, detail: "account " + out}
@@ -183,37 +175,66 @@ func checkAWSCreds(profile string) checkResult {
 // which is the most common silent cause of a `terraform apply` that succeeds but
 // never schedules the GPU node.
 func checkAWSGPUQuota(region, profile, instance string) checkResult {
-	out, err := run("aws", awsArgs(profile, quotaArgs(region)...)...)
-	return gpuQuotaResult(out, err, region, instance)
+	return gpuQuota(func(args ...string) (string, error) { return run("aws", awsArgs(profile, args...)...) }, region, instance)
 }
 
-func quotaArgs(region string) []string {
-	return []string{"service-quotas", "get-service-quota",
-		"--service-code", "ec2", "--quota-code", "L-DB2E81BA",
-		"--region", region, "--query", "Quota.Value", "--output", "text"}
+// gpuQuotaBuckets are the EC2 on-demand quotas GPU instances draw on, by family prefix.
+var gpuQuotaBuckets = []struct{ prefix, code, name string }{
+	{"vt", "L-DB2E81BA", "Running On-Demand G and VT instances"},
+	{"g", "L-DB2E81BA", "Running On-Demand G and VT instances"},
+	{"p", "L-417A185B", "Running On-Demand P instances"},
 }
 
-func gpuQuotaResult(out string, err error, region, instance string) checkResult {
-	need := 4
+// gpuQuota compares the instance's vCPUs with the quota it draws on. A type outside the
+// catalog is looked up: assuming a small one passed a 192-vCPU type against a quota of
+// 64, and AWS then took about 40 minutes to refuse the node group. When either number
+// cannot be read the row warns rather than guesses.
+func gpuQuota(aws func(args ...string) (string, error), region, instance string) checkResult {
+	need := 0
 	if gi, ok := gpuInstances[instance]; ok {
 		need = gi.VCPU
+	} else if out, err := aws("ec2", "describe-instance-types", "--instance-types", instance, "--region", region,
+		"--query", "InstanceTypes[0].VCpuInfo.DefaultVCpus", "--output", "text"); err == nil {
+		if n, perr := strconv.Atoi(strings.TrimSpace(out)); perr == nil {
+			need = n
+		}
 	}
+	for _, b := range gpuQuotaBuckets {
+		if strings.HasPrefix(instance, b.prefix) {
+			out, err := aws("service-quotas", "get-service-quota", "--service-code", "ec2", "--quota-code", b.code,
+				"--region", region, "--query", "Quota.Value", "--output", "text")
+			return gpuQuotaResult(out, err, region, instance, b.name, need)
+		}
+	}
+	return checkResult{name: "GPU vCPU quota", status: checkWarn, detail: "cannot tell which quota " + instance + " draws on",
+		hint: "verify the account's on-demand quota for this instance family in " + region}
+}
+
+// gpuQuotaResult judges a quota reading. need 0 means the instance's vCPUs are unknown.
+func gpuQuotaResult(out string, err error, region, instance, quota string, need int) checkResult {
 	want := fmt.Sprintf("need %d for %s", need, instance)
+	if need == 0 {
+		want = "could not read how many " + instance + " needs"
+	}
 	if err != nil {
 		return checkResult{name: "GPU vCPU quota", status: checkWarn,
 			detail: "could not read",
-			hint:   "verify 'Running On-Demand G and VT instances' quota in " + region + " (" + want + ")"}
+			hint:   "verify '" + quota + "' quota in " + region + " (" + want + ")"}
 	}
 	v, perr := strconv.ParseFloat(out, 64)
 	if perr != nil {
 		return checkResult{name: "GPU vCPU quota", status: checkWarn,
 			detail: "unexpected value " + out,
-			hint:   "verify 'Running On-Demand G and VT instances' quota in " + region}
+			hint:   "verify '" + quota + "' quota in " + region}
 	}
 	detail := fmt.Sprintf("%g vCPUs (%s)", v, want)
+	if need == 0 {
+		return checkResult{name: "GPU vCPU quota", status: checkWarn, detail: detail,
+			hint: "verify that '" + quota + "' covers this instance type in " + region + "; reading its size needs ec2:DescribeInstanceTypes"}
+	}
 	if v < float64(need) {
 		return checkResult{name: "GPU vCPU quota", status: checkFail, detail: detail,
-			hint: "request an increase for 'Running On-Demand G and VT instances' — or, if you install into a different account, re-run with --profile/--region to match it"}
+			hint: "request an increase for '" + quota + "' — or, if you install into a different account, re-run with --profile/--region to match it"}
 	}
 	return checkResult{name: "GPU vCPU quota", status: checkPass, detail: detail}
 }
@@ -238,7 +259,7 @@ func awsSessionExpiry(profile string) (time.Time, error) {
 }
 
 // checkAWSSession fails when the session would lapse inside an install
-// (~35-50 minutes of apply plus the platform deploy).
+// (~20 minutes of apply and the platform deploy, more with a GPU model).
 func checkAWSSession(profile string, minMinutes int) checkResult {
 	return sessionResult(awsSessionExpiry, profile, minMinutes, time.Now())
 }
@@ -247,7 +268,7 @@ func sessionResult(expiry func(string) (time.Time, error), profile string, minMi
 	exp, err := expiry(profile)
 	if err != nil {
 		return checkResult{name: "session lifetime", status: checkWarn, detail: "could not read",
-			hint: "needs AWS CLI >= 2.9; make sure the session lasts the whole install (about 90 minutes)"}
+			hint: "needs a working AWS session and AWS CLI >= 2.9; make sure the session outlasts the install (20 to 30 minutes, more for a larger model or a resume)"}
 	}
 	if exp.IsZero() {
 		return checkResult{name: "session lifetime", status: checkPass, detail: "long-lived credentials"}
@@ -256,7 +277,7 @@ func sessionResult(expiry func(string) (time.Time, error), profile string, minMi
 	detail := fmt.Sprintf("%d min remaining", int(left.Minutes()))
 	if minMinutes > 0 && left < time.Duration(minMinutes)*time.Minute {
 		return checkResult{name: "session lifetime", status: checkFail, detail: detail,
-			hint: fmt.Sprintf("the install needs about %d minutes — run `aws sso login` (add --profile <name>) and retry; to proceed with less, lower the bar: make deploy MIN_SESSION=<minutes> (or --min-session)", minMinutes)}
+			hint: fmt.Sprintf("the install needs about %d minutes — run `aws sso login` (add --profile <name>) and retry; to proceed with less, lower the bar with --min-session <minutes>", minMinutes)}
 	}
 	return checkResult{name: "session lifetime", status: checkPass, detail: detail}
 }
@@ -274,8 +295,8 @@ func checkAccountMatch(profile string, want []string) checkResult {
 
 func accountMatchResult(got string, want []string) checkResult {
 	if len(want) == 0 {
-		return checkResult{name: "account match", status: checkWarn, detail: "tfvars pins no account",
-			hint: "re-run ./bin/darkplum init so the install is pinned to one account"}
+		return checkResult{name: "account match", status: checkWarn, detail: "the install pins no account",
+			hint: "re-run darkplum init so the install is pinned to one account"}
 	}
 	for _, w := range want {
 		if w == got {
@@ -283,8 +304,8 @@ func accountMatchResult(got string, want []string) checkResult {
 		}
 	}
 	return checkResult{name: "account match", status: checkFail,
-		detail: fmt.Sprintf("credentials are for %s, tfvars pins %s", got, strings.Join(want, ",")),
-		hint:   "use the profile for the pinned account (aws_profile in terraform.tfvars) or re-run ./bin/darkplum init"}
+		detail: fmt.Sprintf("credentials are for %s, the install pins %s", got, strings.Join(want, ",")),
+		hint:   "use the profile for the pinned account (the install's profile) or re-run darkplum init"}
 }
 
 // checkOfferings re-verifies that every AZ in tfvars still offers the instance
@@ -307,7 +328,7 @@ func checkOfferings(a *awsCloud, region string, azs, types []string) checkResult
 	}
 	if len(missing) > 0 {
 		return checkResult{name: "instance offerings", status: checkFail, detail: strings.Join(missing, ", ") + " lack " + strings.Join(types, "+"),
-			hint: "re-run ./bin/darkplum init to pick zones that offer them"}
+			hint: "re-run darkplum init to pick zones that offer them"}
 	}
 	return checkResult{name: "instance offerings", status: checkPass, detail: strings.Join(types, ", ") + " in " + strings.Join(azs, ", ")}
 }

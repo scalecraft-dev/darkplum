@@ -159,10 +159,11 @@ func Load() (*Config, error) {
 		port = "8080"
 	}
 
+	// VLLM_UPSTREAM is the primary self-hosted vLLM ("vllm-default"). Unset
+	// means there is none: a Bedrock-only install must not list or probe an
+	// upstream that does not exist. The CLI sets it when it deploys the default
+	// vllm-inference model; "mock" selects the in-process mock.
 	upstream := os.Getenv("VLLM_UPSTREAM")
-	if upstream == "" {
-		upstream = "http://vllm-inference.darkplum-inference.svc.cluster.local:8000"
-	}
 
 	// DevMode is computed before ValidateUpstreamURL is invoked below (for
 	// VLLM_UPSTREAMS) since it governs whether loopback/link-local upstream

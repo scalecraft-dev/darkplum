@@ -1,8 +1,6 @@
 package commands
 
 import (
-	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -10,15 +8,13 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/scalecraft-dev/darkplum/cli/internal/install"
 	"github.com/scalecraft-dev/darkplum/cli/internal/kube"
+	"github.com/scalecraft-dev/darkplum/cli/internal/runner"
 )
 
-// defaultTFVars is where `darkplum init` writes the install settings, relative
-// to the darkplum/ directory the CLI is run from.
-var defaultTFVars = filepath.Join("terraform", "aws", "terraform.tfvars")
-
 // installContext is the only context in the install's private kubeconfig.
-const installContext = "darkplum"
+const installContext = runner.Context
 
 // clusterTarget is the install's EKS cluster and how kubectl reaches it.
 //
@@ -30,64 +26,92 @@ type clusterTarget struct {
 	Name, Region, Profile, Account string
 	Endpoint                       string
 	// Kubeconfig is the absolute path of the install's private kubeconfig
-	// (one cluster, one exec user, context "darkplum"); "" only for the
-	// explicit --context escape, which uses the operator's own kubeconfig.
+	// (one cluster, one exec user, context "darkplum"), in the install's workspace.
 	Kubeconfig string
 	Context    string
-}
-
-// env is what kubectl needs: the install's AWS profile for the exec credential
-// (`aws eks get-token`) and, via kube.NewPinned, KUBECONFIG.
-func (t clusterTarget) env() []string {
-	if t.Profile == "" {
-		return nil
-	}
-	return []string{"AWS_PROFILE=" + t.Profile}
+	// h is the proof that this cluster was validated, and it is what wrote the
+	// kubeconfig; kubectl is only reachable through it. The zero value (tests, or a
+	// target that failed validation) runs nothing.
+	h runner.ValidatedCluster
 }
 
 func (t clusterTarget) kube(namespace string) *kube.Client {
-	return kube.NewPinned(namespace, t.Kubeconfig, t.Context, t.env())
+	return kube.ForCluster(namespace, t.h)
 }
 
 var (
-	// errNoSettings means init has not been run here: there is no install to pin to.
+	// errNoSettings means there is no install to act on.
 	errNoSettings = errors.New("no install settings")
-	// errClusterNotFound means the settings name a cluster that does not exist
+	// errClusterNotFound means the install names a cluster that does not exist
 	// (never created, or already destroyed).
-	errClusterNotFound = errors.New("cluster not found")
+	errClusterNotFound = runner.ErrClusterNotFound
+	// errClusterNotReady means the cluster exists but is still being created.
+	errClusterNotReady = runner.ErrClusterNotReady
 )
 
-// kubeconfigPath is the install's private kubeconfig, next to its settings
-// (terraform/aws/.darkplum/kubeconfig; gitignored).
-func kubeconfigPath(tfvarsPath string) (string, error) {
-	return filepath.Abs(filepath.Join(filepath.Dir(tfvarsPath), ".darkplum", "kubeconfig"))
+// legacyRootHere reports a Makefile-era Terraform root near the working
+// directory (the darkplum/ directory, or the repository root above it): an
+// install the CLI has not adopted yet.
+func legacyRootHere() bool {
+	for _, root := range []string{filepath.Join("terraform", "aws"), filepath.Join("darkplum", "terraform", "aws")} {
+		for _, f := range []string{"backend.tf", "terraform.tfvars"} {
+			if _, err := os.Stat(filepath.Join(root, f)); err == nil {
+				return true
+			}
+		}
+	}
+	return false
 }
 
-// describedCluster is the part of `aws eks describe-cluster` we use.
-type describedCluster struct {
-	Endpoint string `json:"endpoint"`
-	CA       string `json:"ca"`
-	ARN      string `json:"arn"`
+// openInstall finds the install a command acts on: --install NAME, or the only
+// one. It never looks at the environment or the working directory to choose.
+func openInstall(name string) (install.Install, install.Record, error) {
+	home, err := install.DefaultHome()
+	if err != nil {
+		return install.Install{}, install.Record{}, err
+	}
+	in, err := install.Resolve(home, name)
+	if err != nil {
+		return install.Install{}, install.Record{}, err
+	}
+	rec, err := in.Load()
+	return in, rec, err
+}
+
+// noInstallRow is the refusal for "there is nothing to act on". An install from
+// the Makefile flow in this directory gets the way to take it over.
+func noInstallRow(err error) checkResult {
+	if legacyRootHere() {
+		return checkResult{name: "cluster", status: checkFail, detail: "this directory holds an install from the Makefile flow",
+			hint: "run `darkplum init --adopt` to take it over (its state stays where it is), then re-run"}
+	}
+	hint := "run `darkplum init` to create one"
+	if err != nil && !errors.Is(err, install.ErrNoInstall) {
+		hint = firstLine(err.Error())
+	}
+	return checkResult{name: "cluster", status: checkFail, detail: "no install found", hint: hint}
 }
 
 // installCluster establishes and validates the install's cluster from its
-// settings, and (re)writes the private kubeconfig. It refuses unless the
-// cluster exists, its ARN names the settings' region and name, and both the
-// cluster's account and the caller's account are the account the settings
-// pin. On any refusal the private kubeconfig is removed, so nothing can keep
-// using a cluster that no longer validates.
+// workspace record, and (re)writes the private kubeconfig. It refuses unless the
+// credentials belong to an account the install is pinned to, and the cluster
+// exists in that account with an ARN that names the install's region and name.
+// On any refusal the private kubeconfig is removed, so nothing can keep using a
+// cluster that no longer validates.
 //
 // The returned row is a pass or a fail with a hint. The error wraps
 // errNoSettings or errClusterNotFound where those apply.
-func installCluster(path string, aws cmdRunner) (clusterTarget, checkResult, error) {
-	if _, err := os.Stat(path); err != nil {
-		return clusterTarget{}, checkResult{name: "cluster", status: checkFail, detail: "no install found in this directory",
-			hint: "run from the darkplum/ directory of an install (after ./bin/darkplum init and the deploy)"}, fmt.Errorf("%w at %s", errNoSettings, path)
-	}
-	kp, err := kubeconfigPath(path)
+func installCluster(in install.Install, aws cmdRunner) (clusterTarget, checkResult, error) {
+	rec, err := in.Load()
 	if err != nil {
-		return clusterTarget{}, checkResult{name: "cluster", status: checkFail, detail: err.Error()}, err
+		if errors.Is(err, install.ErrNoInstall) {
+			return clusterTarget{}, noInstallRow(err), fmt.Errorf("%w: %v", errNoSettings, err)
+		}
+		_ = os.Remove(in.Kubeconfig())
+		return clusterTarget{}, checkResult{name: "cluster", status: checkFail, detail: "install record unreadable: " + firstLine(err.Error()),
+			hint: "re-run `darkplum init --adopt` or `darkplum init`"}, err
 	}
+	kp := in.Kubeconfig()
 	fail := func(detail, hint string, cause error) (clusterTarget, checkResult, error) {
 		_ = os.Remove(kp)
 		if cause == nil {
@@ -96,158 +120,61 @@ func installCluster(path string, aws cmdRunner) (clusterTarget, checkResult, err
 		return clusterTarget{}, checkResult{name: "cluster", status: checkFail, detail: detail, hint: hint}, cause
 	}
 
-	tf, err := readTFVars(path)
+	v, err := runner.Validate(runner.Claim{Name: rec.ClusterName, Region: rec.Region, Profile: rec.Profile, AccountIDs: rec.AccountIDs},
+		func(args ...string) (string, error) { return aws("aws", args...) })
 	if err != nil {
-		return fail("install settings unreadable", "re-run ./bin/darkplum init", nil)
-	}
-	t := clusterTarget{Name: "darkplum", Region: tf.Region, Profile: tf.Profile, Kubeconfig: kp, Context: installContext}
-	if s := tfStrings(tf.Raw["cluster_name"]); len(s) > 0 && s[0] != "" {
-		t.Name = s[0]
-	}
-	if t.Region == "" {
-		return fail("install settings name no region", "re-run ./bin/darkplum init", nil)
-	}
-	if len(tf.AccountIDs) == 0 {
-		return fail("install settings pin no AWS account", "re-run ./bin/darkplum init so the install is pinned to one account", nil)
-	}
-	login := "aws sso login"
-	if t.Profile != "" {
-		login += " --profile " + t.Profile
-	}
-
-	out, err := aws("aws", awsArgs(t.Profile, "eks", "describe-cluster", "--name", t.Name, "--region", t.Region,
-		"--query", "cluster.{endpoint:endpoint,ca:certificateAuthority.data,arn:arn}", "--output", "json")...)
-	if err != nil {
-		if strings.Contains(err.Error(), "ResourceNotFoundException") {
-			return fail("cluster "+t.Name+" does not exist in "+t.Region, "deploy the install first",
-				fmt.Errorf("%w: %s in %s", errClusterNotFound, t.Name, t.Region))
+		var rf *runner.Refusal
+		if errors.As(err, &rf) {
+			return fail(rf.Detail, rf.Hint, rf.Cause)
 		}
-		return fail("cannot read cluster "+t.Name+" in "+t.Region+": "+firstLine(err.Error()),
-			"check your AWS session (`"+login+"`) and that the deploy finished", nil)
+		return fail(err.Error(), "", nil)
 	}
-	var dc describedCluster
-	if json.Unmarshal([]byte(out), &dc) != nil {
-		return fail("unexpected answer describing cluster "+t.Name, "check your AWS CLI version (2.x)", nil)
-	}
-	ca, cerr := base64.StdEncoding.DecodeString(dc.CA)
-	if !strings.HasPrefix(dc.Endpoint, "https://") || cerr != nil || len(ca) == 0 {
-		return fail("cluster "+t.Name+" has no usable endpoint or certificate yet", "wait for the deploy to finish, then re-run", nil)
-	}
-	arnAccount, ok := clusterARNAccount(dc.ARN, t.Region, t.Name)
-	if !ok {
-		return fail("cluster ARN "+dc.ARN+" does not match "+t.Name+" in "+t.Region, "re-run ./bin/darkplum init", nil)
-	}
-
-	caller, err := aws("aws", awsArgs(t.Profile, "sts", "get-caller-identity", "--region", t.Region,
-		"--query", "Account", "--output", "text")...)
-	caller = strings.TrimSpace(caller)
-	if err != nil || caller == "" {
-		return fail("cannot read who the AWS credentials belong to", "check your AWS session (`"+login+"`)", nil)
-	}
-	if caller != arnAccount {
-		return fail(fmt.Sprintf("credentials are for account %s, the cluster is in %s", caller, arnAccount),
-			"use the profile for the install's account (re-run ./bin/darkplum init to change it)", nil)
-	}
-	pinned := false
-	for _, a := range tf.AccountIDs {
-		pinned = pinned || a == arnAccount
-	}
-	if !pinned {
-		return fail(fmt.Sprintf("cluster %s is in account %s, not the install's account %s", t.Name, arnAccount, strings.Join(tf.AccountIDs, ",")),
-			"use the profile for the install's account, or re-run ./bin/darkplum init", nil)
-	}
-	t.Endpoint, t.Account = dc.Endpoint, arnAccount
-
-	if err := writePrivateKubeconfig(kp, renderKubeconfig(t, dc.CA)); err != nil {
+	h, err := v.WriteKubeconfig(kp)
+	if err != nil {
 		return fail("cannot write the install's kubeconfig: "+firstLine(err.Error()), "check the permissions of "+filepath.Dir(kp), nil)
 	}
+	t := clusterTarget{Name: rec.ClusterName, Region: rec.Region, Profile: rec.Profile, Account: v.Account(), Endpoint: v.Endpoint(),
+		Kubeconfig: h.Kubeconfig(), Context: installContext, h: h}
 	return t, checkResult{name: "cluster", status: checkPass, detail: fmt.Sprintf("%s (%s) · account %s", t.Name, t.Region, t.Account)}, nil
 }
 
-// clusterARNAccount checks arn:<partition>:eks:<region>:<account>:cluster/<name>
-// and returns the account.
-func clusterARNAccount(arn, region, name string) (string, bool) {
-	f := strings.SplitN(arn, ":", 6)
-	if len(f) != 6 || f[0] != "arn" || !strings.HasPrefix(f[1], "aws") || f[2] != "eks" ||
-		f[3] != region || validateAccountID(f[4]) != nil || f[5] != "cluster/"+name {
-		return "", false
-	}
-	return f[4], true
-}
+// newLocalKind admits only a kind-* context whose API server is on this machine;
+// tests swap it.
+var newLocalKind = runner.NewLocalKind
 
-// renderKubeconfig is the private kubeconfig: endpoint, CA and an exec stanza
-// (no token is ever stored). JSON is valid YAML, and escapes every value.
-func renderKubeconfig(t clusterTarget, caData string) []byte {
-	args := awsArgs(t.Profile, "--region", t.Region, "eks", "get-token", "--cluster-name", t.Name, "--output", "json")
-	var env []map[string]string
-	if t.Profile != "" {
-		env = []map[string]string{{"name": "AWS_PROFILE", "value": t.Profile}}
-	}
-	cfg := map[string]any{
-		"apiVersion":      "v1",
-		"kind":            "Config",
-		"current-context": installContext,
-		"clusters": []any{map[string]any{"name": installContext, "cluster": map[string]any{
-			"server": t.Endpoint, "certificate-authority-data": caData}}},
-		"users": []any{map[string]any{"name": installContext, "user": map[string]any{"exec": map[string]any{
-			"apiVersion": "client.authentication.k8s.io/v1beta1", "command": "aws", "args": args,
-			"env": env, "interactiveMode": "Never"}}}},
-		"contexts": []any{map[string]any{"name": installContext, "context": map[string]any{
-			"cluster": installContext, "user": installContext}}},
-	}
-	b, _ := json.MarshalIndent(cfg, "", "  ")
-	return append(b, '\n')
-}
-
-// writePrivateKubeconfig writes b to path (0600, directory 0700) by renaming a
-// temporary file over it, so a concurrent reader never sees half a file.
-func writePrivateKubeconfig(path string, b []byte) error {
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
-	}
-	if err := os.Chmod(dir, 0o700); err != nil {
-		return err
-	}
-	f, err := os.CreateTemp(dir, ".kubeconfig-*")
+// resolveInstall establishes the named (or only) install; tests swap it.
+var resolveInstall = func(name string) (clusterTarget, checkResult, error) {
+	home, err := install.DefaultHome()
 	if err != nil {
-		return err
+		return clusterTarget{}, checkResult{name: "cluster", status: checkFail, detail: firstLine(err.Error())}, err
 	}
-	defer os.Remove(f.Name()) // no-op after the rename
-	if err := f.Chmod(0o600); err != nil {
-		f.Close()
-		return err
+	in, err := install.Resolve(home, name)
+	if err != nil {
+		return clusterTarget{}, noInstallRow(err), fmt.Errorf("%w: %v", errNoSettings, err)
 	}
-	if _, err := f.Write(b); err != nil {
-		f.Close()
-		return err
-	}
-	if err := f.Close(); err != nil {
-		return err
-	}
-	return os.Rename(f.Name(), path)
-}
-
-// resolveInstall establishes the install in the current directory; tests swap it.
-var resolveInstall = func() (clusterTarget, checkResult, error) {
-	return installCluster(defaultTFVars, runWithStderr)
+	return installCluster(in, runWithStderr)
 }
 
 // installKube is the kube client for every command that touches the cluster
 // (status, admin create, sso configure). It fails closed: an explicit
-// --context is used as given (the operator's own kubeconfig, for clusters
-// darkplum did not install); otherwise the install must establish and
-// validate. It never falls back to the kubeconfig's current context.
-func installKube(w io.Writer, namespace, contextFlag string) (*kube.Client, error) {
+// --context is only for a local kind cluster; otherwise the install must
+// establish and validate. It never falls back to the kubeconfig's current
+// context.
+func installKube(w io.Writer, namespace, contextFlag, installName string) (*kube.Client, error) {
 	if contextFlag != "" {
-		fmt.Fprintln(w, sDim("context "+contextFlag+" (from --context, your own kubeconfig)"))
-		return kube.NewPinned(namespace, "", contextFlag, nil), nil
+		k, err := newLocalKind(contextFlag)
+		if err != nil {
+			printCheckTo(w, checkResult{name: "cluster", status: checkFail, detail: firstLine(err.Error()),
+				hint: "--context is only for a local kind cluster (kind-*); an install is found with --install or as the only one"})
+			return nil, reportedError{"--context refused"}
+		}
+		fmt.Fprintln(w, sDim("context "+contextFlag+" (from --context, your own kubeconfig; a local kind cluster)"))
+		return kube.ForLocalKind(namespace, k), nil
 	}
-	t, row, err := resolveInstall()
+	t, row, err := resolveInstall(installName)
 	if errors.Is(err, errNoSettings) {
-		printCheckTo(w, checkResult{name: "cluster", status: checkFail, detail: "no install found in this directory",
-			hint: "run from the darkplum/ directory of the install, or pass --context <kubeconfig context>"})
-		return nil, reportedError{"no install settings and no --context"}
+		printCheckTo(w, row)
+		return nil, reportedError{"no install and no --context"}
 	}
 	if err != nil {
 		printCheckTo(w, row)
@@ -260,25 +187,20 @@ func installKube(w io.Writer, namespace, contextFlag string) (*kube.Client, erro
 // kubectlHint is a kubectl command an operator can paste: it first has the
 // CLI validate the install and point that shell at its private kubeconfig.
 func kubectlHint(args string) string {
-	return `eval "$(./bin/darkplum kubeconfig)" && kubectl ` + args
+	return `eval "$(darkplum kubeconfig)" && kubectl ` + args
 }
 
 // KubeconfigCmd is `darkplum kubeconfig`.
 type KubeconfigCmd struct {
-	Write  bool   `help:"Validate and write the install's kubeconfig without printing anything (for scripts)."`
-	Tfvars string `help:"Install settings written by darkplum init (default: terraform/aws/terraform.tfvars)." default:""`
+	Write bool `help:"Validate and write the install's kubeconfig without printing anything (for scripts)."`
 }
 
 // Run validates the install's cluster, rewrites its private kubeconfig and
-// prints `export KUBECONFIG=<path>` for `eval "$(./bin/darkplum kubeconfig)"`.
+// prints `export KUBECONFIG=<path>` for `eval "$(darkplum kubeconfig)"`.
 // It never touches ~/.kube/config or the current context. Rows go to stderr,
 // so only the export line reaches an eval.
-func (c *KubeconfigCmd) Run(_ *Globals) error {
-	path := c.Tfvars
-	if path == "" {
-		path = defaultTFVars
-	}
-	t, row, err := installCluster(path, runWithStderr)
+func (c *KubeconfigCmd) Run(g *Globals) error {
+	t, row, err := resolveInstall(g.Install)
 	if err != nil {
 		printCheckTo(os.Stderr, row)
 		return reportedError{"cannot establish the install's cluster"}

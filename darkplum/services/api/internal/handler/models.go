@@ -369,6 +369,7 @@ func (h *ModelHandler) ListModels(c *gin.Context) {
 		SELECT model_id, provider, backend_class, discovered_at, availability_detail
 		FROM models
 		WHERE enabled = true
+		  AND availability_state IS DISTINCT FROM 'retired' -- AWS ended its life: it can only fail a chat
 		ORDER BY provider, model_id
 	`)
 	if err != nil {
@@ -399,6 +400,7 @@ func (h *ModelHandler) ListModels(c *gin.Context) {
 		FROM model_aliases a
 		JOIN models m ON m.model_id = a.target_model_id
 		WHERE m.enabled = true
+		  AND m.availability_state IS DISTINCT FROM 'retired'
 		ORDER BY a.alias
 	`)
 	if err != nil {
@@ -436,7 +438,8 @@ func (h *ModelHandler) ListModels(c *gin.Context) {
 			(m.model_id IS NOT NULL) AS target_exists,
 			COALESCE(m.enabled, false) AS target_enabled,
 			COALESCE(m.provider, ''), COALESCE(m.backend_class, ''),
-			m.discovered_at, m.availability_detail
+			m.discovered_at, m.availability_detail,
+			COALESCE(m.availability_state = 'retired', false) AS target_retired
 		FROM model_aliases a
 		JOIN model_alias_routes r ON r.alias = a.alias
 		LEFT JOIN models m ON m.model_id = r.target_model_id
@@ -457,7 +460,7 @@ func (h *ModelHandler) ListModels(c *gin.Context) {
 		var rt routedAliasRouteDBRow
 		var discoveredAt *time.Time
 		if err := routedRows.Scan(&aliasName, &defaultRoute, &rt.RouteName, &rt.Description, &rt.TargetModelID,
-			&rt.TargetExists, &rt.TargetEnabled, &rt.TargetProvider, &rt.TargetBackendClass, &discoveredAt, &rt.TargetAvailability); err != nil {
+			&rt.TargetExists, &rt.TargetEnabled, &rt.TargetProvider, &rt.TargetBackendClass, &discoveredAt, &rt.TargetAvailability, &rt.TargetRetired); err != nil {
 			slog.ErrorContext(ctx, "scan routed model alias row failed", "err", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "scan models failed"})
 			return
@@ -677,7 +680,7 @@ func (h *ModelHandler) ListAdminModels(c *gin.Context) {
 	permitExternalAPI := requestPermitsExternalAPI(c.GetHeader(darkplumClassesHeader))
 
 	rows, err := h.pool.Query(c.Request.Context(), `
-		SELECT id, model_id, provider, display_name, enabled, backend_class, discovered_at, updated_at, availability_detail
+		SELECT id, model_id, provider, display_name, enabled, backend_class, discovered_at, updated_at, availability_detail, availability_state
 		FROM models
 		ORDER BY provider, model_id
 	`)
@@ -692,7 +695,8 @@ func (h *ModelHandler) ListAdminModels(c *gin.Context) {
 	models := make([]modelRow, 0)
 	for rows.Next() {
 		var m modelRow
-		if err := rows.Scan(&m.ID, &m.ModelID, &m.Provider, &m.DisplayName, &m.Enabled, &m.BackendClass, &m.DiscoveredAt, &m.UpdatedAt, &m.Availability); err != nil {
+		var state *string
+		if err := rows.Scan(&m.ID, &m.ModelID, &m.Provider, &m.DisplayName, &m.Enabled, &m.BackendClass, &m.DiscoveredAt, &m.UpdatedAt, &m.Availability, &state); err != nil {
 			slog.ErrorContext(c.Request.Context(), "scan admin model row failed", "err", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "scan models failed"})
 			return
@@ -700,7 +704,8 @@ func (h *ModelHandler) ListAdminModels(c *gin.Context) {
 		if m.BackendClass == backendClassExternalAPI && !permitExternalAPI {
 			continue
 		}
-		m.Available = modelIsAvailableWithin(m.DiscoveredAt, now, h.availabilityWindow)
+		m.Available = modelRowAvailable(m.DiscoveredAt, now, h.availabilityWindow, state)
+		m.Availability = adminAvailability(m.Availability, state)
 		models = append(models, m)
 	}
 	if err := rows.Err(); err != nil {
@@ -852,6 +857,19 @@ func (h *ModelHandler) ToggleModel(c *gin.Context) {
 		}
 	}
 
+	// A model the cloud has retired cannot be turned on: every chat to it fails.
+	// Turning it off stays possible.
+	if req.Enabled != nil && *req.Enabled {
+		var state *string
+		err := tx.QueryRow(ctx, `SELECT availability_state FROM models WHERE id = $1`, id).Scan(&state)
+		if err == nil && modelRetiredState(state) {
+			c.JSON(http.StatusConflict, gin.H{"error": modelRetiredEnableMessage, "code": "model_retired"})
+			return
+		}
+		// A missing row falls through to the UPDATE's 404; a read error is not
+		// a reason to block the toggle.
+	}
+
 	// Each field is applied only when it was sent: COALESCE keeps the stored
 	// value for an absent enabled, and the display_name branch is taken only
 	// when the key was present (null clears it).
@@ -893,15 +911,17 @@ func (h *ModelHandler) ToggleModel(c *gin.Context) {
 	// Fetch and return the updated row so the frontend can refresh without a
 	// separate GET.
 	var m modelRow
+	var state *string
 	if err := h.pool.QueryRow(c.Request.Context(), `
-		SELECT id, model_id, provider, display_name, enabled, backend_class, discovered_at, updated_at, availability_detail
+		SELECT id, model_id, provider, display_name, enabled, backend_class, discovered_at, updated_at, availability_detail, availability_state
 		FROM models WHERE id = $1
-	`, id).Scan(&m.ID, &m.ModelID, &m.Provider, &m.DisplayName, &m.Enabled, &m.BackendClass, &m.DiscoveredAt, &m.UpdatedAt, &m.Availability); err != nil {
+	`, id).Scan(&m.ID, &m.ModelID, &m.Provider, &m.DisplayName, &m.Enabled, &m.BackendClass, &m.DiscoveredAt, &m.UpdatedAt, &m.Availability, &state); err != nil {
 		slog.ErrorContext(c.Request.Context(), "fetch updated model failed", "id", id, "err", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "fetch updated model failed"})
 		return
 	}
-	m.Available = modelIsAvailableWithin(m.DiscoveredAt, time.Now(), h.availabilityWindow)
+	m.Available = modelRowAvailable(m.DiscoveredAt, time.Now(), h.availabilityWindow, state)
+	m.Availability = adminAvailability(m.Availability, state)
 
 	c.JSON(http.StatusOK, m)
 }
@@ -1371,3 +1391,10 @@ func (h *ModelHandler) syncModelsPerRow(ctx context.Context, tx pgx.Tx, models [
 	}
 	return inserted, updated, discoveredIDs, nil
 }
+
+// modelRetiredEnableMessage is the 409 for enabling a model AWS has retired.
+const modelRetiredEnableMessage = "This model has been retired by AWS and cannot be enabled. Enable another model."
+
+// modelRetiredState is true for the availability state the gateway reports for
+// a model the cloud has retired.
+func modelRetiredState(state *string) bool { return state != nil && *state == "retired" }

@@ -73,6 +73,7 @@ import {
   awsOptInStatusHint,
   needsAwsOptIn,
 } from '../lib/dataRetention'
+import { RETIRED_LABEL, RETIRED_STATUS_HINT, RETIRED_TOGGLE_TITLE, isRetired } from '../lib/modelRetired'
 import { Skeleton } from '../components/ui/Skeleton'
 import { AccessOverviewSection } from './AccessOverviewSection'
 import { RoutingPolicyCard, type OrgPolicyDraft } from './RoutingPolicyCard'
@@ -148,6 +149,7 @@ type RowFlag =
   | { kind: 'blocked'; hint: string }
   | { kind: 'unknown'; hint: string }
   | { kind: 'aws_opt_in'; hint: string }
+  | { kind: 'retired'; hint: string }
   | { kind: 'unreachable'; hint: string }
   | null
 
@@ -156,6 +158,10 @@ function rowFlag(
   residency: Residency,
   allowedModels: string[] | null,
 ): RowFlag {
+  // First, off or on: a retired model fails every chat whatever the policy says,
+  // and no policy change or backend recovery brings it back.
+  if (isRetired(m)) return { kind: 'retired', hint: RETIRED_STATUS_HINT }
+
   const cls = displayClassOf(m)
   const permitted = residencyPermits(residency, cls)
   const onAllowlist = allowedModels === null || allowedModels.includes(m.model_id)
@@ -216,17 +222,21 @@ function ToggleSwitch({
   loading,
   onToggle,
   modelName,
+  blockedReason,
 }: {
   enabled: boolean
   loading: boolean
   onToggle: () => void
   modelName: string
+  /** Why it cannot be turned on; set means the switch is inert. */
+  blockedReason?: string
 }) {
   return (
     <button
       className={`${styles.toggle} ${enabled ? styles.toggleEnabled : ''}`}
       onClick={onToggle}
-      disabled={loading}
+      disabled={loading || !!blockedReason}
+      title={blockedReason}
       role="switch"
       aria-checked={enabled}
       aria-label={`${enabled ? 'Disable' : 'Enable'} ${modelName}`}
@@ -361,7 +371,7 @@ function ProviderSection({
   const [collapsed, setCollapsed] = useState(false)
 
   const enabledCount = models.filter((m) => m.enabled).length
-  const unreachableCount = models.filter((m) => !isReachable(m)).length
+  const unreachableCount = models.filter((m) => !isReachable(m) && !isRetired(m)).length
 
   /** The class of this provider's models. Providers are homogeneous in
    *  practice, so one badge on the header says it for every row beneath —
@@ -392,7 +402,7 @@ function ProviderSection({
     const flag = rowFlag(m, residency, allowedModels)
     // Configured, but the gateway has not seen its backend for a few minutes.
     // Counted apart from the flag, which reports only the top problem.
-    const unreachable = !isReachable(m)
+    const unreachable = !isReachable(m) && flag?.kind !== 'retired'
     return (
       <tr key={m.id} className={flag ? styles.rowFlagged : ''}>
         <td>
@@ -448,6 +458,12 @@ function ProviderSection({
                   {AWS_OPT_IN_LABEL}
                 </Badge>
               )}
+              {flag?.kind === 'retired' && (
+                <Badge variant={m.enabled ? 'warning' : 'neutral'} bordered>
+                  <UnreachableGlyph />
+                  {RETIRED_LABEL}
+                </Badge>
+              )}
               {flag?.kind === 'unknown' && (
                 <Badge variant="neutral" bordered dashed>
                   <UnknownGlyph />
@@ -470,6 +486,7 @@ function ProviderSection({
             loading={togglingIds.has(m.id)}
             onToggle={() => onToggle(m)}
             modelName={displayName}
+            blockedReason={isRetired(m) && !m.enabled ? RETIRED_TOGGLE_TITLE : undefined}
           />
         </td>
       </tr>
@@ -1000,7 +1017,7 @@ function ModelsPageBody() {
   }, [filtered])
 
   const totalEnabled = models.filter((m) => m.enabled).length
-  const totalUnreachable = models.filter((m) => !isReachable(m)).length
+  const totalUnreachable = models.filter((m) => !isReachable(m) && !isRetired(m)).length
   const totalAwsOptIn = models.filter(needsAwsOptIn).length
 
   /**

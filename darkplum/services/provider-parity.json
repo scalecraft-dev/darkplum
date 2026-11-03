@@ -1,0 +1,21 @@
+{
+  "_comment": "Shared by services/cli/internal/vendor and services/api/internal/handler tests. The CLI and the api are separate Go modules that must apply the same rules to a vendor catalog filter; both read this file, so changing a rule in one place without the other fails a test.",
+  "bare_wildcard": [
+    {"pattern": "*", "want": true},
+    {"pattern": "?", "want": true},
+    {"pattern": "**", "want": true},
+    {"pattern": "*?*", "want": true},
+    {"pattern": "", "want": true},
+    {"pattern": "claude-*", "want": false},
+    {"pattern": "gpt-4?", "want": false},
+    {"pattern": "a", "want": false}
+  ],
+  "next_stamp": [
+    {"now": "2026-10-31T12:00:00Z", "old": "", "want": "2026-10-31T12:00:00Z"},
+    {"now": "2026-10-31T12:00:00Z", "old": "garbage", "want": "2026-10-31T12:00:00Z"},
+    {"now": "2026-10-31T12:00:00Z", "old": "2026-10-31T11:00:00Z", "want": "2026-10-31T12:00:00Z"},
+    {"now": "2026-10-31T12:00:00Z", "old": "2026-10-31T12:00:00Z", "want": "2026-10-31T12:00:01Z"},
+    {"now": "2026-10-31T12:00:00Z", "old": "2026-10-31T12:00:05Z", "want": "2026-10-31T12:00:06Z"},
+    {"now": "2026-10-31T12:00:00Z", "old": "2030-01-01T00:00:00Z", "want": "2030-01-01T00:00:01Z"}
+  ]
+}

@@ -19,7 +19,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/scalecraft-dev/darkplum/cli/internal/install"
 	"github.com/scalecraft-dev/darkplum/cli/internal/kube"
+
+	"github.com/scalecraft-dev/darkplum/cli/internal/runner"
 )
 
 const (
@@ -41,7 +44,8 @@ type fakeAPI struct {
 	models        []map[string]any
 	chatStatus    int
 	chatBody      string
-	notEnabled    int // model_not_enabled answers before a chat succeeds
+	chatByModel   map[string]chatAnswer // overrides chatStatus/chatBody per model id
+	notEnabled    int                   // model_not_enabled answers before a chat succeeds
 
 	calls     []string
 	csrfFails int
@@ -53,6 +57,17 @@ func boolp(b bool) *bool { return &b }
 func newFakeAPI() *fakeAPI {
 	return &fakeAPI{setupRequired: boolp(true), users: map[string]string{}, chatStatus: 200,
 		chatBody: `{"choices":[{"message":{"role":"assistant","content":"Hello there!"}}]}`}
+}
+
+type chatAnswer struct {
+	status int
+	body   string
+}
+
+func retiredBedrockModel(id string, enabled bool) map[string]any {
+	m := bedrockModel(id, enabled)
+	m["availability"] = map[string]string{"state": "retired"}
+	return m
 }
 
 func bedrockModel(id string, enabled bool) map[string]any {
@@ -162,9 +177,13 @@ func (f *fakeAPI) handler(dead *atomic.Bool, onRequest func(string)) http.Handle
 				writeJSON(w, 403, map[string]any{"error": map[string]string{"message": "not enabled", "code": "model_not_enabled"}})
 				return
 			}
+			status, answer := f.chatStatus, f.chatBody
+			if a, ok := f.chatByModel[fmt.Sprint(body["model"])]; ok {
+				status, answer = a.status, a.body
+			}
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(f.chatStatus)
-			_, _ = w.Write([]byte(f.chatBody))
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(answer))
 		default:
 			writeJSON(w, 404, map[string]string{"error": "not found"})
 		}
@@ -219,6 +238,7 @@ type fakeKube struct {
 	restarts     int
 	deleted      []string
 	oidcRedirect string
+	waitErr      error
 }
 
 func (k *fakeKube) Run(stdin []byte, _ string, args ...string) ([]byte, error) {
@@ -254,6 +274,10 @@ func (k *fakeKube) Run(stdin []byte, _ string, args ...string) ([]byte, error) {
 		return nil, nil
 	case strings.Contains(joined, "rollout status deployment/darkplum-web"):
 		return nil, nil
+	case strings.Contains(joined, "get pods -l app.kubernetes.io/name=darkplum-web"):
+		return []byte("pod/darkplum-web-old-a\npod/darkplum-web-old-b\n"), nil
+	case strings.Contains(joined, "wait --for=delete"):
+		return nil, k.waitErr
 	case strings.Contains(joined, "get secret darkplum-auth"):
 		return []byte(base64.StdEncoding.EncodeToString([]byte(k.oidcRedirect))), nil
 	case strings.Contains(joined, "get deploy"):
@@ -279,11 +303,18 @@ type configureHarness struct {
 	hook   func(string)
 	resolv func() (clusterTarget, checkResult, error)
 
+	clockStore *deployClock // the workspace's deploy clock (nil: none)
+
 	web      webAddress
 	tfOut    map[string]json.RawMessage
 	tfErr    error
 	probeErr error
 	probed   []string
+
+	// logInstall, when set, keeps the run in that workspace's logs/, as the
+	// command does.
+	logInstall *install.Install
+	logger     *deferredLog
 }
 
 // newHarness starts n tunnels (httptest servers) onto one fake api.
@@ -333,7 +364,7 @@ func (h *configureHarness) run(c *ConfigureCmd, answers string, secrets ...strin
 		namespace:   "darkplum-system",
 		resolve:     resolve,
 		newKube: func(t clusterTarget, ns string) *kube.Client {
-			return &kube.Client{Runner: h.kube, Namespace: ns, Kubeconfig: t.Kubeconfig, Context: t.Context}
+			return kube.ForTest(h.kube, ns, "--kubeconfig", t.Kubeconfig, "--context", t.Context)
 		},
 		newFwd: func(clusterTarget) Forwarder { return h.fwd },
 		httpc:  &http.Client{Timeout: 5 * time.Second},
@@ -345,6 +376,15 @@ func (h *configureHarness) run(c *ConfigureCmd, answers string, secrets ...strin
 		web:       h.web,
 		tfOutputs: func() (map[string]json.RawMessage, error) { return h.tfOut, h.tfErr },
 		probe:     func(u string) error { h.probed = append(h.probed, u); return h.probeErr },
+	}
+	if h.clockStore != nil {
+		h.env.loadClock = func() (deployClock, bool) { return *h.clockStore, !h.clockStore.Started.IsZero() }
+		h.env.saveClock = func(c deployClock) error { *h.clockStore = c; return nil }
+	}
+	if h.logInstall != nil {
+		h.logger = newRunLog(*h.logInstall, "configure", h.out, h.clock)
+		defer h.logger.Close()
+		h.env.out = h.logger
 	}
 	err := c.execute(context.Background(), h.env)
 	h.checkInvariants()
@@ -403,7 +443,7 @@ func TestConfigureFirstRunBedrock(t *testing.T) {
 	h.contains("✓ first admin", "Jane.Doe@acme.com created", "? Name [Jane Doe]", "enabled now",
 		"✓ test chat", "answered in", "Hello there!",
 		"Open darkplum: http://localhost:", "Sign in as Jane.Doe@acme.com", "Ctrl-C closes it",
-		"No team address yet: re-run ./bin/darkplum init to add a private HTTPS address")
+		"No team address yet: re-run darkplum init to add a private HTTPS address")
 	if got := api.users["Jane.Doe@acme.com"]; got != testPassword {
 		t.Errorf("setup did not carry the password")
 	}
@@ -602,7 +642,7 @@ func TestConfigureHoldOpenGivesUpAfterSecondDrop(t *testing.T) {
 	api := newFakeAPI()
 	h := newHarness(t, api, 2)
 	out := &bytes.Buffer{}
-	r := &configureRun{configureEnv: &configureEnv{out: out}, fwd: h.fwd, kc: &kube.Client{Runner: h.kube}}
+	r := &configureRun{configureEnv: &configureEnv{out: out}, fwd: h.fwd, kc: kube.ForTest(h.kube, "")}
 	base, _ := h.fwd.Open(context.Background())
 	r.api = &apiClient{fwd: h.fwd, base: base}
 	go func() {
@@ -622,7 +662,7 @@ func TestConfigureHoldOpenGivesUpAfterSecondDrop(t *testing.T) {
 	if err == nil || !IsReported(err) {
 		t.Fatalf("second drop must end with a reported ✗, got %v", err)
 	}
-	for _, w := range []string{"reconnecting", "(new address)", "✗ connection", "re-run ./bin/darkplum configure"} {
+	for _, w := range []string{"reconnecting", "(new address)", "✗ connection", "re-run darkplum configure"} {
 		if !strings.Contains(out.String(), w) {
 			t.Errorf("output lacks %q:\n%s", w, out.String())
 		}
@@ -655,7 +695,7 @@ func TestConfigureSelfHostedLoadingDoesNotBlockBedrock(t *testing.T) {
 	if err := h.run(&ConfigureCmd{}, "a@acme.com\n\n\n", testPassword, testPassword); err != nil {
 		t.Fatalf("configure: %v\n%s", err, h.out.String())
 	}
-	h.contains("! self-hosted model", "downloading the model weights", "re-run ./bin/darkplum configure", "✓ test chat")
+	h.contains("! self-hosted model", "downloading the model weights", "re-run darkplum configure", "✓ test chat")
 	if strings.Contains(h.out.String(), "waiting for the self-hosted model") {
 		t.Error("without --wait configure must not wait while a Bedrock model is ready")
 	}
@@ -671,7 +711,7 @@ func TestConfigureWaitModelNeverReady(t *testing.T) {
 		t.Fatalf("want a reported failure, got %v\n%s", err, h.out.String())
 	}
 	h.contains("waiting for the self-hosted model, up to 10 min", "self-hosted model: downloading the model weights",
-		"✗ self-hosted model", "not ready after 10 min", "logs -f deploy/vllm-inference -c model-download", `eval "$(./bin/darkplum kubeconfig)" && kubectl`)
+		"✗ self-hosted model", "not ready after 10 min", "logs -f deploy/vllm-inference -c model-download", `eval "$(darkplum kubeconfig)" && kubectl`)
 }
 
 func TestConfigureWaitThenEnablesSelfHosted(t *testing.T) {
@@ -766,7 +806,7 @@ func TestVLLMStateFromPods(t *testing.T) {
 			if s.phase != tc.phase || s.broken != tc.broken || s.ready != tc.ready {
 				t.Errorf("got %+v", s)
 			}
-			if s.broken && !strings.Contains(s.hint, `eval "$(./bin/darkplum kubeconfig)" && kubectl -n darkplum-inference`) {
+			if s.broken && !strings.Contains(s.hint, `eval "$(darkplum kubeconfig)" && kubectl -n darkplum-inference`) {
 				t.Errorf("diagnostic must validate the install first: %q", s.hint)
 			}
 		})
@@ -803,101 +843,6 @@ func TestNameFromEmail(t *testing.T) {
 			t.Errorf("nameFromEmail(%q) = %q, want %q", in, got, want)
 		}
 	}
-}
-
-func TestForwardingLineParse(t *testing.T) {
-	var got []string
-	w := &lineWriter{fn: func(l string) {
-		if m := forwardingRe.FindStringSubmatch(l); m != nil {
-			got = append(got, m[1])
-		}
-	}}
-	_, _ = w.Write([]byte("Forwarding from 127.0.0.1:5"))
-	_, _ = w.Write([]byte("4321 -> 80\nHandling connection for 54321\n"))
-	if fmt.Sprint(got) != "[54321]" {
-		t.Errorf("parsed ports %v", got)
-	}
-	f := newKubectlForwarder(clusterTarget{Kubeconfig: testKubeconfig, Context: testContext, Profile: "acme"}, "darkplum-system")
-	if a := f.args(); strings.Join(a, " ") !=
-		"--kubeconfig "+testKubeconfig+" --context "+testContext+" -n darkplum-system port-forward --address 127.0.0.1 svc/darkplum-web :80" {
-		t.Errorf("port-forward args = %q", a)
-	}
-	if strings.Join(f.env, " ") != "AWS_PROFILE=acme KUBECONFIG="+testKubeconfig {
-		t.Errorf("port-forward env = %q", f.env)
-	}
-}
-
-// fakeKubectl puts a script named kubectl first on PATH.
-func fakeKubectl(t *testing.T, script string) {
-	t.Helper()
-	dir := t.TempDir()
-	if err := os.WriteFile(filepath.Join(dir, "kubectl"), []byte("#!/bin/sh\n"+script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
-}
-
-func TestKubectlForwarderLifecycle(t *testing.T) {
-	t.Run("parses the port and stops the process on Close", func(t *testing.T) {
-		fakeKubectl(t, `echo "Forwarding from 127.0.0.1:43210 -> 80"; echo "Forwarding from [::1]:43210 -> 80"; exec sleep 30`)
-		f := newKubectlForwarder(clusterTarget{Kubeconfig: testKubeconfig, Context: testContext}, "darkplum-system")
-		base, err := f.Open(context.Background())
-		if err != nil || base != "http://127.0.0.1:43210" {
-			t.Fatalf("Open = %q, %v", base, err)
-		}
-		done := f.Done()
-		start := time.Now()
-		f.Close()
-		select {
-		case <-done:
-		case <-time.After(2 * time.Second):
-			t.Fatal("Close left kubectl running")
-		}
-		if time.Since(start) > 2*time.Second {
-			t.Error("Close was slow")
-		}
-	})
-	t.Run("Done closes when kubectl dies", func(t *testing.T) {
-		fakeKubectl(t, `echo "Forwarding from 127.0.0.1:43211 -> 80"; sleep 0.2; exit 1`)
-		f := newKubectlForwarder(clusterTarget{Kubeconfig: testKubeconfig, Context: testContext}, "darkplum-system")
-		defer f.Close()
-		if _, err := f.Open(context.Background()); err != nil {
-			t.Fatal(err)
-		}
-		select {
-		case <-f.Done():
-		case <-time.After(3 * time.Second):
-			t.Fatal("Done did not close when kubectl exited")
-		}
-	})
-	t.Run("a refusal is reported from stderr", func(t *testing.T) {
-		fakeKubectl(t, `echo "error: services \"darkplum-web\" not found" >&2; exit 1`)
-		f := newKubectlForwarder(clusterTarget{Kubeconfig: testKubeconfig, Context: testContext}, "darkplum-system")
-		_, err := f.Open(context.Background())
-		if err == nil || !strings.Contains(err.Error(), "darkplum-web") {
-			t.Fatalf("Open = %v", err)
-		}
-	})
-	t.Run("Ctrl-C leaves the tunnel for the sign-out; Close stops it", func(t *testing.T) {
-		fakeKubectl(t, `echo "Forwarding from 127.0.0.1:43212 -> 80"; exec sleep 30`)
-		f := newKubectlForwarder(clusterTarget{Kubeconfig: testKubeconfig, Context: testContext}, "darkplum-system")
-		ctx, cancel := context.WithCancel(context.Background())
-		if _, err := f.Open(ctx); err != nil {
-			t.Fatal(err)
-		}
-		cancel()
-		select {
-		case <-f.Done():
-			t.Fatal("cancelling the run killed the tunnel before configure could sign out through it")
-		case <-time.After(300 * time.Millisecond):
-		}
-		f.Close()
-		select {
-		case <-f.Done():
-		case <-time.After(3 * time.Second):
-			t.Fatal("Close left kubectl running")
-		}
-	})
 }
 
 func TestLoginAndChatAreNotReplayedOnANewTunnel(t *testing.T) {
@@ -958,16 +903,15 @@ func loggingKubectl(t *testing.T) (logPath string) {
 
 func TestWriteCommandsFailClosed(t *testing.T) {
 	g := &Globals{Namespace: "darkplum-system"}
-	t.Run("sso with install settings that do not resolve refuses", func(t *testing.T) {
+	t.Run("sso with an install that does not resolve refuses", func(t *testing.T) {
 		log := loggingKubectl(t)
-		dir := t.TempDir()
-		if err := os.MkdirAll(filepath.Join(dir, "terraform", "aws"), 0o755); err != nil {
+		testInstall(t, nil)
+		// an aws that cannot answer: the install cannot be validated
+		bin := t.TempDir()
+		if err := os.WriteFile(filepath.Join(bin, "aws"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(dir, defaultTFVars), []byte("aws_region = \"us-east-2\"\nallowed_account_ids = [\"123456789012\"]\n"), 0o600); err != nil {
-			t.Fatal(err)
-		}
-		t.Chdir(dir)
+		t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 		err := (&SSOConfigureCmd{Issuer: "https://idp", ClientID: "c", RedirectURL: "https://x/cb", SecretStdin: true}).Run(g)
 		if err == nil || !IsReported(err) {
 			t.Fatalf("want a reported refusal, got %v", err)
@@ -994,15 +938,13 @@ func TestWriteCommandsFailClosed(t *testing.T) {
 	})
 	t.Run("--context pins every call", func(t *testing.T) {
 		t.Chdir(t.TempDir())
-		kc, err := installKube(io.Discard, "darkplum-system", "kind-darkplum-dev")
-		if err != nil {
-			t.Fatal(err)
+		old := newLocalKind
+		defer func() { newLocalKind = old }()
+		newLocalKind = func(ctx string) (runner.LocalKind, error) {
+			return runner.LocalKind{}, errors.New("stub: pretend kind")
 		}
-		rec := &fakeKube{}
-		kc.Runner = rec
-		_, _ = kc.NS(nil, "get", "svc", "darkplum-web")
-		if got := strings.Join(rec.calls[0], " "); got != "--context kind-darkplum-dev -n darkplum-system get svc darkplum-web" {
-			t.Errorf("args = %q", got)
+		if _, err := installKube(io.Discard, "darkplum-system", "kind-darkplum-dev", ""); err == nil {
+			t.Fatal("the stub refused; installKube must surface it")
 		}
 	})
 }
@@ -1114,6 +1056,13 @@ func TestConfigureAuditStepStates(t *testing.T) {
 			t.Errorf("deleted %v, restarts %d", h.kube.deleted, h.kube.restarts)
 		}
 		h.contains("removed the old load balancer trust list and web-ingress policy")
+		waited := false
+		for _, c := range h.kube.calls {
+			waited = waited || strings.Contains(strings.Join(c, " "), "wait --for=delete")
+		}
+		if !waited {
+			t.Error("the tunnel opened next could land on a web pod that is still stopping")
+		}
 	})
 }
 
@@ -1154,7 +1103,7 @@ func TestConfigureWarnsWhenSSORedirectIsElsewhere(t *testing.T) {
 			t.Errorf("redirect %s: warning shown = %v, want %v\n%s", redirect, got, warn, h.out.String())
 		}
 		if warn {
-			h.contains("./bin/darkplum sso configure --redirect-url https://darkplum.acme.com/auth/callback")
+			h.contains("darkplum sso configure --redirect-url https://darkplum.acme.com/auth/callback")
 		}
 	}
 }
@@ -1191,5 +1140,243 @@ func TestConfigureAuditIdempotentWithTrailingWhitespace(t *testing.T) {
 	}
 	if h.kube.restarts != 0 {
 		t.Errorf("an unchanged list must not restart web (restarts %d)", h.kube.restarts)
+	}
+}
+
+// The owner's row-1 run: the gateway answered 404 with Bedrock's end-of-life
+// text and configure said "the gateway does not list it yet, wait a minute".
+// Waiting never helps; the message must say the model is retired.
+func TestConfigureChatNamesARetiredModel(t *testing.T) {
+	const awsEOL = `{"error":{"message":"This model version has reached the end of its life. Please refer to the AWS documentation for more details.","type":"invalid_request_error"}}`
+	const gwEOL = `{"error":{"message":"This model has been retired by AWS and can no longer be used.","type":"invalid_request_error","code":"model_retired"}}`
+	for name, body := range map[string]string{"older gateway (message only)": awsEOL, "gateway with model_retired": gwEOL} {
+		t.Run(name, func(t *testing.T) {
+			api := newFakeAPI()
+			api.models = []map[string]any{bedrockModel("us.anthropic.claude-3-haiku-20240307-v1:0", true)}
+			api.setupRequired = boolp(false)
+			api.users["a@acme.com"] = testPassword
+			api.chatStatus = 404
+			api.chatBody = body
+			h := newHarness(t, api, 1)
+			if err := h.run(&ConfigureCmd{}, "a@acme.com\n", testPassword); err == nil || !IsReported(err) {
+				t.Fatalf("want a reported failure, got %v", err)
+			}
+			h.contains("✗ test chat", "is retired by AWS (end of life); waiting will not help", "re-run darkplum configure")
+			if strings.Contains(h.out.String(), "does not list") || strings.Contains(h.out.String(), "wait a minute") {
+				t.Errorf("a retired model is not 'not listed yet':\n%s", h.out.String())
+			}
+		})
+	}
+}
+
+func TestChatFailureNotListedYetOnlyForModelNotFound(t *testing.T) {
+	m := adminModel{ModelID: "m", Provider: "bedrock"}
+	d, _ := chatFailure(m, 404, "model_not_found", `model "m" is not available on this gateway`)
+	if !strings.Contains(d, "does not list") {
+		t.Errorf("model_not_found: %q", d)
+	}
+	d, h := chatFailure(m, 404, "", "Could not resolve the foundation model")
+	if strings.Contains(d, "does not list") || strings.Contains(h, "wait a minute") || !strings.Contains(d, "Could not resolve") {
+		t.Errorf("a provider 404 must show the provider's message, got %q / %q", d, h)
+	}
+}
+
+func readLogs(t *testing.T, in install.Install, prefix string) string {
+	t.Helper()
+	files, _ := filepath.Glob(filepath.Join(in.LogsDir(), prefix+"-*.log"))
+	if len(files) != 1 {
+		t.Fatalf("want one %s log under %s, found %v", prefix, in.LogsDir(), files)
+	}
+	if st, _ := os.Stat(files[0]); st.Mode().Perm() != 0o600 {
+		t.Errorf("log mode = %v, want 0600", st.Mode().Perm())
+	}
+	b, err := os.ReadFile(files[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+// configure keeps its run in the install's logs/ (docs/E2E-RELEASE-CHECK.md row 1
+// wants the logs of all three commands). The log holds what the screen showed,
+// the time-to-first-chat line included, and never the password.
+func TestConfigureWritesALogWithoutThePassword(t *testing.T) {
+	in, err := install.OpenDir(t.TempDir(), "darkplum")
+	if err != nil {
+		t.Fatal(err)
+	}
+	api := newFakeAPI()
+	api.models = []map[string]any{bedrockModel("us.anthropic.claude-sonnet", true)}
+	h := newHarness(t, api, 1)
+	h.logInstall = &in
+	h.clockStore = &deployClock{Started: h.clock.Add(-20 * time.Minute), Finished: h.clock.Add(-2 * time.Minute)}
+	if err := h.run(&ConfigureCmd{}, "Jane.Doe@acme.com\n\n\n", testPassword, testPassword); err != nil {
+		t.Fatalf("configure: %v\n%s", err, h.out.String())
+	}
+	log := readLogs(t, in, "configure")
+	for _, want := range []string{"✓ first admin", "✓ test chat", "time to first chat:", "configure took"} {
+		if !strings.Contains(log, want) {
+			t.Errorf("log lacks %q:\n%s", want, log)
+		}
+	}
+	if strings.Contains(log, testPassword) {
+		t.Errorf("the password is in the log:\n%s", log)
+	}
+	if strings.Contains(log, sessionToken) {
+		t.Errorf("the session cookie is in the log:\n%s", log)
+	}
+}
+
+// A failed chat is exactly when the log matters.
+func TestConfigureLogKeepsAFailedChat(t *testing.T) {
+	in, _ := install.OpenDir(t.TempDir(), "darkplum")
+	api := newFakeAPI()
+	api.models = []map[string]any{bedrockModel("m", true)}
+	api.setupRequired = boolp(false)
+	api.users["a@acme.com"] = testPassword
+	api.chatStatus = 404
+	api.chatBody = `{"error":{"message":"This model version has reached the end of its life.","type":"invalid_request_error"}}`
+	h := newHarness(t, api, 1)
+	h.logInstall = &in
+	_ = h.run(&ConfigureCmd{}, "a@acme.com\n", testPassword)
+	log := readLogs(t, in, "configure")
+	if !strings.Contains(log, "✗ test chat") || !strings.Contains(log, "configure took") || strings.Contains(log, testPassword) {
+		t.Errorf("log:\n%s", log)
+	}
+}
+
+const awsEOLBody = `{"error":{"message":"This model version has reached the end of its life. Please refer to the AWS documentation for more details.","type":"invalid_request_error"}}`
+
+// The picker never offers a retired model, and it is not first.
+func TestConfigureDoesNotOfferARetiredModel(t *testing.T) {
+	api := newFakeAPI()
+	api.models = []map[string]any{
+		retiredBedrockModel("us.anthropic.claude-3-haiku-20240307-v1:0", false),
+		bedrockModel("us.anthropic.claude-haiku-4-5-20251001-v1:0", false),
+	}
+	h := newHarness(t, api, 1)
+	if err := h.run(&ConfigureCmd{}, "Jane.Doe@acme.com\n\n\n", testPassword, testPassword); err != nil {
+		t.Fatalf("configure: %v\n%s", err, h.out.String())
+	}
+	out := h.out.String()
+	if api.models[0]["enabled"] == true {
+		t.Error("the retired model was enabled")
+	}
+	if api.models[1]["enabled"] != true {
+		t.Error("the current model was not enabled")
+	}
+	if strings.Contains(out, "1) us.anthropic.claude-3-haiku") || strings.Contains(out, "claude-3-haiku-20240307-v1:0     Bedrock") {
+		t.Errorf("a retired model is in the picker:\n%s", out)
+	}
+	h.contains("retired models", "retired by AWS, not offered", "claude-3-haiku", "✓ test chat")
+}
+
+// Already enabled, then retired: a warning, not a green check, and the test chat
+// goes to a model that can answer.
+func TestConfigureWarnsOnAnEnabledRetiredModelAndChatsWithAnother(t *testing.T) {
+	api := newFakeAPI()
+	api.models = []map[string]any{
+		retiredBedrockModel("old", true),
+		bedrockModel("new", true),
+	}
+	api.setupRequired = boolp(false)
+	api.users["a@acme.com"] = testPassword
+	h := newHarness(t, api, 1)
+	if err := h.run(&ConfigureCmd{}, "a@acme.com\n", testPassword); err != nil {
+		t.Fatalf("configure: %v\n%s", err, h.out.String())
+	}
+	out := h.out.String()
+	h.contains("enabled, but retired by AWS", "✓ test chat", "new answered")
+	if strings.Contains(out, "✓ old") {
+		t.Errorf("a retired model got a green check:\n%s", out)
+	}
+	if len(api.chatBods) != 1 || api.chatBods[0]["model"] != "new" {
+		t.Errorf("chat bodies = %v, want one chat to the current model", api.chatBods)
+	}
+}
+
+// An older gateway has no retired state: the first model's chat fails with the
+// end-of-life text, and configure moves on to the next enabled model.
+func TestConfigureChatFallsThroughFromARetiredModel(t *testing.T) {
+	api := newFakeAPI()
+	api.models = []map[string]any{bedrockModel("a-old", true), bedrockModel("b-new", true)}
+	api.chatByModel = map[string]chatAnswer{"a-old": {404, awsEOLBody}}
+	api.setupRequired = boolp(false)
+	api.users["a@acme.com"] = testPassword
+	h := newHarness(t, api, 1)
+	if err := h.run(&ConfigureCmd{}, "a@acme.com\n", testPassword); err != nil {
+		t.Fatalf("configure: %v\n%s", err, h.out.String())
+	}
+	h.contains("a-old is retired by AWS; trying b-new", "✓ test chat", "b-new answered")
+	if len(api.chatBods) != 2 {
+		t.Errorf("want 2 chats (old, then new), got %v", api.chatBods)
+	}
+}
+
+func TestChatFailureNotFoundWording(t *testing.T) {
+	bedrock := adminModel{ModelID: "m", Provider: "bedrock"}
+	d, h := chatFailure(bedrock, 404, "", "Could not resolve the foundation model")
+	if !strings.Contains(d, "Could not resolve") || h != "re-run darkplum configure and pick another model, or check model access in the Bedrock console" {
+		t.Errorf("bedrock 404: %q / %q", d, h)
+	}
+	// no real message, or not Bedrock: the default wording
+	for _, m := range []adminModel{bedrock, {ModelID: "m", Provider: "openai"}} {
+		msg := "boom"
+		if m.Provider == "bedrock" {
+			msg = http.StatusText(404)
+		}
+		if d, _ := chatFailure(m, 404, "", msg); !strings.Contains(d, "refused") || !strings.Contains(d, "(404)") || strings.Contains(d, "could not find") {
+			t.Errorf("%s: want the default refusal, got %q", m.Provider, d)
+		}
+	}
+}
+
+func TestRunLogStripsColourAndKeepsTheUncaughtError(t *testing.T) {
+	in, _ := install.OpenDir(t.TempDir(), "darkplum")
+	var console bytes.Buffer
+	rl := newRunLog(in, "configure", &console, time.Now())
+	fmt.Fprint(rl, "\x1b[32m✓\x1b[0m done \x1b[2mdim\x1b[0m\n")
+	rl.logError(errors.New("kubectl: boom"))
+	rl.logError(reportedError{"already shown"}) // on screen already
+	rl.logError(errAborted)
+	rl.Close()
+	if !strings.Contains(console.String(), "\x1b[32m") {
+		t.Error("the console lost its colour")
+	}
+	log := readLogs(t, in, "configure")
+	if strings.Contains(log, "\x1b") || !strings.Contains(log, "✓ done dim") {
+		t.Errorf("log kept escapes or lost text: %q", log)
+	}
+	if !strings.Contains(log, "error: kubectl: boom") || strings.Contains(log, "already shown") {
+		t.Errorf("log = %q", log)
+	}
+}
+
+// The tunnel opened after the restart must not land on a pod that is still stopping,
+// or the address printed for the person dies seconds later. Measured: it did, 4s in.
+func TestConfigureWaitsForTheOldWebPodsToGo(t *testing.T) {
+	for name, waitErr := range map[string]error{"gone in time": nil, "wait fails": errors.New("timed out waiting")} {
+		t.Run(name, func(t *testing.T) {
+			h := webHarness(t)
+			h.kube.waitErr = waitErr
+			if err := h.run(&ConfigureCmd{}, "a@acme.com\n", testPassword); err != nil {
+				t.Fatalf("a failed wait must not fail configure: %v\n%s", err, h.out.String())
+			}
+			find := func(want string) int {
+				for i, c := range h.kube.calls {
+					if strings.Contains(strings.Join(c, " "), want) {
+						return i
+					}
+				}
+				return -1
+			}
+			names, restart, status, wait := find("get pods -l app.kubernetes.io/name=darkplum-web"), find("rollout restart deployment/darkplum-web"), find("rollout status deployment/darkplum-web"), find("wait --for=delete --timeout=60s pod/darkplum-web-old-a pod/darkplum-web-old-b")
+			if names < 0 || !(names < restart && restart < status && status < wait) {
+				t.Errorf("order: names %d, restart %d, status %d, wait %d", names, restart, status, wait)
+			}
+			if name == "wait fails" {
+				h.contains("✓ audit")
+			}
+		})
 	}
 }

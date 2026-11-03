@@ -1,6 +1,6 @@
 # Opt-in dev variant: the dev stack plus the developer's AWS credentials mounted
 # into the gateway so Bedrock works from a laptop. Applied by
-# `make dev-up DEV_AWS=1 [DEV_AWS_PROFILE=<profile>]`. Never used in production —
+# `DEV_AWS=1 [DEV_AWS_PROFILE=<profile>] scripts/dev.sh up`. Never used in production —
 # there the gateway gets credentials from EKS Pod Identity.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization

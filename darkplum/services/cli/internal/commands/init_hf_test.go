@@ -11,7 +11,7 @@ import (
 // TestCatalogResolvesOnHuggingFace is the scheduled catalog check
 // (.github/workflows/catalog-sha.yml): every reviewed entry must still be
 // public, still ship safetensors, and its pinned SHA must still resolve (a force
-// pushed or deleted revision would fail make deploy at model download time).
+// pushed or deleted revision would fail darkplum deploy at model download time).
 // It calls huggingface.co, so it only runs with DARKPLUM_CHECK_CATALOG=1.
 func TestCatalogResolvesOnHuggingFace(t *testing.T) {
 	if os.Getenv("DARKPLUM_CHECK_CATALOG") != "1" {

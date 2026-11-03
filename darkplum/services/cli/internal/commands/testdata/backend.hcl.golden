@@ -1,0 +1,10 @@
+# Written by `darkplum init`: Terraform state lives in a versioned, KMS-encrypted,
+# private S3 bucket in your own account. Native S3 locking needs Terraform >= 1.10.
+# Passed to terraform init as -backend-config=backend.hcl (the AWS profile is added separately).
+# WARNING: deleting the KMS key alias/darkplum-tfstate makes this state unrecoverable.
+bucket       = "darkplum-tfstate-123456789012-us-east-2-a1b2c3"
+key          = "darkplum/aws/darkplum/terraform.tfstate"
+region       = "us-east-2"
+encrypt      = true
+kms_key_id   = "arn:aws:kms:us-east-2:123456789012:key/abc"
+use_lockfile = true

@@ -23,5 +23,5 @@ terraform/*/.darkplum/
 # OS cruft
 .DS_Store
 
-# Scratch file make destroy uses to carry the snapshot name past terraform destroy.
+# Scratch file the old make-based destroy used (kept ignored for old checkouts).
 terraform/aws/.destroy-snapshot

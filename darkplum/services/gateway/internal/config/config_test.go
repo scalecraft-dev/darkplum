@@ -519,3 +519,29 @@ func TestLoad_UserHMACDirDefaultAndOverride(t *testing.T) {
 		t.Errorf("UserHMACDir = %q err=%v", cfg.UserHMACDir, err)
 	}
 }
+
+// A Bedrock-only install sets no VLLM_UPSTREAM. The gateway must not invent a
+// "vllm-default" upstream (it showed as unreachable in /health).
+func TestLoad_VLLMUpstreamUnsetMeansNoPrimaryUpstream(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("VLLM_UPSTREAM", "")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.VLLMUpstream != "" {
+		t.Errorf("VLLMUpstream = %q, want empty (no primary vLLM)", cfg.VLLMUpstream)
+	}
+}
+
+func TestLoad_VLLMUpstreamExplicitIsKept(t *testing.T) {
+	baseEnv(t)
+	t.Setenv("VLLM_UPSTREAM", "http://vllm-inference.darkplum-inference.svc.cluster.local:8000")
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.VLLMUpstream != "http://vllm-inference.darkplum-inference.svc.cluster.local:8000" {
+		t.Errorf("VLLMUpstream = %q", cfg.VLLMUpstream)
+	}
+}

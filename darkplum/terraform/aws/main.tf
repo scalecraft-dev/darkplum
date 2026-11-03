@@ -10,6 +10,7 @@ provider "aws" {
 # normalized container_registry output so the platform-deploy step never has to
 # call `aws sts get-caller-identity` itself.
 data "aws_caller_identity" "current" {}
+data "aws_partition" "current" {}
 
 locals {
   # Bedrock is the inference backend on AWS. This value is surfaced as a
@@ -67,6 +68,16 @@ module "eks" {
   tags            = local.tags
 }
 
+# A reinstall finds the log group `darkplum destroy` kept. The import happens in the
+# normal plan and apply (the plan shows "1 to import"), not in a separate
+# `terraform import`, which evaluates the whole configuration against an empty state
+# and fails on any for_each that depends on a resource not yet created.
+import {
+  for_each = var.adopt_eks_log_group ? toset(["eks"]) : toset([])
+  to       = module.eks.module.eks.aws_cloudwatch_log_group.this[0]
+  id       = "/aws/eks/${var.cluster_name}/cluster"
+}
+
 module "node_groups" {
   source = "./modules/node-groups"
 
@@ -116,10 +127,24 @@ module "pod_identity_gateway" {
         ],
         [
           {
-            Sid      = "DiscoverModels"
-            Effect   = "Allow"
-            Action   = ["bedrock:ListInferenceProfiles"]
+            Sid    = "DiscoverModels"
+            Effect = "Allow"
+            # Read-only listings. ListFoundationModels carries each model's
+            # lifecycle (ACTIVE / LEGACY / end-of-life time), so a model AWS has
+            # retired is shown as retired instead of offered as ready.
+            Action   = ["bedrock:ListInferenceProfiles", "bedrock:ListFoundationModels"]
             Resource = "*"
+          },
+          {
+            # AWS omits a retired model from the list while its inference profile
+            # stays active; GetFoundationModel answers for it with the
+            # end-of-life error. Scoped to foundation-model ARNs (any region: a
+            # profile's models can be in other regions, and global.* profiles
+            # have an empty region in the ARN).
+            Sid      = "ReadModelLifecycle"
+            Effect   = "Allow"
+            Action   = ["bedrock:GetFoundationModel"]
+            Resource = "arn:${data.aws_partition.current.partition}:bedrock:*::foundation-model/*"
           },
           {
             # Read-only: lets the gateway tell an administrator, before anyone
@@ -202,4 +227,13 @@ module "web_access" {
   node_security_group_id      = module.eks.cluster_primary_security_group_id
   node_autoscaling_group_name = module.node_groups.cpu_autoscaling_group_name
   tags                        = local.tags
+}
+
+# The first-party image repositories (<cluster_name>/darkplum-{gateway,api,web}).
+# `darkplum deploy` mirrors the verified release images into them.
+module "ecr" {
+  source = "./modules/ecr"
+
+  cluster_name = var.cluster_name
+  tags         = local.tags
 }

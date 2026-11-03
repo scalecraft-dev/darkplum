@@ -152,7 +152,7 @@ export type ProviderState =
  * Where the model filter in force for a vendor was written.
  *
  *   db    the UI, or anything else that wrote through the api
- *   env   the command line (`make set-*-key MODELS=…`), mirrored into the
+ *   env   the command line (`darkplum keys set <vendor> --models …`), mirrored into the
  *         gateway's environment
  *   none  no filter, which for a vendor means no models are offered
  *
@@ -267,12 +267,13 @@ export interface ModelRouteSummary {
  * the UI shows no badge for it rather than guessing either way.
  */
 export interface ModelAvailability {
-  state: 'ok' | 'needs_aws_opt_in' | 'unknown'
-  reason: 'data_retention'
+  state: 'ok' | 'needs_aws_opt_in' | 'retired' | 'unknown'
+  reason: 'data_retention' | 'end_of_life'
   /** The mode the account is in now, verbatim: default | none | inherit |
    *  aws_review | provider_data_share | unknown. */
   account_mode: string
-  required_mode: 'aws_review'
+  /** Only on needs_aws_opt_in / ok / unknown rows; a retired row has none. */
+  required_mode?: 'aws_review'
 }
 
 export interface Model {

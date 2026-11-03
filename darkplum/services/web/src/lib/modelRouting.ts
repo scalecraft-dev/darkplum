@@ -97,18 +97,19 @@ export function vendorLabel(name: string | null | undefined): string {
 export const VENDORS: VendorName[] = ['anthropic', 'openai']
 
 /** The command that installs one vendor's key. Shown verbatim, to be copied:
- *  it must work as pasted, so it reads the key without echoing it and names the
- *  catalogue filter, which the target requires the first time. */
+ *  it must work as pasted. `darkplum keys set` asks for the key at a hidden
+ *  prompt (never on the command line) and needs the catalogue filter, --models,
+ *  the first time. */
 export const VENDOR_KEY_COMMAND: Record<VendorName, string> = {
-  anthropic: "read -s ANTHROPIC_API_KEY && export ANTHROPIC_API_KEY\nmake set-anthropic-key MODELS='claude-*'",
-  openai: "read -s OPENAI_API_KEY && export OPENAI_API_KEY\nmake set-openai-key MODELS='gpt-*'",
+  anthropic: "darkplum keys set anthropic --models 'claude-*'",
+  openai: "darkplum keys set openai --models 'gpt-*'",
 }
 
-/** Re-running the install target with MODELS is how the catalogue filter is
+/** Re-running the install command with --models is how the catalogue filter is
  *  changed; the key it already holds can be re-entered or rotated at the same time. */
 export const VENDOR_FILTER_COMMAND: Record<VendorName, string> = {
-  anthropic: "make set-anthropic-key MODELS='claude-*'",
-  openai: "make set-openai-key MODELS='gpt-*'",
+  anthropic: "darkplum keys set anthropic --models 'claude-*'",
+  openai: "darkplum keys set openai --models 'gpt-*'",
 }
 
 /** How a provider kind is named wherever models are grouped by it. */
@@ -717,6 +718,7 @@ export const DENIAL_CODES = [
   'model_requires_data_retention',
   'route_target_unavailable',
   'model_class_downgraded',
+  'model_retired',
 ] as const
 
 const DENIAL_LABELS: Record<string, string> = {
@@ -730,6 +732,7 @@ const DENIAL_LABELS: Record<string, string> = {
   // Same phrase as the Models badge (lib/dataRetention AWS_OPT_IN_LABEL);
   // written out here because check-policy pins the two to each other.
   model_requires_data_retention: 'Needs AWS opt-in',
+  model_retired: 'Model retired',
   // Recorded on a refused request (gateway chat.go sets it before route
   // resolution) but deliberately NOT in DENIAL_CODES above: the api's
   // validDenialCodeFilter does not accept it, so offering it as a filter

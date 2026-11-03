@@ -31,3 +31,9 @@ func TestNormalizeAvailability(t *testing.T) {
 		}
 	}
 }
+
+func TestValidDenialCodeFilter_AcceptsModelRetired(t *testing.T) {
+	if !validDenialCodeFilter("model_retired") {
+		t.Fatal("model_retired must be an accepted denial_code filter")
+	}
+}

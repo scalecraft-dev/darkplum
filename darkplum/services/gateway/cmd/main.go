@@ -100,7 +100,7 @@ func main() {
 		reg.Set(mockProv.Name(), mockProv)
 		sources = append(sources, routing.NewMockSource(mockProv.Name(), mockProv.Models()))
 		log.Println("gateway: mock mode enabled — no upstream required")
-	} else {
+	} else if cfg.VLLMUpstream != "" {
 		// Validate the vLLM upstream URL before attempting to connect.
 		if err := config.ValidateUpstreamURL(cfg.VLLMUpstream, cfg.DevMode); err != nil {
 			log.Fatalf("vllm: upstream validation failed: %v", err)
@@ -217,7 +217,7 @@ func main() {
 	// included in the /health response body but NEVER used to flip the pod
 	// to unready.
 	var healthEntries []health.Entry
-	if !mockMode {
+	if !mockMode && cfg.VLLMUpstream != "" {
 		healthEntries = append(healthEntries, health.Entry{
 			Name:     "vllm-default",
 			ProbeURL: cfg.VLLMUpstream + "/v1/models",

@@ -297,15 +297,50 @@ func TestOfferingsCheck(t *testing.T) {
 	}
 }
 
-func TestGPUQuotaParameterisedByInstance(t *testing.T) {
-	if r := gpuQuotaResult("4", nil, "us-east-2", "g5.xlarge"); r.status != checkPass {
-		t.Errorf("%+v", r)
+func TestGPUQuotaUsesTheInstancesRealSize(t *testing.T) {
+	const gv, pq = "L-DB2E81BA", "L-417A185B"
+	type answer struct {
+		out string
+		err error
 	}
-	if r := gpuQuotaResult("4", nil, "us-east-2", "g5.2xlarge"); r.status != checkFail || !strings.Contains(r.detail, "8") {
-		t.Errorf("g5.2xlarge needs 8 vCPUs: %+v", r)
-	}
-	if r := gpuQuotaResult("", errors.New("x"), "us-east-2", "g5.xlarge"); r.status != checkWarn {
-		t.Errorf("%+v", r)
+	for name, tc := range map[string]struct {
+		instance  string
+		vcpus     answer
+		quota     answer
+		wantCode  string
+		want      checkStatus
+		wantInRow string
+	}{
+		"catalog type within quota":  {instance: "g5.xlarge", quota: answer{out: "4"}, wantCode: gv, want: checkPass},
+		"catalog type over quota":    {instance: "g5.2xlarge", quota: answer{out: "4"}, wantCode: gv, want: checkFail, wantInRow: "need 8"},
+		"other type over quota":      {instance: "g6e.48xlarge", vcpus: answer{out: "192"}, quota: answer{out: "64"}, wantCode: gv, want: checkFail, wantInRow: "need 192"},
+		"other type within quota":    {instance: "g6e.xlarge", vcpus: answer{out: "4"}, quota: answer{out: "64"}, wantCode: gv, want: checkPass},
+		"P family has its own quota": {instance: "p5.48xlarge", vcpus: answer{out: "192"}, quota: answer{out: "100"}, wantCode: pq, want: checkFail, wantInRow: "need 192"},
+		"size unreadable: no guess":  {instance: "g6e.48xlarge", vcpus: answer{err: errors.New("denied")}, quota: answer{out: "64"}, wantCode: gv, want: checkWarn, wantInRow: "could not read how many"},
+		"quota unreadable":           {instance: "g5.xlarge", quota: answer{err: errors.New("x")}, wantCode: gv, want: checkWarn},
+		"unknown family":             {instance: "inf2.xlarge", vcpus: answer{out: "4"}, want: checkWarn, wantInRow: "cannot tell which quota"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var code string
+			r := gpuQuota(func(args ...string) (string, error) {
+				joined := strings.Join(args, " ")
+				if strings.Contains(joined, "describe-instance-types") {
+					return tc.vcpus.out, tc.vcpus.err
+				}
+				for i, a := range args {
+					if a == "--quota-code" {
+						code = args[i+1]
+					}
+				}
+				return tc.quota.out, tc.quota.err
+			}, "us-east-2", tc.instance)
+			if r.status != tc.want || !strings.Contains(r.detail, tc.wantInRow) {
+				t.Errorf("row = %+v", r)
+			}
+			if code != tc.wantCode {
+				t.Errorf("quota code = %q, want %q", code, tc.wantCode)
+			}
+		})
 	}
 }
 
@@ -326,45 +361,6 @@ func TestTFVarsRoundTripThroughDoctorReader(t *testing.T) {
 	}
 	if _, err := readTFVars(p + ".missing"); err == nil {
 		t.Error("missing tfvars must error")
-	}
-}
-
-// make deploy must stop before doing anything when init has not run.
-func TestMakeDeployRefusesWithoutTFVars(t *testing.T) {
-	if _, err := exec.LookPath("make"); err != nil {
-		t.Skip("no make")
-	}
-	root := filepath.Join("..", "..", "..", "..")
-	empty := t.TempDir()
-	for _, target := range []string{"deploy", "deploy-infra"} {
-		out, err := exec.Command("make", "-C", root, target, "TF_DIR="+empty).CombinedOutput()
-		if err == nil {
-			t.Errorf("make %s succeeded without tfvars", target)
-		}
-		if !strings.Contains(string(out), "darkplum init") {
-			t.Errorf("make %s: no init hint:\n%s", target, out)
-		}
-		if strings.Contains(string(out), "Building darkplum CLI") || strings.Contains(string(out), "Initializing Terraform") {
-			t.Errorf("make %s did work before the guard:\n%s", target, out)
-		}
-	}
-}
-
-func TestMakeGuardsOnlyForAWS(t *testing.T) {
-	if _, err := exec.LookPath("make"); err != nil {
-		t.Skip("no make")
-	}
-	root := filepath.Join("..", "..", "..", "..")
-	out, _ := exec.Command("make", "-n", "-C", root, "deploy", "CLOUD=gcp", "TF_DIR="+t.TempDir()).CombinedOutput()
-	if strings.Contains(string(out), "terraform.tfvars not found") || strings.Contains(string(out), "doctor check") {
-		t.Errorf("gcp must keep its own path, got the aws guards:\n%s", out)
-	}
-	out, _ = exec.Command("make", "-n", "-C", root, "deploy", "TF_DIR="+t.TempDir()).CombinedOutput()
-	if !strings.Contains(string(out), "terraform.tfvars not found") || !strings.Contains(string(out), "doctor check") {
-		t.Errorf("aws deploy lacks the tfvars guard or doctor step:\n%s", out)
-	}
-	if !strings.Contains(string(out), "--min-session 90") {
-		t.Errorf("no tfvars means the 90-minute bar; want it in:\n%s", out)
 	}
 }
 
@@ -410,5 +406,65 @@ func TestTFVarsDocsGuard(t *testing.T) {
 	// The repository itself is clean.
 	if out, err := exec.Command("python3", "-I", script).CombinedOutput(); err != nil {
 		t.Errorf("repository docs fail the guard:\n%s", out)
+	}
+}
+
+func TestAWSStateLockedReadsTheLockFile(t *testing.T) {
+	const key = "darkplum/aws/darkplum/terraform.tfstate"
+	cases := []struct {
+		name    string
+		err     error
+		want    bool
+		wantErr bool
+	}{
+		{"present", nil, true, false},
+		{"absent", errors.New("An error occurred (404) when calling the HeadObject operation: Not Found"), false, false},
+		// Without s3:ListBucket a missing object answers 403: never read that as free.
+		{"forbidden", errors.New("An error occurred (403) when calling the HeadObject operation: Forbidden"), false, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			sr := &scriptRunner{rules: []rule{
+				{"sts get-caller-identity", `{"UserId":"X","Account":"123456789012","Arn":"x"}`, nil},
+				{"s3api head-object", "{}", c.err},
+			}}
+			a := newAWSCloud("scalecraft", sr.run)
+			if _, err := a.Identity(); err != nil {
+				t.Fatal(err)
+			}
+			got, err := a.StateLocked("b", key, "us-east-2")
+			if got != c.want || (err != nil) != c.wantErr {
+				t.Fatalf("got %v, %v", got, err)
+			}
+			if !strings.Contains(sr.calls[len(sr.calls)-1], "--key "+key+".tflock") {
+				t.Errorf("wrong object: %s", sr.calls[len(sr.calls)-1])
+			}
+		})
+	}
+}
+
+func TestFirstAndLastLine(t *testing.T) {
+	kubectl := "error: error when retrieving current configuration of:\nResource: \"/v1, Resource=configmaps\"\nfrom server for: \"STDIN\": Get \"https://x\": net/http: TLS handshake timeout\n"
+	want := `error: error when retrieving current configuration of: … from server for: "STDIN": Get "https://x": net/http: TLS handshake timeout`
+	if got := firstAndLastLine(kubectl); got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+	if got := firstAndLastLine("just one line\n"); got != "just one line" {
+		t.Errorf("one line: got %q", got)
+	}
+}
+
+// Logged out, the row must say what is wrong rather than show nothing, or the bare
+// "exit status 255" that is all the runner keeps of the failure.
+func TestCheckAWSCredsSaysWhatIsWrong(t *testing.T) {
+	dir := t.TempDir()
+	script := "#!/bin/sh\nprintf '\\nError loading SSO Token: Token for https://x does not exist\\n' >&2\nexit 255\n"
+	if err := os.WriteFile(filepath.Join(dir, "aws"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	r := checkAWSCreds("acme")
+	if r.status != checkFail || !strings.Contains(r.detail, "logged out") || strings.Contains(r.detail, "exit status") {
+		t.Errorf("row = %+v", r)
 	}
 }

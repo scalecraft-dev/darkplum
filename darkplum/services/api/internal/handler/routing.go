@@ -107,7 +107,7 @@ const semanticRouterProbeTimeout = 2 * time.Second
 // semanticRouterNotConfiguredWarning is the exact warning text surfaced on a
 // routed alias using classifier_kind='semantic_router' when the gateway's
 // own /health reports routing.classifier.semantic_router.status != "configured".
-const semanticRouterNotConfiguredWarning = "Semantic Router is not installed on the gateway — run 'make deploy-semantic-router'. Until then this alias always uses its default route."
+const semanticRouterNotConfiguredWarning = "Semantic Router is not installed on the gateway — turn the semantic router on with 'darkplum init', then run 'darkplum deploy'. Until then this alias always uses its default route."
 
 // RoutingHandler serves the model-alias and routing-policy admin endpoints.
 type RoutingHandler struct {
@@ -246,7 +246,8 @@ func loadAliasRoutes(ctx context.Context, q rowsQuerier, aliases []string, now t
 			(m.model_id IS NOT NULL) AS target_exists,
 			COALESCE(m.enabled, false) AS target_enabled,
 			m.backend_class,
-			m.discovered_at
+			m.discovered_at,
+			m.availability_state
 		FROM model_alias_routes r
 		LEFT JOIN models m ON m.model_id = r.target_model_id
 		WHERE r.alias = ANY($1)
@@ -261,11 +262,12 @@ func loadAliasRoutes(ctx context.Context, q rowsQuerier, aliases []string, now t
 		var alias string
 		var rr aliasRouteResponse
 		var discoveredAt *time.Time
+		var availState *string
 		if err := rows.Scan(&alias, &rr.RouteName, &rr.Description, &rr.TargetModelID, &rr.Keywords,
-			&rr.TargetExists, &rr.TargetEnabled, &rr.TargetBackendClass, &discoveredAt); err != nil {
+			&rr.TargetExists, &rr.TargetEnabled, &rr.TargetBackendClass, &discoveredAt, &availState); err != nil {
 			return nil, fmt.Errorf("scan alias route: %w", err)
 		}
-		rr.TargetAvailable = discoveredAt != nil && modelIsAvailableWithin(*discoveredAt, now, window)
+		rr.TargetAvailable = targetAvailable(discoveredAt, availState, now, window)
 		result[alias] = append(result[alias], rr)
 	}
 	if err := rows.Err(); err != nil {
@@ -290,6 +292,7 @@ func (h *RoutingHandler) ListAliases(c *gin.Context) {
 			COALESCE(m.enabled, false) AS target_enabled,
 			m.backend_class,
 			m.discovered_at,
+			m.availability_state,
 			a.created_at,
 			a.updated_at
 		FROM model_aliases a
@@ -313,9 +316,10 @@ func (h *RoutingHandler) ListAliases(c *gin.Context) {
 		var classifierKind *string
 		var onRouteUnavailable string
 		var targetDiscoveredAt *time.Time
+		var targetState *string
 		if err := rows.Scan(
 			&a.Alias, &a.Kind, &targetModelID, &defaultRoute, &classifierKind, &onRouteUnavailable,
-			&a.TargetExists, &a.TargetEnabled, &a.TargetBackendClass, &targetDiscoveredAt, &a.CreatedAt, &a.UpdatedAt,
+			&a.TargetExists, &a.TargetEnabled, &a.TargetBackendClass, &targetDiscoveredAt, &targetState, &a.CreatedAt, &a.UpdatedAt,
 		); err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "scan alias failed"})
 			return
@@ -323,7 +327,7 @@ func (h *RoutingHandler) ListAliases(c *gin.Context) {
 		if targetModelID != nil {
 			a.TargetModelID = *targetModelID
 		}
-		a.TargetAvailable = targetDiscoveredAt != nil && modelIsAvailableWithin(*targetDiscoveredAt, now, h.availabilityWindow)
+		a.TargetAvailable = targetAvailable(targetDiscoveredAt, targetState, now, h.availabilityWindow)
 		if a.Kind == aliasKindRouted {
 			if defaultRoute != nil {
 				a.DefaultRoute = *defaultRoute
@@ -625,9 +629,10 @@ func (h *RoutingHandler) putStaticAlias(c *gin.Context, tx pgx.Tx, alias string,
 	var targetEnabled bool
 	var targetBackendClass string
 	var targetDiscoveredAt time.Time
+	var targetState *string
 	err := tx.QueryRow(ctx,
-		`SELECT enabled, backend_class, discovered_at FROM models WHERE model_id = $1`, req.TargetModelID,
-	).Scan(&targetEnabled, &targetBackendClass, &targetDiscoveredAt)
+		`SELECT enabled, backend_class, discovered_at, availability_state FROM models WHERE model_id = $1`, req.TargetModelID,
+	).Scan(&targetEnabled, &targetBackendClass, &targetDiscoveredAt, &targetState)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			c.JSON(http.StatusNotFound, gin.H{"error": "target model not found"})
@@ -677,7 +682,7 @@ func (h *RoutingHandler) putStaticAlias(c *gin.Context, tx pgx.Tx, alias string,
 	row.TargetExists = true
 	row.TargetEnabled = targetEnabled
 	row.TargetBackendClass = &targetBackendClass
-	row.TargetAvailable = modelIsAvailableWithin(targetDiscoveredAt, time.Now(), h.availabilityWindow)
+	row.TargetAvailable = targetAvailable(&targetDiscoveredAt, targetState, time.Now(), h.availabilityWindow)
 
 	if err := tx.Commit(ctx); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "commit alias failed"})

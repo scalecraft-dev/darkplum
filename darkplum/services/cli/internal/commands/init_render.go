@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/scalecraft-dev/darkplum/cli/internal/install"
 )
 
 // tfvarsKV is one rendered variable. Value is a Go string, int, bool or []string.
@@ -17,8 +19,8 @@ type tfvarsKV struct {
 
 // hclString quotes s as an HCL string literal. Besides \ and ", the template
 // sequences ${ and %{ must be escaped or Terraform would interpolate them, and
-// control characters must not break the one-line-per-key layout the Makefile's
-// aws_profile sed relies on.
+// control characters must not break the one-line-per-key layout the CLI's
+// line-by-line tfvars reader relies on.
 func hclString(s string) string {
 	var b strings.Builder
 	b.WriteByte('"')
@@ -80,30 +82,31 @@ func renderTFVars(kvs []tfvarsKV, now time.Time) string {
 	if !now.IsZero() {
 		b.WriteString(" on " + now.UTC().Format("2006-01-02"))
 	}
-	b.WriteString(".\n# Change a value by re-running ./bin/darkplum init; every other variable keeps its\n# default (see variables.tf). Keep one `key = \"value\"` per line: the Makefile reads\n# aws_profile from here with sed.\n")
+	b.WriteString(".\n# Change a value by re-running darkplum init; every other variable keeps its\n# default (see variables.tf). Keep one `key = \"value\"` per line: the darkplum CLI reads\n# this file line by line.\n")
 	for _, kv := range kvs {
 		fmt.Fprintf(&b, "%s = %s\n", kv.Key, hclValue(kv.Value))
 	}
 	return b.String()
 }
 
-// backendSpec is the S3 backend written to backend.tf.
+// backendFileName is the partial backend configuration init writes next to
+// terraform.tfvars. The Terraform code declares `backend "s3" {}` and nothing
+// else; this file supplies the bucket, key and region (terraform init
+// -backend-config=backend.hcl), so the code that ships in the binary never
+// names a customer's bucket and nothing is ever written into it.
+const backendFileName = "backend.hcl"
+
+// backendSpec is the S3 backend written to backend.hcl.
 type backendSpec struct {
 	Bucket, Key, Region, KMSKeyARN string
 }
 
 func renderBackend(s backendSpec) string {
-	var b strings.Builder
-	b.WriteString("# Written by `darkplum init`: Terraform state lives in a versioned, KMS-encrypted,\n# private S3 bucket in your own account. Native S3 locking needs Terraform >= 1.10.\n# The AWS profile is not stored here: make deploy passes it with -backend-config=profile=...\n# WARNING: deleting the KMS key alias/darkplum-tfstate makes this state unrecoverable.\n")
-	b.WriteString("terraform {\n  backend \"s3\" {\n")
-	fmt.Fprintf(&b, "    bucket       = %s\n", hclString(s.Bucket))
-	fmt.Fprintf(&b, "    key          = %s\n", hclString(s.Key))
-	fmt.Fprintf(&b, "    region       = %s\n", hclString(s.Region))
-	b.WriteString("    encrypt      = true\n")
-	fmt.Fprintf(&b, "    kms_key_id   = %s\n", hclString(s.KMSKeyARN))
-	b.WriteString("    use_lockfile = true\n")
-	b.WriteString("  }\n}\n")
-	return b.String()
+	return "# Written by `darkplum init`: Terraform state lives in a versioned, KMS-encrypted,\n" +
+		"# private S3 bucket in your own account. Native S3 locking needs Terraform >= 1.10.\n" +
+		"# Passed to terraform init as -backend-config=backend.hcl (the AWS profile is added separately).\n" +
+		"# WARNING: deleting the KMS key alias/darkplum-tfstate makes this state unrecoverable.\n" +
+		backendHCLBody(install.Backend{Bucket: s.Bucket, Key: s.Key, Region: s.Region, KMSKeyID: s.KMSKeyARN, Encrypt: true, UseLockfile: true})
 }
 
 // writeFileAtomic writes data to path with mode 0600 via temp file + rename, so

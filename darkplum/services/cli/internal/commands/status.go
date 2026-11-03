@@ -3,46 +3,90 @@ package commands
 import (
 	"encoding/base64"
 	"fmt"
+	"io"
 	"os"
 	"strings"
+
+	"github.com/scalecraft-dev/darkplum/cli/internal/kube"
+	"github.com/scalecraft-dev/darkplum/cli/internal/release"
 )
 
 // StatusCmd is `darkplum status`.
 type StatusCmd struct {
-	Context string `name:"context" help:"Kubeconfig context to read. Needed only where there are no install settings (run from darkplum/ after darkplum init)." default:""`
+	Context string `name:"context" help:"Local kind context (kind-*) to read, for a cluster Darkplum did not install. An install is found from its settings. A loopback address can still be an ssh tunnel to a remote cluster: the flag cannot tell, so do not point it at one." default:""`
 }
 
 // Run executes `darkplum status`. Like every kube command it establishes and
 // validates the install's cluster first, and refuses rather than read
 // whatever cluster the current context points at.
 func (s *StatusCmd) Run(g *Globals) error {
-	c, err := installKube(os.Stdout, g.Namespace, s.Context)
+	c, err := installKube(os.Stdout, g.Namespace, s.Context, g.Install)
 	if err != nil {
 		return err
 	}
+	e := &statusEnv{out: os.Stdout, kc: c, ns: g.Namespace}
+	if m, err := release.Current(); err == nil {
+		e.proof.version = m.Version
+		// Where the images are comes from the install's own record (what deploy
+		// mirrored), not from a guess at the registry: an adopted install may have
+		// no single account, and the registry host is whatever deploy wrote.
+		// What they must be, the digest, is this build's.
+		e.build = &m
+	}
+	// The install's own settings tell which sections apply (web address, GPU). A
+	// cluster reached with --context has none; those sections are read live.
+	if s.Context == "" {
+		if in, _, err := openInstall(g.Install); err == nil {
+			if tf, err := readTFVars(in.TFVars()); err == nil {
+				e.tf = &tf
+			}
+		}
+	}
+	return e.run()
+}
 
-	// OIDC on/off is read from the auth secret (no DB access needed). make
-	// deploy writes the placeholder "unconfigured" when SSO is not set up; the
-	// api treats that as off (auth/config.go), so status must too.
+// statusEnv is what status reads, so tests can replace the cluster.
+type statusEnv struct {
+	out io.Writer
+	kc  *kube.Client
+	ns  string
+	tf  *tfvarsInfo // nil when there is no install record (--context)
+	// proof is what this build can confirm about the images; recorded is the
+	// release version the install's own record says it runs (read by release()).
+	proof    imageProof
+	build    *release.Manifest // this build's manifest; nil for a dev build
+	recorded string
+}
+
+func (e *statusEnv) run() error {
+	c := e.kc
+	failed := e.release()
+
+	// OIDC on/off is read from the auth secret (no DB access needed). deploy
+	// writes the placeholder "unconfigured" when SSO is not set up; the api
+	// treats that as off (auth/config.go), so status must too.
 	issuer, _ := c.NS(nil, "get", "secret", "darkplum-auth",
 		"-o", "jsonpath={.data.OIDC_ISSUER}")
 	if oidcConfigured(issuer) {
-		fmt.Printf("%s     %s\n", sDim("auth"), sInfo("local + OIDC"))
+		fmt.Fprintf(e.out, "%s     %s\n", sDim("auth"), sInfo("local + OIDC"))
 	} else {
-		fmt.Printf("%s     %s\n", sDim("auth"), sInfo("local only"))
+		fmt.Fprintf(e.out, "%s     %s\n", sDim("auth"), sInfo("local only"))
+	}
+	if e.imageTrust() {
+		failed = true
 	}
 
 	anyNotReady := false
-	for _, ns := range []string{g.Namespace, "darkplum-inference"} {
-		fmt.Printf("\n%s\n", sHeader("▸ "+ns))
+	for _, ns := range []string{e.ns, inferenceNamespace} {
+		fmt.Fprintf(e.out, "\n%s\n", sHeader("▸ "+ns))
 		out, err := c.Run(nil, "-n", ns, "get", "pods", "--no-headers")
 		if err != nil {
-			fmt.Printf("  (unavailable: %v)\n", err)
+			fmt.Fprintf(e.out, "  (unavailable: %v)\n", err)
 			continue
 		}
 		out = strings.TrimSpace(out)
 		if out == "" {
-			fmt.Println("  (no pods)")
+			fmt.Fprintln(e.out, "  (no pods)")
 			continue
 		}
 		for _, line := range strings.Split(out, "\n") {
@@ -60,28 +104,34 @@ func (s *StatusCmd) Run(g *Globals) error {
 				mark = sFail("✗ not ready")
 				anyNotReady = true
 			}
-			fmt.Printf("  %s %-40s %s %s\n", mark, pod, sDim(fmt.Sprintf("%-7s", ready)), sDim(phase))
+			fmt.Fprintf(e.out, "  %s %-40s %s %s\n", mark, pod, sDim(fmt.Sprintf("%-7s", ready)), sDim(phase))
 			if !ok {
 				logs, _ := c.Run(nil, "-n", ns, "logs", pod, "--tail=3", "--all-containers")
 				for _, l := range strings.Split(strings.TrimSpace(logs), "\n") {
 					if l != "" {
-						fmt.Printf("      %s\n", sDim("│ "+l))
+						fmt.Fprintf(e.out, "      %s\n", sDim("│ "+l))
 					}
 				}
 			}
 		}
 	}
 
-	fmt.Println()
-	if anyNotReady {
+	e.webUI()
+	e.models()
+
+	fmt.Fprintln(e.out)
+	switch {
+	case anyNotReady:
 		return fmt.Errorf("one or more pods are not ready")
+	case failed:
+		return reportedError{"the images this install runs were not verified"}
 	}
-	fmt.Println(sSuccess("✓ all pods ready"))
+	fmt.Fprintln(e.out, sSuccess("✓ all pods ready"))
 	return nil
 }
 
 // oidcConfigured reports whether a base64 OIDC_ISSUER from the auth secret
-// names a real issuer rather than being empty or make deploy's placeholder.
+// names a real issuer rather than being empty or deploy's placeholder.
 func oidcConfigured(b64 string) bool {
 	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(b64))
 	if err != nil {

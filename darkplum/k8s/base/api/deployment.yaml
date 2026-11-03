@@ -23,7 +23,7 @@ spec:
       containers:
         - name: api
           image: darkplum-api:latest
-          imagePullPolicy: Always  # :latest is mutable; IfNotPresent keeps a node on the old image after make deploy-platform
+          imagePullPolicy: Always  # :latest is mutable; IfNotPresent keeps a node on the old image after darkplum deploy
           ports:
             - name: http
               containerPort: 8080
@@ -88,6 +88,13 @@ spec:
             # Where library tool (MCP server) credentials are mounted.
             - name: TOOL_CREDENTIALS_DIR
               value: /var/run/darkplum/tool-credentials
+          # Keep serving while the Service stops sending here; the listener otherwise
+          # closes on SIGTERM while traffic still arrives. Fits the 30s grace period,
+          # with the 10s the server takes to finish what it is doing.
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
           readinessProbe:
             httpGet:
               path: /health

@@ -74,8 +74,8 @@ resource "aws_db_instance" "this" {
   # data is the customer's and survives. So: a week of automated backups (PITR
   # within the window), a final snapshot on destroy, and deletion protection so
   # neither `terraform destroy` nor a console click removes the instance until
-  # an operator deliberately turns protection off (make destroy does this
-  # itself, right before the destroy, see Makefile).
+  # an operator deliberately turns protection off (`darkplum destroy` does this
+  # itself, right before the destroy).
   backup_retention_period   = var.backup_retention_period
   deletion_protection       = var.deletion_protection
   skip_final_snapshot       = var.skip_final_snapshot

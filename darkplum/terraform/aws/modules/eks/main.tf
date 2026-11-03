@@ -1,6 +1,6 @@
 module "eks" {
   source  = "terraform-aws-modules/eks/aws"
-  version = "~> 20.31"
+  version = "20.37.2"
 
   cluster_name    = var.cluster_name
   cluster_version = var.cluster_version
@@ -17,6 +17,11 @@ module "eks" {
   # change). Remove when confirmed nothing else uses the OIDC provider.
   enable_irsa = true
 
+  # KNOWN NON-REPRODUCIBLE: `most_recent` resolves to whatever add-on version EKS
+  # offers for cluster_version on the day of the apply, so two installs of the
+  # same Darkplum release can differ here. Pinning needs a tested version per
+  # cluster_version and is tracked separately; the module and provider versions
+  # (this file, modules/vpc, versions.tf, the lock file) are exact.
   cluster_addons = {
     vpc-cni = {
       most_recent = true

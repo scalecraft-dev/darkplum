@@ -8,8 +8,8 @@
 # and those routes.
 #
 # Kubelet health probes and `kubectl port-forward` are not subject to pod
-# NetworkPolicy (node-local traffic), so /health probes, `make test` and
-# `make status` keep working.
+# NetworkPolicy (node-local traffic), so /health probes, `scripts/dev.sh test` and
+# `scripts/dev.sh status` keep working.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:

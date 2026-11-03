@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/scalecraft-dev/darkplum/cli/internal/install"
 )
 
 var update = flag.Bool("update", false, "rewrite golden files")
@@ -47,6 +49,8 @@ type fakeCloud struct {
 	objects     map[string]int
 	objectsFull map[string]stateContents // wins over objects (outputs, too)
 	objectErr   map[string]error
+	locks       map[string]bool // "bucket/key" whose .tflock exists
+	lockErr     error
 	reads       []string
 
 	// Route53 / ACM (init_web.go).
@@ -129,6 +133,9 @@ func (f *fakeCloud) ReadState(bucket, key, _ string) (stateContents, bool, error
 	n, ok := f.objects[k]
 	return stateContents{Resources: n}, ok, nil
 }
+func (f *fakeCloud) StateLocked(bucket, key, _ string) (bool, error) {
+	return f.locks[bucket+"/"+key], f.lockErr
+}
 func (f *fakeCloud) CreateBackend(_, _ string, st backendState) (string, error) {
 	f.createCalls++
 	f.createdWith = st
@@ -175,7 +182,7 @@ func testEnv(t *testing.T, cloud initCloud, hf modelLookup, answers string) (*in
 }
 
 func yesCmd(dir string, extra func(*InitCmd)) *InitCmd {
-	c := &InitCmd{Cloud: "aws", Yes: true, Dir: dir, ClusterName: "darkplum", GPUCount: 1, Backend: "local", Domain: "acme.com"}
+	c := &InitCmd{Cloud: "aws", Yes: true, Dir: dir, ClusterName: "darkplum", Domain: "acme.com"}
 	if extra != nil {
 		extra(c)
 	}
@@ -219,8 +226,13 @@ func TestInitYesBedrockGolden(t *testing.T) {
 	if st.Mode().Perm() != 0o600 {
 		t.Errorf("mode = %v, want 0600", st.Mode().Perm())
 	}
+	// The only Terraform-side file init writes is the partial backend config;
+	// it never writes Terraform code (backend.tf) into the checkout.
+	if _, err := os.Stat(filepath.Join(dir, "backend.hcl")); err != nil {
+		t.Errorf("backend.hcl not written: %v", err)
+	}
 	if _, err := os.Stat(filepath.Join(dir, "backend.tf")); err == nil {
-		t.Error("--backend local must not write backend.tf")
+		t.Error("init wrote backend.tf into the Terraform root")
 	}
 }
 
@@ -238,13 +250,13 @@ func TestInitS3BackendGolden(t *testing.T) {
 	dir := t.TempDir()
 	cloud := newFakeCloud()
 	env, _ := testEnv(t, cloud, nil, "-")
-	if err := yesCmd(dir, func(c *InitCmd) { c.Backend = "s3"; c.Profile = "acme" }).execute(env); err != nil {
+	if err := yesCmd(dir, func(c *InitCmd) { c.Profile = "acme" }).execute(env); err != nil {
 		t.Fatal(err)
 	}
 	if cloud.createCalls != 1 {
 		t.Fatalf("CreateBackend calls = %d, want 1", cloud.createCalls)
 	}
-	golden(t, "backend.tf.golden", readFile(t, filepath.Join(dir, "backend.tf")))
+	golden(t, "backend.hcl.golden", readFile(t, filepath.Join(dir, "backend.hcl")))
 }
 
 func TestInitS3BackendFailureWritesNothing(t *testing.T) {
@@ -252,7 +264,7 @@ func TestInitS3BackendFailureWritesNothing(t *testing.T) {
 	cloud := newFakeCloud()
 	cloud.createErr = errors.New("AccessDenied")
 	env, _ := testEnv(t, cloud, nil, "-")
-	if err := yesCmd(dir, func(c *InitCmd) { c.Backend = "s3" }).execute(env); err == nil {
+	if err := yesCmd(dir, nil).execute(env); err == nil {
 		t.Fatal("want error")
 	}
 	entries, _ := os.ReadDir(dir)
@@ -265,7 +277,7 @@ func TestInitDryRunWritesNothingAndPrintsCommands(t *testing.T) {
 	dir := t.TempDir()
 	cloud := newFakeCloud()
 	env, out := testEnv(t, cloud, nil, "-")
-	err := yesCmd(dir, func(c *InitCmd) { c.Backend = "s3"; c.DryRun = true }).execute(env)
+	err := yesCmd(dir, func(c *InitCmd) { c.DryRun = true }).execute(env)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -302,7 +314,7 @@ func TestInitGCPNotSupported(t *testing.T) {
 
 func TestInitNonTTYWithoutYesListsFlags(t *testing.T) {
 	err := (&InitCmd{Cloud: "aws"}).missingFlagsError()
-	for _, want := range []string{"--region", "--mode", "--backend", "--yes"} {
+	for _, want := range []string{"--region", "--mode", "--yes"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error %q lacks %s", err, want)
 		}
@@ -345,8 +357,8 @@ func TestInitNameCollision(t *testing.T) {
 	}
 	// Interactive: re-asks, and the second name is used. The fake flips to free.
 	dir := t.TempDir()
-	env, _ = testEnv(t, &collideOnce{fakeCloud: newFakeCloud()}, nil, "\ndarkplum-b\n\n")
-	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Region: "us-east-2", Mode: "bedrock", Backend: "local", Profile: "acme", Domain: "acme.com"}
+	env, _ = testEnv(t, &collideOnce{fakeCloud: newFakeCloud()}, nil, "\n\ndarkplum-b\n\n")
+	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", Region: "us-east-2", Mode: "bedrock", Profile: "acme", Domain: "acme.com"}
 	if err := c.execute(env); err != nil {
 		t.Fatal(err)
 	}
@@ -390,7 +402,7 @@ func TestInitConfirmOverwriteDefaultsToNo(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "terraform.tfvars")
 	_ = os.WriteFile(path, []byte("old\n"), 0o600)
-	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Region: "us-east-2", Mode: "bedrock", Backend: "local", Profile: "acme", Domain: "acme.com"}
+	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", Region: "us-east-2", Mode: "bedrock", Profile: "acme", Domain: "acme.com"}
 	// Start over (not just add the address), default networks, then Enter at the overwrite question.
 	env, _ := testEnv(t, newFakeCloud(), nil, "2\n\n\n")
 	if err := c.execute(env); !errors.Is(err, errAborted) {
@@ -403,7 +415,7 @@ func TestInitConfirmOverwriteDefaultsToNo(t *testing.T) {
 
 func TestInitAbortOnEOFWritesNothing(t *testing.T) {
 	dir := t.TempDir()
-	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Profile: "acme"}
+	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", Profile: "acme"}
 	env, _ := testEnv(t, newFakeCloud(), nil, "us-east-2\n") // input ends at the mode question
 	if err := c.execute(env); !errors.Is(err, errAborted) {
 		t.Fatalf("got %v", err)
@@ -416,8 +428,8 @@ func TestInitAbortOnEOFWritesNothing(t *testing.T) {
 func TestInitInteractiveGPUFlow(t *testing.T) {
 	dir := t.TempDir()
 	// profile, region, mode 2 (gpu), model 2 (mistral), backend 2 (local), final confirm
-	env, out := testEnv(t, newFakeCloud(), nil, "acme\n\n2\n2\nacme.com\n\n2\n\n")
-	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1}
+	env, out := testEnv(t, newFakeCloud(), nil, "acme\n\n2\n2\nacme.com\n\n\n2\n\n")
+	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum"}
 	if err := c.execute(env); err != nil {
 		t.Fatalf("%v\n%s", err, out)
 	}
@@ -427,13 +439,13 @@ func TestInitInteractiveGPUFlow(t *testing.T) {
 			t.Errorf("tfvars lacks %s:\n%s", want, got)
 		}
 	}
-	for _, want := range []string{"Installing into account " + testAccount, "make deploy", "Settings saved"} {
+	for _, want := range []string{"Installing into account " + testAccount, "darkplum deploy", "Settings saved"} {
 		if !strings.Contains(out.String(), want) {
 			t.Errorf("output lacks %q", want)
 		}
 	}
 	// File names are an implementation detail the operator should not need.
-	for _, unwanted := range []string{"backend.tf", "terraform.tfvars"} {
+	for _, unwanted := range []string{"backend.hcl", "terraform.tfvars"} {
 		if strings.Contains(out.String(), unwanted) {
 			t.Errorf("output mentions %q", unwanted)
 		}
@@ -498,8 +510,8 @@ func TestInitGatedConfirmed(t *testing.T) {
 	sha := strings.Repeat("ab", 20)
 	dir := t.TempDir()
 	// profile, region, mode(gpu), model: custom(3), id, gated confirm y, sha, networks, backend local, final confirm
-	env, _ := testEnv(t, newFakeCloud(), &fakeHF{err: errHFGated}, "acme\n\n2\n3\nmeta/Gated-1\ny\n"+sha+"\n\n2\n\n")
-	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", GPUCount: 1, Domain: "acme.com"}
+	env, _ := testEnv(t, newFakeCloud(), &fakeHF{err: errHFGated}, "acme\n\n2\n3\nmeta/Gated-1\ny\n"+sha+"\n\n\n2\n\n")
+	c := &InitCmd{Cloud: "aws", Dir: dir, ClusterName: "darkplum", Domain: "acme.com"}
 	if err := c.execute(env); err != nil {
 		t.Fatal(err)
 	}
@@ -614,5 +626,42 @@ func TestPrompter(t *testing.T) {
 	}
 	if !strings.Contains(out.String(), "nope") || !strings.Contains(out.String(), "1 to 2") {
 		t.Errorf("validation hints missing:\n%s", out.String())
+	}
+}
+
+// init keeps its run in the workspace's logs/ once it starts writing there,
+// including what it printed before that; a dry run writes nothing, log included.
+func TestInitWritesALogOnceItWrites(t *testing.T) {
+	dir := t.TempDir()
+	in, err := install.OpenDir(dir, "darkplum")
+	if err != nil {
+		t.Fatal(err)
+	}
+	env, out := testEnv(t, newFakeCloud(), nil, "-")
+	rl := newDeferredLog(out)
+	defer rl.Close()
+	env.out = rl
+	if err := yesCmd(dir, nil).execute(env); err != nil {
+		t.Fatal(err)
+	}
+	files, _ := filepath.Glob(filepath.Join(in.LogsDir(), "init-*.log"))
+	if len(files) != 1 {
+		t.Fatalf("want one init log, found %v", files)
+	}
+	log := readFile(t, files[0])
+	if !strings.Contains(log, "init · aws") || !strings.Contains(log, "Settings saved") {
+		t.Errorf("log lacks the start or the end of the run:\n%s", log)
+	}
+}
+
+func TestInitDryRunWritesNoLog(t *testing.T) {
+	dir := t.TempDir()
+	env, out := testEnv(t, newFakeCloud(), nil, "-")
+	env.out = newDeferredLog(out)
+	if err := yesCmd(dir, func(c *InitCmd) { c.DryRun = true }).execute(env); err != nil {
+		t.Fatal(err)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Errorf("dry run wrote %v", entries)
 	}
 }

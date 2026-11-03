@@ -9,7 +9,7 @@
 # pod IPs directly and gateway-egress's selector already covers them.
 #
 # Not in kustomization.yaml: PLACEHOLDER_SERVICE_CIDR is substituted by
-# `make deploy-platform` from the cluster's kubernetesNetworkConfig.
+# `darkplum deploy` from the cluster's kubernetesNetworkConfig.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
