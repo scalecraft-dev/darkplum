@@ -268,7 +268,7 @@ func sessionResult(expiry func(string) (time.Time, error), profile string, minMi
 	exp, err := expiry(profile)
 	if err != nil {
 		return checkResult{name: "session lifetime", status: checkWarn, detail: "could not read",
-			hint: "needs a working AWS session and AWS CLI >= 2.9; make sure the session lasts the whole install (about 90 minutes)"}
+			hint: "needs a working AWS session and AWS CLI >= 2.9; make sure the session outlasts the install (20 to 30 minutes, more for a larger model or a resume)"}
 	}
 	if exp.IsZero() {
 		return checkResult{name: "session lifetime", status: checkPass, detail: "long-lived credentials"}

@@ -49,7 +49,6 @@ func setup(t *testing.T, withTables bool) *pgxpool.Pool {
 	return pool
 }
 
-// drain waits until the queue is empty and the last write finished.
 // drain waits for the writer to finish. An empty queue is not enough, because the last
 // item has been taken but may still be writing: a fixed sleep after it failed on a busy
 // CI runner. So it also waits until the writer holds no database connection.
