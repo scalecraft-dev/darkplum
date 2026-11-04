@@ -92,7 +92,7 @@ interface StateCopy {
  * working Change models button, which is an instruction to do the hard thing
  * for no reason.
  */
-function stateCopy(p: ProviderStatus, canInstallKey: boolean, canChangeFilter: boolean): StateCopy {
+export function stateCopy(p: ProviderStatus, canInstallKey: boolean, canChangeFilter: boolean): StateCopy {
   const vendor = vendorLabel(p.name)
   switch (p.state) {
     case 'ok':
@@ -232,16 +232,12 @@ export function VendorStatusSection({
       <div className={styles.head}>
         <h2 id="model-vendors-heading" className={styles.title}>Model vendors</h2>
         <p className={styles.subtitle}>
-          Anthropic and OpenAI, called at their own APIs with a key your organisation installs.
-          Prompts sent to them leave your cloud account. A vendor that is not working is reported
-          here and never takes the gateway down with it.
+          Keys for calling Anthropic and OpenAI directly. Prompts sent this way leave your cloud
+          account.
         </p>
-        {/* The boundary of this card, in one sentence rather than a banner:
-            somebody who came here to add a model needs to know this is not
-            where self-hosted ones are added, and nothing more than that. */}
         <p className={styles.scope}>
-          Vendor keys and vendor models only. Self-hosted models and AWS Bedrock model patterns are
-          set when the platform is deployed, not from this page.
+          Self-hosted models and AWS Bedrock model patterns are set when the platform is deployed,
+          not from this page.
         </p>
       </div>
 

@@ -622,3 +622,374 @@
   gap: var(--space-2);
   padding-top: var(--space-2);
 }
+
+/* ============================================================
+   Catalogue, second pass: one table per provider, makers as
+   collapsible row groups, one logical row per model.
+   ============================================================ */
+
+/* --- Vendor-key strip: the one line the Models tab says about keys --- */
+
+.vendorStrip {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+  min-height: 44px;
+  padding: var(--space-2) var(--space-4);
+  margin-bottom: var(--space-5);
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+}
+
+.vendorStripDanger {
+  box-shadow: inset 2px 0 0 var(--danger-fg);
+}
+
+.vendorStripWarning {
+  box-shadow: inset 2px 0 0 var(--warning-fg);
+}
+
+.vendorList {
+  display: flex;
+  gap: var(--space-4);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.vendorList li {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.vendorName {
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  color: var(--fg-default);
+}
+
+.vendorStripNote {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--fs-xs);
+  color: var(--fg-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vendorStripLink {
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-medium);
+  color: var(--brand-fg);
+  white-space: nowrap;
+}
+
+.vendorStripLink:hover {
+  text-decoration: underline;
+}
+
+.vendorStripLink:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* --- Toolbar additions --- */
+
+.searchClear {
+  position: absolute;
+  right: var(--space-1);
+  top: 50%;
+  transform: translateY(-50%);
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--radius-sm);
+  color: var(--fg-subtle);
+}
+
+.searchClear:hover {
+  color: var(--fg-default);
+  background: var(--bg-surface-hover);
+}
+
+.chipCount {
+  margin-left: var(--space-1);
+  color: var(--fg-subtle);
+  font-variant-numeric: tabular-nums;
+}
+
+.chipActive .chipCount {
+  color: inherit;
+  opacity: 0.8;
+}
+
+.showRetired {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--fs-sm);
+  color: var(--fg-muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.showRetired input {
+  accent-color: var(--brand-default);
+}
+
+.summaryInline {
+  background: none;
+  border: none;
+  padding: 0;
+  font: inherit;
+  color: var(--brand-fg);
+  cursor: pointer;
+}
+
+.summaryInline:hover {
+  text-decoration: underline;
+}
+
+.summarySep {
+  color: var(--fg-subtle);
+}
+
+/* --- Section header actions --- */
+
+.providerHeaderRight {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.expandAll {
+  padding: var(--space-1) var(--space-2);
+  font-size: var(--fs-xs);
+  color: var(--fg-muted);
+  border-radius: var(--radius-sm);
+}
+
+.expandAll:hover {
+  color: var(--fg-default);
+  background: var(--bg-surface-hover);
+}
+
+/* --- Maker groups: a row group with one header row --- */
+
+.groupRow th {
+  padding: 0;
+  background: var(--bg-base);
+  border-bottom: 1px solid var(--border-default);
+  text-align: left;
+}
+
+.groupBtn {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  width: 100%;
+  min-height: 36px;
+  padding: var(--space-2) var(--space-5);
+  background: none;
+  border: 0;
+  text-align: left;
+  cursor: pointer;
+  color: inherit;
+}
+
+.groupBtn:hover {
+  background: var(--bg-surface-hover);
+}
+
+.groupBtn:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: -2px;
+}
+
+.groupChevron {
+  flex-shrink: 0;
+  width: 14px;
+  height: 14px;
+  color: var(--fg-subtle);
+  transition: transform var(--transition-fast);
+}
+
+.groupChevronOpen {
+  transform: rotate(90deg);
+}
+
+.groupName {
+  font-size: var(--fs-sm);
+  font-weight: var(--fw-semibold);
+  color: var(--fg-default);
+}
+
+.groupMeta {
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- Logical rows --- */
+
+.detailsCol {
+  width: 40px;
+}
+
+.scopeCol {
+  width: 136px;
+}
+
+.flagCol {
+  width: 200px;
+}
+
+.detailsBtn {
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--radius-sm);
+  color: var(--fg-subtle);
+}
+
+.detailsBtn:hover {
+  color: var(--fg-default);
+  background: var(--bg-surface-hover);
+}
+
+.detailsBtn:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: -2px;
+}
+
+.detailsChevron {
+  transition: transform var(--transition-fast);
+}
+
+.detailsChevronOpen {
+  transform: rotate(90deg);
+}
+
+.scopeText {
+  font-size: var(--fs-sm);
+  color: var(--fg-muted);
+}
+
+/* Reads as a label until pointed at: fifty identical dropdowns would be the
+   loudest thing in the table, and the choice is one most rows never need. */
+.scopeSelect {
+  min-width: 120px;
+  width: auto;
+}
+
+.scopeSelect:not(:hover):not(:focus-visible):not(:disabled) {
+  background: transparent;
+  border-color: transparent;
+}
+
+.scopeSelect:disabled {
+  background: transparent;
+  border-color: transparent;
+  color: var(--fg-subtle);
+  cursor: default;
+}
+
+.rowRetiredOff .modelName,
+.rowRetiredOff .nameBtn {
+  color: var(--fg-subtle);
+}
+
+.detailCell {
+  padding: var(--space-3) var(--space-5) var(--space-4) calc(var(--space-5) + 40px);
+  background: var(--bg-base);
+}
+
+.detailHint {
+  max-width: 72ch;
+  margin-bottom: var(--space-3);
+  font-size: var(--fs-sm);
+  line-height: var(--lh-normal);
+  color: var(--fg-muted);
+}
+
+.detailGrid {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: var(--space-2) var(--space-4);
+  font-size: var(--fs-xs);
+}
+
+.detailLabel {
+  color: var(--fg-subtle);
+  font-weight: var(--fw-medium);
+}
+
+.detailIds {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.detailIdRow {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+/* --- Empty state actions --- */
+
+.emptyActions {
+  display: flex;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.emptyCard {
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+}
+
+.emptyCard .emptyHint {
+  max-width: 48ch;
+  text-align: center;
+}
+
+/* --- Loading: fixed heights so nothing shifts when rows land --- */
+
+.skeletonFixedRow {
+  display: flex;
+  align-items: center;
+  gap: var(--space-4);
+  height: 44px;
+  padding: 0 var(--space-5);
+  border-bottom: 1px solid var(--border-muted);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .groupChevron,
+  .detailsChevron {
+    transition: none;
+  }
+}
+
+@media (max-width: 767px) {
+  .scopeCol,
+  .flagCol {
+    width: auto;
+  }
+}
+
+.tabWarn {
+  display: inline-flex;
+  margin-left: var(--space-1);
+  color: var(--warning-fg);
+}

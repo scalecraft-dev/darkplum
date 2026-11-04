@@ -1,6 +1,6 @@
 import { Fragment, useMemo } from 'react'
 import type { Model, ModelRouteSummary } from '../types'
-import { formatModelName } from '../lib/formatModelName'
+import { formatModelName, parseBedrockId, scopeLabel } from '../lib/formatModelName'
 import {
   backendClassChatLabel,
   displayClassOf,
@@ -23,6 +23,21 @@ interface Props {
 /** Label for one entry. Aliases lead with the alias; a static one names its
  *  target, a routed one says how many models its routes can reach. Naming a
  *  single model there would claim a decision the routes have not made yet. */
+/** Labels for every entry, with the routing scope added wherever two entries
+ *  would otherwise read the same: a model enabled as both "us." and "global."
+ *  is one name twice until one of them says which. */
+function optionLabels(models: Model[]): Map<string, string> {
+  const base = models.map((m) => ({ id: m.id, label: optionLabel(m) }))
+  const counts = new Map<string, number>()
+  for (const b of base) counts.set(b.label, (counts.get(b.label) ?? 0) + 1)
+  const out = new Map<string, string>()
+  for (const b of base) {
+    const scope = parseBedrockId(b.id).scope
+    out.set(b.id, (counts.get(b.label) ?? 0) > 1 && scope ? `${b.label} (${scopeLabel(scope)})` : b.label)
+  }
+  return out
+}
+
 function optionLabel(m: Model): string {
   if (m.alias_kind === 'routed') {
     const count = m.routes?.length ?? 0
@@ -181,6 +196,9 @@ export function ModelSelector({ models, isLoading, error, value, onChange }: Pro
           ? styles.dotCloud
           : styles.dotGreen
 
+  const labels = useMemo(() => optionLabels(models), [models])
+  const labelOf = (m: Model) => labels.get(m.id) ?? optionLabel(m)
+
   return (
     <div className={styles.wrapper}>
       <select
@@ -193,21 +211,21 @@ export function ModelSelector({ models, isLoading, error, value, onChange }: Pro
         {groups.aliases.length > 0 && (
           <optgroup label="Shortcuts">
             {groups.aliases.map((m) => (
-              <option key={m.id} value={m.id}>{optionLabel(m)}</option>
+              <option key={m.id} value={m.id}>{labelOf(m)}</option>
             ))}
           </optgroup>
         )}
         {groups.selfHosted.length > 0 && (
           <optgroup label="Your infrastructure">
             {groups.selfHosted.map((m) => (
-              <option key={m.id} value={m.id}>{optionLabel(m)}</option>
+              <option key={m.id} value={m.id}>{labelOf(m)}</option>
             ))}
           </optgroup>
         )}
         {groups.cloud.length > 0 && (
           <optgroup label="Your cloud account">
             {groups.cloud.map((m) => (
-              <option key={m.id} value={m.id}>{optionLabel(m)}</option>
+              <option key={m.id} value={m.id}>{labelOf(m)}</option>
             ))}
           </optgroup>
         )}
@@ -217,14 +235,14 @@ export function ModelSelector({ models, isLoading, error, value, onChange }: Pro
         {groups.externalByVendor.map(({ vendor, models: vendorModels }) => (
           <optgroup key={vendor} label={`${vendorLabel(vendor)} — leaves your cloud account`}>
             {vendorModels.map((m) => (
-              <option key={m.id} value={m.id}>{optionLabel(m)}</option>
+              <option key={m.id} value={m.id}>{labelOf(m)}</option>
             ))}
           </optgroup>
         ))}
         {groups.unknown.length > 0 && (
           <optgroup label="Where these run is not known yet">
             {groups.unknown.map((m) => (
-              <option key={m.id} value={m.id}>{optionLabel(m)}</option>
+              <option key={m.id} value={m.id}>{labelOf(m)}</option>
             ))}
           </optgroup>
         )}

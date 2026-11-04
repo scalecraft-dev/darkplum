@@ -11,7 +11,8 @@
     "check:parity": "node --experimental-strip-types scripts/check-api-parity.mts",
     "check:policy": "node --experimental-strip-types scripts/check-policy.mts",
     "check:stream": "node --experimental-strip-types scripts/check-chat-stream.mts",
-    "check:attachments": "node --experimental-strip-types scripts/check-attachments.mts"
+    "check:attachments": "node --experimental-strip-types scripts/check-attachments.mts",
+    "check:names": "node --experimental-strip-types scripts/check-model-names.mts"
   },
   "dependencies": {
     "@fontsource-variable/inter": "^5.2.8",

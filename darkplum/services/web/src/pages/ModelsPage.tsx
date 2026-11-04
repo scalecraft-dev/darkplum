@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, Navigate, useSearchParams } from 'react-router-dom'
 import {
   ApiError,
@@ -11,11 +11,10 @@ import {
   toggleModel,
   updateRoutingPolicy,
 } from '../lib/api'
-import { formatModelName } from '../lib/formatModelName'
+import { disambiguate, formatModelName, parseBedrockId, scopeLabel, type BedrockScope } from '../lib/formatModelName'
 import {
   UNKNOWN_CLASS_HINT,
   UNREACHABLE_HINT,
-  UNSUPPORTED_CONTENT_NOTE,
   aliasReferenceConsequence,
   aliasReferencesTo,
   backendClassLabel,
@@ -37,7 +36,6 @@ import {
   residencyPermits,
 } from '../lib/policy'
 import { canInstallKeyOverTransport, installPhase, keyTransportHelp } from '../lib/vendorKeys'
-import type { KeyTransportHelp } from '../lib/vendorKeys'
 import type { AliasReference } from '../lib/modelRouting'
 import type {
   AdminModel,
@@ -58,11 +56,11 @@ import {
   LockGlyph,
   Modal,
   OptInGlyph,
+  Select,
   Tab,
   TabList,
   TabPanel,
   Table,
-  TableEmpty,
   UnknownGlyph,
   UnreachableGlyph,
 } from '../components/ui'
@@ -80,7 +78,7 @@ import { RoutingPolicyCard, type OrgPolicyDraft } from './RoutingPolicyCard'
 import { SystemPromptCard } from './SystemPromptCard'
 import { VendorEnableModal } from './VendorEnableModal'
 import { VendorInstallModal, type Outcome, type VendorInstallMode } from './VendorInstallModal'
-import { VendorStatusSection } from './VendorStatusSection'
+import { VendorStatusSection, stateCopy } from './VendorStatusSection'
 import { VendorBillingKeyModal, type BillingKeyMode } from './VendorBillingKeyModal'
 import pageStyles from './PageLayout.module.css'
 import { PricesTab } from './PricesTab'
@@ -106,27 +104,13 @@ type Filter = 'all' | 'enabled' | 'disabled'
  *  which of it anyone actually reaches. Each is a tab; `?tab=` names the open
  *  one so either can be linked to. Aliases and routed aliases have their own
  *  page, Admin > Routing; `?tab=aliases` is redirected there so old links land. */
-type TabKey = 'models' | 'policy' | 'prices' | 'prompt'
+type TabKey = 'models' | 'vendors' | 'policy' | 'prices' | 'prompt'
 /** Prefix for this page's tab/panel DOM ids, so another tab set on the same
  *  page could never share an id with these. */
 const TAB_SCOPE = 'models-page'
 
 function tabFromParam(value: string | null): TabKey {
-  return value === 'policy' || value === 'prices' || value === 'prompt' ? value : 'models'
-}
-
-/** Extract the vendor from a Bedrock inference profile ID.
- *  "us.anthropic.claude-3-5-sonnet-..." → "anthropic"
- *  "global.amazon.nova-pro-v1:0"       → "amazon"
- *  "anthropic.claude-..."              → "anthropic"  (foundation model fallback)
- */
-function extractVendor(modelId: string): string {
-  const parts = modelId.split('.')
-  // Inference profile IDs: region.vendor.model (3+ segments)
-  if (parts.length >= 3) return parts[1]
-  // Foundation model IDs: vendor.model (2 segments)
-  if (parts.length === 2) return parts[0]
-  return ''
+  return value === 'vendors' || value === 'policy' || value === 'prices' || value === 'prompt' ? value : 'models'
 }
 
 /** A Bedrock sub-group heading. Unlike a vendor provider, this is the company
@@ -279,7 +263,7 @@ function DisplayNameCell({
   const [editing, setEditing] = useState(false)
   const [value, setValue] = useState(model.display_name ?? '')
   const [saving, setSaving] = useState(false)
-  const shown = model.display_name ?? formatModelName(model.model_id)
+  const shown = model.display_name ?? formatModelName(model.model_id, model.provider)
 
   const commit = async () => {
     const next = value.trim()
@@ -301,7 +285,7 @@ function DisplayNameCell({
         autoFocus
         maxLength={100}
         aria-label={`Display name for ${model.model_id}`}
-        placeholder={formatModelName(model.model_id)}
+        placeholder={formatModelName(model.model_id, model.provider)}
         onChange={(e) => setValue(e.target.value)}
         onBlur={() => void commit()}
         onKeyDown={(e) => {
@@ -344,176 +328,396 @@ function DisplayNameCell({
 
 interface ProviderSectionProps {
   provider: string
+  /** The rows to list: what search and the chip left. */
   models: AdminModel[]
+  /** The provider's visible catalogue, for the header's counts, so they agree
+   *  with the summary line whatever the search box says. */
+  allModels: AdminModel[]
   togglingIds: Set<string>
   residency: Residency
-  /** The organisation's allowlist, or null when every enabled model is allowed. */
   allowedModels: string[] | null
-  /** True for a vendor whose key works and whose models are all still off:
-   *  the one moment the first-run banner belongs on this card. */
   firstRun: boolean
+  /** True while the search box or the filter is away from its default: every
+   *  maker group is then open, because the person is looking for something. */
+  searching: boolean
   onReviewAndEnable: (vendor: VendorName) => void
   onToggle: (model: AdminModel) => void
   onRename: (model: AdminModel, displayName: string | null) => Promise<void>
 }
 
+/** One model as the catalogue shows it. On Bedrock the same model is offered
+ *  under more than one routing scope ("us.", "global."), each its own id and
+ *  its own switch at the gateway; here they are one row with a scope choice,
+ *  because an administrator decides "Claude Sonnet 4.5: yes or no" once, and
+ *  where AWS may route it is the second question, not a second model. */
+interface LogicalRow {
+  key: string
+  /** The maker of the weights ("anthropic"), for grouping. '' when unknown. */
+  maker: string
+  scopes: { scope: BedrockScope | null; model: AdminModel }[]
+}
+
+/** Groups a provider's rows into logical rows, makers in alphabetical order.
+ *  Ordering is by id, never by state, so a row does not move when its switch
+ *  is flipped. */
+function logicalRows(provider: string, models: AdminModel[]): Map<string, LogicalRow[]> {
+  const byKey = new Map<string, LogicalRow>()
+  for (const m of models) {
+    const parsed = provider === 'bedrock' ? parseBedrockId(m.model_id) : null
+    const key = parsed ? parsed.unscoped : m.model_id
+    let row = byKey.get(key)
+    if (!row) {
+      row = { key, maker: parsed?.maker ?? '', scopes: [] }
+      byKey.set(key, row)
+    }
+    row.scopes.push({ scope: parsed?.scope ?? null, model: m })
+  }
+  const groups = new Map<string, LogicalRow[]>()
+  for (const row of byKey.values()) {
+    // US first, then the rest alphabetically: the in-region scope is the
+    // default choice, so it is the first option too.
+    row.scopes.sort((a, b) => (a.scope === 'us' ? -1 : b.scope === 'us' ? 1 : (a.scope ?? '').localeCompare(b.scope ?? '')))
+    const list = groups.get(row.maker) ?? []
+    list.push(row)
+    groups.set(row.maker, list)
+  }
+  for (const list of groups.values()) {
+    list.sort((a, b) => {
+      // Retired-and-off rows sink to the bottom of their group.
+      const ar = a.scopes.every((x) => isRetired(x.model) && !x.model.enabled)
+      const br = b.scopes.every((x) => isRetired(x.model) && !x.model.enabled)
+      if (ar !== br) return ar ? 1 : -1
+      return a.key.localeCompare(b.key)
+    })
+  }
+  return new Map([...groups.entries()].sort(([a], [b]) => a.localeCompare(b)))
+}
+
+/** Which scope a row shows: the one that is on; failing that, US; failing
+ *  that, the first. The person can change it while the row is off. */
+function defaultScope(row: LogicalRow): string {
+  const on = row.scopes.filter((x) => x.model.enabled)
+  if (on.length === 1) return on[0].model.id
+  // Off everywhere: prefer a scope that can actually be turned on.
+  const live = row.scopes.filter((x) => !isRetired(x.model))
+  const pool = live.length > 0 ? live : row.scopes
+  const us = pool.find((x) => x.scope === 'us')
+  return (us ?? pool[0]).model.id
+}
+
+/** The scope a row shows. With exactly one scope on, that is the one: a
+ *  remembered choice (or the US default) must never put the switch on a
+ *  scope other than the one that is live. Otherwise the person's choice. */
+function shownScopeId(row: LogicalRow, chosen: string | undefined): string {
+  const on = row.scopes.filter((x) => x.model.enabled)
+  if (on.length === 1) return on[0].model.id
+  if (chosen && row.scopes.some((x) => x.model.id === chosen)) return chosen
+  return defaultScope(row)
+}
+
+/** The one badge a row shows, or null when there is nothing wrong with it. */
+function FlagBadge({ flag, enabled, unreachable }: { flag: RowFlag; enabled: boolean; unreachable: boolean }) {
+  if (flag?.kind === 'blocked') {
+    return (
+      <Badge variant="warning" bordered>
+        <LockGlyph />
+        Blocked by policy
+      </Badge>
+    )
+  }
+  if (flag?.kind === 'disabled_by_policy') {
+    return (
+      <Badge variant="neutral" bordered>
+        <LockGlyph />
+        Blocked by policy
+      </Badge>
+    )
+  }
+  if (flag?.kind === 'aws_opt_in') {
+    return (
+      <Badge variant={enabled ? 'warning' : 'neutral'} bordered>
+        <OptInGlyph />
+        {AWS_OPT_IN_LABEL}
+      </Badge>
+    )
+  }
+  if (flag?.kind === 'retired') {
+    return (
+      <Badge variant={enabled ? 'warning' : 'neutral'} bordered>
+        <UnreachableGlyph />
+        {RETIRED_LABEL}
+      </Badge>
+    )
+  }
+  if (flag?.kind === 'unknown') {
+    return (
+      <Badge variant="neutral" bordered dashed>
+        <UnknownGlyph />
+        Not reported
+      </Badge>
+    )
+  }
+  if (unreachable) {
+    return (
+      <Badge variant="warning" bordered>
+        <UnreachableGlyph />
+        Not reachable
+      </Badge>
+    )
+  }
+  return null
+}
+
 function ProviderSection({
   provider,
   models,
+  allModels,
   togglingIds,
   residency,
   allowedModels,
   firstRun,
+  searching,
   onReviewAndEnable,
   onToggle,
   onRename,
 }: ProviderSectionProps) {
   const [collapsed, setCollapsed] = useState(false)
+  /** Maker groups the person has opened or closed by hand. Anything not here
+   *  follows the rule: open if it has a model that is on, or while searching. */
+  const [groupOverride, setGroupOverride] = useState<Map<string, boolean>>(() => new Map())
+  const [openDetails, setOpenDetails] = useState<Set<string>>(() => new Set())
+  const [chosenScope, setChosenScope] = useState<Map<string, string>>(() => new Map())
 
-  const enabledCount = models.filter((m) => m.enabled).length
-  const unreachableCount = models.filter((m) => !isReachable(m) && !isRetired(m)).length
+  const groups = useMemo(() => logicalRows(provider, models), [provider, models])
+  // Bedrock only (other providers' ids are not in that shape), and by unscoped
+  // id: the us. and global. twins are one model and must not "collide".
+  const names = useMemo(
+    () =>
+      provider === 'bedrock'
+        ? disambiguate([...new Set(models.map((m) => parseBedrockId(m.model_id).unscoped))])
+        : new Map<string, string>(),
+    [provider, models],
+  )
+  const allGroups = useMemo(() => logicalRows(provider, allModels), [provider, allModels])
+  const logicalCount = useMemo(() => [...allGroups.values()].reduce((n, g) => n + g.length, 0), [allGroups])
+  const enabledLogical = useMemo(
+    () => [...allGroups.values()].reduce((n, g) => n + g.filter((r) => r.scopes.some((x) => x.model.enabled)).length, 0),
+    [allGroups],
+  )
+  const unreachableCount = useMemo(
+    () =>
+      [...allGroups.values()].reduce(
+        (n, g) => n + g.filter((r) => r.scopes.some((x) => !isReachable(x.model) && !isRetired(x.model))).length,
+        0,
+      ),
+    [allGroups],
+  )
 
-  /** The class of this provider's models. Providers are homogeneous in
-   *  practice, so one badge on the header says it for every row beneath —
-   *  and where they are not, the per-row badge still tells the truth. */
+  /** The class of this provider's models. One badge on the header says it for
+   *  every row beneath; a row that differs from it gets its own badge. */
   const headerClass: DisplayClass = useMemo(() => {
     const classes = new Set(models.map((m) => displayClassOf(m)))
     return classes.size === 1 ? [...classes][0] : 'unknown'
   }, [models])
 
-  // For Bedrock, sub-group by vendor
-  const isBedrock = provider === 'bedrock'
-  const vendorGroups = useMemo(() => {
-    if (!isBedrock) return null
-    const groups = new Map<string, AdminModel[]>()
-    for (const m of models) {
-      const vendor = extractVendor(m.model_id)
-      const key = vendor || '_other'
-      if (!groups.has(key)) groups.set(key, [])
-      groups.get(key)!.push(m)
-    }
-    // Sort vendor groups alphabetically
-    return [...groups.entries()].sort(([a], [b]) => a.localeCompare(b))
-  }, [isBedrock, models])
+  const isGroupOpen = (maker: string, rows: LogicalRow[]) => {
+    const forced = groupOverride.get(maker)
+    if (forced !== undefined) return forced
+    return searching || rows.some((r) => r.scopes.some((x) => x.model.enabled))
+  }
+  const allOpen = [...groups.entries()].every(([maker, rows]) => isGroupOpen(maker, rows))
+  const setAllGroups = (open: boolean) => {
+    setGroupOverride(new Map([...groups.keys()].map((maker) => [maker, open])))
+  }
 
-  const renderModelRow = (m: AdminModel) => {
-    const displayName = m.display_name ?? formatModelName(m.model_id)
-    const cls = displayClassOf(m)
+  const renderRow = (row: LogicalRow) => {
+    const selectedId = shownScopeId(row, chosenScope.get(row.key))
+    const selected = row.scopes.find((x) => x.model.id === selectedId) ?? row.scopes[0]
+    const m = selected.model
+    const onCount = row.scopes.filter((x) => x.model.enabled).length
+    const displayName = m.display_name ?? names.get(parseBedrockId(m.model_id).unscoped) ?? formatModelName(m.model_id, m.provider)
     const flag = rowFlag(m, residency, allowedModels)
-    // Configured, but the gateway has not seen its backend for a few minutes.
-    // Counted apart from the flag, which reports only the top problem.
     const unreachable = !isReachable(m) && flag?.kind !== 'retired'
+    // A stripe only when a chat to this row is failing now: on, and refused.
+    const failing =
+      m.enabled && (flag?.kind === 'blocked' || flag?.kind === 'aws_opt_in' || flag?.kind === 'retired' || unreachable)
+    const retiredOff = row.scopes.every((x) => isRetired(x.model) && !x.model.enabled)
+    const detailsOpen = openDetails.has(row.key)
+    const detailsId = `model-details-${provider}-${row.key.replace(/[^a-zA-Z0-9]/g, '-')}`
+    const cls = displayClassOf(m)
+    const toggleName = row.scopes.length > 1 ? `${displayName} (${scopeLabel(selected.scope)})` : displayName
     return (
-      <tr key={m.id} className={flag ? styles.rowFlagged : ''}>
-        <td>
-          <div className={styles.modelCell}>
-            <DisplayNameCell model={m} onRename={onRename} />
-          </div>
-        </td>
-        <td>
-          <div className={styles.modelIdCell}>
-            <code className={styles.modelId}>{m.model_id}</code>
-            <CopyButton value={m.model_id} label="Copy" />
-          </div>
-        </td>
-        <td>
-          <Badge
-            variant={backendClassVariant(cls)}
-            bordered
-            dashed={cls === 'unknown'}
-            title={backendClassTooltip(cls)}
-          >
-            <ClassGlyph cls={cls} />
-            {backendClassLabel(cls)}
-          </Badge>
-        </td>
-        <td>
-          <div className={styles.statusCell}>
-            <div className={styles.statusBadges}>
-              {/* Configuration first: it is what the toggle beside it controls. */}
-              <Badge variant={m.enabled ? 'success' : 'neutral'}>
-                {m.enabled ? 'Enabled' : 'Disabled'}
-              </Badge>
-              {flag?.kind === 'blocked' && (
-                <Badge variant="warning" bordered>
-                  <LockGlyph />
-                  Blocked by policy
-                </Badge>
-              )}
-              {/* A row that is off and would still be refused if turned on.
-                  Named differently from a live refusal, because nothing is
-                  being refused yet — this is about what would happen. */}
-              {flag?.kind === 'disabled_by_policy' && (
-                <Badge variant="neutral" bordered>
-                  <LockGlyph />
-                  Blocked by policy
-                </Badge>
-              )}
-              {/* Warning while it is on and being refused; neutral while it
-                  is off, like the disabled policy badge — nothing is being
-                  refused yet. */}
-              {flag?.kind === 'aws_opt_in' && (
-                <Badge variant={m.enabled ? 'warning' : 'neutral'} bordered>
-                  <OptInGlyph />
-                  {AWS_OPT_IN_LABEL}
-                </Badge>
-              )}
-              {flag?.kind === 'retired' && (
-                <Badge variant={m.enabled ? 'warning' : 'neutral'} bordered>
-                  <UnreachableGlyph />
-                  {RETIRED_LABEL}
-                </Badge>
-              )}
-              {flag?.kind === 'unknown' && (
-                <Badge variant="neutral" bordered dashed>
-                  <UnknownGlyph />
-                  Not reported
-                </Badge>
-              )}
-              {unreachable && (
-                <Badge variant="warning" bordered>
-                  <UnreachableGlyph />
-                  Not reachable
+      <Fragment key={row.key}>
+        <tr className={`${failing ? styles.rowFlagged : ''} ${retiredOff ? styles.rowRetiredOff : ''}`}>
+          <td className={styles.detailsCol}>
+            <button
+              type="button"
+              className={styles.detailsBtn}
+              aria-expanded={detailsOpen}
+              aria-controls={detailsId}
+              aria-label={`Details for ${displayName}`}
+              onClick={() =>
+                setOpenDetails((prev) => {
+                  const next = new Set(prev)
+                  if (next.has(row.key)) next.delete(row.key)
+                  else next.add(row.key)
+                  return next
+                })
+              }
+            >
+              <svg
+                className={`${styles.detailsChevron} ${detailsOpen ? styles.detailsChevronOpen : ''}`}
+                width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"
+              >
+                <polyline points="9 18 15 12 9 6" />
+              </svg>
+            </button>
+          </td>
+          <td>
+            <div className={styles.modelCell} title={m.model_id}>
+              <DisplayNameCell model={m} onRename={onRename} />
+              {cls !== headerClass && (
+                <Badge variant={backendClassVariant(cls)} bordered dashed={cls === 'unknown'} title={backendClassTooltip(cls)}>
+                  <ClassGlyph cls={cls} />
+                  {backendClassLabel(cls)}
                 </Badge>
               )}
             </div>
-            {flag && <span className={styles.statusHint}>{flag.hint}</span>}
-          </div>
-        </td>
-        <td className={styles.statusCol}>
-          <ToggleSwitch
-            enabled={m.enabled}
-            loading={togglingIds.has(m.id)}
-            onToggle={() => onToggle(m)}
-            modelName={displayName}
-            blockedReason={isRetired(m) && !m.enabled ? RETIRED_TOGGLE_TITLE : undefined}
-          />
-        </td>
-      </tr>
+          </td>
+          <td className={styles.scopeCol}>
+            {provider !== 'bedrock' ? null : row.scopes.length > 1 && onCount <= 1 ? (
+              <Select
+                className={styles.scopeSelect}
+                aria-label={`Routing scope for ${displayName}`}
+                value={selected.model.id}
+                disabled={m.enabled || togglingIds.has(m.id)}
+                title={m.enabled ? 'Turn the model off to change where AWS may route it.' : 'Where AWS may route requests for this model.'}
+                onChange={(e) => setChosenScope((prev) => new Map(prev).set(row.key, e.target.value))}
+              >
+                {row.scopes.map((x) => (
+                  // The status badge beside the select says why a scope is
+                  // refused; the option only says when it cannot be chosen.
+                  <option key={x.model.id} value={x.model.id} disabled={isRetired(x.model)}>
+                    {scopeLabel(x.scope)}
+                    {x.scope === 'us' ? ' regions' : ''}
+                    {isRetired(x.model) ? ' (retired)' : ''}
+                  </option>
+                ))}
+              </Select>
+            ) : (
+              <span className={styles.scopeText} title={onCount > 1 ? 'Both scopes are on; see details.' : undefined}>
+                {onCount > 1 ? 'Both' : scopeLabel(selected.scope)}
+              </span>
+            )}
+          </td>
+          <td className={styles.flagCol}>
+            <FlagBadge flag={flag} enabled={m.enabled} unreachable={unreachable} />
+          </td>
+          <td className={styles.statusCol}>
+            {onCount > 1 ? (
+              // Both scopes are on; one switch here would turn off only the
+              // scope it happened to show. Each scope has its own in details.
+              <span className={styles.scopeText} title="Both scopes are on. Open details to turn either off.">
+                Both on
+              </span>
+            ) : (
+              <ToggleSwitch
+                enabled={m.enabled}
+                loading={togglingIds.has(m.id)}
+                onToggle={() => onToggle(m)}
+                modelName={toggleName}
+                blockedReason={isRetired(m) && !m.enabled ? RETIRED_TOGGLE_TITLE : undefined}
+              />
+            )}
+          </td>
+        </tr>
+        {detailsOpen && (
+          <tr id={detailsId}>
+            <td colSpan={5} className={styles.detailCell}>
+              {flag && <p className={styles.detailHint}>{flag.hint}</p>}
+              {!flag && unreachable && (
+                <p className={styles.detailHint}>
+                  The gateway has not seen this model's backend for a few minutes. It stays configured; chats to it fail until it is back.
+                </p>
+              )}
+              <div className={styles.detailGrid}>
+                <span className={styles.detailLabel}>{row.scopes.length > 1 ? 'Model IDs' : 'Model ID'}</span>
+                <div className={styles.detailIds}>
+                  {row.scopes.map((x) => {
+                    const f = rowFlag(x.model, residency, allowedModels)
+                    const u = !isReachable(x.model) && f?.kind !== 'retired'
+                    return (
+                      <div key={x.model.id} className={styles.detailIdRow}>
+                        {row.scopes.length > 1 && <span className={styles.scopeText}>{scopeLabel(x.scope)}</span>}
+                        <code className={styles.modelId}>{x.model.model_id}</code>
+                        <CopyButton value={x.model.model_id} label="Copy" />
+                        {row.scopes.length > 1 && <FlagBadge flag={f} enabled={x.model.enabled} unreachable={u} />}
+                        {row.scopes.length > 1 && onCount > 1 && (
+                          <ToggleSwitch
+                            enabled={x.model.enabled}
+                            loading={togglingIds.has(x.model.id)}
+                            onToggle={() => onToggle(x.model)}
+                            modelName={`${displayName} (${scopeLabel(x.scope)})`}
+                            blockedReason={isRetired(x.model) && !x.model.enabled ? RETIRED_TOGGLE_TITLE : undefined}
+                          />
+                        )}
+                      </div>
+                    )
+                  })}
+                </div>
+                <span className={styles.detailLabel}>Hosting</span>
+                <span>
+                  {backendClassLabel(cls)}
+                  {backendClassTooltip(cls) ? ` — ${backendClassTooltip(cls)}` : ''}
+                </span>
+                <span className={styles.detailLabel}>Name</span>
+                <span>{m.display_name ? 'Renamed' : 'Generated from the model ID'}</span>
+                <span className={styles.detailLabel}>Discovered</span>
+                <span>{new Date(m.discovered_at).toLocaleDateString()}</span>
+                <span className={styles.detailLabel}>Updated</span>
+                <span>{new Date(m.updated_at).toLocaleDateString()}</span>
+              </div>
+            </td>
+          </tr>
+        )}
+      </Fragment>
     )
   }
+
+  const hasMakers = provider === 'bedrock' && groups.size > 1
 
   return (
     <div className={styles.providerSection}>
       <div className={styles.providerCard}>
-        <div
-          className={styles.providerHeader}
-          onClick={() => setCollapsed((prev) => !prev)}
-          role="button"
-          tabIndex={0}
-          aria-expanded={!collapsed}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' || e.key === ' ') {
-              e.preventDefault()
-              setCollapsed((prev) => !prev)
-            }
-          }}
-        >
-          <div className={styles.providerHeaderLeft}>
+        <div className={styles.providerHeader}>
+          <div
+            className={styles.providerHeaderLeft}
+            onClick={() => setCollapsed((prev) => !prev)}
+            role="button"
+            tabIndex={0}
+            aria-expanded={!collapsed}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault()
+                setCollapsed((prev) => !prev)
+              }
+            }}
+          >
+            <svg
+              className={`${styles.collapseChevron} ${!collapsed ? styles.collapseChevronOpen : ''}`}
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <polyline points="6 9 12 15 18 9" />
+            </svg>
             <span className={styles.providerName}>{providerLabel(provider)}</span>
-            {/* Where everything under this header runs. On the header rather
-                than only per row, because the decision an administrator makes
-                here — expand this card at all? — is about the whole group. */}
+            {/* Where everything under this header runs: said once here, not on
+                every row. A row that differs carries its own badge. */}
             <Badge
               variant={backendClassVariant(headerClass)}
               bordered
@@ -524,34 +728,22 @@ function ProviderSection({
               {backendClassLabel(headerClass)}
             </Badge>
             <span className={styles.providerCount}>
-              {enabledCount} of {models.length} enabled
+              {enabledLogical} of {logicalCount} enabled
             </span>
-            {/* Counted apart from "enabled": an unreachable model can be either. */}
             {unreachableCount > 0 && (
-              <span className={styles.providerUnreachable}>
-                {unreachableCount} not reachable
-              </span>
+              <span className={styles.providerUnreachable}>{unreachableCount} not reachable</span>
             )}
           </div>
-          <svg
-            className={`${styles.collapseChevron} ${!collapsed ? styles.collapseChevronOpen : ''}`}
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="2.5"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            aria-hidden="true"
-          >
-            <polyline points="6 9 12 15 18 9" />
-          </svg>
+          {hasMakers && !collapsed && (
+            <div className={styles.providerHeaderRight}>
+              <button type="button" className={styles.expandAll} onClick={() => setAllGroups(!allOpen)}>
+                {allOpen ? 'Collapse all' : 'Expand all'}
+              </button>
+            </div>
+          )}
         </div>
 
         <div className={collapsed ? styles.providerBodyCollapsed : styles.providerBody}>
-          {/* The one moment this banner is worth showing: the key works, the
-              models are here, and not one of them is on. It disappears the
-              instant any of them is — including when it is turned on from the
-              row switch rather than from the button. */}
           {firstRun && (
             <div className={styles.firstRun}>
               <div className={styles.firstRunText}>
@@ -563,60 +755,80 @@ function ProviderSection({
                   account. Review what that means and pick which models before anything changes.
                 </p>
               </div>
-              <Button
-                size="sm"
-                variant="secondary"
-                onClick={() => onReviewAndEnable(provider as VendorName)}
-              >
+              <Button size="sm" variant="secondary" onClick={() => onReviewAndEnable(provider as VendorName)}>
                 Review and enable
               </Button>
             </div>
           )}
 
-          {/* The note about what a request may carry used to hang here, on each
-              vendor card. It is not a vendor limit any more — tool calls and
-              images are refused on every backend — so repeating it per vendor
-              said the opposite of what is true. It is stated once, above the
-              catalogue. */}
-
-          {vendorGroups ? (
-            // Bedrock: render sub-groups with vendor headings
-            vendorGroups.map(([vendor, vendorModels]) => (
-              <div key={vendor}>
-                <div className={styles.vendorHeading}>{bedrockVendorHeading(vendor)}</div>
-                <Table label={`${bedrockVendorHeading(vendor)} models on ${providerLabel(provider)}`}>
-                  <thead>
-                    <tr>
-                      <th>Model</th>
-                      <th>Model ID</th>
-                      <th>Hosting</th>
-                      <th>Status</th>
-                      <th className={styles.statusCol}></th>
+          <Table label={`${providerLabel(provider)} models`}>
+            <thead>
+              <tr>
+                <th className={styles.detailsCol}>
+                  <span className={styles.srOnly}>Details</span>
+                </th>
+                <th>Model</th>
+                <th className={styles.scopeCol}>Scope</th>
+                <th className={styles.flagCol}>Status</th>
+                <th className={styles.statusCol}>
+                  <span className={styles.srOnly}>Enabled</span>
+                </th>
+              </tr>
+            </thead>
+            {[...groups.entries()].map(([maker, rows]) => {
+              const open = !hasMakers || isGroupOpen(maker, rows)
+              const on = rows.filter((r) => r.scopes.some((x) => x.model.enabled)).length
+              const optIn = rows.filter((r) => r.scopes.some((x) => needsAwsOptIn(x.model))).length
+              const retired = rows.filter((r) => r.scopes.every((x) => isRetired(x.model))).length
+              // Said on the closed group, so a problem inside it is not hidden
+              // behind the chevron.
+              const blocked = rows.filter((r) =>
+                r.scopes.some((x) => {
+                  const k = rowFlag(x.model, residency, allowedModels)?.kind
+                  return k === 'blocked' || k === 'disabled_by_policy'
+                }),
+              ).length
+              const down = rows.filter((r) => r.scopes.some((x) => !isReachable(x.model) && !isRetired(x.model))).length
+              return (
+                <tbody key={maker || '_other'}>
+                  {hasMakers && (
+                    <tr className={styles.groupRow}>
+                      <th colSpan={5} scope="rowgroup">
+                        <button
+                          type="button"
+                          className={styles.groupBtn}
+                          aria-expanded={open}
+                          onClick={() => setGroupOverride((prev) => new Map(prev).set(maker, !open))}
+                        >
+                          <svg
+                            className={`${styles.groupChevron} ${open ? styles.groupChevronOpen : ''}`}
+                            viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"
+                          >
+                            <polyline points="9 18 15 12 9 6" />
+                          </svg>
+                          <span className={styles.groupName}>{bedrockVendorHeading(maker)}</span>
+                          <span className={styles.groupMeta}>
+                            {rows.length} {rows.length === 1 ? 'model' : 'models'}
+                            {on > 0 ? ` · ${on} enabled` : ''}
+                            {retired > 0 ? ` · ${retired} retired` : ''}
+                            {blocked > 0 ? ` · ${blocked} blocked by policy` : ''}
+                            {down > 0 ? ` · ${down} not reachable` : ''}
+                          </span>
+                          {optIn > 0 && (
+                            <Badge variant="neutral" bordered>
+                              <OptInGlyph />
+                              {optIn} {optIn === 1 ? 'needs' : 'need'} AWS opt-in
+                            </Badge>
+                          )}
+                        </button>
+                      </th>
                     </tr>
-                  </thead>
-                  <tbody>
-                    {vendorModels.map(renderModelRow)}
-                  </tbody>
-                </Table>
-              </div>
-            ))
-          ) : (
-            // Non-bedrock: flat table
-            <Table label={`${providerLabel(provider)} models`}>
-              <thead>
-                <tr>
-                  <th>Model</th>
-                  <th>Model ID</th>
-                  <th>Hosting</th>
-                  <th>Status</th>
-                  <th className={styles.statusCol}></th>
-                </tr>
-              </thead>
-              <tbody>
-                {models.map(renderModelRow)}
-              </tbody>
-            </Table>
-          )}
+                  )}
+                  {open && rows.map(renderRow)}
+                </tbody>
+              )
+            })}
+          </Table>
         </div>
       </div>
     </div>
@@ -624,12 +836,15 @@ function ProviderSection({
 }
 
 // ---------------------------------------------------------------------------
-// Loading skeleton
+// Loading skeleton: fixed heights, so nothing moves when the rows land.
 // ---------------------------------------------------------------------------
+
+const SKELETON_NAME_WIDTHS = ['38%', '52%', '30%', '45%', '34%', '48%']
 
 function LoadingSkeleton() {
   return (
-    <div className={styles.providerSection}>
+    <div className={styles.providerSection} aria-busy="true">
+      <span className={styles.srOnly}>Loading models</span>
       <div className={styles.providerCard}>
         <div className={styles.providerHeader} style={{ cursor: 'default' }}>
           <div className={styles.providerHeaderLeft}>
@@ -638,12 +853,12 @@ function LoadingSkeleton() {
           </div>
         </div>
         <div className={styles.providerBody}>
-          {[1, 2, 3].map((i) => (
-            <div key={i} className={styles.skeletonRow}>
-              <Skeleton width="160px" height="14px" />
-              <Skeleton width="220px" height="14px" />
-              <Skeleton width="80px" height="18px" borderRadius="var(--radius-full)" />
-              <Skeleton width="60px" height="18px" borderRadius="var(--radius-full)" />
+          {SKELETON_NAME_WIDTHS.map((w, i) => (
+            <div key={i} className={styles.skeletonFixedRow}>
+              <Skeleton width="14px" height="14px" />
+              <Skeleton width={w} height="14px" />
+              <Skeleton width="48px" height="14px" />
+              {i === 1 || i === 4 ? <Skeleton width="88px" height="18px" borderRadius="var(--radius-full)" /> : <span style={{ width: 88 }} />}
               <Skeleton width="36px" height="20px" borderRadius="var(--radius-full)" />
             </div>
           ))}
@@ -715,6 +930,9 @@ function ModelsPageBody() {
   const [loading, setLoading] = useState(true)
   const [search, setSearch] = useState('')
   const [filter, setFilter] = useState<Filter>('all')
+  // Retired models are history, not choices; they are listed on request. One
+  // that is still on is always shown, because chats to it are failing.
+  const [showRetired, setShowRetired] = useState(false)
   const [togglingIds, setTogglingIds] = useState<Set<string>>(new Set())
 
   const [policy, setPolicy] = useState<RoutingPolicy | null>(null)
@@ -969,7 +1187,7 @@ function ModelsPageBody() {
         prev.map((m) => (m.id === updated.id ? updated : m)),
       )
       toast(
-        `${model.display_name ?? formatModelName(model.model_id)} ${newEnabled ? 'enabled' : 'disabled'}`,
+        `${model.display_name ?? formatModelName(model.model_id, model.provider)} ${newEnabled ? 'enabled' : 'disabled'}`,
         'success',
       )
     } catch (err) {
@@ -985,23 +1203,83 @@ function ModelsPageBody() {
 
   // Filter + search
   const filtered = useMemo(() => {
-    let result = models
-
-    if (filter === 'enabled') result = result.filter((m) => m.enabled)
-    if (filter === 'disabled') result = result.filter((m) => !m.enabled)
-
-    if (search.trim()) {
-      const q = search.trim().toLowerCase()
-      result = result.filter(
-        (m) =>
+    // Enabled/Disabled and search decide per logical model, not per id: a model
+    // on in one routing scope and off in the other is one row, and filtering
+    // must not split it into a half that contradicts the chip counts.
+    const keyOf = (m: AdminModel) =>
+      `${m.provider}:${m.provider === 'bedrock' ? parseBedrockId(m.model_id).unscoped : m.model_id}`
+    const q = search.trim().toLowerCase()
+    const keep = new Set<string>()
+    const enabledKeys = new Set<string>()
+    for (const m of models) if (m.enabled) enabledKeys.add(keyOf(m))
+    for (const m of models) {
+      const k = keyOf(m)
+      if (filter === 'enabled' && !enabledKeys.has(k)) continue
+      if (filter === 'disabled' && enabledKeys.has(k)) continue
+      if (
+        q &&
+        !(
           m.model_id.toLowerCase().includes(q) ||
           (m.display_name?.toLowerCase().includes(q) ?? false) ||
-          formatModelName(m.model_id).toLowerCase().includes(q),
+          formatModelName(m.model_id, m.provider).toLowerCase().includes(q)
+        )
       )
+        continue
+      keep.add(k)
     }
+    return models.filter((m) => keep.has(keyOf(m)) && (showRetired || !(isRetired(m) && !m.enabled)))
+  }, [models, filter, search, showRetired])
 
-    return result
-  }, [models, filter, search])
+  /** The catalogue as the page shows it: retired-and-off rows are out unless
+   *  asked for. Every count on the page is taken from this one list, by model
+   *  rather than by id (a Bedrock model offered in two routing scopes is one
+   *  choice), so the summary, the chips, the tab badge and the section
+   *  headers can never disagree. Search and the Enabled/Disabled chip narrow
+   *  what is listed, never what is counted. */
+  const visible = useMemo(
+    () => (showRetired ? models : models.filter((m) => !(isRetired(m) && !m.enabled))),
+    [models, showRetired],
+  )
+  const logical = useMemo(() => {
+    const keys = new Map<string, { enabled: boolean; optIn: boolean; unreachable: boolean }>()
+    for (const m of visible) {
+      const key = `${m.provider}:${m.provider === 'bedrock' ? parseBedrockId(m.model_id).unscoped : m.model_id}`
+      const cur = keys.get(key) ?? { enabled: false, optIn: false, unreachable: false }
+      keys.set(key, {
+        enabled: cur.enabled || m.enabled,
+        optIn: cur.optIn || needsAwsOptIn(m),
+        unreachable: cur.unreachable || (!isReachable(m) && !isRetired(m)),
+      })
+    }
+    const rows = [...keys.values()]
+    const enabled = rows.filter((r) => r.enabled).length
+    // Retired-and-off models, counted from the whole catalogue: the number
+    // the "Show retired" control would add.
+    const retiredKeys = new Map<string, boolean>()
+    for (const m of models) {
+      const key = `${m.provider}:${m.provider === 'bedrock' ? parseBedrockId(m.model_id).unscoped : m.model_id}`
+      retiredKeys.set(key, (retiredKeys.get(key) ?? true) && isRetired(m) && !m.enabled)
+    }
+    const retiredOff = [...retiredKeys.values()].filter(Boolean).length
+    return {
+      total: rows.length,
+      enabled,
+      disabled: rows.length - enabled,
+      retiredOff,
+      optIn: rows.filter((r) => r.optIn).length,
+      unreachable: rows.filter((r) => r.unreachable).length,
+    }
+  }, [models, visible])
+
+  /** The visible catalogue by provider, for the section headers' counts. */
+  const visibleByProvider = useMemo(() => {
+    const groups = new Map<string, AdminModel[]>()
+    for (const m of visible) {
+      if (!groups.has(m.provider)) groups.set(m.provider, [])
+      groups.get(m.provider)!.push(m)
+    }
+    return groups
+  }, [visible])
 
   // Group by provider
   const providerGroups = useMemo(() => {
@@ -1016,9 +1294,11 @@ function ModelsPageBody() {
     return [...groups.entries()].sort(([a], [b]) => compareProviders(a, b))
   }, [filtered])
 
-  const totalEnabled = models.filter((m) => m.enabled).length
-  const totalUnreachable = models.filter((m) => !isReachable(m) && !isRetired(m)).length
-  const totalAwsOptIn = models.filter(needsAwsOptIn).length
+  /** A key that is installed and not working, or a filter that matches
+   *  nothing: the tab says so before anyone opens it. */
+  const vendorsNeedAttention = providers.some((p) =>
+    p.state === 'auth_failed' || p.state === 'unreachable' || p.state === 'filter_missing' || p.state === 'filter_matched_nothing',
+  )
 
   /**
    * Vendors whose key works and whose models are every one of them still off.
@@ -1201,7 +1481,7 @@ function ModelsPageBody() {
         <Tab
           id="models"
           active={tab === 'models'}
-          count={totalEnabled > 0 ? totalEnabled : undefined}
+          count={logical.enabled > 0 ? logical.enabled : undefined}
           onClick={() => selectTab('models')}
         >
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
@@ -1211,6 +1491,18 @@ function ModelsPageBody() {
             <rect x="3" y="14" width="7" height="7" />
           </svg>
           Models
+        </Tab>
+        <Tab id="vendors" active={tab === 'vendors'} onClick={() => selectTab('vendors')}>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4" />
+          </svg>
+          Vendor keys
+          {vendorsNeedAttention && (
+            <span className={styles.tabWarn} title="A vendor key needs attention">
+              <UnreachableGlyph />
+              <span className={styles.srOnly}>needs attention</span>
+            </span>
+          )}
         </Tab>
         <Tab
           id="policy"
@@ -1244,32 +1536,42 @@ function ModelsPageBody() {
           filtered={filtered}
           providerGroups={providerGroups}
           providers={providers}
-          providerFeatures={providerFeatures}
-          transportOk={keyTransportAllowed}
-          transportHelp={keyTransportFault}
-          removalWarnings={removalWarnings}
           firstRunVendors={firstRunVendors}
-          enableableVendors={enableableVendors}
           loading={loading}
           search={search}
           filter={filter}
+          showRetired={showRetired}
           togglingIds={togglingIds}
           residency={residency}
           allowedModels={allowedModels}
-          totalEnabled={totalEnabled}
-          totalUnreachable={totalUnreachable}
-          totalAwsOptIn={totalAwsOptIn}
+          logical={logical}
+          visibleByProvider={visibleByProvider}
           policyRestricted={policyRestricted}
           onGoToTab={goToTab}
           onSearch={setSearch}
           onFilter={setFilter}
+          onShowRetired={setShowRetired}
           onToggle={handleToggle}
           onRename={handleRename}
           onReviewAndEnable={setEnablingVendor}
-          onManageVendor={(vendor, mode) => setManaging({ vendor, mode })}
-          onManageBilling={(vendor, mode) => setManagingBilling({ vendor, mode })}
+          onCheckAgain={() => void loadModels()}
+        />
+      </TabPanel>
+
+      <TabPanel id="vendors" scope={TAB_SCOPE} active={tab === 'vendors'}>
+        <VendorStatusSection
+          providers={providers}
+          providerFeatures={providerFeatures}
+          transportOk={keyTransportAllowed}
+          transportHelp={keyTransportFault}
+          removalWarnings={removalWarnings}
+          loading={loading}
+          enableableVendors={enableableVendors}
+          onManage={(vendor, mode) => setManaging({ vendor, mode })}
+          onReviewAndEnable={setEnablingVendor}
           onCheckAgain={() => void loadModels()}
           onAdoptFilter={handleAdoptFilter}
+          onManageBilling={(vendor, mode) => setManagingBilling({ vendor, mode })}
         />
       </TabPanel>
 
@@ -1427,82 +1729,188 @@ function ModelsPageBody() {
 // Models tab — the catalogue
 // ---------------------------------------------------------------------------
 
+interface LogicalCounts {
+  total: number
+  enabled: number
+  disabled: number
+  /** Models every scope of which AWS has retired, and none of which is on. */
+  retiredOff: number
+  /** Models AWS refuses until the account's data-retention mode is raised. */
+  optIn: number
+  /** Models whose backend the gateway has not seen for a few minutes. */
+  unreachable: number
+}
+
 interface ModelsTabProps {
   models: AdminModel[]
   filtered: AdminModel[]
   providerGroups: [string, AdminModel[]][]
   providers: ProviderStatus[]
-  providerFeatures: string[]
-  transportOk: boolean
-  transportHelp: KeyTransportHelp | null
-  removalWarnings: Partial<Record<VendorName, string[]>>
   firstRunVendors: Set<VendorName>
-  enableableVendors: Set<VendorName>
   loading: boolean
   search: string
   filter: Filter
+  showRetired: boolean
   togglingIds: Set<string>
   residency: Residency
   allowedModels: string[] | null
-  totalEnabled: number
-  totalUnreachable: number
-  /** Rows AWS refuses until the account's Bedrock data-retention mode is
-   *  raised. Whole catalogue, like the other counts. */
-  totalAwsOptIn: number
+  logical: LogicalCounts
+  visibleByProvider: Map<string, AdminModel[]>
   policyRestricted: boolean
   onGoToTab: (tab: TabKey) => void
   onSearch: (value: string) => void
   onFilter: (value: Filter) => void
+  onShowRetired: (value: boolean) => void
   onToggle: (model: AdminModel) => void
   onRename: (model: AdminModel, displayName: string | null) => Promise<void>
   onReviewAndEnable: (vendor: VendorName) => void
-  onManageVendor: (vendor: VendorName, mode: VendorInstallMode) => void
-  onManageBilling: (vendor: VendorName, mode: BillingKeyMode) => void
   onCheckAgain: () => void
-  onAdoptFilter: (vendor: VendorName, filter: string[]) => Promise<void>
 }
+
+/** The one line the Models tab says about vendor keys. Everything else about
+ *  them lives on the Vendor keys tab; this is what tells someone whether that
+ *  tab needs a visit. */
+function VendorStrip({ providers, onGoToTab }: { providers: ProviderStatus[]; onGoToTab: (tab: TabKey) => void }) {
+  const copies = providers.map((p) => ({ p, copy: stateCopy(p, true, true) }))
+  const failed = copies.find(({ p }) => p.state === 'auth_failed')
+  const landing = copies.find(({ p }) => p.installing_until && new Date(p.installing_until).getTime() > Date.now())
+  const warn = copies.find(({ p }) => p.state === 'unreachable' || p.state === 'filter_missing' || p.state === 'filter_matched_nothing')
+  const allOff = providers.length > 0 && providers.every((p) => p.state === 'not_configured')
+  const vendorModels = providers.reduce((n, p) => n + (p.configured ? p.model_count : 0), 0)
+
+  let note: string
+  let tone = ''
+  if (failed) {
+    note = `${vendorLabel(failed.p.name)} rejected the key darkplum holds. Requests to it are refused.`
+    tone = styles.vendorStripDanger
+  } else if (landing) {
+    note = `Installing the ${vendorLabel(landing.p.name)} key — checking it through the gateway.`
+  } else if (warn) {
+    note = warn.copy.detail
+    tone = styles.vendorStripWarning
+  } else if (allOff) {
+    note = 'Optional. Bedrock and self-hosted models work without them.'
+  } else {
+    note = `${vendorModels} ${vendorModels === 1 ? 'model' : 'models'} from vendor APIs in the catalogue.`
+  }
+
+  return (
+    <section className={`${styles.vendorStrip} ${tone}`} aria-labelledby="vendor-strip-heading">
+      <h2 id="vendor-strip-heading" className={styles.srOnly}>
+        Vendor keys
+      </h2>
+      <ul className={styles.vendorList}>
+        {copies.map(({ p, copy }) => (
+          <li key={p.name}>
+            <span className={styles.vendorName}>{vendorLabel(p.name)}</span>
+            <Badge variant={copy.variant} bordered dashed={copy.dashed}>
+              {copy.label}
+            </Badge>
+          </li>
+        ))}
+      </ul>
+      <span className={styles.vendorStripNote} title={note}>
+        {note}
+      </span>
+      <Link
+        className={styles.vendorStripLink}
+        to={{ search: '?tab=vendors' }}
+        onClick={(e) => {
+          if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
+          e.preventDefault()
+          onGoToTab('vendors')
+        }}
+      >
+        Manage vendor keys
+      </Link>
+    </section>
+  )
+}
+
+function EmptyCard({
+  glyph,
+  title,
+  hint,
+  actions,
+}: {
+  glyph: React.ReactNode
+  title: string
+  hint?: string
+  actions?: React.ReactNode
+}) {
+  return (
+    <div className={`${styles.providerSection} ${styles.emptyCard}`}>
+      <div className={styles.empty}>
+        {glyph}
+        <span className={styles.emptyTitle}>{title}</span>
+        {hint && <span className={styles.emptyHint}>{hint}</span>}
+        {actions && <div className={styles.emptyActions}>{actions}</div>}
+      </div>
+    </div>
+  )
+}
+
+const SearchGlyph = () => (
+  <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <circle cx="11" cy="11" r="8" />
+    <line x1="21" y1="21" x2="16.65" y2="16.65" />
+  </svg>
+)
+
+const CatalogueGlyph = () => (
+  <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
+    <line x1="8" y1="21" x2="16" y2="21" />
+    <line x1="12" y1="17" x2="12" y2="21" />
+  </svg>
+)
 
 function ModelsTab({
   models,
   filtered,
   providerGroups,
   providers,
-  providerFeatures,
-  transportOk,
-  transportHelp,
-  removalWarnings,
   firstRunVendors,
-  enableableVendors,
   loading,
   search,
   filter,
+  showRetired,
   togglingIds,
   residency,
   allowedModels,
-  totalEnabled,
-  totalUnreachable,
-  totalAwsOptIn,
+  logical,
+  visibleByProvider,
   policyRestricted,
   onGoToTab,
   onSearch,
   onFilter,
+  onShowRetired,
   onToggle,
   onRename,
   onReviewAndEnable,
-  onManageVendor,
-  onManageBilling,
   onCheckAgain,
-  onAdoptFilter,
 }: ModelsTabProps) {
   /** Enabled models that send prompts out of the account. Counted from the
    *  whole catalogue, like the other summary counts, not from the filter. */
   const egressEnabled = models.filter((m) => m.enabled && isEgress(displayClassOf(m))).length
+  /** An opt-in row that is on is refusing chats now; the summary then says it
+   *  in the warning colour rather than as a count of things to know about. */
+  const optInLive = models.some((m) => m.enabled && needsAwsOptIn(m))
+  const searching = search.trim() !== '' || filter !== 'all'
+  const retiredMatching =
+    !showRetired && search.trim()
+      ? models.filter((m) => isRetired(m) && !m.enabled && m.model_id.toLowerCase().includes(search.trim().toLowerCase())).length
+      : 0
+
+  // Matches counted by model, like every other number on this line.
+  const matching = new Set(
+    filtered.map((m) => `${m.provider}:${m.provider === 'bedrock' ? parseBedrockId(m.model_id).unscoped : m.model_id}`),
+  ).size
+  const filterLabel: Record<Filter, string> = { all: 'All', enabled: 'Enabled', disabled: 'Disabled' }
+  const filterCount: Record<Filter, number | null> = { all: null, enabled: logical.enabled, disabled: logical.disabled }
 
   return (
     <>
-      {/* The catalogue on its own reads as "everything here is reachable". When
-          the policy says otherwise, that is said once, here, with the way to
-          go and read it. */}
       {policyRestricted && (
         <p className={styles.policyNote}>
           <LockGlyph />
@@ -1512,9 +1920,6 @@ function ModelsTab({
               className={styles.policyNoteLink}
               to={{ search: '?tab=policy' }}
               onClick={(e) => {
-                // A plain click switches in place and hands focus to the tab;
-                // a modified or middle click keeps the browser's own
-                // open-in-new-tab behaviour via the real href.
                 if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return
                 e.preventDefault()
                 onGoToTab('policy')
@@ -1526,33 +1931,17 @@ function ModelsTab({
         </p>
       )}
 
-      {/* Whether a vendor can be reached at all decides whether half the
-          catalogue below means anything, so it is answered before it. */}
-      <VendorStatusSection
-        providers={providers}
-        providerFeatures={providerFeatures}
-        transportOk={transportOk}
-        transportHelp={transportHelp}
-        removalWarnings={removalWarnings}
-        loading={loading}
-        enableableVendors={enableableVendors}
-        onManage={onManageVendor}
-        onReviewAndEnable={onReviewAndEnable}
-        onCheckAgain={onCheckAgain}
-        onAdoptFilter={onAdoptFilter}
-        onManageBilling={onManageBilling}
-      />
+      {loading ? (
+        <div className={styles.vendorStrip} aria-hidden="true">
+          <Skeleton width="90px" height="18px" borderRadius="var(--radius-full)" />
+          <Skeleton width="90px" height="18px" borderRadius="var(--radius-full)" />
+        </div>
+      ) : (
+        <VendorStrip providers={providers} onGoToTab={onGoToTab} />
+      )}
 
-      {/* Named for anyone navigating by heading, like the other two tabs; the
-          visible name is the tab itself. */}
       <h2 className={styles.srOnly}>Available models</h2>
 
-      {/* One standing limit on every model below, whoever serves it — said once
-          here rather than on each provider's card, which made a product-wide
-          refusal read as something one vendor does. */}
-      <p className={styles.catalogueNote}>{UNSUPPORTED_CONTENT_NOTE}</p>
-
-      {/* Search + filters */}
       <div className={styles.toolbar}>
         <div className={styles.searchWrap}>
           <svg
@@ -1571,134 +1960,171 @@ function ModelsTab({
           <input
             className={styles.searchInput}
             type="text"
-            placeholder="Search models..."
+            placeholder="Search models or IDs"
             value={search}
             onChange={(e) => onSearch(e.target.value)}
-            aria-label="Search models"
+            aria-label="Search models or IDs"
           />
+          {search && (
+            <button type="button" className={styles.searchClear} onClick={() => onSearch('')} aria-label="Clear search">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" aria-hidden="true">
+                <line x1="18" y1="6" x2="6" y2="18" />
+                <line x1="6" y1="6" x2="18" y2="18" />
+              </svg>
+            </button>
+          )}
         </div>
-        <div className={styles.filters}>
+        <div className={styles.filters} role="group" aria-label="Show">
           {(['all', 'enabled', 'disabled'] as const).map((f) => (
             <button
               key={f}
+              type="button"
+              aria-pressed={filter === f}
               className={`${styles.chip} ${filter === f ? styles.chipActive : ''}`}
+              disabled={loading}
               onClick={() => onFilter(f)}
             >
-              {f === 'all' ? 'All' : f === 'enabled' ? 'Enabled' : 'Disabled'}
+              {filterLabel[f]}
+              {!loading && filterCount[f] !== null && <span className={styles.chipCount}>{filterCount[f]}</span>}
             </button>
           ))}
         </div>
+        {!loading && logical.retiredOff > 0 && (
+          <label className={styles.showRetired}>
+            <input type="checkbox" checked={showRetired} onChange={(e) => onShowRetired(e.target.checked)} />
+            Show retired
+          </label>
+        )}
       </div>
 
-      {/* Summary */}
       {!loading && models.length > 0 && (
         <div className={styles.summary}>
           <span className={styles.summaryText}>
-            {totalEnabled} of {models.length} models enabled
+            {logical.enabled} of {logical.total} enabled
           </span>
-          {/* Counted separately and said plainly. An administrator asked "how
-              much of this leaves our account?" should not have to read every
-              row's badge to find out. */}
+          {logical.optIn > 0 && (
+            <>
+              <span className={styles.summarySep}>·</span>
+              <span className={optInLive ? styles.summaryFlag : styles.summaryText}>
+                {optInLive && <OptInGlyph />}
+                {awsOptInCountText(logical.optIn)}
+              </span>
+            </>
+          )}
+          {logical.retiredOff > 0 && (
+            <>
+              <span className={styles.summarySep}>·</span>
+              <span className={styles.summaryText}>
+                {logical.retiredOff} retired{showRetired ? '' : ', hidden'}
+                {!showRetired && (
+                  <>
+                    {' '}
+                    <button type="button" className={styles.summaryInline} onClick={() => onShowRetired(true)}>
+                      Show
+                    </button>
+                  </>
+                )}
+              </span>
+            </>
+          )}
           {egressEnabled > 0 && (
-            <span className={styles.summaryFlag}>
-              <EgressGlyph />
-              {egressEnabled} {egressEnabled === 1 ? 'sends prompts' : 'send prompts'} outside your
-              cloud account
-            </span>
+            <>
+              <span className={styles.summarySep}>·</span>
+              <span className={styles.summaryFlag}>
+                <EgressGlyph />
+                {egressEnabled} {egressEnabled === 1 ? 'sends prompts' : 'send prompts'} outside your cloud account
+              </span>
+            </>
           )}
-          {totalAwsOptIn > 0 && (
-            <span className={styles.summaryFlag}>
-              <OptInGlyph />
-              {awsOptInCountText(totalAwsOptIn)}
-            </span>
-          )}
-          {totalUnreachable > 0 && (
-            <span className={styles.summaryFlag}>
-              <UnreachableGlyph />
-              {totalUnreachable} not reachable right now
-            </span>
+          {logical.unreachable > 0 && (
+            <>
+              <span className={styles.summarySep}>·</span>
+              <span className={styles.summaryFlag}>
+                <UnreachableGlyph />
+                {logical.unreachable} not reachable right now
+              </span>
+            </>
           )}
           {search && (
-            <span className={styles.summaryText}>
-              — {filtered.length} matching "{search}"
-            </span>
+            <>
+              <span className={styles.summarySep}>·</span>
+              <span className={styles.summaryText}>
+                {matching} matching "{search}"
+              </span>
+            </>
           )}
         </div>
       )}
 
-      {/* Content */}
       {loading ? (
-        <>
-          <LoadingSkeleton />
-          <LoadingSkeleton />
-        </>
+        <LoadingSkeleton />
       ) : models.length === 0 ? (
-        <div className={styles.providerSection}>
-          <div className={styles.providerCard}>
-            <Table label="Models">
-              <thead>
-                <tr>
-                  <th>Model</th>
-                  <th>Model ID</th>
-                  <th>Hosting</th>
-                  <th>Status</th>
-                  <th className={styles.statusCol}></th>
-                </tr>
-              </thead>
-              <tbody>
-                <TableEmpty colSpan={5}>
-                  <div className={styles.empty}>
-                    <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                      <rect x="2" y="3" width="20" height="14" rx="2" ry="2" />
-                      <line x1="8" y1="21" x2="16" y2="21" />
-                      <line x1="12" y1="17" x2="12" y2="21" />
-                    </svg>
-                    <span className={styles.emptyTitle}>No models discovered</span>
-                    <span className={styles.emptyHint}>Models will appear here once the gateway discovers them from your infrastructure</span>
-                  </div>
-                </TableEmpty>
-              </tbody>
-            </Table>
-          </div>
-        </div>
+        <EmptyCard
+          glyph={<CatalogueGlyph />}
+          title="No models discovered yet"
+          hint="Models appear here when the gateway finds them on Bedrock, on your self-hosted backends, or through a vendor key."
+          actions={
+            <>
+              <Button size="sm" variant="secondary" onClick={onCheckAgain}>
+                Check again
+              </Button>
+              <Button size="sm" variant="ghost" onClick={() => onGoToTab('vendors')}>
+                Set up a vendor key
+              </Button>
+            </>
+          }
+        />
+      ) : filtered.length === 0 && search.trim() ? (
+        <EmptyCard
+          glyph={<SearchGlyph />}
+          title={`No models match "${search.trim()}"`}
+          hint={`Search covers names and model IDs.${retiredMatching > 0 ? ` ${retiredMatching} retired ${retiredMatching === 1 ? 'model matches and is' : 'models match and are'} hidden.` : ''}`}
+          actions={
+            <>
+              <Button size="sm" variant="secondary" onClick={() => onSearch('')}>
+                Clear search
+              </Button>
+              {retiredMatching > 0 && (
+                <Button size="sm" variant="ghost" onClick={() => onShowRetired(true)}>
+                  Show retired
+                </Button>
+              )}
+            </>
+          }
+        />
+      ) : filtered.length === 0 && filter === 'enabled' ? (
+        <EmptyCard
+          glyph={<CatalogueGlyph />}
+          title="No models are enabled yet"
+          hint="Turn one on and it becomes available in chat for everyone your policy allows."
+          actions={
+            <Button size="sm" variant="secondary" onClick={() => onFilter('all')}>
+              Show all models
+            </Button>
+          }
+        />
       ) : filtered.length === 0 ? (
-        <div className={styles.providerSection}>
-          <div className={styles.providerCard}>
-            <Table label="Models matching your filters">
-              <thead>
-                <tr>
-                  <th>Model</th>
-                  <th>Model ID</th>
-                  <th>Hosting</th>
-                  <th>Status</th>
-                  <th className={styles.statusCol}></th>
-                </tr>
-              </thead>
-              <tbody>
-                <TableEmpty colSpan={5}>
-                  <div className={styles.empty}>
-                    <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                      <circle cx="11" cy="11" r="8" />
-                      <line x1="21" y1="21" x2="16.65" y2="16.65" />
-                    </svg>
-                    <span className={styles.emptyTitle}>No models match your filters</span>
-                    <span className={styles.emptyHint}>Try adjusting your search or filter criteria</span>
-                  </div>
-                </TableEmpty>
-              </tbody>
-            </Table>
-          </div>
-        </div>
+        <EmptyCard
+          glyph={<CatalogueGlyph />}
+          title="Every model is enabled"
+          actions={
+            <Button size="sm" variant="ghost" onClick={() => onFilter('all')}>
+              Show all models
+            </Button>
+          }
+        />
       ) : (
         providerGroups.map(([provider, providerModels]) => (
           <ProviderSection
             key={provider}
             provider={provider}
             models={providerModels}
+            allModels={visibleByProvider.get(provider) ?? providerModels}
             togglingIds={togglingIds}
             residency={residency}
             allowedModels={allowedModels}
             firstRun={isVendorProvider(provider) && firstRunVendors.has(provider)}
+            searching={searching}
             onReviewAndEnable={onReviewAndEnable}
             onToggle={onToggle}
             onRename={onRename}
