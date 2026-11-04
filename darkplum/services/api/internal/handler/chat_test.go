@@ -701,3 +701,71 @@ func TestProxyChat_StreamEndsWithoutAnAddedError(t *testing.T) {
 		}
 	})
 }
+
+// A gateway 4xx that points at messages[i] counts the system messages the api
+// prepended. On the session path the index is mapped back to the browser's.
+func TestShiftMessageIndexes(t *testing.T) {
+	in := `{"error":{"message":"messages[3].content[1]: unsupported; see also messages[2]","type":"invalid_request_error","param":"messages[3].content[1]","code":"unsupported"}}`
+	var out struct {
+		Error map[string]string `json:"error"`
+	}
+	if err := json.Unmarshal(shiftMessageIndexes([]byte(in), 2), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Error["param"] != "messages[1].content[1]" || out.Error["message"] != "messages[1].content[1]: unsupported; see also messages[0]" || out.Error["code"] != "unsupported" || out.Error["type"] != "invalid_request_error" {
+		t.Errorf("shifted = %v", out.Error)
+	}
+	for name, body := range map[string]string{
+		"no index":      `{"error":{"message":"bad","param":"model"}}`,
+		"prepended one": `{"error":{"message":"messages[1] bad","param":"messages[1]"}}`,
+		"not an error":  `{"x":1}`,
+		"not json":      `nope`,
+	} {
+		if got := string(shiftMessageIndexes([]byte(body), 2)); got != body {
+			t.Errorf("%s changed: %s", name, got)
+		}
+	}
+	if got := string(shiftMessageIndexes([]byte(in), 0)); got != in {
+		t.Errorf("zero shift changed the body: %s", got)
+	}
+}
+
+func shiftGateway(t *testing.T) *bearerGateway {
+	return newBearerGateway(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"messages[2].content[0]: bad part","type":"invalid_request_error","param":"messages[2].content[0]","code":"invalid_content"}}`))
+	})
+}
+
+func TestProxyChat_SessionRefusalIndexMatchesWhatTheBrowserSent(t *testing.T) {
+	gw := shiftGateway(t)
+	gin.SetMode(gin.TestMode)
+	h := NewChatHandler(gw.URL, "service-key", nil)
+	r := gin.New()
+	r.Use(func(c *gin.Context) { c.Set("user_id", "u1"); c.Next() })
+	r.POST("/v1/chat/completions", h.ProxyChat)
+	// Browser sent messages[0], [1]; the api prepends the system prompt, so the
+	// gateway's messages[2] is the browser's messages[1].
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"a"},{"role":"user","content":"b"}]}`))
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != 400 || !strings.Contains(rec.Body.String(), `"param":"messages[1].content[0]"`) || !strings.Contains(rec.Body.String(), `messages[1].content[0]: bad part`) {
+		t.Fatalf("session: %d %s", rec.Code, rec.Body.String())
+	}
+	// A leading system message means nothing was prepended: untouched.
+	req = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"system","content":"s"},{"role":"user","content":"a"}]}`))
+	rec = httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if !strings.Contains(rec.Body.String(), `"param":"messages[2].content[0]"`) {
+		t.Errorf("nothing prepended but index changed: %s", rec.Body.String())
+	}
+}
+
+func TestProxyChat_BearerRefusalIndexIsUntouched(t *testing.T) {
+	gw := shiftGateway(t)
+	rec := postBearer(bearerRouter(gw.URL), `{"model":"m","messages":[{"role":"user","content":"a"},{"role":"user","content":"b"}]}`)
+	if rec.Code != 400 || !strings.Contains(rec.Body.String(), `"param":"messages[2].content[0]"`) {
+		t.Fatalf("bearer: %d %s", rec.Code, rec.Body.String())
+	}
+}

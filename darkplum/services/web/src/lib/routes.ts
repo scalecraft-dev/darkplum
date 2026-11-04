@@ -148,6 +148,7 @@ export const ROUTES = {
   deleteConversation:    { method: 'DELETE', path: '/api/v1/conversations/:id' },
   appendMessages:        { method: 'POST',   path: '/api/v1/conversations/:id/messages' },
   truncateMessages:      { method: 'DELETE', path: '/api/v1/conversations/:id/messages' },
+  getAttachment:         { method: 'GET',    path: '/api/v1/conversations/:id/attachments/:aid' },
 } as const
 
 export type RouteName = keyof typeof ROUTES

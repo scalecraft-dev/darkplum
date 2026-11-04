@@ -5,11 +5,49 @@
 }
 
 .main {
+  position: relative;
   flex: 1;
   display: flex;
   flex-direction: column;
   min-width: 0;
   overflow: hidden;
+}
+
+/* --- Files dragged over the column --- */
+
+.dropOverlay {
+  position: absolute;
+  inset: var(--space-4);
+  z-index: var(--z-overlay);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  text-align: center;
+  pointer-events: none;
+  color: var(--fg-muted);
+  background: color-mix(in srgb, var(--bg-primary) 88%, transparent);
+  border: 2px dashed var(--border-focus);
+  border-radius: var(--radius-lg);
+  animation: dropIn var(--transition-fast) both;
+}
+
+.dropTitle {
+  font-size: var(--fs-md);
+  font-weight: var(--fw-semibold);
+  color: var(--fg-default);
+}
+
+.dropHint {
+  font-size: var(--fs-sm);
+  color: var(--fg-muted);
+  max-width: 44ch;
+}
+
+@keyframes dropIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
 }
 
 .header {
@@ -85,7 +123,23 @@
   border: 0;
 }
 
-/* --- Empty state --- */
+/* --- Empty state ---
+   A blank chat is a greeting and a composer in the middle of the page, with
+   the starters under the composer. The thread column, the composer and the
+   starters are siblings in .main, so centring the group is one rule on the
+   parent rather than a second layout. */
+
+/* The header stays at the top; the auto margins centre everything after it
+   in the space that remains. */
+.mainCentered .emptyState {
+  flex: 0 0 auto;
+  margin-top: auto;
+  padding-bottom: var(--space-2);
+}
+
+.mainCentered > :last-child {
+  margin-bottom: auto;
+}
 
 .emptyState {
   flex: 1;
@@ -98,18 +152,31 @@
   text-align: center;
 }
 
-.emptyTitle {
+.greeting {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  max-width: 900px;
   font-family: var(--font-serif);
-  font-size: var(--fs-2xl);
-  font-weight: var(--fw-semibold);
+  font-size: 2.25rem;
+  font-weight: var(--fw-normal);
+  line-height: var(--lh-tight);
+  letter-spacing: -0.015em;
   color: var(--fg-default);
-  letter-spacing: -0.02em;
+  text-wrap: balance;
+  animation: greet 0.5s ease-out both;
 }
 
-.emptyTagline {
-  font-size: var(--fs-base);
-  color: var(--fg-muted);
-  margin-bottom: var(--space-6);
+.greetingMark {
+  display: inline-flex;
+  flex-shrink: 0;
+}
+
+@keyframes greet {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: none; }
 }
 
 /* --- Model-state notice (error / empty) ---
@@ -164,44 +231,52 @@
 }
 
 .starters {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: var(--space-3);
-  max-width: 560px;
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--space-2);
+  max-width: 900px;
   width: 100%;
+  margin: 0 auto;
+  padding: 0 var(--space-6) var(--space-4);
 }
 
-.starterBtn {
-  padding: var(--space-3) var(--space-4);
-  /* Offset left padding by border width so text stays aligned */
-  padding-left: calc(var(--space-4) - 2px);
+.starterChip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-4);
   font-size: var(--fs-sm);
   color: var(--fg-muted);
-  background: var(--bg-surface);
+  background: transparent;
   border: 1px solid var(--border-default);
-  border-left: 2px solid var(--brand-default);
-  border-radius: var(--radius-md);
-  text-align: left;
+  border-radius: var(--radius-full);
   cursor: pointer;
   transition: background var(--transition-fast), color var(--transition-fast),
-    border-color var(--transition-fast), transform var(--transition-fast),
-    box-shadow var(--transition-fast);
+    border-color var(--transition-fast);
 }
 
-.starterBtn:hover {
-  background: var(--bg-surface-raised);
+.starterChip svg {
+  color: var(--fg-subtle);
+  transition: color var(--transition-fast);
+}
+
+.starterChip:hover {
   color: var(--fg-default);
-  border-color: var(--brand-default);
-  transform: translateY(-1px);
-  box-shadow: var(--shadow-md);
+  background: var(--bg-surface);
+  border-color: var(--fg-subtle);
 }
 
-.starterBtn:active {
-  transform: translateY(0);
-  box-shadow: none;
+.starterChip:hover svg {
+  color: var(--brand-fg);
 }
 
-.starterBtn:disabled {
+.starterChip:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
+.starterChip:disabled {
   opacity: 0.5;
   pointer-events: none;
 }
@@ -211,8 +286,8 @@
    ============================================================ */
 
 @media (max-width: 639px) {
-  .starters {
-    grid-template-columns: 1fr;
+  .greeting {
+    font-size: var(--fs-2xl);
   }
 
   .emptyState {
@@ -229,8 +304,12 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .starterBtn {
+  .greeting,
+  .dropOverlay {
+    animation: none;
+  }
+
+  .starterChip {
     transition-duration: 0.01ms !important;
-    transform: none !important;
   }
 }

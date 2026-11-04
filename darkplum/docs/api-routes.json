@@ -130,6 +130,13 @@
   {
     "service": "api",
     "method": "GET",
+    "path": "/api/v1/conversations/:id/attachments/:aid",
+    "auth": "session",
+    "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
     "path": "/api/v1/me/routing-policy/effective",
     "auth": "session",
     "surface": "ui"

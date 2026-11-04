@@ -3,9 +3,19 @@ import { NavLink, useLocation } from 'react-router-dom'
 import { useAuth } from '../context/AuthContext'
 import { useTheme } from '../context/ThemeContext'
 import { Avatar, PlumMark } from './ui'
+import { SidebarSlotContext } from './SidebarSlot'
 import styles from './Layout.module.css'
 
 const SIDEBAR_STORAGE_KEY = 'darkplum-sidebar-collapsed'
+const RECENTS_STORAGE_KEY = 'darkplum-recents-open'
+
+function readRecentsPref(): boolean {
+  try {
+    return localStorage.getItem(RECENTS_STORAGE_KEY) !== 'false'
+  } catch {
+    return true
+  }
+}
 
 function readCollapsedPref(): boolean {
   try {
@@ -22,6 +32,31 @@ export function Layout({ children }: { children: React.ReactNode }) {
 
   const [collapsed, setCollapsed] = useState<boolean>(readCollapsedPref)
   const [mobileOpen, setMobileOpen] = useState(false)
+  const [recentsOpen, setRecentsOpen] = useState<boolean>(readRecentsPref)
+  /** The element the chat page portals its conversation list into. */
+  const [recentsSlot, setRecentsSlot] = useState<HTMLElement | null>(null)
+  // Recents are the chat page's conversations, and only that page holds them.
+  const onChat = location.pathname.startsWith('/chat')
+
+  const toggleRecents = () => {
+    setRecentsOpen((prev) => {
+      const next = !prev
+      try { localStorage.setItem(RECENTS_STORAGE_KEY, String(next)) } catch { /* storage unavailable */ }
+      return next
+    })
+  }
+
+  // In the phone drawer, picking a conversation (or New chat) is a navigation:
+  // the drawer closes so the thread is visible. The rename and delete
+  // controls carry an aria-label and are the only buttons in the list that do;
+  // they keep the drawer open, because renaming needs it.
+  const onRecentsClick = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (!mobileOpen) return
+    const btn = (e.target as HTMLElement).closest('button')
+    if (btn && !btn.hasAttribute('aria-label')) closeMobile()
+  }
+
+  const closeMobile = () => setMobileOpen(false)
 
   const toggleCollapsed = () => {
     setCollapsed((prev) => {
@@ -30,8 +65,6 @@ export function Layout({ children }: { children: React.ReactNode }) {
       return next
     })
   }
-
-  const closeMobile = () => setMobileOpen(false)
 
   useEffect(() => { setMobileOpen(false) }, [location.pathname])
 
@@ -172,6 +205,32 @@ export function Layout({ children }: { children: React.ReactNode }) {
               </NavLink>
             </div>
           )}
+
+          {onChat && (
+            <div className={`${styles.recents} ${recentsOpen ? '' : styles.recentsClosed}`}>
+              <button
+                type="button"
+                className={styles.recentsToggle}
+                onClick={toggleRecents}
+                aria-expanded={recentsOpen}
+                aria-controls="sidebar-recents"
+              >
+                <span className={styles.navLinkText}>Recents</span>
+                <svg
+                  className={`${styles.recentsChevron} ${recentsOpen ? styles.recentsChevronOpen : ''}`}
+                  width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"
+                >
+                  <polyline points="6 9 12 15 18 9" />
+                </svg>
+              </button>
+              <div
+                id="sidebar-recents"
+                className={styles.recentsBody}
+                ref={setRecentsSlot}
+                onClick={onRecentsClick}
+              />
+            </div>
+          )}
         </nav>
 
         <div className={styles.footer}>
@@ -241,7 +300,9 @@ export function Layout({ children }: { children: React.ReactNode }) {
         </div>
       </aside>
 
-      <main className={styles.content}>{children}</main>
+      <SidebarSlotContext.Provider value={onChat ? recentsSlot : null}>
+        <main className={styles.content}>{children}</main>
+      </SidebarSlotContext.Provider>
     </div>
   )
 }

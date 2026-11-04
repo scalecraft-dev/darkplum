@@ -104,7 +104,7 @@ func TestRegistryShape(t *testing.T) {
 			if s != want {
 				t.Errorf("%s strict %s = %s, want %s", k, b, s, want)
 			}
-			if d == ContractRefuse && r.Reason == "" && r.When != "non-text-content" {
+			if d == ContractRefuse && r.Reason == "" {
 				// A refusal needs its sentence.
 				t.Errorf("%s refuses on %s but has no reason", k, b)
 			}

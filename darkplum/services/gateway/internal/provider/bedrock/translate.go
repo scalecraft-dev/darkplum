@@ -63,7 +63,14 @@ func translateRequest(req provider.ChatRequest) (system []types.SystemContentBlo
 	var systemText strings.Builder
 	var turns []*turn
 
+	docN := 0 // documents so far in the request, for their neutral names
 	for mi, m := range req.Messages {
+		if m.Role != "user" {
+			if at := nonTextPartAt(m); at >= 0 {
+				return nil, nil, nil, validationErrorCode(contentInvalidCode, fmt.Sprintf("messages[%d].content[%d]", mi, at),
+					fmt.Sprintf("messages[%d].content[%d]: images and files are accepted only in user messages", mi, at))
+			}
+		}
 		switch m.Role {
 		case "system":
 			if strings.TrimSpace(m.Content) == "" {
@@ -74,12 +81,25 @@ func translateRequest(req provider.ChatRequest) (system []types.SystemContentBlo
 			}
 			systemText.WriteString(m.Content)
 		case "user":
-			if strings.TrimSpace(m.Content) == "" {
-				// Empty-content messages must not produce empty text blocks —
-				// Converse rejects them. Drop rather than send a blank turn.
+			// Images and documents first (Converse reads them as context for
+			// the text), built before the turn list is touched so a bad part
+			// rejects the whole request. A turn with media and no text is
+			// kept; only a turn with neither is dropped (Converse rejects an
+			// empty text block).
+			imgs, docs, merr := mediaBlocks(mi, m, &docN)
+			if merr != nil {
+				return nil, nil, nil, merr
+			}
+			hasText := strings.TrimSpace(m.Content) != ""
+			if !hasText && len(imgs) == 0 && len(docs) == 0 {
 				continue
 			}
-			turnFor(&turns, types.ConversationRoleUser).addText(m.Content)
+			t := turnFor(&turns, types.ConversationRoleUser)
+			t.images = append(t.images, imgs...)
+			t.docs = append(t.docs, docs...)
+			if hasText {
+				t.addText(m.Content)
+			}
 		case "assistant":
 			hasText := strings.TrimSpace(m.Content) != ""
 			if !hasText && len(m.ToolCalls) == 0 {
@@ -193,7 +213,11 @@ const emptyToolResultText = "(empty result)"
 type turn struct {
 	role    types.ConversationRole
 	results []types.ContentBlock
-	blocks  []types.ContentBlock
+	// images and docs are a user turn's media, emitted after the tool results
+	// and before the text: images, then documents, then text.
+	images []types.ContentBlock
+	docs   []types.ContentBlock
+	blocks []types.ContentBlock
 }
 
 // turnFor returns the turn a new message of role belongs to: the last turn
@@ -220,12 +244,16 @@ func (t *turn) addText(s string) {
 }
 
 func (t *turn) content() []types.ContentBlock {
-	out := make([]types.ContentBlock, 0, len(t.results)+len(t.blocks))
+	out := make([]types.ContentBlock, 0, len(t.results)+len(t.images)+len(t.docs)+len(t.blocks))
 	out = append(out, t.results...)
+	out = append(out, t.images...)
+	out = append(out, t.docs...)
 	return append(out, t.blocks...)
 }
 
-func (t *turn) empty() bool { return len(t.results) == 0 && len(t.blocks) == 0 }
+func (t *turn) empty() bool {
+	return len(t.results) == 0 && len(t.images) == 0 && len(t.docs) == 0 && len(t.blocks) == 0
+}
 
 func (t *turn) toolUseIDs() map[string]bool {
 	ids := map[string]bool{}
@@ -254,8 +282,75 @@ func (t *turn) dropResults(ids map[string]bool) {
 // validationError is the 400 BedrockAPIError for a request the gateway can
 // tell Converse would refuse (or that is malformed), without a round trip.
 func validationError(msg string) *BedrockAPIError {
-	statusCode, body := TranslateBedrockError("ValidationException", msg)
-	return &BedrockAPIError{StatusCode: statusCode, Body: body}
+	return validationErrorCode("", "", msg)
+}
+
+// validationErrorCode is validationError with a closed error code and the
+// request field it refers to (either may be empty). The body is the same
+// OpenAI envelope TranslateBedrockError writes for a ValidationException.
+func validationErrorCode(code, param, msg string) *BedrockAPIError {
+	body, _ := json.Marshal(struct {
+		Error errDetail `json:"error"`
+	}{errDetail{Message: msg, Type: "invalid_request_error", Code: code, Param: param}})
+	return &BedrockAPIError{StatusCode: http.StatusBadRequest, Body: body}
+}
+
+// contentInvalidCode is the gateway's closed code for an image or file part
+// that cannot be sent; the handler's provider.ValidateContent normally refuses
+// first, so reaching it here means a caller built a ChatRequest without it.
+const contentInvalidCode = "invalid_content"
+
+// nonTextPartAt is the index of the first non-text part of m, or -1.
+func nonTextPartAt(m provider.Message) int {
+	for j, p := range m.Parts {
+		if p.Kind != provider.KindText {
+			return j
+		}
+	}
+	return -1
+}
+
+// mediaBlocks builds the image and document blocks of one user message.
+// Documents are named "document N" (N counts across the request): the SDK
+// treats a document name as a prompt-injection vector and restricts its
+// charset, so a caller's filename is never sent. Bytes come from the
+// validator's single decode. A part that is not an inline, allowed image or
+// file is a 400, never skipped: skipping would answer a question about an
+// attachment the model never saw. There is no S3Location here by design --
+// request input never names a bucket.
+func mediaBlocks(mi int, m provider.Message, docN *int) (images, docs []types.ContentBlock, err error) {
+	for j := range m.Parts {
+		p := &m.Parts[j]
+		if p.Kind == provider.KindText {
+			continue
+		}
+		bad := func(why string) *BedrockAPIError {
+			at := fmt.Sprintf("messages[%d].content[%d]", mi, j)
+			return validationErrorCode(contentInvalidCode, at, at+": "+why)
+		}
+		format := provider.ContentFormat(p.MediaType)
+		if p.Remote || format == "" || (p.Kind != provider.KindImage && p.Kind != provider.KindFile) {
+			return nil, nil, bad("not an inline image or file of an accepted type")
+		}
+		b, derr := p.Bytes()
+		if derr != nil || len(b) == 0 {
+			return nil, nil, bad("data is not valid base64")
+		}
+		if p.Kind == provider.KindImage {
+			images = append(images, &types.ContentBlockMemberImage{Value: types.ImageBlock{
+				Format: types.ImageFormat(format),
+				Source: &types.ImageSourceMemberBytes{Value: b},
+			}})
+			continue
+		}
+		*docN++
+		docs = append(docs, &types.ContentBlockMemberDocument{Value: types.DocumentBlock{
+			Format: types.DocumentFormat(format),
+			Name:   aws.String(fmt.Sprintf("document %d", *docN)),
+			Source: &types.DocumentSourceMemberBytes{Value: b},
+		}})
+	}
+	return images, docs, nil
 }
 
 // decodeJSONDocument parses raw JSON for the SDK's document encoder. Numbers
@@ -641,20 +736,46 @@ func IsModelRetiredMessage(msg string) bool {
 	return strings.Contains(strings.ToLower(msg), "end of its life")
 }
 
+// errDetail and errEnvelope are the OpenAI error body the gateway writes.
+type errDetail struct {
+	Message string `json:"message"`
+	Type    string `json:"type"`
+	Code    string `json:"code,omitempty"`
+	Param   string `json:"param,omitempty"`
+}
+
+type errEnvelope struct {
+	Error errDetail `json:"error"`
+}
+
+// mentionsMediaInput reports whether a ValidationException is about an image
+// or document block (the model cannot take it, or could not read it).
+func mentionsMediaInput(msg string) bool {
+	m := strings.ToLower(msg)
+	return strings.Contains(m, "image") || strings.Contains(m, "document")
+}
+
+// mediaRefusalMessage replaces Bedrock's own wording, which can name internal
+// limits and echo parts of the request; it is never relayed.
+const mediaRefusalMessage = "the model serving this request did not accept the image or document input (it may not support that input type, or the file could not be processed); choose a model that accepts images and files"
+
 // TranslateBedrockError converts a Bedrock SDK error code to an HTTP status
 // and an OpenAI-compatible JSON error body. The errorCode parameter is the
 // smithy fault type name (e.g. "ThrottlingException"). rawMessage is forwarded
-// as-is for ValidationException so the caller sees Bedrock's validation detail.
+// as-is for ValidationException so the caller sees Bedrock's validation detail,
+// except a ValidationException about image or document input on a request that
+// carried such parts: that becomes a
+// 400 unsupported_parameter with fixed text, never the raw AWS wording.
 func TranslateBedrockError(errorCode string, rawMessage string) (statusCode int, body []byte) {
-	type errDetail struct {
-		Message string `json:"message"`
-		Type    string `json:"type"`
-		Code    string `json:"code,omitempty"`
-	}
-	type errEnvelope struct {
-		Error errDetail `json:"error"`
-	}
+	return translateBedrockError(errorCode, rawMessage, "", false)
+}
 
+// translateBedrockError is TranslateBedrockError with the request field an
+// image/document refusal refers to (messages[i].content[j]) when it is known.
+// hasMedia says the request carried image or file parts; only then is a
+// ValidationException that mentions an image or document treated as a media
+// refusal. Without media parts the text is about something else and is relayed.
+func translateBedrockError(errorCode, rawMessage, mediaParam string, hasMedia bool) (statusCode int, body []byte) {
 	var detail errDetail
 	switch errorCode {
 	case "ThrottlingException":
@@ -678,6 +799,14 @@ func TranslateBedrockError(errorCode string, rawMessage string) (statusCode int,
 		detail = errDetail{
 			Message: msg,
 			Type:    "invalid_request_error",
+		}
+		if hasMedia && mentionsMediaInput(rawMessage) {
+			detail = errDetail{
+				Message: mediaRefusalMessage,
+				Type:    "invalid_request_error",
+				Code:    "unsupported_parameter",
+				Param:   mediaParam,
+			}
 		}
 	case "ResourceNotFoundException":
 		statusCode = http.StatusNotFound

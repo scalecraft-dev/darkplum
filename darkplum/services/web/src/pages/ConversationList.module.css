@@ -1,36 +1,32 @@
+/* Lives in the sidebar's Recents section (see Layout), so it has no edge or
+   surface of its own: it fills the height it is given and scrolls inside. */
 .panel {
   display: flex;
   flex-direction: column;
-  height: 100%;
-  width: 260px;
-  flex-shrink: 0;
-  background: var(--bg-base);
-  border-right: 1px solid var(--border-default);
+  flex: 1;
+  min-height: 0;
 }
 
 .newBtn {
   display: flex;
   align-items: center;
   gap: var(--space-2);
-  margin: var(--space-3);
+  margin: 0 0 var(--space-2);
   padding: var(--space-2) var(--space-3);
   font-size: var(--fs-sm);
   color: var(--fg-default);
-  background: var(--bg-surface);
-  border: 1px solid var(--border-default);
   border-radius: var(--radius-md);
-  transition: background var(--transition-fast), border-color var(--transition-fast);
+  transition: background var(--transition-fast);
 }
 
 .newBtn:hover {
-  background: var(--bg-surface-raised);
-  border-color: var(--fg-subtle);
+  background: var(--bg-surface);
 }
 
 .list {
   flex: 1;
   overflow-y: auto;
-  padding: 0 var(--space-2);
+  padding: 0;
   list-style: none;
   margin: 0;
 }
@@ -56,9 +52,12 @@
   padding: var(--space-2) var(--space-3);
 }
 
+/* The recents are navigation rows now, like the links above them, not cards
+   in a rail: hover and the open one are tones, not stripes. */
+
 .notice,
 .noticeWarn {
-  margin: 0 var(--space-3) var(--space-2);
+  margin: 0 var(--space-1) var(--space-2);
   font-size: var(--fs-xs);
   line-height: var(--lh-normal);
   color: var(--fg-subtle);
@@ -71,7 +70,7 @@
 }
 
 .panelError {
-  margin: 0 var(--space-3);
+  margin: 0;
   padding: var(--space-3);
   padding-left: calc(var(--space-3) - 2px);
   display: flex;
@@ -137,25 +136,20 @@
   display: flex;
   align-items: center;
   border-radius: var(--radius-md);
-  /* Offset left padding by border width so content column stays stable */
-  padding-left: calc(var(--space-3) - 2px);
-  border-left: 2px solid transparent;
-  transition: background var(--transition-fast), border-left-color var(--transition-fast);
+  padding-left: var(--space-3);
+  transition: background var(--transition-fast);
 }
 
 .itemRow:hover {
   background: var(--bg-surface);
-  border-left-color: var(--brand-default);
 }
 
 .active {
   background: var(--brand-muted);
-  border-left-color: var(--brand-default);
 }
 
 .active:hover {
   background: var(--brand-muted);
-  border-left-color: var(--brand-default);
 }
 
 /* Button that selects the conversation */
@@ -268,7 +262,7 @@
 /* Sits under the list, not in it: it is a way to see more, not a conversation. */
 .loadMoreBtn {
   flex-shrink: 0;
-  margin: var(--space-2) var(--space-2) var(--space-3);
+  margin: var(--space-2) 0 var(--space-3);
   padding: var(--space-2);
   background: none;
   border: 1px solid var(--border-default);

@@ -2,9 +2,11 @@ package router
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 
 	"github.com/scalecraft-dev/darkplum/gateway/internal/policy"
+	"github.com/scalecraft-dev/darkplum/gateway/internal/provider"
 )
 
 func aliasWithRoutes(routes ...policy.RouteDef) policy.AliasDef {
@@ -127,5 +129,34 @@ func TestRulesClassifier_ImplementsClassifierAndNeverAborts(t *testing.T) {
 	}
 	if d.RouteName != "general" {
 		t.Errorf("got %+v", d)
+	}
+}
+
+// builtin:multimodal is live now that a Bedrock-served route can take an image:
+// an inline image part (not only a URL) sets the signal, the classifier input
+// carries the text alone, and a text-only message does not set it.
+func TestDecideRules_BuiltinMultimodal_FromDecodedImageMessage(t *testing.T) {
+	alias := aliasWithRoutes(policy.RouteDef{Name: "vision", Target: "vlm", Keywords: []string{BuiltinMultimodal}})
+	inputOf := func(content string) Input {
+		var m provider.Message
+		if err := json.Unmarshal([]byte(`{"role":"user","content":`+content+`}`), &m); err != nil {
+			t.Fatal(err)
+		}
+		return Input{Text: m.Content, OriginalLen: len([]rune(m.Content)), HasNonText: m.HasNonTextContent}
+	}
+
+	in := inputOf(`[{"type":"text","text":"what is this?"},{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}}]`)
+	if in.Text != "what is this?" {
+		t.Errorf("classifier text = %q: image data must never reach the router", in.Text)
+	}
+	if d := DecideRules(alias, in); d.RouteName != "vision" {
+		t.Errorf("inline image should select the multimodal route, got %+v", d)
+	}
+	if d := DecideRules(alias, inputOf(`[{"type":"text","text":"what is this?"}]`)); d.RouteName != "general" {
+		t.Errorf("text-only should not select it, got %+v", d)
+	}
+	// An image-only turn: empty text, still multimodal.
+	if d := DecideRules(alias, inputOf(`[{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}}]`)); d.RouteName != "vision" {
+		t.Errorf("image-only turn should select the multimodal route, got %+v", d)
 	}
 }

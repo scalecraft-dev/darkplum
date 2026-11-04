@@ -1,4 +1,5 @@
-import type { User, ApiKey, ChatMessage, ActivityEvent, AliasRouteTest, BackendClass, InferenceEvent, InferencePurpose, UsageBucket, UsageSummary, UserUsageSummary, KeyUsageSummary, Model, AdminModel, AdminModelsResult, ModelAlias, ModelAliasInput, ProviderStatus, Residency, RoutingPolicy, PrincipalPolicy, EffectivePolicy, PolicyPreview, PolicyPrincipalsPage, ConversationSummary, ConversationFull, ConversationMessage, ConversationMessageInput, VendorName, SpendGroupBy, SpendReport, SpendTimelineGroupBy, ProviderBilling, ReconciliationGroupBy, ReconciliationReport, ModelPricesResult, ModelPrice, ModelPriceInput , SystemPromptSetting, LibraryItem, LibraryItemInput, LibraryItemUpdate, LibraryImportRequest, LibraryImportPreview, LibraryKind, LibraryVisibility, ToolEvent, ToolHostsSetting } from '../types'
+import type { User, ApiKey, ActivityEvent, AliasRouteTest, BackendClass, InferenceEvent, InferencePurpose, UsageBucket, UsageSummary, UserUsageSummary, KeyUsageSummary, Model, AdminModel, AdminModelsResult, ModelAlias, ModelAliasInput, ProviderStatus, Residency, RoutingPolicy, PrincipalPolicy, EffectivePolicy, PolicyPreview, PolicyPrincipalsPage, ConversationSummary, ConversationFull, ConversationMessage, ConversationMessageInput, VendorName, SpendGroupBy, SpendReport, SpendTimelineGroupBy, ProviderBilling, ReconciliationGroupBy, ReconciliationReport, ModelPricesResult, ModelPrice, ModelPriceInput , SystemPromptSetting, LibraryItem, LibraryItemInput, LibraryItemUpdate, LibraryImportRequest, LibraryImportPreview, LibraryKind, LibraryVisibility, ToolEvent, ToolHostsSetting } from '../types'
+import type { WireMessage } from './attachments'
 import { STREAM_CUT_OFF_CODE, STREAM_CUT_OFF_MESSAGE, readChatStream } from './chatStream'
 import { parseRetryAfter } from './modelRouting'
 import { ROUTES, buildPath, type QueryValue, type Route } from './routes'
@@ -788,6 +789,12 @@ export function createConversation(body: {
   return request<ConversationFull>(ROUTES.createConversation, { body })
 }
 
+/** Where a stored attachment's bytes are read from, for an <img> or a link.
+ *  Session-cookie auth; the api serves only the signed-in person's own. */
+export function attachmentUrl(conversationId: string, attachmentId: string): string {
+  return pathOf(ROUTES.getAttachment, { id: conversationId, aid: attachmentId })
+}
+
 export function getConversation(id: string): Promise<ConversationFull> {
   return request<ConversationFull>(ROUTES.getConversation, { params: { id } })
 }
@@ -944,7 +951,7 @@ export interface StreamChatOptions {
 }
 
 export async function streamChat(
-  messages: ChatMessage[],
+  messages: WireMessage[],
   model: string,
   onToken: (token: string) => void,
   onDone: () => void,

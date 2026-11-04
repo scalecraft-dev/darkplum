@@ -16,6 +16,7 @@ const (
 	conversationTitleTruncateLen  = 60
 	conversationDefaultTitle      = "New conversation"
 	conversationContentMaxBytes   = 16 << 20 // 16 MiB; mirrors migration 025's CHECK on conversation_messages.content, = chatBodyMaxBytes
+	conversationBodyMaxBytes      = 16 << 20 // create/append request cap (= chatBodyMaxBytes)
 	conversationImportKeyMaxLen   = 200      // mirrors migration 012's CHECK on conversations.import_key
 	conversationRequestIDMaxLen   = 200      // defensive cap; request_id is an opaque hex string in practice (see cmd/main.go requestID())
 	conversationsListDefaultLimit = 200
@@ -29,6 +30,10 @@ const (
 func deriveConversationTitle(messages []messageInput) string {
 	for _, m := range messages {
 		if m.Role == roleUser {
+			// An attachment-only first turn is titled by its first file.
+			if strings.TrimSpace(m.Content) == "" && len(m.Attachments) > 0 {
+				return truncateTitle(m.Attachments[0].Name)
+			}
 			return truncateTitle(m.Content)
 		}
 	}
@@ -81,28 +86,42 @@ func validImportKey(importKey *string) bool {
 // against inference_events (see resolveAssistantProvenance in
 // conversations.go), never trusted as-is.
 func validMessageInput(m messageInput) error {
+	_, err := checkMessageInput(m)
+	return err
+}
+
+// checkMessageInput is validMessageInput that also returns the decoded
+// attachments, so the handler stores the bytes validation already decoded
+// instead of decoding (and holding) the base64 a second time.
+func checkMessageInput(m messageInput) ([]decodedAttachment, error) {
 	if m.Role != roleUser && m.Role != roleAssistant {
-		return fmt.Errorf("role must be 'user' or 'assistant'")
+		return nil, fmt.Errorf("role must be 'user' or 'assistant'")
 	}
-	if m.Content == "" {
-		return fmt.Errorf("content is required")
+	atts, err := decodeAttachments(m)
+	if err != nil {
+		return nil, err
+	}
+	// An attachment-only turn (a photo with no caption) is legitimate; a
+	// turn with neither text nor attachment is still a blank turn.
+	if m.Content == "" && len(m.Attachments) == 0 {
+		return nil, fmt.Errorf("content is required")
 	}
 	if len(m.Content) > conversationContentMaxBytes {
-		return fmt.Errorf("content exceeds %d bytes", conversationContentMaxBytes)
+		return nil, fmt.Errorf("content exceeds %d bytes", conversationContentMaxBytes)
 	}
 	if m.RequestID != nil && utf8.RuneCountInString(*m.RequestID) > conversationRequestIDMaxLen {
-		return fmt.Errorf("request_id exceeds %d characters", conversationRequestIDMaxLen)
+		return nil, fmt.Errorf("request_id exceeds %d characters", conversationRequestIDMaxLen)
 	}
 	if ev := bytes.TrimSpace(m.ToolEvents); len(ev) > 0 && string(ev) != "null" {
 		if len(ev) > toolEventsMaxBytes {
-			return fmt.Errorf("tool_events exceeds %d bytes", toolEventsMaxBytes)
+			return nil, fmt.Errorf("tool_events exceeds %d bytes", toolEventsMaxBytes)
 		}
 		var arr []json.RawMessage
 		if err := json.Unmarshal(ev, &arr); err != nil {
-			return fmt.Errorf("tool_events must be a JSON array")
+			return nil, fmt.Errorf("tool_events must be a JSON array")
 		}
 	}
-	return nil
+	return atts, nil
 }
 
 // toolEventsMaxBytes sits under the 1 MiB CHECK in migration 026 with room
@@ -138,12 +157,22 @@ func toolEventsForStorage(m messageInput) []byte {
 // count or role-order restriction -- an imported historical conversation can
 // be an arbitrary user/assistant sequence.
 func validateInitialMessages(msgs []messageInput) error {
+	_, err := decodeInitialMessages(msgs)
+	return err
+}
+
+// decodeInitialMessages is validateInitialMessages returning each message's
+// decoded attachments, index-aligned with msgs.
+func decodeInitialMessages(msgs []messageInput) ([][]decodedAttachment, error) {
+	out := make([][]decodedAttachment, len(msgs))
 	for i, m := range msgs {
-		if err := validMessageInput(m); err != nil {
-			return fmt.Errorf("messages[%d]: %w", i, err)
+		atts, err := checkMessageInput(m)
+		if err != nil {
+			return nil, fmt.Errorf("messages[%d]: %w", i, err)
 		}
+		out[i] = atts
 	}
-	return nil
+	return out, nil
 }
 
 // validateAppendMessages validates the body of POST
@@ -152,21 +181,31 @@ func validateInitialMessages(msgs []messageInput) error {
 // (the reply to an already-stored user turn, e.g. after a regenerate has
 // truncated the previous reply) -- never two of the same role.
 func validateAppendMessages(msgs []messageInput) error {
+	_, err := decodeAppendMessages(msgs)
+	return err
+}
+
+// decodeAppendMessages is validateAppendMessages returning each message's
+// decoded attachments, index-aligned with msgs.
+func decodeAppendMessages(msgs []messageInput) ([][]decodedAttachment, error) {
 	if len(msgs) < 1 || len(msgs) > 2 {
-		return fmt.Errorf("messages must contain 1 or 2 items")
+		return nil, fmt.Errorf("messages must contain 1 or 2 items")
 	}
+	out := make([][]decodedAttachment, len(msgs))
 	for i, m := range msgs {
-		if err := validMessageInput(m); err != nil {
-			return fmt.Errorf("messages[%d]: %w", i, err)
+		atts, err := checkMessageInput(m)
+		if err != nil {
+			return nil, fmt.Errorf("messages[%d]: %w", i, err)
 		}
+		out[i] = atts
 	}
 	if len(msgs) == 2 {
 		if msgs[0].Role != roleUser {
-			return fmt.Errorf("messages[0] must have role 'user'")
+			return nil, fmt.Errorf("messages[0] must have role 'user'")
 		}
 		if msgs[1].Role != roleAssistant {
-			return fmt.Errorf("messages[1] must have role 'assistant'")
+			return nil, fmt.Errorf("messages[1] must have role 'assistant'")
 		}
 	}
-	return nil
+	return out, nil
 }

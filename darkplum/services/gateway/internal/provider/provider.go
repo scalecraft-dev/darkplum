@@ -141,6 +141,14 @@ type Message struct {
 	// alias's builtin:multimodal rules signal (see internal/router). Always
 	// false for a plain string content body.
 	HasNonTextContent bool `json:"-"`
+	// Parts is the structured view of an array-form content, in request
+	// order, text parts included (so Parts[j] is content[j]). Nil for a
+	// string content. See content.go.
+	Parts []ContentPart `json:"-"`
+	// MalformedContent is true when content was neither a string nor a
+	// decodable array of parts. Content is then empty; the handler refuses
+	// the request (ValidateContentShape) rather than guess.
+	MalformedContent bool `json:"-"`
 }
 
 func (m *Message) UnmarshalJSON(data []byte) error {
@@ -175,25 +183,18 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 		return nil
 	}
 
-	// Array of content blocks: [{"type":"text","text":"..."},...]
-	var blocks []struct {
-		Type string `json:"type"`
-		Text string `json:"text"`
-	}
-	if err := json.Unmarshal(p.Content, &blocks); err == nil {
-		var combined string
-		for _, b := range blocks {
-			if b.Type == "text" {
-				combined += b.Text
-			} else {
-				m.HasNonTextContent = true
-			}
-		}
-		m.Content = combined
+	// Array of content blocks: [{"type":"text","text":"..."},...]. Anything
+	// else (a number, an object, an array that does not decode) is NOT
+	// prompt text: it is flagged and refused by the handler.
+	parts, text, nonText, ok := parseContentArray(p.Content)
+	if !ok {
+		m.Content = ""
+		m.MalformedContent = true
 		return nil
 	}
-
-	m.Content = string(p.Content)
+	m.Content = text
+	m.HasNonTextContent = nonText
+	m.Parts = parts
 	return nil
 }
 

@@ -15,6 +15,7 @@ import {
   truncateConversationMessages,
   updateConversation,
 } from './api'
+import { fromMeta, fromPending, toWireContent, type PendingAttachment, type WireMessage } from './attachments'
 
 /**
  * Conversation history lives on the server, under the signed-in person's own
@@ -70,7 +71,8 @@ const TITLE_MAX = 60
 export function deriveTitle(messages: ChatMessage[]): string {
   const first = messages.find((m) => m.role === 'user')
   if (!first) return NEW_CONVERSATION_TITLE
-  const text = first.content.trim().replace(/\s+/g, ' ')
+  // A turn that is only a photo or a file is titled by what was sent.
+  const text = (first.content.trim() || first.attachments?.[0]?.name || '').replace(/\s+/g, ' ')
   if (!text) return NEW_CONVERSATION_TITLE
   return text.length > TITLE_MAX ? `${text.slice(0, TITLE_MAX - 3)}...` : text
 }
@@ -109,6 +111,7 @@ function fromFull(full: ConversationFull): Conversation {
     content: m.content,
     model: m.model,
     toolEvents: m.tool_events ?? null,
+    attachments: m.attachments && m.attachments.length > 0 ? m.attachments.map(fromMeta) : undefined,
   }))
   const lastSeq = full.messages.length > 0 ? full.messages[full.messages.length - 1].seq : 0
   return {
@@ -280,19 +283,43 @@ export function forgetConversation(id: string): void {
   order = order.filter((existing) => existing !== id)
 }
 
-/** Strips the display-only fields before a turn goes back to the gateway. */
-export function toWireMessages(messages: ChatMessage[]): ChatMessage[] {
-  return messages.map((m) => ({ role: m.role, content: m.content }))
+/** Strips the display-only fields before a turn goes back to the gateway. A
+ *  user turn with attachments goes as content parts: stored ones by id, which
+ *  the api expands from this person's own record, the one being sent as bytes. */
+export function toWireMessages(messages: ChatMessage[]): WireMessage[] {
+  return messages.map((m) => ({
+    role: m.role,
+    content: m.role === 'user' ? toWireContent(m.content, m.attachments) : m.content,
+  }))
+}
+
+function attachmentInputs(m: ChatMessage): ConversationMessageInput['attachments'] {
+  const pending = (m.attachments ?? []).filter((a) => !a.id && a.data)
+  if (pending.length === 0) return undefined
+  return pending.map((a) => ({ kind: a.kind, media_type: a.mediaType, name: a.name, data: a.data as string }))
 }
 
 function toInput(m: ChatMessage): ConversationMessageInput {
   const input: ConversationMessageInput = { role: m.role, content: fit(m.content) }
   if (m.role === 'assistant' && m.model) input.model = m.model
+  if (m.role === 'user') {
+    const atts = attachmentInputs(m)
+    if (atts) input.attachments = atts
+  }
   return input
 }
 
-export function userTurn(content: string): ConversationMessageInput {
-  return { role: 'user', content: fit(content) }
+export function userTurn(content: string, attachments?: PendingAttachment[]): ConversationMessageInput {
+  const input: ConversationMessageInput = { role: 'user', content: fit(content) }
+  if (attachments && attachments.length > 0) {
+    input.attachments = attachments.map((a) => ({ kind: a.kind, media_type: a.mediaType, name: a.name, data: a.data }))
+  }
+  return input
+}
+
+/** A pending turn's attachments, as the message on screen carries them. */
+export function pendingToMessage(attachments: PendingAttachment[]): ChatMessage['attachments'] {
+  return attachments.length > 0 ? attachments.map(fromPending) : undefined
 }
 
 /** The model and request id are what the server fills in from its own audit

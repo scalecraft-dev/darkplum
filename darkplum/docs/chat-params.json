@@ -132,7 +132,7 @@
     },
     {
       "param": "messages",
-      "when": "non-text-content",
+      "when": "unknown-content",
       "backends": {
         "anthropic": "contract-refuse",
         "bedrock": "contract-refuse",
@@ -147,8 +147,8 @@
       },
       "before_route": true,
       "refusal_param": "messages[].content",
-      "reason": "images, audio and files in message content are not supported",
-      "note": "A content array containing anything but text parts."
+      "reason": "this content part type is not supported; only text, inline images (data: URLs) and inline files are accepted, not URLs, file ids or audio",
+      "note": "A content array containing a part that is not text, an inline image or an inline file: audio, a URL or file id, or any other type."
     },
     {
       "param": "model",
@@ -183,6 +183,42 @@
         "openaicompat": "forward"
       },
       "note": "Translated to the backend's own message schema where it differs."
+    },
+    {
+      "param": "messages",
+      "when": "image-content",
+      "backends": {
+        "anthropic": "contract-refuse",
+        "bedrock": "translate",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "translate",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      },
+      "reason": "this backend does not accept images; choose a model served by Bedrock",
+      "note": "A user message containing an inline image (data: URL). Bedrock only; the part is validated (type, size, count) before dispatch. Refusal names messages[i].content[j]."
+    },
+    {
+      "param": "messages",
+      "when": "file-content",
+      "backends": {
+        "anthropic": "contract-refuse",
+        "bedrock": "translate",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      },
+      "strict": {
+        "anthropic": "contract-refuse",
+        "bedrock": "translate",
+        "openai": "contract-refuse",
+        "openaicompat": "contract-refuse"
+      },
+      "reason": "this backend does not accept files; choose a model served by Bedrock",
+      "note": "A user message containing an inline file (pdf, csv, doc, docx, xls, xlsx, html, txt, md). Bedrock only; needs a text part beside it. Refusal names messages[i].content[j]."
     },
     {
       "param": "stream",

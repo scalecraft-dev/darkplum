@@ -493,3 +493,52 @@ func TestToolLoop_CutOffAfterAToolRan(t *testing.T) {
 		t.Errorf("stream = %s", out)
 	}
 }
+
+// Attachments ride every round and tool results grow the body, so round two can
+// be refused 413 after the stream is committed. The browser gets a named error
+// frame and the stream ends; it is not left with a silent cut.
+func TestToolLoop_LaterRound413IsANamedErrorFrame(t *testing.T) {
+	gw := &fakeGateway{}
+	round1 := gw.handler(t)
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			round1(w, r)
+			return
+		}
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusRequestEntityTooLarge)
+		_, _ = w.Write([]byte(`{"error":{"message":"request body exceeds 16777216 bytes","type":"invalid_request_error","code":"request_too_large"}}`))
+	}))
+	defer srv.Close()
+
+	w := httptest.NewRecorder()
+	serveToolLoop(t, srv, context.Background(), w)
+	out := w.Body.String()
+	if atomic.LoadInt32(&calls) != 2 {
+		t.Fatalf("gateway calls = %d", calls)
+	}
+	if w.Code != http.StatusOK {
+		t.Errorf("status = %d (headers were committed by round 1)", w.Code)
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n\n")
+	last, errFrame := lines[len(lines)-1], lines[len(lines)-2]
+	if last != "data: [DONE]" {
+		t.Errorf("stream does not end with [DONE]: %q", last)
+	}
+	var f struct {
+		Error struct {
+			Code, Type, Message string
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(errFrame, "data: ")), &f); err != nil {
+		t.Fatalf("error frame: %v: %q", err, errFrame)
+	}
+	if f.Error.Code != "request_too_large" || f.Error.Type != "invalid_request_error" || !strings.Contains(f.Error.Message, "tool results") || !strings.Contains(f.Error.Message, "attachments") {
+		t.Errorf("error frame = %+v", f.Error)
+	}
+	if !strings.Contains(out, "Let me check. ") {
+		t.Errorf("round 1 text missing: %s", out)
+	}
+}

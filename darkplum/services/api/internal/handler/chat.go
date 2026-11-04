@@ -11,6 +11,8 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -106,25 +108,33 @@ func withSystemPrompt(body []byte) (modified []byte, stream bool, err error) {
 // withSystemPromptText is withSystemPrompt with the prompt text supplied:
 // the admin-set one when there is one, else the built-in default.
 func withSystemPromptText(body []byte, prompt string) (modified []byte, stream bool, err error) {
+	modified, stream, _, err = withSystemPromptCounted(body, prompt)
+	return modified, stream, err
+}
+
+// withSystemPromptCounted is withSystemPromptText that also reports how many
+// messages it put in front of the caller's (0 or 1), for mapping a gateway
+// message index back to the one the browser sent.
+func withSystemPromptCounted(body []byte, prompt string) (modified []byte, stream bool, prepended int, err error) {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(body, &fields); err != nil {
-		return nil, false, err
+		return nil, false, 0, err
 	}
 	if fields == nil {
 		// A literal `null` body unmarshals into a nil map without error;
 		// assigning "messages" into it would panic.
-		return nil, false, fmt.Errorf("request body must be a JSON object")
+		return nil, false, 0, fmt.Errorf("request body must be a JSON object")
 	}
 	var env chatEnvelope
 	if err := json.Unmarshal(body, &env); err != nil {
-		return nil, false, err
+		return nil, false, 0, err
 	}
 
 	if len(env.Messages) == 0 {
 		// The platform system prompt is prepended below, so an empty
 		// client array would reach the gateway as a one-message
 		// "conversation" with no user turn. OpenAI refuses this; so do we.
-		return nil, false, fmt.Errorf("messages must be a non-empty array")
+		return nil, false, 0, fmt.Errorf("messages must be a non-empty array")
 	}
 	hasSystemMsg := false
 	if len(env.Messages) > 0 {
@@ -132,25 +142,26 @@ func withSystemPromptText(body []byte, prompt string) (modified []byte, stream b
 			Role string `json:"role"`
 		}
 		if err := json.Unmarshal(env.Messages[0], &first); err != nil {
-			return nil, false, err
+			return nil, false, 0, err
 		}
 		hasSystemMsg = first.Role == "system"
 	}
 	if !hasSystemMsg {
 		system, err := json.Marshal(map[string]string{"role": "system", "content": prompt})
 		if err != nil {
-			return nil, false, err
+			return nil, false, 0, err
 		}
 		env.Messages = append([]json.RawMessage{system}, env.Messages...)
+		prepended = 1
 	}
 
 	messages, err := json.Marshal(env.Messages)
 	if err != nil {
-		return nil, false, err
+		return nil, false, 0, err
 	}
 	fields["messages"] = messages
 	modified, err = json.Marshal(fields)
-	return modified, env.Stream, err
+	return modified, env.Stream, prepended, err
 }
 
 // resolvedSystemPrompt fills the {{current_date}} placeholder in text.
@@ -256,6 +267,9 @@ func (h *ChatHandler) ProxyChat(c *gin.Context) {
 
 	var modified []byte
 	var stream bool
+	// prepended is how many messages this process put in front of the ones
+	// the browser sent (platform prompt, library message). Session path only.
+	prepended := 0
 	if isBearer {
 		// API-key traffic is the caller's own conversation: the org system
 		// prompt is a webchat setting, so the body goes to the gateway byte
@@ -268,8 +282,15 @@ func (h *ChatHandler) ProxyChat(c *gin.Context) {
 		// number formatting are not preserved) and prepends the org prompt
 		// unless the first message has role "system"; a leading "developer"
 		// message still gets the prompt (unchanged behaviour).
+		// Stored-attachment references become data: parts first, so the
+		// prompt, library and tool-loop steps below all see the bytes.
+		expanded, refusal := expandAttachmentRefs(c.Request.Context(), h.db, c.GetString("user_id"), body)
+		if refusal != nil {
+			refusal.write(c)
+			return
+		}
 		var err error
-		modified, stream, err = withSystemPromptText(body, h.effectiveSystemPrompt(c.Request.Context()))
+		modified, stream, prepended, err = withSystemPromptCounted(expanded, h.effectiveSystemPrompt(c.Request.Context()))
 		if err != nil {
 			slog.WarnContext(c.Request.Context(), "parse request body", "err", err)
 			c.JSON(http.StatusBadRequest, chatProxyError("invalid request body: expected a JSON object with a messages array", "invalid_request_error", "invalid_body"))
@@ -278,9 +299,16 @@ func (h *ChatHandler) ProxyChat(c *gin.Context) {
 	}
 	if att != nil {
 		var err error
-		modified, err = withLibraryMessage(modified, composeLibraryText(att.text))
+		libText := composeLibraryText(att.text)
+		modified, err = withLibraryMessage(modified, libText)
 		if err != nil {
 			c.JSON(http.StatusBadRequest, chatProxyError("invalid request body", "invalid_request_error", "invalid_body"))
+			return
+		}
+		if libText != "" {
+			prepended++
+		}
+		if h.refuseTooLarge(c, modified) {
 			return
 		}
 		c.Header(libraryUsedHeader, att.usedHeaderValue())
@@ -291,9 +319,13 @@ func (h *ChatHandler) ProxyChat(c *gin.Context) {
 				return
 			}
 			c.Header(libraryToolsHeader, fmt.Sprint(len(defs)))
-			h.proxyWithTools(c, modified, stream, defs, bindings)
+			h.proxyWithToolsOffset(c, modified, stream, defs, bindings, prepended)
 			return
 		}
+	}
+
+	if att == nil && h.refuseTooLarge(c, modified) {
+		return
 	}
 
 	target := fmt.Sprintf("%s/v1/chat/completions", h.gatewayURL)
@@ -324,6 +356,15 @@ func (h *ChatHandler) ProxyChat(c *gin.Context) {
 	// log) with the resolved user id. We deliberately do not write a separate
 	// activity_events row here — activity_events is the admin/auth audit log, and
 	// recording chats there would pollute the Admin Events view with API traffic.
+
+	if prepended > 0 && resp.StatusCode >= 400 && resp.StatusCode < 500 {
+		// A gateway refusal that points at messages[i] counts the messages
+		// added above; point at the one the browser sent.
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		copyProxyHeaders(c, resp)
+		c.Data(resp.StatusCode, resp.Header.Get("Content-Type"), shiftMessageIndexes(raw, prepended))
+		return
+	}
 
 	c.Status(resp.StatusCode)
 	copyProxyHeaders(c, resp)
@@ -357,6 +398,18 @@ func (h *ChatHandler) ProxyChat(c *gin.Context) {
 			slog.WarnContext(c.Request.Context(), "response copy interrupted", "err", err)
 		}
 	}
+}
+
+// refuseTooLarge refuses a body that grew past the cap while being rewritten
+// (expanded attachments, system prompt, library text) with the same 413 the
+// gateway would give, instead of letting the gateway discover it. It reports
+// whether it wrote the refusal.
+func (h *ChatHandler) refuseTooLarge(c *gin.Context, body []byte) bool {
+	if len(body) <= chatBodyMaxBytes {
+		return false
+	}
+	c.JSON(http.StatusRequestEntityTooLarge, chatProxyError(fmt.Sprintf("request body exceeds %d bytes", chatBodyMaxBytes), "invalid_request_error", "request_too_large"))
+	return true
 }
 
 // setProxyHeaders sets the headers every hop to the gateway carries: the
@@ -418,4 +471,61 @@ func copyProxyHeaders(c *gin.Context, resp *http.Response) {
 			c.Header(header, v)
 		}
 	}
+}
+
+var messageIndexRE = regexp.MustCompile(`messages\[(\d+)\]`)
+
+// shiftMessageIndexes rewrites a gateway error body so that error.param, and
+// any messages[N] in error.message, count from the caller's first message
+// rather than from the system messages this process prepended. An index that
+// points at a prepended message (below n) is left alone: the browser never
+// sent it. A body that is not a gateway error object, or has no such index,
+// is returned as it came.
+func shiftMessageIndexes(body []byte, n int) []byte {
+	if n <= 0 {
+		return body
+	}
+	var top map[string]json.RawMessage
+	if json.Unmarshal(body, &top) != nil || top["error"] == nil {
+		return body
+	}
+	var e map[string]json.RawMessage
+	if json.Unmarshal(top["error"], &e) != nil || e == nil {
+		return body
+	}
+	shift := func(s string) (string, bool) {
+		changed := false
+		out := messageIndexRE.ReplaceAllStringFunc(s, func(tok string) string {
+			idx, err := strconv.Atoi(messageIndexRE.FindStringSubmatch(tok)[1])
+			if err != nil || idx < n {
+				return tok
+			}
+			changed = true
+			return fmt.Sprintf("messages[%d]", idx-n)
+		})
+		return out, changed
+	}
+	changed := false
+	var param string
+	if json.Unmarshal(e["param"], &param) == nil && messageIndexRE.MatchString(param) && strings.HasPrefix(param, "messages[") {
+		if np, ok := shift(param); ok {
+			e["param"], _ = json.Marshal(np)
+			changed = true
+			var msg string
+			if json.Unmarshal(e["message"], &msg) == nil {
+				if nm, ok := shift(msg); ok {
+					e["message"], _ = json.Marshal(nm)
+				}
+			}
+		}
+	}
+	if !changed {
+		return body
+	}
+	top["error"], _ = json.Marshal(e)
+	out, err := json.Marshal(top)
+	if err != nil {
+		return body
+	}
+	return out
 }

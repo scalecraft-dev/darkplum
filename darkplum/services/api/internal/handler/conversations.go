@@ -68,6 +68,10 @@ type messageInput struct {
 	// chat_library.go toolEvent). Stored as given, bounded in size; it is
 	// the user's own conversation content. Ignored on user turns.
 	ToolEvents json.RawMessage `json:"tool_events,omitempty"`
+	// Attachments are images and files on a user turn (see
+	// attachments_logic.go for the limits). Stored in
+	// conversation_attachments; responses carry their metadata only.
+	Attachments []attachmentInput `json:"attachments,omitempty"`
 }
 
 // conversationSummary is the wire shape returned by list/patch and embedded
@@ -99,6 +103,10 @@ type conversationMessage struct {
 	CreatedAt time.Time `json:"created_at"`
 	// ToolEvents is null on turns that made no tool calls.
 	ToolEvents json.RawMessage `json:"tool_events"`
+	// Attachments is metadata only (never the bytes, which come from the
+	// fetch route); always an array.
+	Attachments []attachmentMeta `json:"attachments"`
+	id          string           // conversation_messages.id, for attachment lookup
 }
 
 // conversationFull is the wire shape for get/create: summary fields plus the
@@ -215,7 +223,7 @@ func (h *ConversationHandler) loadConversationFull(ctx context.Context, userID, 
 	// safe to query by conversation_id alone here only because the row above
 	// already proved convID belongs to userID.
 	rows, err := h.db.Query(ctx, `
-		SELECT seq, role, content, model, request_id, created_at, tool_events
+		SELECT seq, role, content, model, request_id, created_at, tool_events, id
 		FROM conversation_messages
 		WHERE conversation_id = $1
 		ORDER BY seq
@@ -229,7 +237,7 @@ func (h *ConversationHandler) loadConversationFull(ctx context.Context, userID, 
 	for rows.Next() {
 		var m conversationMessage
 		var events []byte
-		if err := rows.Scan(&m.Seq, &m.Role, &m.Content, &m.Model, &m.RequestID, &m.CreatedAt, &events); err != nil {
+		if err := rows.Scan(&m.Seq, &m.Role, &m.Content, &m.Model, &m.RequestID, &m.CreatedAt, &events, &m.id); err != nil {
 			return nil, err
 		}
 		if len(events) > 0 {
@@ -241,6 +249,9 @@ func (h *ConversationHandler) loadConversationFull(ctx context.Context, userID, 
 		return nil, err
 	}
 	rows.Close()
+	if err := h.loadAttachmentMeta(ctx, convID, full.Messages); err != nil {
+		return nil, err
+	}
 	full.MessageCount = len(full.Messages)
 	if full.LibraryItemIDs == nil {
 		full.LibraryItemIDs = []string{}
@@ -248,6 +259,78 @@ func (h *ConversationHandler) loadConversationFull(ctx context.Context, userID, 
 	h.backfillProvenance(ctx, userID, convID, full.Messages)
 
 	return &full, nil
+}
+
+// loadAttachmentMeta fills each message's Attachments with one query for the
+// whole conversation (never one per message), without selecting the bytes.
+// convID must already be proven to belong to the caller.
+func (h *ConversationHandler) loadAttachmentMeta(ctx context.Context, convID string, msgs []conversationMessage) error {
+	byMessage := make(map[string][]attachmentMeta)
+	rows, err := h.db.Query(ctx, `
+		SELECT a.message_id, a.id, a.kind, a.media_type, a.name, a.size_bytes
+		FROM conversation_attachments a
+		JOIN conversation_messages m ON m.id = a.message_id
+		WHERE m.conversation_id = $1
+		ORDER BY m.seq, a.position
+	`, convID)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var mid string
+		var a attachmentMeta
+		if err := rows.Scan(&mid, &a.ID, &a.Kind, &a.MediaType, &a.Name, &a.SizeBytes); err != nil {
+			return err
+		}
+		byMessage[mid] = append(byMessage[mid], a)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for i := range msgs {
+		msgs[i].Attachments = byMessage[msgs[i].id]
+		if msgs[i].Attachments == nil {
+			msgs[i].Attachments = []attachmentMeta{}
+		}
+	}
+	return nil
+}
+
+// insertAttachments stores a turn's attachments in the caller's transaction
+// and returns their metadata (always a non-nil slice).
+func insertAttachments(ctx context.Context, tx pgx.Tx, messageID string, atts []decodedAttachment) ([]attachmentMeta, error) {
+	out := make([]attachmentMeta, 0, len(atts))
+	for pos, a := range atts {
+		var id string
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO conversation_attachments (message_id, position, kind, media_type, name, size_bytes, data)
+			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			RETURNING id
+		`, messageID, pos, a.kind, a.mediaType, a.name, len(a.data), a.data).Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, attachmentMeta{ID: id, Kind: a.kind, MediaType: a.mediaType, Name: a.name, SizeBytes: len(a.data)})
+	}
+	return out, nil
+}
+
+// readJSONBody binds a create/append body under the 16 MiB cap (the chat
+// body cap, so a turn the chat accepted can be saved). It writes the error
+// response itself and returns false on failure.
+func readJSONBody(c *gin.Context, dst any, allowEmpty bool) bool {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, conversationBodyMaxBytes)
+	err := c.ShouldBindJSON(dst)
+	if err == nil || (allowEmpty && errors.Is(err, io.EOF)) {
+		return true
+	}
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": fmt.Sprintf("request body exceeds %d bytes", conversationBodyMaxBytes)})
+		return false
+	}
+	c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	return false
 }
 
 // loadFullByImportKey resolves (userID, importKey) to a conversation id and
@@ -336,14 +419,21 @@ func (h *ConversationHandler) CreateConversation(c *gin.Context) {
 	userID := c.GetString("user_id")
 
 	var req createConversationRequest
-	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	if !readJSONBody(c, &req, true) {
 		return
 	}
 
-	if err := validateInitialMessages(req.Messages); err != nil {
+	decoded, err := decodeInitialMessages(req.Messages)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
+	}
+	// The base64 text is no longer needed once decoded; let it go before the
+	// transaction rather than holding both forms for the whole request.
+	for i := range req.Messages {
+		for j := range req.Messages[i].Attachments {
+			req.Messages[i].Attachments[j].Data = ""
+		}
 	}
 	if !validImportKey(req.ImportKey) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "import_key too long"})
@@ -445,18 +535,26 @@ func (h *ConversationHandler) CreateConversation(c *gin.Context) {
 		}
 
 		var createdAtMsg time.Time
+		var msgID string
 		if err := tx.QueryRow(ctx, `
 			INSERT INTO conversation_messages (conversation_id, seq, role, content, model, request_id, tool_events)
 			VALUES ($1, $2, $3, $4, $5, $6, $7)
-			RETURNING created_at
-		`, convID, seq, m.Role, m.Content, msgModel, msgRequestID, toolEventsArg(m)).Scan(&createdAtMsg); err != nil {
+			RETURNING id, created_at
+		`, convID, seq, m.Role, m.Content, msgModel, msgRequestID, toolEventsArg(m)).Scan(&msgID, &createdAtMsg); err != nil {
 			slog.ErrorContext(ctx, "create conversation: insert message failed", "err", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "create conversation failed"})
+			return
+		}
+		meta, err := insertAttachments(ctx, tx, msgID, decoded[i])
+		if err != nil {
+			slog.ErrorContext(ctx, "create conversation: insert attachments failed", "err", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "create conversation failed"})
 			return
 		}
 		messages = append(messages, conversationMessage{
 			Seq: seq, Role: m.Role, Content: m.Content,
 			Model: msgModel, RequestID: msgRequestID, CreatedAt: createdAtMsg,
+			Attachments: meta, id: msgID,
 		})
 	}
 
@@ -661,13 +759,20 @@ func (h *ConversationHandler) AppendMessages(c *gin.Context) {
 	ctx := c.Request.Context()
 
 	var req appendMessagesRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if !readJSONBody(c, &req, false) {
+		return
+	}
+	decoded, err := decodeAppendMessages(req.Messages)
+	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	if err := validateAppendMessages(req.Messages); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
+	// The base64 text is no longer needed once decoded; let it go before the
+	// transaction rather than holding both forms for the whole request.
+	for i := range req.Messages {
+		for j := range req.Messages[i].Attachments {
+			req.Messages[i].Attachments[j].Data = ""
+		}
 	}
 
 	tx, err := h.db.Begin(ctx)
@@ -719,20 +824,27 @@ func (h *ConversationHandler) AppendMessages(c *gin.Context) {
 		}
 
 		var createdAt time.Time
+		var msgID string
 		events := toolEventsForStorage(m)
 		if err := tx.QueryRow(ctx, `
 			INSERT INTO conversation_messages (conversation_id, seq, role, content, model, request_id, tool_events)
 			VALUES ($1, $2, $3, $4, $5, $6, $7)
-			RETURNING created_at
-		`, id, seq, m.Role, m.Content, msgModel, msgRequestID, toolEventsArg(m)).Scan(&createdAt); err != nil {
+			RETURNING id, created_at
+		`, id, seq, m.Role, m.Content, msgModel, msgRequestID, toolEventsArg(m)).Scan(&msgID, &createdAt); err != nil {
 			slog.ErrorContext(ctx, "append messages: insert failed", "id", id, "err", err)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "append messages failed"})
+			return
+		}
+		meta, err := insertAttachments(ctx, tx, msgID, decoded[i])
+		if err != nil {
+			slog.ErrorContext(ctx, "append messages: insert attachments failed", "id", id, "err", err)
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "append messages failed"})
 			return
 		}
 		inserted = append(inserted, conversationMessage{
 			Seq: seq, Role: m.Role, Content: m.Content,
 			Model: msgModel, RequestID: msgRequestID, CreatedAt: createdAt,
-			ToolEvents: json.RawMessage(events),
+			ToolEvents: json.RawMessage(events), Attachments: meta, id: msgID,
 		})
 	}
 
@@ -794,6 +906,18 @@ func (h *ConversationHandler) DeleteConversation(c *gin.Context) {
 		return
 	}
 
+	var attCount int
+	if err := tx.QueryRow(ctx, `
+		SELECT COUNT(*) FROM conversation_attachments a
+		JOIN conversation_messages cm ON cm.id = a.message_id
+		JOIN conversations c ON c.id = cm.conversation_id
+		WHERE c.id = $1 AND c.user_id = $2
+	`, id, userID).Scan(&attCount); err != nil {
+		slog.ErrorContext(ctx, "delete conversation: count attachments failed", "id", id, "err", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "delete conversation failed"})
+		return
+	}
+
 	tag, err := tx.Exec(ctx, `DELETE FROM conversations WHERE id = $1 AND user_id = $2`, id, userID)
 	if err != nil {
 		slog.ErrorContext(ctx, "delete conversation failed", "id", id, "err", err)
@@ -814,7 +938,7 @@ func (h *ConversationHandler) DeleteConversation(c *gin.Context) {
 	evt := activity.FromContext(c, activity.ConversationDeleted)
 	evt.TargetType = activity.StrPtr("conversation")
 	evt.TargetID = activity.StrPtr(id)
-	evt.Detail = map[string]any{"message_count": msgCount}
+	evt.Detail = map[string]any{"message_count": msgCount, "attachment_count": attCount}
 	h.activity.Record(c.Request.Context(), evt)
 
 	c.Status(http.StatusNoContent)

@@ -29,6 +29,9 @@ spec:
           env:
             - name: GATEWAY_PORT
               value: "8080"
+            # 80% of the memory limit below.
+            - name: GOMEMLIMIT
+              value: "800MiB"
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -139,12 +142,16 @@ spec:
             initialDelaySeconds: 15
             periodSeconds: 20
             failureThreshold: 6
+          # A chat body may be 16 MiB and is held several times over while it
+          # is decoded, validated and re-encoded for the vendor (attachments
+          # are the case that gets there). GOMEMLIMIT keeps the Go heap under
+          # the cgroup limit so the collector runs before the kernel does.
           resources:
             requests:
-              memory: 128Mi
+              memory: 256Mi
               cpu: 100m
             limits:
-              memory: 512Mi
+              memory: 1Gi
               cpu: 500m
       volumes:
         # Optional: the gateway starts, and serves self-hosted and Bedrock models,

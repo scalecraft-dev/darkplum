@@ -116,6 +116,7 @@ jobs:
       - run: pnpm run check:parity
       - run: pnpm run check:policy
       - run: pnpm run check:stream
+      - run: pnpm run check:attachments
 
   terraform:
     name: Terraform

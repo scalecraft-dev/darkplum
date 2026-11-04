@@ -81,12 +81,7 @@ func valueClass(param string, v json.RawMessage, req *chatCompletionRequest) str
 		}
 		return "unknown-type"
 	case "messages":
-		for _, m := range req.Messages {
-			if m.HasNonTextContent {
-				return "non-text-content"
-			}
-		}
-		return "text"
+		return messagesClass(req.Messages)
 	case "stream_options":
 		return "object"
 	case "max_completion_tokens":
@@ -153,6 +148,55 @@ func valueClass(param string, v json.RawMessage, req *chatCompletionRequest) str
 	return chatparams.WhenAny
 }
 
+// messagesClass is the registry "when" for the messages parameter. Priority is
+// unknown > file > image > text. Collapsing image and file into one class per
+// request is only correct while every backend treats the two alike (today:
+// Bedrock takes both, every other backend refuses both); a backend that takes
+// one and not the other needs this to name both.
+func messagesClass(msgs []provider.Message) string {
+	class := "text"
+	for _, m := range msgs {
+		for _, p := range m.Parts {
+			switch p.Kind {
+			case provider.KindUnknown:
+				return "unknown-content"
+			case provider.KindFile:
+				class = "file-content"
+			case provider.KindImage:
+				if class == "text" {
+					class = "image-content"
+				}
+			}
+		}
+		if len(m.Parts) == 0 && m.HasNonTextContent {
+			return "unknown-content" // defence in depth: a flag with no parts is not text
+		}
+	}
+	return class
+}
+
+// mediaPartParam names the first part a messages image/file refusal is about
+// as messages[i].content[j], or "" when when is not such a class.
+func mediaPartParam(msgs []provider.Message, when string) string {
+	want := ""
+	switch when {
+	case "image-content":
+		want = provider.KindImage
+	case "file-content":
+		want = provider.KindFile
+	default:
+		return ""
+	}
+	for i, m := range msgs {
+		for j, p := range m.Parts {
+			if p.Kind == want {
+				return fmt.Sprintf("messages[%d].content[%d]", i, j)
+			}
+		}
+	}
+	return ""
+}
+
 // nestedObject decodes raw[parent] as an object; ok is false when absent,
 // null or not an object.
 func nestedObject(raw map[string]json.RawMessage, parent string) (map[string]json.RawMessage, bool) {
@@ -214,7 +258,7 @@ func matchingRows(raw map[string]json.RawMessage, req *chatCompletionRequest, fn
 
 // earlyRefusal is the contract refusal that is the same on every backend and
 // is reported before the model is resolved (functions, function_call,
-// structured output, non-text content, conflicting token limits).
+// structured output, content parts of an unknown type, conflicting token limits).
 func earlyRefusal(raw map[string]json.RawMessage, req *chatCompletionRequest) *paramRefusal {
 	var out *paramRefusal
 	matchingRows(raw, req, func(row chatparams.Row) {
@@ -238,7 +282,13 @@ func planParams(raw map[string]json.RawMessage, req *chatCompletionRequest, kind
 			plan.acts = append(plan.acts, paramAction{row.Param, actionDropped})
 		case chatparams.ContractRefuse:
 			if plan.refuse == nil {
-				plan.refuse = &paramRefusal{Param: row.RefusalName(), Reason: row.Reason}
+				param := row.RefusalName()
+				if row.Param == "messages" {
+					if p := mediaPartParam(req.Messages, row.When); p != "" {
+						param = p
+					}
+				}
+				plan.refuse = &paramRefusal{Param: param, Reason: row.Reason}
 			}
 		}
 	})
