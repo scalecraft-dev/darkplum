@@ -12,3 +12,22 @@ spec:
           env:
             - name: CORS_ALLOWED_ORIGINS
               value: "http://localhost:3000,http://localhost:5173,http://localhost:5174,http://localhost:8080"
+            # The Library's bucket: the dev object store (resources/objectstore.yaml). With
+            # DEV_AWS=1 and DEV_LIBRARY_BUCKET=<bucket>, scripts/dev.sh rewrites
+            # these so the dev api writes to a real bucket in your account
+            # through the mounted profile instead.
+            - name: LIBRARY_STORE_URL
+              value: "s3://darkplum-library/library/v1/"
+            - name: LIBRARY_S3_ENDPOINT
+              value: "http://objectstore.darkplum-system.svc.cluster.local:9000"
+            - name: LIBRARY_S3_REGION
+              value: "us-east-1"
+            # Static credentials for the dev object store only (the same values
+            # as resources/objectstore.yaml; dev-only, not a secret). They are read by
+            # the library store alone, never by the default AWS credential
+            # chain, so with DEV_AWS=1 Bedrock and Cost Explorer still use the
+            # mounted profile. Blanked by scripts/dev.sh for a real bucket.
+            - name: LIBRARY_S3_ACCESS_KEY_ID
+              value: "darkplum-dev"
+            - name: LIBRARY_S3_SECRET_ACCESS_KEY
+              value: "darkplum-dev-minio-secret"

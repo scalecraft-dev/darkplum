@@ -345,6 +345,11 @@ func (e *deployEnv) realChecks(minSession int) []checkResult {
 		checkTool("terraform"), checkTool(runner.Kubectl), checkTool("aws"),
 		checkAWSCreds(p), checkAWSSession(p, minSession), checkAccountMatch(p, e.rec.AccountIDs),
 	}
+	if acct := libraryAccount(e.rec); acct != "" {
+		if r, bad := libraryNameCheck(e.rec.ClusterName, acct); bad {
+			checks = append(checks, r)
+		}
+	}
 	if e.tfv.GPUDesired > 0 {
 		gpuType := defaultGPUInstance
 		if e.tfv.GPUType != "" {
@@ -446,9 +451,15 @@ func (e *deployEnv) run(ctx context.Context) (err error) {
 			hint: "nothing was applied; fix the above and re-run"}, "cannot check the audit log group")
 	}
 
+	adoptLib, err := e.adoptLibraryBucket(state)
+	if err != nil {
+		return e.stop(checkResult{name: "library bucket", status: checkFail, detail: firstLine(err.Error()),
+			hint: "nothing was applied; fix the above and re-run"}, "cannot check the library bucket")
+	}
+
 	// ---- 4. plan, confirm, apply ------------------------------------------------
 	e.step(4, "Terraform plan and apply")
-	if err := e.planAndApply(ctx, tf, adopt); err != nil {
+	if err := e.planAndApply(ctx, tf, adopt, adoptLib); err != nil {
 		return err
 	}
 
@@ -470,6 +481,14 @@ func (e *deployEnv) run(ctx context.Context) (err error) {
 			hint:   "the state backend does not belong to this install; check backend.hcl"}, "state and install disagree")
 	}
 	e.row(checkResult{name: "outputs", status: checkPass, detail: fmt.Sprintf("cluster %s · %d GPU node(s)", out.ClusterName, out.GPUDesired)})
+	if out.LibraryStoreURL == "" {
+		// Optional for this release: the api keeps the Library in Postgres only while
+		// LIBRARY_STORE_URL is empty.
+		e.row(checkResult{name: "library store", status: checkWarn, detail: "terraform printed no library_store_url output: the Library stays in Postgres only",
+			hint: "the bucket is applied by the Terraform step; run `darkplum deploy` again if the apply was skipped or stopped"})
+	} else {
+		e.row(checkResult{name: "library store", status: checkPass, detail: out.LibraryStoreURL})
+	}
 	if imgs.Unsigned() {
 		if err := e.unsignedSources(imgs, out); err != nil {
 			return err
@@ -577,6 +596,7 @@ func (e *deployEnv) run(ctx context.Context) (err error) {
 	phases, err := manifests.Platform(fsys, manifests.Inputs{
 		Images: images, BedrockRegion: out.InferenceRegion, BedrockModelFilter: out.BedrockModelFilter,
 		VLLMUpstreams: upstreams, DefaultVLLM: defaultVLLM, ServiceCIDR: out.ServiceCIDR, VPCCIDR: out.VPCCIDR,
+		LibraryStoreURL: out.LibraryStoreURL, LibraryRegion: out.Region,
 	})
 	if err != nil {
 		return e.stop(checkResult{name: "manifests", status: checkFail, detail: firstLine(err.Error())}, "the platform manifests do not render")
@@ -1135,6 +1155,59 @@ func (e *deployEnv) adoptLogGroup(state map[string]bool) (bool, error) {
 	return true, nil
 }
 
+// libraryBucketAddr is the library bucket in the shipped Terraform.
+const libraryBucketAddr = "module.library_bucket.aws_s3_bucket.this"
+
+// libraryBucketName is <cluster_name>-library-<account_id>, as the Terraform names
+// it (main.tf, local.library_bucket_name).
+func libraryBucketName(cluster, account string) string { return cluster + "-library-" + account }
+
+// libraryBucketMax is S3's bucket-name limit.
+const libraryBucketMax = 63
+
+// libraryAccount is the one account the install is pinned to ("" if several or none).
+func libraryAccount(rec install.Record) string {
+	if len(rec.AccountIDs) == 1 {
+		return rec.AccountIDs[0]
+	}
+	return ""
+}
+
+// bucketGone says an `aws s3api head-bucket` error is the bucket not existing.
+func bucketGone(err error) bool {
+	m := err.Error()
+	return strings.Contains(m, "(404)") || strings.Contains(m, "Not Found") || strings.Contains(m, "NoSuchBucket")
+}
+
+// adoptLibraryBucket says whether the plan must import the library bucket: it
+// exists but is not managed, because destroy keeps it on purpose (it holds the
+// Library), and a reinstall would otherwise fail creating it. The import is an
+// import block in the shipped Terraform gated by adopt_library_bucket, like the
+// audit log group's. A bucket that answers but is not this account's, or a failing
+// read, is an error, never "not there".
+func (e *deployEnv) adoptLibraryBucket(state map[string]bool) (bool, error) {
+	acct := libraryAccount(e.rec)
+	if acct == "" {
+		e.row(checkResult{name: "library bucket", status: checkWarn, detail: "the install is not pinned to one account: not looking for a kept bucket"})
+		return false, nil
+	}
+	b := libraryBucketName(e.rec.ClusterName, acct)
+	if state[libraryBucketAddr] {
+		e.row(checkResult{name: "library bucket", status: checkPass, detail: b + " (in the state)"})
+		return false, nil
+	}
+	_, err := e.aws("aws", runner.ProfileArgs(e.rec.Profile, "s3api", "head-bucket", "--bucket", b, "--expected-bucket-owner", acct, "--region", e.rec.Region)...)
+	switch {
+	case err == nil:
+		e.row(checkResult{name: "library bucket", status: checkPass, detail: "the plan adopts " + b + " (kept from a previous install)"})
+		return true, nil
+	case bucketGone(err):
+		e.row(checkResult{name: "library bucket", status: checkPass, detail: "none to adopt"})
+		return false, nil
+	}
+	return false, fmt.Errorf("cannot tell whether the bucket %s exists: %w (a 403 means the name belongs to another account, or this session may not read it)", b, err)
+}
+
 // tail keeps the last few KB of what Terraform printed, to recognise an expired
 // session in it after the fact.
 type tail struct {
@@ -1158,7 +1231,7 @@ func (t *tail) Write(p []byte) (int, error) {
 
 func (t *tail) String() string { t.mu.Lock(); defer t.mu.Unlock(); return string(t.buf) }
 
-func (e *deployEnv) planAndApply(ctx context.Context, tf tfRunner, adoptLogGroup bool) error {
+func (e *deployEnv) planAndApply(ctx context.Context, tf tfRunner, adoptLogGroup, adoptLibrary bool) error {
 	sweepStalePlans(e.in.Dir())
 	planPath := filepath.Join(e.in.Dir(), "plan-"+e.now().UTC().Format("20060102T150405Z")+".tfplan")
 	defer os.Remove(planPath)
@@ -1175,6 +1248,9 @@ func (e *deployEnv) planAndApply(ctx context.Context, tf tfRunner, adoptLogGroup
 	planArgs := []string{"plan", "-input=false", "-out=" + planPath, vf}
 	if adoptLogGroup {
 		planArgs = append(planArgs, "-var", "adopt_eks_log_group=true")
+	}
+	if adoptLibrary {
+		planArgs = append(planArgs, "-var", "adopt_library_bucket=true")
 	}
 	if err := e.streamTF(ctx, tf, 4, "plan", planArgs...); err != nil {
 		return err
@@ -1204,6 +1280,15 @@ func (e *deployEnv) planAndApply(ctx context.Context, tf tfRunner, adoptLogGroup
 			if c.Address == logGroupAddr {
 				return e.stop(checkResult{name: "audit log group", status: checkFail, detail: "the plan would delete the log group kept from a previous install, and the Kubernetes audit logs in it",
 					hint: "see the plan above for what forces the replacement. To start without those logs, export what you need and delete the log group, then re-run. Nothing was applied"}, "the plan would delete the audit logs")
+			}
+		}
+	}
+	if adoptLibrary {
+		// Replacing the bucket while adopting it deletes the library destroy kept.
+		for _, c := range dangerous {
+			if c.Address == libraryBucketAddr {
+				return e.stop(checkResult{name: "library bucket", status: checkFail, detail: "the plan would delete the library bucket kept from a previous install, and the Library in it",
+					hint: "see the plan above for what forces the replacement. Nothing was applied"}, "the plan would delete the library")
 			}
 		}
 	}
@@ -1942,7 +2027,8 @@ func gpuAllocatable(kc *kube.Client) bool {
 // layer1 runs the IAM self-test. A role that is wider or narrower than the install
 // says is a failure; being unable to ask IAM is a warning.
 func (e *deployEnv) layer1(ctx context.Context, out deployOutputs) (failed bool) {
-	rep, err := e.iam(ctx, iamcheck.Outputs{GatewayRoleARN: out.GatewayRoleARN, InferenceRegion: out.InferenceRegion, BedrockInvokeARNs: out.InvokeARNs})
+	rep, err := e.iam(ctx, iamcheck.Outputs{GatewayRoleARN: out.GatewayRoleARN, InferenceRegion: out.InferenceRegion, BedrockInvokeARNs: out.InvokeARNs,
+		APIRoleARN: out.APIRoleARN, LibraryStoreURL: out.LibraryStoreURL})
 	var sim *iamcheck.SimulationError
 	if errors.As(err, &sim) || (err != nil && len(rep.Checks) == 0) {
 		e.row(checkResult{name: "layer 1 (IAM)", status: checkWarn, detail: firstLine(err.Error()),

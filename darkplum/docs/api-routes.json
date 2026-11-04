@@ -387,6 +387,46 @@
   {
     "service": "api",
     "method": "GET",
+    "path": "/api/v1/library/folders",
+    "auth": "session",
+    "surface": "ui",
+    "reason": "Direct child folders of ?scope=private|org&path= with folder and item counts; a private scope is always the caller's own tree"
+  },
+  {
+    "service": "api",
+    "method": "POST",
+    "path": "/api/v1/library/folders",
+    "auth": "session",
+    "surface": "ui",
+    "reason": "Create a folder {scope, path, name?}; missing parents are created; 409 folder_exists, 400 folder_invalid; org folders may be created by anyone"
+  },
+  {
+    "service": "api",
+    "method": "POST",
+    "path": "/api/v1/library/folders/move",
+    "auth": "session",
+    "surface": "ui",
+    "reason": "Rename or move a folder {scope, from, to}; atomic in Postgres, everything under it is re-queued for the bucket; org folders admin-only"
+  },
+  {
+    "service": "api",
+    "method": "DELETE",
+    "path": "/api/v1/library/folders",
+    "auth": "session",
+    "surface": "ui",
+    "reason": "Delete ?scope=&path=&recursive=0|1; 409 folder_not_empty without recursive; response carries counts; org folders admin-only"
+  },
+  {
+    "service": "api",
+    "method": "POST",
+    "path": "/api/v1/library/sync",
+    "auth": "session",
+    "surface": "ui",
+    "reason": "Sync from bucket {scope}: adopt edits made in the caller's own prefix (org: admins only); reports imported, updated, skipped, conflicts, errors; 503 library_storage_unavailable"
+  },
+  {
+    "service": "api",
+    "method": "GET",
     "path": "/api/v1/library/:id",
     "auth": "session",
     "surface": "ui"
@@ -411,6 +451,14 @@
     "path": "/api/v1/library/:id/share",
     "auth": "session",
     "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "POST",
+    "path": "/api/v1/library/:id/move",
+    "auth": "session",
+    "surface": "ui",
+    "reason": "Move an item {scope, path, slug?}; private to org is the share, org to private the unshare; owner only (admins may move org items within the org tree)"
   },
   {
     "service": "api",
@@ -446,6 +494,14 @@
     "path": "/api/v1/library/shared",
     "auth": "admin",
     "surface": "ui"
+  },
+  {
+    "service": "api",
+    "method": "GET",
+    "path": "/api/v1/admin/library/status",
+    "auth": "admin",
+    "surface": "ui",
+    "reason": "Library object store health: reachable (cached sentinel HEAD), bucket, queue_depth, failing, oldest_queued_seconds, last_reconcile_at, foreign_objects; no keys, names or paths"
   },
   {
     "service": "api",

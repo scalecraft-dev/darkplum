@@ -1,0 +1,130 @@
+# Dev-only object store for the Library: the api writes every library item to
+# an S3 bucket as a plain file, and the kind stack needs a bucket to write to.
+# RustFS speaks the S3 API (MinIO-compatible; MinIO itself no longer publishes
+# public images), so the api runs its real S3 code path locally: path-style
+# addressing, static keys, no KMS. Everything here is on emptyDir and has the
+# same lifetime as the dev Postgres, so the index and the files stay together.
+# Never used in production: there the bucket comes from Terraform.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: objectstore-credentials
+  namespace: darkplum-system
+stringData:
+  # Dev-only values; the api patch repeats them as plain env.
+  RUSTFS_ACCESS_KEY: darkplum-dev
+  RUSTFS_SECRET_KEY: darkplum-dev-minio-secret
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: objectstore
+  namespace: darkplum-system
+  labels:
+    app.kubernetes.io/name: objectstore
+    app.kubernetes.io/part-of: darkplum
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: objectstore
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: objectstore
+        app.kubernetes.io/part-of: darkplum
+    spec:
+      containers:
+        - name: rustfs
+          image: rustfs/rustfs:1.0.4
+          envFrom:
+            - secretRef:
+                name: objectstore-credentials
+          env:
+            - name: RUSTFS_VOLUMES
+              value: /data
+            - name: RUSTFS_ADDRESS
+              value: ":9000"
+            - name: RUSTFS_CONSOLE_ENABLE
+              value: "true"
+            - name: RUSTFS_CONSOLE_ADDRESS
+              value: ":9001"
+          ports:
+            - containerPort: 9000
+            - containerPort: 9001
+          readinessProbe:
+            tcpSocket:
+              port: 9000
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: objectstore
+  namespace: darkplum-system
+  labels:
+    app.kubernetes.io/name: objectstore
+    app.kubernetes.io/part-of: darkplum
+spec:
+  selector:
+    app.kubernetes.io/name: objectstore
+  ports:
+    - name: s3
+      port: 9000
+      targetPort: 9000
+    - name: console
+      port: 9001
+      targetPort: 9001
+---
+# Creates the bucket (versioned) once the store answers. Re-runnable.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: objectstore-init
+  namespace: darkplum-system
+  labels:
+    app.kubernetes.io/name: objectstore-init
+    app.kubernetes.io/part-of: darkplum
+spec:
+  backoffLimit: 20
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: objectstore-init
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: aws
+          image: amazon/aws-cli:2.24.5
+          env:
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: objectstore-credentials
+                  key: RUSTFS_ACCESS_KEY
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: objectstore-credentials
+                  key: RUSTFS_SECRET_KEY
+            - name: AWS_DEFAULT_REGION
+              value: us-east-1
+            - name: AWS_EC2_METADATA_DISABLED
+              value: "true"
+          command:
+            - /bin/sh
+            - -ec
+            - |
+              EP=http://objectstore.darkplum-system.svc.cluster.local:9000
+              until aws --endpoint-url "$EP" s3 ls >/dev/null 2>&1; do echo "waiting for the object store"; sleep 2; done
+              aws --endpoint-url "$EP" s3api head-bucket --bucket darkplum-library >/dev/null 2>&1 \
+                || aws --endpoint-url "$EP" s3api create-bucket --bucket darkplum-library >/dev/null
+              aws --endpoint-url "$EP" s3api put-bucket-versioning --bucket darkplum-library --versioning-configuration Status=Enabled || echo "versioning not supported by this store; continuing"
+              echo "bucket ready"

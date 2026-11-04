@@ -161,27 +161,34 @@ var resolveInstall = func(name string) (clusterTarget, checkResult, error) {
 // establish and validate. It never falls back to the kubeconfig's current
 // context.
 func installKube(w io.Writer, namespace, contextFlag, installName string) (*kube.Client, error) {
+	c, _, err := installKubeTarget(w, namespace, contextFlag, installName)
+	return c, err
+}
+
+// installKubeTarget is installKube that also returns the established install
+// cluster (nil for a local kind --context), for the commands that open a tunnel.
+func installKubeTarget(w io.Writer, namespace, contextFlag, installName string) (*kube.Client, *clusterTarget, error) {
 	if contextFlag != "" {
 		k, err := newLocalKind(contextFlag)
 		if err != nil {
 			printCheckTo(w, checkResult{name: "cluster", status: checkFail, detail: firstLine(err.Error()),
 				hint: "--context is only for a local kind cluster (kind-*); an install is found with --install or as the only one"})
-			return nil, reportedError{"--context refused"}
+			return nil, nil, reportedError{"--context refused"}
 		}
 		fmt.Fprintln(w, sDim("context "+contextFlag+" (from --context, your own kubeconfig; a local kind cluster)"))
-		return kube.ForLocalKind(namespace, k), nil
+		return kube.ForLocalKind(namespace, k), nil, nil
 	}
 	t, row, err := resolveInstall(installName)
 	if errors.Is(err, errNoSettings) {
 		printCheckTo(w, row)
-		return nil, reportedError{"no install and no --context"}
+		return nil, nil, reportedError{"no install and no --context"}
 	}
 	if err != nil {
 		printCheckTo(w, row)
-		return nil, reportedError{"cannot reach the install's cluster"}
+		return nil, nil, reportedError{"cannot reach the install's cluster"}
 	}
 	fmt.Fprintln(w, sDim("cluster "+row.detail))
-	return t.kube(namespace), nil
+	return t.kube(namespace), &t, nil
 }
 
 // kubectlHint is a kubectl command an operator can paste: it first has the

@@ -18,6 +18,7 @@ var outputs = Outputs{GatewayRoleARN: role, InferenceRegion: "us-east-2",
 type fakeAWS struct {
 	calls   [][]string
 	byRes   map[string]string
+	byRole  map[string]string // "<role>|<action>|<resource>"
 	err     error
 	nothing bool
 }
@@ -27,11 +28,19 @@ func (f *fakeAWS) run(args ...string) (string, error) {
 	if f.err != nil {
 		return "", f.err
 	}
-	var res string
+	var res, pol, act string
 	for i, a := range args {
-		if a == "--resource-arns" {
+		switch a {
+		case "--resource-arns":
 			res = args[i+1]
+		case "--policy-source-arn":
+			pol = args[i+1]
+		case "--action-names":
+			act = args[i+1]
 		}
+	}
+	if d, ok := f.byRole[pol+"|"+act+"|"+res]; ok {
+		return d, nil
 	}
 	if f.nothing {
 		return "None", nil
@@ -218,5 +227,107 @@ func TestRoleAccount(t *testing.T) {
 		if _, ok := RoleAccount(bad); ok {
 			t.Errorf("%q accepted", bad)
 		}
+	}
+}
+
+const apiRole = "arn:aws:iam::111122223333:role/darkplum-api"
+const libBkt = "arn:aws:s3:::acme-library-111122223333"
+const libObj = "arn:aws:s3:::acme-library-111122223333/library/v1/org/darkplum-check.skill.md"
+
+var libOutputs = func() Outputs {
+	o := outputs
+	o.APIRoleARN, o.LibraryStoreURL = apiRole, "s3://acme-library-111122223333/library/v1/"
+	return o
+}()
+
+// libraryBehaviour is a healthy install: the api reads its prefix, the gateway
+// is explicitly denied, everything else is implicitly denied.
+func libraryBehaviour() *fakeAWS {
+	f := allowedBehaviour()
+	f.byRole = map[string]string{role + "|s3:GetObject|" + libObj: ExplicitDeny}
+	for _, a := range []string{"s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:DeleteObjectVersion"} {
+		f.byRole[apiRole+"|"+a+"|"+libObj] = Allowed
+	}
+	for _, a := range []string{"s3:ListBucket", "s3:ListBucketVersions"} {
+		f.byRole[apiRole+"|"+a+"|"+libBkt] = Allowed
+	}
+	return f
+}
+
+func TestRunProvesTheLibraryBucketBoundary(t *testing.T) {
+	f := libraryBehaviour()
+	rep, err := Run(context.Background(), f.run, libOutputs)
+	if err != nil || !rep.Passed() || len(rep.Checks) != 13 {
+		t.Fatalf("%v passed=%v checks=%d", err, rep.Passed(), len(rep.Checks))
+	}
+	var buf bytes.Buffer
+	rep.WriteText(&buf)
+	for _, want := range []string{
+		"ok    allowed  s3:GetObject as darkplum-api  " + libObj,
+		"ok    explicitDeny  s3:GetObject as darkplum-gateway  " + libObj,
+		"ok    implicitDeny  s3:GetObject as darkplum-api  arn:aws:s3:::darkplum-not-the-library-111122223333/",
+		"ok    implicitDeny  s3:GetObject as darkplum-api  arn:aws:s3:::acme-library-111122223333/not-the-library/",
+	} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("missing %q in:\n%s", want, buf.String())
+		}
+	}
+}
+
+func TestRunFailsWhenTheLibraryBoundaryIsWrong(t *testing.T) {
+	other := "arn:aws:s3:::darkplum-not-the-library-111122223333/library/v1/org/darkplum-check.skill.md"
+	outside := "arn:aws:s3:::acme-library-111122223333/not-the-library/darkplum-check"
+	for name, mut := range map[string]func(*fakeAWS){
+		"api cannot read the library":                                   func(f *fakeAWS) { f.byRole[apiRole+"|s3:GetObject|"+libObj] = ImplicitDeny },
+		"api cannot put":                                                func(f *fakeAWS) { f.byRole[apiRole+"|s3:PutObject|"+libObj] = ImplicitDeny },
+		"api cannot delete":                                             func(f *fakeAWS) { f.byRole[apiRole+"|s3:DeleteObject|"+libObj] = ImplicitDeny },
+		"api cannot purge a version":                                    func(f *fakeAWS) { f.byRole[apiRole+"|s3:DeleteObjectVersion|"+libObj] = ImplicitDeny },
+		"api cannot list (404 would be 403)":                            func(f *fakeAWS) { f.byRole[apiRole+"|s3:ListBucket|"+libBkt] = ImplicitDeny },
+		"api cannot list versions":                                      func(f *fakeAWS) { f.byRole[apiRole+"|s3:ListBucketVersions|"+libBkt] = ImplicitDeny },
+		"api can read another bucket":                                   func(f *fakeAWS) { f.byRole[apiRole+"|s3:GetObject|"+other] = Allowed },
+		"api can read outside prefix":                                   func(f *fakeAWS) { f.byRole[apiRole+"|s3:GetObject|"+outside] = Allowed },
+		"gateway can read the bucket":                                   func(f *fakeAWS) { f.byRole[role+"|s3:GetObject|"+libObj] = Allowed },
+		"gateway only implicitly denied (the explicit deny is missing)": func(f *fakeAWS) { f.byRole[role+"|s3:GetObject|"+libObj] = ImplicitDeny },
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := libraryBehaviour()
+			mut(f)
+			rep, err := Run(context.Background(), f.run, libOutputs)
+			if err != nil || rep.Passed() || rep.Failed() != 1 {
+				t.Fatalf("err=%v passed=%v failed=%d", err, rep.Passed(), rep.Failed())
+			}
+		})
+	}
+}
+
+func TestLibraryChecksAreSkippedWithANoteWhenHalfTheOutputsAreMissing(t *testing.T) {
+	for name, mut := range map[string]func(*Outputs){
+		"no api role":  func(o *Outputs) { o.APIRoleARN = "" },
+		"no store url": func(o *Outputs) { o.LibraryStoreURL = "" },
+		"gcs url":      func(o *Outputs) { o.LibraryStoreURL = "gs://b/library/v1/" },
+	} {
+		o := libOutputs
+		mut(&o)
+		f := libraryBehaviour()
+		rep, err := Run(context.Background(), f.run, o)
+		if err != nil || !rep.Passed() || len(rep.Checks) != 4 || !strings.Contains(rep.NoteLine, "Library") {
+			t.Errorf("%s: %v passed=%v checks=%d note=%q", name, err, rep.Passed(), len(rep.Checks), rep.NoteLine)
+		}
+	}
+	// neither output: applied before the Library existed, nothing to say here
+	f := allowedBehaviour()
+	if rep, err := Run(context.Background(), f.run, outputs); err != nil || len(rep.Checks) != 4 || rep.NoteLine != "" {
+		t.Errorf("old state: %v %d %q", err, len(rep.Checks), rep.NoteLine)
+	}
+}
+
+func TestFromTerraformReadsTheLibraryOutputs(t *testing.T) {
+	raw := map[string]json.RawMessage{
+		"api_role_arn":      json.RawMessage(`"` + apiRole + `"`),
+		"library_store_url": json.RawMessage(`"s3://b/library/v1/"`),
+	}
+	o, err := FromTerraform(raw)
+	if err != nil || o.APIRoleARN != apiRole || o.LibraryStoreURL != "s3://b/library/v1/" {
+		t.Errorf("%+v %v", o, err)
 	}
 }

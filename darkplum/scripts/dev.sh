@@ -20,6 +20,9 @@
 #   DEV_AWS=1                mount your AWS credential files (read-only) into the dev gateway and
 #                            enable Bedrock; off by default so no credentials leave the host
 #   DEV_AWS_PROFILE=default  the AWS profile the dev gateway uses when DEV_AWS is set
+#   DEV_LIBRARY_BUCKET=<b>   with DEV_AWS: the dev api keeps the Library in this real S3
+#                            bucket (yours, created beforehand, never shared) instead of
+#                            the in-cluster object store
 #   DEV_EMAIL, DEV_PASSWORD  let `test` also run the authenticated chat checks
 #   MODEL=<id>               the model `test` chats with (default: the first enabled one)
 set -euo pipefail
@@ -30,6 +33,7 @@ NS=darkplum-system
 DEV_PORT="${DEV_PORT:-8080}"
 DEV_AWS="${DEV_AWS:-}"
 DEV_AWS_PROFILE="${DEV_AWS_PROFILE:-default}"
+DEV_LIBRARY_BUCKET="${DEV_LIBRARY_BUCKET:-}"
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -58,6 +62,27 @@ validate_env() {
   DEV_PORT=$((10#$DEV_PORT)) # "08" would reach the kind config as a YAML octal
   [[ "$DEV_AWS_PROFILE" =~ ^[A-Za-z0-9_.@-]+$ ]] \
     || die "DEV_AWS_PROFILE may contain only letters, digits and _ . @ -, got '$DEV_AWS_PROFILE'."
+  if [ -n "$DEV_LIBRARY_BUCKET" ]; then
+    [ -n "$DEV_AWS" ] || die "DEV_LIBRARY_BUCKET needs DEV_AWS=1: the api reaches a real bucket through your AWS profile."
+    [[ "$DEV_LIBRARY_BUCKET" =~ ^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$ ]] \
+      || die "DEV_LIBRARY_BUCKET is not a valid bucket name, got '$DEV_LIBRARY_BUCKET'."
+  fi
+}
+
+# The dev api's Library store: the in-cluster object store, or, with DEV_LIBRARY_BUCKET,
+# a real bucket reached through the mounted profile. Path-style addressing
+# follows the endpoint (set for the dev store, unset for AWS), so only three values
+# change: the store URL, the endpoint, and the static dev-store keys, which are
+# blanked so the AWS default chain is used. Each pattern matches one line
+# that occurs nowhere else in the rendered manifests. Fills LIB_SED.
+LIB_SED=()
+library_sed_args() {
+  LIB_SED=()
+  [ -n "$DEV_LIBRARY_BUCKET" ] || return 0
+  LIB_SED+=(-e "s|s3://darkplum-library/library/v1/|s3://$DEV_LIBRARY_BUCKET/library/v1/|")
+  LIB_SED+=(-e 's|http://objectstore.darkplum-system.svc.cluster.local:9000||')
+  LIB_SED+=(-e 's|value: "\{0,1\}darkplum-dev"\{0,1\}$|value: ""|')
+  LIB_SED+=(-e 's|value: "\{0,1\}darkplum-dev-minio-secret"\{0,1\}$|value: ""|')
 }
 
 cluster_exists() { kind get clusters 2>/dev/null | grep -qx "$DEV_CLUSTER"; }
@@ -106,14 +131,20 @@ cmd_up() {
   kind load docker-image --name "$DEV_CLUSTER" darkplum-gateway:latest darkplum-api:latest darkplum-web:latest
 
   echo "Deploying all services ($overlay overlay)..."
+  library_sed_args
+  # ${arr[@]+"${arr[@]}"}: an empty array under set -u, on the bash 3.2 macOS ships.
   kc kustomize "k8s/overlays/$overlay" \
     | sed -e "s|http://localhost:8080|http://localhost:$DEV_PORT|g" \
           -e "s|PLACEHOLDER_AWS_PROFILE|$DEV_AWS_PROFILE|g" \
+          ${LIB_SED[@]+"${LIB_SED[@]}"} \
     | kc apply -f -
 
   echo "Waiting for services to be ready..."
   sleep 5
   kc wait --namespace="$NS" --for=condition=ready pod -l app.kubernetes.io/name=postgres --timeout=60s
+  if [ -z "$DEV_LIBRARY_BUCKET" ]; then
+    kc wait --namespace="$NS" --for=condition=ready pod -l app.kubernetes.io/name=objectstore --timeout=120s
+  fi
   kc wait --namespace="$NS" --for=condition=ready pod -l app.kubernetes.io/name=darkplum-gateway --timeout=90s
   kc wait --namespace="$NS" --for=condition=ready pod -l app.kubernetes.io/name=darkplum-api --timeout=90s
   kc wait --namespace="$NS" --for=condition=ready pod -l app.kubernetes.io/name=darkplum-web --timeout=60s
@@ -128,6 +159,9 @@ cmd_up() {
 First run: create an admin account at http://localhost:$DEV_PORT,
 then enable a model under Admin > Models (new models start disabled).
 LLM responses are mocked. LM Studio on :1234 is picked up automatically if running.
+The Library's files are written to the in-cluster object store (RustFS; console:
+kubectl port-forward svc/objectstore 9001, user darkplum-dev / darkplum-dev-minio-secret)
+unless DEV_LIBRARY_BUCKET was set.
 
 Useful commands:
   scripts/dev.sh status   Show pod status

@@ -566,11 +566,15 @@ func TestImportBlockAdoptsTheLogGroupDeployChecks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m := regexp.MustCompile(`(?ms)^import \{\n(.*?)^\}`).FindAllSubmatch(b, -1)
-	if len(m) != 1 {
-		t.Fatalf("want exactly one import block in main.tf, found %d", len(m))
+	var block string
+	for _, m := range regexp.MustCompile(`(?ms)^import \{\n(.*?)^\}`).FindAllSubmatch(b, -1) {
+		if strings.Contains(string(m[1]), "adopt_eks_log_group") {
+			block = string(m[1])
+		}
 	}
-	block := string(m[0][1])
+	if block == "" {
+		t.Fatal("no import block in main.tf is gated by adopt_eks_log_group")
+	}
 	for _, want := range []string{
 		`(?m)^\s*for_each\s*=\s*var\.adopt_eks_log_group\b`,
 		`(?m)^\s*to\s*=\s*` + regexp.QuoteMeta(logGroupAddr) + `\s*$`,

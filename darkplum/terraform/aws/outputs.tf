@@ -133,3 +133,13 @@ output "web_allowed_cidrs" {
   description = "Networks allowed to reach web_url."
   value       = var.web_domain != "" ? module.web_access[0].allowed_cidrs : []
 }
+
+output "library_store_url" {
+  description = "Where the Library's files live: s3://<bucket>/library/v1/ (gs://... on GCP). The api writes every item there as a plain file."
+  value       = module.library_bucket.store_url
+}
+
+output "api_role_arn" {
+  description = "IAM role the api assumes via EKS Pod Identity. `darkplum verify` proves what it may and may not read."
+  value       = module.pod_identity_api.role_arn
+}

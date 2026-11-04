@@ -14,7 +14,7 @@ import {
   updateLibraryItem,
 } from '../../lib/api'
 import { saveBlob } from '../../lib/download'
-import type { LibraryItem, LibraryKind } from '../../types'
+import type { LibraryItem, LibraryKind, LibraryScope } from '../../types'
 import { Button, CodeBlock, CopyButton, Input } from '../../components/ui'
 import { useToast } from '../../components/Toast'
 import { KindGlyph } from '../../components/ui/KindGlyph'
@@ -22,6 +22,7 @@ import { ToolSection } from './ToolSection'
 import { ShareModal } from './ShareModal'
 import { CredentialModal } from './CredentialModal'
 import { useTwoClick } from './useTwoClick'
+import { displayPath, fileNameOf, pathOf, scopeOf } from './libraryPath'
 import {
   KIND_LABEL,
   KIND_NOUN,
@@ -36,13 +37,12 @@ import {
   ownerName,
   parseAllowedTools,
   runeLength,
-  scopeText,
   toolBody,
 } from './libraryText'
 import styles from './ItemDrawer.module.css'
 
 export type DrawerTarget =
-  | { mode: 'new'; kind: LibraryKind }
+  | { mode: 'new'; kind: LibraryKind; scope?: LibraryScope; path?: string }
   | { mode: 'open'; item: LibraryItem }
 
 interface Props {
@@ -55,6 +55,8 @@ interface Props {
   onOpen: (item: LibraryItem) => void
   /** Admin: take the reader to the allowed-servers card. */
   onShowHosts: () => void
+  /** Opens the Move dialog for this item. */
+  onMove?: (item: LibraryItem) => void
 }
 
 interface Draft {
@@ -114,7 +116,7 @@ const mdComponents = {
  * else reads it, and may copy it into their own library. An administrator
  * reading someone else's shared item also gets the two governance actions.
  */
-export function ItemDrawer({ target, isAdmin, onClose, onChanged, onOpen, onShowHosts }: Props) {
+export function ItemDrawer({ target, isAdmin, onClose, onChanged, onOpen, onShowHosts, onMove }: Props) {
   const { toast } = useToast()
   const ids = useId()
   const nameRef = useRef<HTMLInputElement>(null)
@@ -215,6 +217,8 @@ export function ItemDrawer({ target, isAdmin, onClose, onChanged, onOpen, onShow
           name: draft.name.trim(),
           description: draft.description.trim(),
           body,
+          visibility: target?.mode === 'new' && target.scope === 'org' ? 'org' : 'private',
+          path: target?.mode === 'new' ? target.path ?? '' : '',
         })
         setItem(created)
         setDraft(draftOf(created))
@@ -352,7 +356,7 @@ export function ItemDrawer({ target, isAdmin, onClose, onChanged, onOpen, onShow
                 <Dialog.Title className={styles.title}>{title}</Dialog.Title>
                 <Dialog.Description className={styles.subtitle}>
                   {item
-                    ? <>{KIND_LABEL[item.kind]} · {scopeText(item)} · <time dateTime={item.updated_at} title={formatFull(item.updated_at)}>edited {formatRelative(item.updated_at)}</time></>
+                    ? <>{KIND_LABEL[item.kind]} · {displayPath(pathOf(item), scopeOf(item))} · <time dateTime={item.updated_at} title={formatFull(item.updated_at)}>edited {formatRelative(item.updated_at)}</time></>
                     : `Only you can see it until you share it.`}
                 </Dialog.Description>
               </div>
@@ -512,6 +516,55 @@ export function ItemDrawer({ target, isAdmin, onClose, onChanged, onOpen, onShow
               )}
               {item === null && kind === 'tool' && (
                 <p className={styles.hint}>Save the tool to verify its server and set a credential.</p>
+              )}
+
+              {item && (
+                <section className={styles.section} aria-labelledby={`${ids}-location`}>
+                  <h3 id={`${ids}-location`} className={styles.sectionTitle}>Location</h3>
+                  <dl className={styles.facts}>
+                    <dt>Folder</dt>
+                    <dd className={styles.factRow}>
+                      <span>{displayPath(pathOf(item), scopeOf(item))}</span>
+                      {onMove && (item.mine || (isAdmin && scopeOf(item) === 'org')) && (
+                        <Button variant="secondary" size="sm" onClick={() => onMove(item)} disabled={busy || dirty} title={dirty ? 'Save your changes first' : undefined}>
+                          Move…
+                        </Button>
+                      )}
+                    </dd>
+                    <dt>File</dt>
+                    <dd className={styles.factRow}>
+                      <code className={styles.mono}>{fileNameOf(item)}</code>
+                      <CopyButton value={fileNameOf(item)} label="Copy" />
+                    </dd>
+                    {item.s3_uri && (
+                      <>
+                        <dt>Bucket</dt>
+                        <dd className={styles.factRow}>
+                          <code className={styles.mono} title={item.s3_uri}>{item.s3_uri}</code>
+                          <CopyButton value={item.s3_uri} label="Copy" />
+                        </dd>
+                      </>
+                    )}
+                    {item.bucket_changed ? (
+                      <>
+                        <dt>Bucket</dt>
+                        <dd className={styles.factRow}>
+                          <span className={styles.hint}>
+                            The file in the bucket was changed outside the app. Sync from bucket adopts it; saving here keeps this version
+                            and leaves the bucket's in its history.
+                          </span>
+                        </dd>
+                      </>
+                    ) : item.synced === false ? (
+                      <>
+                        <dt>Bucket</dt>
+                        <dd className={styles.factRow}>
+                          <span className={styles.hint}>Not written to the bucket yet; it will be shortly.</span>
+                        </dd>
+                      </>
+                    ) : null}
+                  </dl>
+                </section>
               )}
 
               {item?.mine && (

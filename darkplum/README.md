@@ -225,9 +225,9 @@ Measured on one account with the default 7B model. A larger model takes longer t
 | `darkplum init` | Create an install, or show an existing one and change its settings (`--dry-run` previews) |
 | `darkplum deploy` | Create or update the install: infrastructure, verified images, the platform. Safe to re-run; also the upgrade path |
 | `darkplum configure` | First run: first admin, models, a test chat, open the web UI |
-| `darkplum status` | Show cluster, node, pod and GPU status |
-| `darkplum doctor check` | Check this machine can run an install (tools, credentials, GPU quota) |
-| `darkplum verify` | Prove the gateway's IAM role allows only the configured Bedrock models |
+| `darkplum status` | Show cluster, node, pod and GPU status, and the Library bucket (reachable, sync queue, failures, foreign objects) |
+| `darkplum doctor check` | Check this machine can run an install (tools, credentials, GPU quota; warns about a kept Library bucket and a bucket name over 63 characters) |
+| `darkplum verify` | Prove the gateway's IAM role allows only the configured Bedrock models, and that only the api role can read the Library bucket (the gateway is explicitly denied) |
 | `darkplum models add <name> --hf <id>` | Add another self-hosted open-source model (one GPU each) |
 | `darkplum models remove <name>` / `list` / `test <name>` | Remove a model added with `models add`; list models and gateway upstreams; send a test chat to one |
 | `darkplum keys set huggingface` | Store a Hugging Face token for gated models |
@@ -238,7 +238,7 @@ Measured on one account with the default 7B model. A larger model takes longer t
 | `darkplum sso configure` / `darkplum admin create` | Configure OIDC sign-in; create a local break-glass admin |
 | `darkplum kubeconfig` | Point this shell's kubectl at the install's cluster (`eval "$(darkplum kubeconfig)"`) |
 | `darkplum version` | The release, the digests it deploys, the third-party images it pins |
-| `darkplum destroy` | Tear down all resources (type the cluster name to confirm) |
+| `darkplum destroy` | Tear down all resources (type the cluster name to confirm). The Library bucket is kept with its contents; `--delete-library-data=<cluster_name>` deletes it and every version |
 | `pnpm run check:parity` (in `services/web`) | Verify every API route has a UI and vice versa against `docs/api-routes.json` |
 
 Working on darkplum itself (local kind stack, rebuilding one service) uses
@@ -693,19 +693,36 @@ darkplum models add llama --hf meta-llama/Llama-3.1-8B-Instruct --revision <comm
 
 ## Library: skills, tools and context
 
-Every signed-in person has a Library (one entry in the nav; three tabs:
-Skills, Tools, Context) stored in the organisation's own Postgres, not in any
-AI vendor's account. A skill is instructions in Markdown, context is
-reference text, a tool is an MCP server (streamable HTTP) the model may call
-during a chat. Items are private by default; sharing to the organisation lets
-everyone read and attach them, the owner alone edits them, and administrators
-can unshare or remove shared items. Administrators never see private items.
-Deleting a user removes their private items and passes their shared ones to
-the acting administrator. Everything exports as plain files: `.md` with a
-`name`/`description`/`kind` front matter, `.json` for a tool (never with its
-credential), or one zip of all of it. Import reads the instruction text of a
-Markdown file (a Claude `SKILL.md`'s scripts and resources are never
-imported or run) and lists what it dropped before anything is written.
+Every signed-in person has a Library: a tree of folders under two roots,
+**Private** (theirs alone) and **Organisation** (shared with everyone), holding
+skills, context and tools as files. A skill is instructions in Markdown,
+context is reference text, a tool is an MCP server (streamable HTTP) the model
+may call during a chat. Moving an item from Private to Organisation shares it:
+everyone can read and attach it, the owner alone edits it, and administrators
+can move it back or remove it. Administrators never see private items in the
+app. Deleting a user removes their private items and passes their shared ones
+to the acting administrator.
+
+**The library is a folder in your own S3 bucket.** The app's index is its
+Postgres; every item is also written, as a plain file, to the install's
+Library bucket (`<cluster_name>-library-<account_id>`) under `library/v1/`:
+`org/<folders>/<slug>.skill.md`, `.context.md` or `.tool.json` for shared
+items, `people/<person>/<folders>/...` for private ones, with the name,
+description, kind and a stable id in the front matter, and never a tool's
+credential. The bucket is versioned, so earlier versions of a file can be
+read back; a rename or move starts a fresh history at the new key. Open it in
+the S3 console, back it up, `aws s3 sync` it to disk, put it in git. The app
+is the writer: a file edited, added or deleted in the bucket is not seen until
+someone presses **Sync from bucket** (own files; an administrator for the
+Organisation root), which imports new files and adopts edited ones, leaves a
+file alone when it changed in the app as well (the app's version wins, the
+bucket's stays in version history), and never treats a deleted file as a
+deletion (the app writes it back). Export still produces the same files as a
+zip, byte for byte; Import reads the instruction text of a Markdown file (a
+Claude `SKILL.md`'s scripts and resources are never imported or run) into the
+folder you are in and lists what it dropped before anything is written. The
+dev stack runs an in-cluster object store so the same code path runs locally
+(see CONTRIBUTING.md).
 
 **Tools do nothing until an administrator allows their hosts.** The
 allowlist (Library > Tools > Allowed tool servers, or `PUT
@@ -751,6 +768,17 @@ were stored but never enforced. Now they are, so:
 
 The EKS control-plane log group is kept after `darkplum destroy` (Kubernetes
 audit logs) and re-adopted by the next `darkplum deploy`.
+
+The Library bucket (`<cluster_name>-library-<account_id>`, every library file
+under `library/v1/`) is kept too, with all its versions: `darkplum destroy`
+takes it and its configuration out of Terraform's state, prints it in the
+leftovers report, and the next `darkplum deploy` with the same cluster name
+imports it back. To delete the Library for good, run
+`darkplum destroy --delete-library-data=<cluster_name>`: it deletes every
+version and delete marker, then the bucket, after the infrastructure is gone. It
+is repeatable, and also works on a later run once the install is already
+destroyed. `darkplum doctor check` warns when such a bucket exists, and when the
+name would be over S3's 63 characters.
 
 **An install made with the old make-based flow** is taken over with
 `darkplum init --adopt`, run from the `darkplum/` directory it was installed

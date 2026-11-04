@@ -21,3 +21,11 @@ output "lb_private_ips" {
 output "reserved_lb_cidrs" {
   value = tolist(aws_ec2_subnet_cidr_reservation.lb[*].cidr_block)
 }
+
+output "private_route_table_ids" {
+  value = module.vpc.private_route_table_ids
+}
+
+output "s3_endpoint_id" {
+  value = aws_vpc_endpoint.s3.id
+}

@@ -47,6 +47,9 @@ type destroyAWS struct {
 	callerErr error
 	extra     map[string]string // substring -> output
 	extraErr  map[string]error
+	// s3 answers the s3api calls (see fakeLibraryBucket); nil means there is no
+	// library bucket in the account.
+	s3 func(joined string) (string, error)
 }
 
 func (a *destroyAWS) run(name string, args ...string) (string, error) {
@@ -57,6 +60,14 @@ func (a *destroyAWS) run(name string, args ...string) (string, error) {
 	}
 	if strings.Contains(j, "eks describe-cluster") || strings.Contains(j, "sts get-caller-identity") {
 		return a.base.run(name, args...)
+	}
+	if strings.Contains(j, "s3api ") {
+		if a.s3 != nil {
+			return a.s3(j)
+		}
+		if strings.Contains(j, "s3api head-bucket") {
+			return "", errNoBucket
+		}
 	}
 	for sub, err := range a.extraErr {
 		if strings.Contains(j, sub) {

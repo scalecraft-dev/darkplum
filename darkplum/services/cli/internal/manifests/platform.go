@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io/fs"
 	"regexp"
+	"strings"
 )
 
 // Inputs are everything the platform's manifests need from the rest of the
@@ -23,7 +24,35 @@ type Inputs struct {
 	DefaultVLLM bool
 	ServiceCIDR string // the cluster's Kubernetes service CIDR
 	VPCCIDR     string
+	// LibraryStoreURL is where the api writes the Library's files: the Terraform
+	// output library_store_url, s3://<bucket>/library/v1/ (gs://... on GCP). Empty
+	// leaves the api's LIBRARY_STORE_URL empty, which keeps its library worker off:
+	// the library then lives in Postgres only, as before.
+	LibraryStoreURL string
+	// LibraryRegion is the region of an s3:// library bucket (the provider_region
+	// output): the api's S3 client has no other way to learn it, and falls back to
+	// us-east-1, which fails for a bucket anywhere else.
+	LibraryRegion string
 }
+
+var awsRegionRe = regexp.MustCompile(`^[a-z]{2}(-[a-z]+)+-[0-9]{1,2}$`)
+
+// libraryURLRe is the one shape the api is given: a bucket the cloud would accept
+// and the fixed key prefix of the layout's first version.
+var libraryURLRe = regexp.MustCompile(`^(?:s3://[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]|gs://[a-z0-9][a-z0-9._-]{1,220}[a-z0-9])/library/v1/$`)
+
+// libraryBucketOK refuses what is not a bucket name: consecutive dots, an
+// address, which a path-style request would resolve as a host.
+func libraryBucketOK(url string) bool {
+	if !libraryURLRe.MatchString(url) {
+		return false
+	}
+	host := url[strings.Index(url, "://")+3 : strings.Index(url, "/library/")]
+	return !strings.Contains(host, "..") && !strings.Contains(host, ".-") && !strings.Contains(host, "-.") &&
+		!ipv4Re.MatchString(host)
+}
+
+var ipv4Re = regexp.MustCompile(`^[0-9]{1,3}(\.[0-9]{1,3}){3}$`)
 
 // DefaultVLLMURL is the in-cluster address of the default vllm-inference Service.
 const DefaultVLLMURL = "http://vllm-inference.darkplum-inference.svc.cluster.local:8000"
@@ -56,6 +85,15 @@ func (in Inputs) validate() error {
 	}
 	if in.BedrockRegion == "" {
 		errs = append(errs, errors.New("no Bedrock region (the inference_region output; terraform always sets it, so deploy again)"))
+	}
+	if in.LibraryStoreURL != "" && !libraryBucketOK(in.LibraryStoreURL) {
+		errs = append(errs, fmt.Errorf("the library store URL %q must be s3://<bucket>/library/v1/ (or gs://<bucket>/library/v1/) with a valid bucket name", in.LibraryStoreURL))
+	}
+	if in.LibraryRegion != "" && !awsRegionRe.MatchString(in.LibraryRegion) {
+		errs = append(errs, fmt.Errorf("the library bucket's region %q is not an AWS region", in.LibraryRegion))
+	}
+	if strings.HasPrefix(in.LibraryStoreURL, "s3://") && in.LibraryRegion == "" {
+		errs = append(errs, errors.New("an s3:// library store needs its region (the provider_region output), or the api's S3 client uses us-east-1"))
 	}
 	return errors.Join(errs...)
 }
@@ -150,6 +188,13 @@ func Platform(k8s fs.FS, in Inputs) ([]Phase, error) {
 		if err := SetContainerImage(d, firstPartyImage(w.svc), in.Images[w.svc]); err != nil {
 			return nil, err
 		}
+	}
+	ad, _ := find(apiWork, "Deployment", "darkplum-api")
+	if err := SetEnv(ad, "LIBRARY_STORE_URL", in.LibraryStoreURL); err != nil {
+		return nil, err
+	}
+	if err := SetEnv(ad, "LIBRARY_S3_REGION", in.LibraryRegion); err != nil {
+		return nil, err
 	}
 	gd, _ := find(gwWork, "Deployment", "darkplum-gateway")
 	defaultVLLM := ""

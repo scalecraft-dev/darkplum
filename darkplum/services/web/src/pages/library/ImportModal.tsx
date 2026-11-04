@@ -1,6 +1,6 @@
 import { useEffect, useId, useRef, useState } from 'react'
 import { importLibraryItem } from '../../lib/api'
-import type { LibraryImportPreview, LibraryKind, LibraryVisibility } from '../../types'
+import type { LibraryImportPreview, LibraryKind, LibraryScope, LibraryVisibility } from '../../types'
 import { Button, Modal } from '../../components/ui'
 import { KindGlyph } from '../../components/ui/KindGlyph'
 import { KIND_LABEL, KIND_PLURAL, errorText, formatSize } from './libraryText'
@@ -23,8 +23,11 @@ type Row = {
 
 interface Props {
   open: boolean
-  /** The tab it was opened from. A `kind:` in a file's front matter wins. */
+  /** The kind filter it was opened from. A `kind:` in a file's front matter wins. */
   kind: LibraryKind
+  /** Where the files land: the root and folder open when Import was pressed. */
+  scope: LibraryScope
+  path: string
   onClose: () => void
   /** Called once the imports have run, with how many came in. */
   onImported: (count: number) => void
@@ -39,7 +42,7 @@ function readFile(file: File): Promise<string> {
   })
 }
 
-export function ImportModal({ open, kind, onClose, onImported }: Props) {
+export function ImportModal({ open, kind, scope, path, onClose, onImported }: Props) {
   const inputId = useId()
   const inputRef = useRef<HTMLInputElement>(null)
   const [rows, setRows] = useState<Row[]>([])
@@ -50,11 +53,11 @@ export function ImportModal({ open, kind, onClose, onImported }: Props) {
   useEffect(() => {
     if (!open) return
     setRows([])
-    setVisibility('private')
+    setVisibility(scope === 'org' ? 'org' : 'private')
     setPhase('pick')
     setSummary('')
     if (inputRef.current) inputRef.current.value = ''
-  }, [open])
+  }, [open, scope])
 
   const update = (key: string, patch: Partial<Row>) =>
     setRows((prev) => prev.map((r) => (r.key === key ? { ...r, ...patch } : r)))
@@ -101,7 +104,7 @@ export function ImportModal({ open, kind, onClose, onImported }: Props) {
     let failed = rows.filter((r) => r.status === 'failed').length
     for (const row of ready) {
       try {
-        await importLibraryItem({ filename: row.filename, content: row.content ?? '', kind, visibility })
+        await importLibraryItem({ filename: row.filename, content: row.content ?? '', kind, visibility, path: visibility === (scope === 'org' ? 'org' : 'private') ? path : '' })
         imported++
         update(row.key, { status: 'imported' })
       } catch (err) {

@@ -351,6 +351,9 @@ type deployOutputs struct {
 	Repos                                     map[string]string // service -> ECR repository URL
 	GatewayRoleARN                            string
 	InvokeARNs                                []string
+	// LibraryStoreURL and APIRoleARN are optional for this release: state applied by
+	// an older darkplum has neither. Empty means "not applied yet".
+	LibraryStoreURL, APIRoleARN string
 }
 
 func parseOutputs(raw []byte) (deployOutputs, error) {
@@ -369,6 +372,14 @@ func parseOutputs(raw []byte) (deployOutputs, error) {
 		}
 		if err := json.Unmarshal(o.Value, into); err != nil {
 			errs = append(errs, fmt.Errorf("terraform output %q has an unexpected type", key))
+		}
+	}
+	// An output that may be absent: the value stays empty and the caller says so.
+	optional := func(key string, into *string) {
+		if o, ok := all[key]; ok && len(o.Value) > 0 && string(o.Value) != "null" {
+			if err := json.Unmarshal(o.Value, into); err != nil {
+				errs = append(errs, fmt.Errorf("terraform output %q has an unexpected type", key))
+			}
 		}
 	}
 	var o deployOutputs
@@ -391,6 +402,8 @@ func parseOutputs(raw []byte) (deployOutputs, error) {
 	get("image_repositories", &o.Repos)
 	get("gateway_role_arn", &o.GatewayRoleARN)
 	get("bedrock_invoke_arns", &o.InvokeARNs)
+	optional("library_store_url", &o.LibraryStoreURL)
+	optional("api_role_arn", &o.APIRoleARN)
 	if o.GPUDesired > 0 {
 		get("model_name", &o.ModelName)
 		get("model_revision", &o.ModelRevision)

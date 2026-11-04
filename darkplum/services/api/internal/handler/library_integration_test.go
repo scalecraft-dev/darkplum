@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
 
@@ -160,7 +161,7 @@ func TestLibrary_VisibilityAndSharing(t *testing.T) {
 		t.Errorf("admin delete of a private item must be 404, got %d", w.Code)
 	}
 	// Slug collisions auto-suffix for the same owner.
-	w = libraryDo(t, asAlice, http.MethodPost, "/api/v1/library", map[string]any{"kind": "context", "name": "Contract review", "body": "ref"})
+	w = libraryDo(t, asAlice, http.MethodPost, "/api/v1/library", map[string]any{"kind": "skill", "name": "Contract review", "body": "ref"})
 	if w.Code != http.StatusCreated || !strings.Contains(w.Body.String(), `"slug":"contract-review-2"`) {
 		t.Errorf("second slug: %d %s", w.Code, w.Body.String())
 	}
@@ -211,7 +212,7 @@ func TestLibrary_ExportImportAndOwnerDeletion(t *testing.T) {
 
 	// Single export is a markdown file with front matter.
 	w = libraryDo(t, asAlice, http.MethodGet, "/api/v1/library/"+shared+"/export", nil)
-	if w.Code != http.StatusOK || !strings.HasPrefix(w.Body.String(), "---\nname: PDF tools\n") || !strings.Contains(w.Header().Get("Content-Disposition"), "pdf-tools.md") {
+	if w.Code != http.StatusOK || !strings.HasPrefix(w.Body.String(), "---\ndarkplum_id: "+shared+"\nname: PDF tools\n") || !strings.Contains(w.Header().Get("Content-Disposition"), "pdf-tools.md") {
 		t.Errorf("export one: %d %q %s", w.Code, w.Header().Get("Content-Disposition"), w.Body.String())
 	}
 	// Admin's zip holds the shared skill only; Alice's holds all three.
@@ -227,16 +228,20 @@ func TestLibrary_ExportImportAndOwnerDeletion(t *testing.T) {
 		return names
 	}
 	w = libraryDo(t, asAdmin, http.MethodGet, "/api/v1/library/export", nil)
-	if n := zipNames(w); len(n) != 1 || n[0] != "skills/pdf-tools.md" {
+	if n := zipNames(w); len(n) != 1 || n[0] != "org/pdf-tools.skill.md" {
 		t.Errorf("admin zip = %v", n)
 	}
 	w = libraryDo(t, asAlice, http.MethodGet, "/api/v1/library/export", nil)
-	if n := zipNames(w); len(n) != 3 || strings.Join(n, ",") != "context/style.md,skills/pdf-tools.md,tools/jira.json" {
+	var aliceSlug string
+	_ = pool.QueryRow(ctx, `SELECT library_slug FROM users WHERE id = $1`, alice).Scan(&aliceSlug)
+	want := "org/pdf-tools.skill.md,people/" + aliceSlug + "/jira.tool.json,people/" + aliceSlug + "/style.context.md"
+	if n := zipNames(w); len(n) != 3 || sortedJoin(n) != want {
 		t.Errorf("alice zip = %v", n)
 	}
 
-	// The administrator already uses the shared item's slug: reassignment
-	// must rename rather than fail the whole deletion.
+	// The administrator already has a PRIVATE skill with the shared item's
+	// slug: org uniqueness is separate from a person's own tree, so
+	// reassignment needs no rename and the shared key does not change.
 	w = libraryDo(t, asAdmin, http.MethodPost, "/api/v1/library", map[string]any{"kind": "skill", "name": "PDF tools", "body": "admin's own"})
 	if w.Code != http.StatusCreated || !strings.Contains(w.Body.String(), `"slug":"pdf-tools"`) {
 		t.Fatalf("admin slug: %d %s", w.Code, w.Body.String())
@@ -265,8 +270,8 @@ func TestLibrary_ExportImportAndOwnerDeletion(t *testing.T) {
 	if w.Code != http.StatusOK || !reassigned.Mine || reassigned.Owner == nil || reassigned.Owner.ID != admin {
 		t.Errorf("reassigned = %d %+v", w.Code, reassigned)
 	}
-	if !strings.HasPrefix(reassigned.Slug, "pdf-tools-") || reassigned.Slug == "pdf-tools" {
-		t.Errorf("reassigned slug = %q, want a suffixed one", reassigned.Slug)
+	if reassigned.Slug != "pdf-tools" || reassigned.Scope != "org" {
+		t.Errorf("reassigned = slug %q scope %q; want the shared key untouched", reassigned.Slug, reassigned.Scope)
 	}
 	w = libraryDo(t, asAdmin, http.MethodPut, "/api/v1/library/"+shared, map[string]any{"name": "PDF tools (kept)", "body": "# Steps\nRead the file.\n"})
 	if w.Code != http.StatusOK {
@@ -319,4 +324,10 @@ func TestLibrary_ConversationAttachmentsAndToolEvents(t *testing.T) {
 	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"library_item_ids":[]`) {
 		t.Errorf("clear ids: %d %s", w.Code, w.Body.String())
 	}
+}
+
+func sortedJoin(in []string) string {
+	c := append([]string(nil), in...)
+	sort.Strings(c)
+	return strings.Join(c, ",")
 }

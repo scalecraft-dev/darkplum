@@ -54,6 +54,21 @@ Upgrading an existing install: all three apply in place without a restart (`terr
 
 Restore is manual and not yet scripted: there is no variable to build a new install from a snapshot, and a point-in-time restore creates an instance Terraform does not track. Until that lands, restore from the console or CLI and point the cluster's `DATABASE_URL` at the result.
 
+## The Library bucket (AWS)
+
+`modules/library-bucket` creates `<cluster_name>-library-<account_id>`: the Library's files, one plain file per item under `library/v1/`, written by the api. What it is built from:
+
+- All four public-access blocks, ACLs disabled (`BucketOwnerEnforced`), versioning on, no Object Lock. A lifecycle rule expires noncurrent versions after `library_noncurrent_days` (default 30; the accidental-delete recovery window), removes orphaned delete markers and aborts multipart uploads after 7 days.
+- Encryption is SSE-S3. Set `library_kms_key_arn` (a key ARN, not an alias) to use your own customer-managed key instead; the api role is then granted `kms:GenerateDataKey`, `kms:Decrypt` and `kms:DescribeKey` on it and nothing else about the key is managed here, so its key policy must allow that role.
+- The bucket policy denies requests without TLS and denies every action to the gateway role. The gateway role also carries an explicit deny on the bucket in its own policy: the gateway never reads library content, the api injects it into a request. Who else may open the bucket is your account's own IAM, so an administrator can browse and sync it from the console.
+- The api role may `s3:ListBucket` and `s3:ListBucketVersions` on the bucket (unconditioned: a Get or Head on a missing key is answered 404 only if the caller holds ListBucket, and that check has no prefix context, so a prefix condition would turn every miss into a 403), `Get`/`Put`/`DeleteObject` and `DeleteObjectVersion` on `bucket/library/*`, and nothing else. `darkplum verify` proves it (api allowed, other buckets and other prefixes denied, gateway explicitly denied).
+- `modules/vpc` adds an S3 gateway endpoint on the private route tables, with no endpoint policy (a restrictive one that omits the buckets ECR serves layers from breaks image pulls). Library and image-layer traffic stays off the NAT gateway.
+- `force_destroy` is false. `darkplum destroy` keeps the bucket (see the operations notes in the README); a reinstall imports it (`adopt_library_bucket`, set by `darkplum deploy`, never in `terraform.tfvars`). Only the bucket needs importing: its configuration resources are re-applied over it.
+
+The bucket name must be at most 63 characters (a precondition refuses a longer one; `cluster_name` is limited to 40, which fits).
+
+`terraform test` in `modules/library-bucket` checks the shape offline (mocked provider): public access, ownership, versioning, encryption, lifecycle, the TLS and gateway denies, `force_destroy` defaulting to false, and the 63-character limit.
+
 ## The normalized output contract
 
 Every cloud root MUST emit the same set of output keys with the same meaning,
@@ -76,6 +91,8 @@ nothing branches yet; the key exists so the seam is ready when `vertex` lands.
 | `inference_region` | Region the hosted-model backend is called in |
 | `bedrock_model_filter` | Catalog globs for the gateway, derived from the hosted-model IAM allowlist (AWS: `bedrock_model_patterns`) |
 | `model_name` / `served_model_name` | Self-hosted vLLM model |
+| `library_store_url` | Where the Library's files live: `s3://<bucket>/library/v1/` (`gs://...` on GCP); `darkplum deploy` gives it to the api as `LIBRARY_STORE_URL` (optional for one release: empty keeps the library in Postgres only) |
+| `api_role_arn` | The api's Pod Identity role (`darkplum verify` simulates it against the Library bucket) |
 | `web_url` / `web_hostname` | The team's private HTTPS address (empty without `web_domain`) |
 | `web_lb_private_ips` | The internal NLB's pinned addresses; `darkplum configure` trusts only these to pass client addresses |
 | `web_name_servers` | Name servers of a zone Terraform created for the address |

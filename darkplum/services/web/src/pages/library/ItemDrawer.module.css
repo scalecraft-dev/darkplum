@@ -481,3 +481,12 @@
     transition: none;
   }
 }
+
+/* A fact with an action beside it: the folder and its Move, the file and its Copy. */
+.factRow {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}

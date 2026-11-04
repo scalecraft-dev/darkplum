@@ -1,11 +1,15 @@
 package commands
 
 import (
+	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/scalecraft-dev/darkplum/cli/internal/kube"
 	"github.com/scalecraft-dev/darkplum/cli/internal/release"
@@ -20,11 +24,14 @@ type StatusCmd struct {
 // validates the install's cluster first, and refuses rather than read
 // whatever cluster the current context points at.
 func (s *StatusCmd) Run(g *Globals) error {
-	c, err := installKube(os.Stdout, g.Namespace, s.Context, g.Install)
+	c, target, err := installKubeTarget(os.Stdout, g.Namespace, s.Context, g.Install)
 	if err != nil {
 		return err
 	}
-	e := &statusEnv{out: os.Stdout, kc: c, ns: g.Namespace}
+	e := &statusEnv{out: os.Stdout, kc: c, ns: g.Namespace, httpc: &http.Client{Timeout: 10 * time.Second}}
+	if target != nil {
+		e.fwd = func() Forwarder { return newKubectlForwarder(*target, g.Namespace) }
+	}
 	if m, err := release.Current(); err == nil {
 		e.proof.version = m.Version
 		// Where the images are comes from the install's own record (what deploy
@@ -56,6 +63,10 @@ type statusEnv struct {
 	proof    imageProof
 	build    *release.Manifest // this build's manifest; nil for a dev build
 	recorded string
+	// fwd opens a tunnel to the web service (nil for a local --context, which has
+	// none); httpc reads through it. Tests replace both.
+	fwd   func() Forwarder
+	httpc *http.Client
 }
 
 func (e *statusEnv) run() error {
@@ -118,6 +129,7 @@ func (e *statusEnv) run() error {
 
 	e.webUI()
 	e.models()
+	e.library()
 
 	fmt.Fprintln(e.out)
 	switch {
@@ -139,4 +151,85 @@ func oidcConfigured(b64 string) bool {
 	}
 	v := strings.TrimSpace(string(raw))
 	return v != "" && v != "unconfigured"
+}
+
+// libraryStatus is GET /api/v1/admin/library/status.
+type libraryStatus struct {
+	Reachable           bool    `json:"reachable"`
+	Bucket              string  `json:"bucket"`
+	QueueDepth          int     `json:"queue_depth"`
+	Failing             int     `json:"failing"`
+	OldestQueuedSeconds *int    `json:"oldest_queued_seconds"`
+	LastReconcileAt     *string `json:"last_reconcile_at"`
+	ForeignObjects      int     `json:"foreign_objects"`
+}
+
+// library shows how the Library's bucket is doing, as the api sees it. It is
+// informational: nothing here fails status (the bucket is never on the chat path).
+// The route is an admin one and status holds no admin session, so an api that wants
+// one is said to, rather than guessed at.
+func (e *statusEnv) library() {
+	fmt.Fprintf(e.out, "\n%s\n", sHeader("▸ Library"))
+	if e.fwd == nil || e.httpc == nil {
+		fmt.Fprintln(e.out, "  not read (a local --context has no tunnel to the api)")
+		return
+	}
+	f := e.fwd()
+	defer f.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	base, err := f.Open(ctx)
+	if err != nil {
+		fmt.Fprintf(e.out, "  %s could not be read: %s\n", sWarn("!"), firstLine(err.Error()))
+		return
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/api/v1/admin/library/status", nil)
+	if err != nil {
+		fmt.Fprintf(e.out, "  %s could not be read: %s\n", sWarn("!"), firstLine(err.Error()))
+		return
+	}
+	req.Header.Set("Accept", "application/json")
+	resp, err := e.httpc.Do(req)
+	if err != nil {
+		fmt.Fprintf(e.out, "  %s could not be read: %s\n", sWarn("!"), firstLine(err.Error()))
+		return
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	switch {
+	case resp.StatusCode == http.StatusNotFound:
+		fmt.Fprintln(e.out, "  library: not available on this api")
+	case resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden:
+		fmt.Fprintf(e.out, "  %s library status needs an admin session: see Admin in the web UI\n", sWarn("!"))
+	case resp.StatusCode != http.StatusOK:
+		fmt.Fprintf(e.out, "  %s could not be read: the api answered %d\n", sWarn("!"), resp.StatusCode)
+	default:
+		var s libraryStatus
+		if json.Unmarshal(body, &s) != nil {
+			fmt.Fprintf(e.out, "  %s could not be read: unexpected answer\n", sWarn("!"))
+			return
+		}
+		e.printLibrary(s)
+	}
+}
+
+func (e *statusEnv) printLibrary(s libraryStatus) {
+	mark, state := sSuccess("✓"), "reachable"
+	if !s.Reachable {
+		mark, state = sWarn("!"), "NOT reachable"
+	}
+	fmt.Fprintf(e.out, "  %s %s %s\n", mark, s.Bucket, sDim(state))
+	oldest := "-"
+	if s.OldestQueuedSeconds != nil {
+		oldest = (time.Duration(*s.OldestQueuedSeconds) * time.Second).String()
+	}
+	reconciled := "never"
+	if s.LastReconcileAt != nil && *s.LastReconcileAt != "" {
+		reconciled = *s.LastReconcileAt
+	}
+	fmt.Fprintf(e.out, "    %s\n", sDim(fmt.Sprintf("queue %d (oldest %s) · failing %d · foreign objects %d · last reconcile %s",
+		s.QueueDepth, oldest, s.Failing, s.ForeignObjects, reconciled)))
+	if s.Failing > 0 {
+		fmt.Fprintf(e.out, "    %s\n", sWarn(fmt.Sprintf("! %d item(s) keep failing to sync; they are listed by id in the api log", s.Failing)))
+	}
 }

@@ -27,6 +27,7 @@ import (
 	"github.com/scalecraft-dev/darkplum/api/internal/db"
 	"github.com/scalecraft-dev/darkplum/api/internal/handler"
 	"github.com/scalecraft-dev/darkplum/api/internal/kube"
+	"github.com/scalecraft-dev/darkplum/api/internal/objectstore"
 	"github.com/scalecraft-dev/darkplum/api/internal/pricing"
 )
 
@@ -242,6 +243,7 @@ func run() error {
 	toolSvc := handler.NewToolService(pool, activityRecorder, kube.NewWriter(), envOr("TOOL_CREDENTIALS_DIR", "/var/run/darkplum/tool-credentials"))
 	chat.WithTools(toolSvc)
 	library := handler.NewLibraryHandler(pool, activityRecorder, toolSvc)
+	startLibraryStore(ctx, pool, library)
 	users.SetToolCredentialCleanup(toolSvc.RemoveCredentialsQuietly)
 
 	// Vendor usage/cost reconciliation (separate billing keys; see
@@ -460,10 +462,19 @@ func buildRouter(d routerDeps) *gin.Engine {
 		v1.POST("/library", d.library.Create)
 		v1.GET("/library/export", d.library.ExportAll)
 		v1.POST("/library/import", d.library.Import)
+		// The tree: folders, moves, and "Sync from bucket". Private folders
+		// are the caller's own; org-tree folder moves/deletes and org sync are
+		// administrator-only inside the handlers.
+		v1.GET("/library/folders", d.library.ListFolders)
+		v1.POST("/library/folders", d.library.CreateFolder)
+		v1.POST("/library/folders/move", d.library.MoveFolder)
+		v1.DELETE("/library/folders", d.library.DeleteFolder)
+		v1.POST("/library/sync", d.library.SyncFromBucket)
 		v1.GET("/library/:id", d.library.Get)
 		v1.PUT("/library/:id", d.library.Update)
 		v1.DELETE("/library/:id", d.library.Delete)
 		v1.POST("/library/:id/share", d.library.Share)
+		v1.POST("/library/:id/move", d.library.MoveItem)
 		v1.GET("/library/:id/export", d.library.ExportOne)
 		v1.POST("/library/:id/tools/verify", d.library.VerifyTool)
 		v1.PUT("/library/:id/tools/credential", d.library.PutToolCredential)
@@ -526,6 +537,7 @@ func buildRouter(d routerDeps) *gin.Engine {
 
 			// Library governance: org-shared items only (private items have
 			// no admin read path), and the allowed tool-server hosts.
+			adminOnly.GET("/admin/library/status", d.library.AdminStatus)
 			adminOnly.GET("/library/shared", d.library.ListShared)
 			adminOnly.POST("/library/shared/:id/unshare", d.library.AdminUnshare)
 			adminOnly.DELETE("/library/shared/:id", d.library.AdminDelete)
@@ -860,4 +872,28 @@ func csrfProtection() gin.HandlerFunc {
 		}
 		c.Next()
 	}
+}
+
+// startLibraryStore wires the library's object store copy. With
+// LIBRARY_STORE_URL unset the worker is off, the library behaves from
+// Postgres alone, and library_sync rows simply accumulate (one per item or
+// folder at most) until a store is configured.
+func startLibraryStore(ctx context.Context, pool *pgxpool.Pool, library *handler.LibraryHandler) {
+	cfg := objectstore.S3ConfigFromEnv()
+	if cfg.URL == "" {
+		slog.Info("library object store disabled: LIBRARY_STORE_URL is unset; the sync worker is off and queued changes accumulate until it is set")
+		return
+	}
+	store, err := objectstore.NewS3(ctx, cfg)
+	if err != nil {
+		// A bad URL must not stop the api: the library still works from
+		// Postgres. The message carries no key material.
+		slog.Error("library object store disabled: LIBRARY_STORE_URL is not usable", "err", err)
+		return
+	}
+	library.SetStore(store)
+	syncer := handler.NewLibrarySyncer(pool, store)
+	library.SetSyncer(syncer)
+	go syncer.Run(ctx)
+	slog.Info("library object store enabled", "bucket", store.Bucket(), "endpoint_override", cfg.Endpoint != "")
 }

@@ -352,3 +352,108 @@ func TestDefaultVLLMUpstreamOnlyWhenDeployed(t *testing.T) {
 		t.Errorf("with the default model: VLLM_UPSTREAM = %q, want %q", v, DefaultVLLMURL)
 	}
 }
+
+// The api is told where the Library lives; the gateway never is (it must not know
+// the bucket exists).
+func TestLibraryStoreURLLandsOnTheAPIOnly(t *testing.T) {
+	envOf := func(in Inputs, key, name string) (string, bool) {
+		phases, err := Platform(k8s(t), in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, o := range all(phases) {
+			if o.Key() == key {
+				return EnvValue(o, name)
+			}
+		}
+		t.Fatalf("no %s", key)
+		return "", false
+	}
+	const api, gw = "Deployment/darkplum-system/darkplum-api", "Deployment/darkplum-system/darkplum-gateway"
+	for _, url := range []string{"s3://acme-library-123456789012/library/v1/", "gs://acme-library/library/v1/"} {
+		in := inputs()
+		in.LibraryStoreURL, in.LibraryRegion = url, "eu-west-3"
+		if v, ok := envOf(in, api, "LIBRARY_STORE_URL"); !ok || v != url {
+			t.Errorf("api LIBRARY_STORE_URL = %q (set=%v), want %q", v, ok, url)
+		}
+		// The region beside it: without it the api's S3 client uses us-east-1.
+		if v, ok := envOf(in, api, "LIBRARY_S3_REGION"); !ok || v != "eu-west-3" {
+			t.Errorf("api LIBRARY_S3_REGION = %q (set=%v), want eu-west-3", v, ok)
+		}
+		if _, ok := envOf(in, gw, "LIBRARY_S3_REGION"); ok {
+			t.Error("the gateway was given the library region")
+		}
+		if _, ok := envOf(in, gw, "LIBRARY_STORE_URL"); ok {
+			t.Error("the gateway was given the library store")
+		}
+	}
+	// Optional for this release: empty is valid and leaves the api's worker off.
+	in := inputs()
+	in.LibraryStoreURL, in.LibraryRegion = "", ""
+	if v, ok := envOf(in, api, "LIBRARY_S3_REGION"); !ok || v != "" {
+		t.Errorf("without a library store: LIBRARY_S3_REGION = %q (set=%v), want set and empty", v, ok)
+	}
+	if v, ok := envOf(in, api, "LIBRARY_STORE_URL"); !ok || v != "" {
+		t.Errorf("without a library store: LIBRARY_STORE_URL = %q (set=%v), want set and empty", v, ok)
+	}
+}
+
+func TestLibraryStoreURLIsValidated(t *testing.T) {
+	for url, ok := range map[string]bool{
+		"s3://acme-library-123456789012/library/v1/":       true,
+		"s3://a.b-c/library/v1/":                           true,
+		"gs://acme_library/library/v1/":                    true,
+		"s3://acme-library/library/v1":                     false, // no trailing slash
+		"s3://acme-library/library/v2/":                    false,
+		"s3://acme-library/":                               false,
+		"s3://acme-library/library/v1/people/":             false,
+		"s3://acme-library/x/library/v1/":                  false,
+		"https://acme-library/library/v1/":                 false,
+		"s3://":                                            false,
+		"s3:///library/v1/":                                false,
+		"s3://Acme-Library/library/v1/":                    false, // upper case
+		"s3://ab/library/v1/":                              false, // too short
+		"s3://acme..library/library/v1/":                   false,
+		"s3://-acme/library/v1/":                           false,
+		"s3://acme-/library/v1/":                           false,
+		"s3://192.168.5.4/library/v1/":                     false, // an address, not a bucket
+		"s3://acme_library/library/v1/":                    false, // underscore is GCS only
+		"s3://user@acme-library/library/v1/":               false,
+		"s3://acme-library/library/v1/\nX=1":               false,
+		"s3://" + strings.Repeat("a", 64) + "/library/v1/": false,
+		" s3://acme-library/library/v1/":                   false,
+	} {
+		in := inputs()
+		in.LibraryStoreURL, in.LibraryRegion = url, "us-east-2"
+		_, err := Platform(k8s(t), in)
+		if (err == nil) != ok {
+			t.Errorf("%q: accepted=%v, want %v (%v)", url, err == nil, ok, err)
+		}
+	}
+}
+
+func TestLibraryRegionIsValidated(t *testing.T) {
+	for _, tc := range []struct {
+		url, region string
+		ok          bool
+	}{
+		{"s3://acme-library/library/v1/", "us-east-2", true},
+		{"s3://acme-library/library/v1/", "us-gov-west-1", true},
+		{"s3://acme-library/library/v1/", "ap-southeast-7", true},
+		{"s3://acme-library/library/v1/", "", false}, // s3 needs its region
+		{"s3://acme-library/library/v1/", "us-east", false},
+		{"s3://acme-library/library/v1/", "US-EAST-2", false},
+		{"s3://acme-library/library/v1/", "us-east-2\nX=1", false},
+		{"s3://acme-library/library/v1/", "https://evil.example", false},
+		{"", "us-east-2", true}, // no store: the region is harmless
+		{"", "nonsense", false},
+		{"gs://acme-library/library/v1/", "", true},
+	} {
+		in := inputs()
+		in.LibraryStoreURL, in.LibraryRegion = tc.url, tc.region
+		_, err := Platform(k8s(t), in)
+		if (err == nil) != tc.ok {
+			t.Errorf("%q in %q: accepted=%v, want %v (%v)", tc.url, tc.region, err == nil, tc.ok, err)
+		}
+	}
+}

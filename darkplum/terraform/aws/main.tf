@@ -29,6 +29,10 @@ locals {
   bedrock_invoke_arns  = module.bedrock_allowlist.invoke_arns
   bedrock_model_filter = module.bedrock_allowlist.model_filter
 
+  # <cluster_name>-library-<account_id>: at most 40 + 9 + 12 characters, so inside
+  # S3's 63; the module still refuses a longer one, and `darkplum doctor` warns.
+  library_bucket_name = "${var.cluster_name}-library-${data.aws_caller_identity.current.account_id}"
+
   tags = {
     Project   = "darkplum"
     ManagedBy = "terraform"
@@ -112,6 +116,19 @@ module "pod_identity_gateway" {
   namespace            = "darkplum-system"
   service_account_name = "darkplum-gateway"
   inline_policies = {
+    # The gateway never reads library content (the api injects it into a request).
+    # An explicit deny, so no policy added later grants it by accident.
+    deny-library = jsonencode({
+      Version = "2012-10-17"
+      Statement = [
+        {
+          Sid      = "NoLibraryBucket"
+          Effect   = "Deny"
+          Action   = ["s3:*"]
+          Resource = ["arn:${data.aws_partition.current.partition}:s3:::${local.library_bucket_name}", "arn:${data.aws_partition.current.partition}:s3:::${local.library_bucket_name}/*"]
+        }
+      ]
+    })
     bedrock-invoke = jsonencode({
       Version = "2012-10-17"
       # An IAM statement cannot have an empty Resource list, so the invoke
@@ -180,6 +197,38 @@ module "pod_identity_api" {
   namespace            = "darkplum-system"
   service_account_name = "darkplum-api"
   inline_policies = {
+    library-store = jsonencode({
+      Version = "2012-10-17"
+      Statement = concat(
+        [
+          {
+            # Unconditioned on purpose: a GetObject or HeadObject on a key that is not
+            # there is answered 404 only when the caller holds s3:ListBucket, and that
+            # check has no s3:prefix context, so a prefix condition turns every miss
+            # into a 403. The data stays scoped: objects are limited to library/*
+            # below, and listing returns names only (the bucket holds nothing else).
+            Sid      = "ListLibraryBucket"
+            Effect   = "Allow"
+            Action   = ["s3:ListBucket", "s3:ListBucketVersions"]
+            Resource = "arn:${data.aws_partition.current.partition}:s3:::${local.library_bucket_name}"
+          },
+          {
+            Sid      = "ReadWriteLibraryObjects"
+            Effect   = "Allow"
+            Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:DeleteObjectVersion"]
+            Resource = "arn:${data.aws_partition.current.partition}:s3:::${local.library_bucket_name}/library/*"
+          }
+        ],
+        var.library_kms_key_arn == null ? [] : [
+          {
+            Sid      = "UseLibraryKey"
+            Effect   = "Allow"
+            Action   = ["kms:GenerateDataKey", "kms:Decrypt", "kms:DescribeKey"]
+            Resource = var.library_kms_key_arn
+          }
+        ]
+      )
+    })
     cost-explorer-read = jsonencode({
       Version = "2012-10-17"
       Statement = [
@@ -236,4 +285,25 @@ module "ecr" {
 
   cluster_name = var.cluster_name
   tags         = local.tags
+}
+
+# The Library's bucket (library/v1/ holds every item as a plain file). A reinstall
+# finds the bucket `darkplum destroy` kept: it is imported in the normal plan, like
+# the EKS log group. Only the bucket needs importing: its configuration resources
+# are re-applied over it, and those are idempotent.
+module "library_bucket" {
+  source = "./modules/library-bucket"
+
+  bucket_name       = local.library_bucket_name
+  partition         = data.aws_partition.current.partition
+  gateway_role_arns = [module.pod_identity_gateway.role_arn]
+  noncurrent_days   = var.library_noncurrent_days
+  kms_key_arn       = var.library_kms_key_arn
+  tags              = local.tags
+}
+
+import {
+  for_each = var.adopt_library_bucket ? toset(["library"]) : toset([])
+  to       = module.library_bucket.aws_s3_bucket.this
+  id       = local.library_bucket_name
 }
