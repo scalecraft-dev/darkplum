@@ -1,4 +1,4 @@
-import type { User, ApiKey, ActivityEvent, AliasRouteTest, BackendClass, InferenceEvent, InferencePurpose, UsageBucket, UsageSummary, UserUsageSummary, KeyUsageSummary, Model, AdminModel, AdminModelsResult, ModelAlias, ModelAliasInput, ProviderStatus, Residency, RoutingPolicy, PrincipalPolicy, EffectivePolicy, PolicyPreview, PolicyPrincipalsPage, ConversationSummary, ConversationFull, ConversationMessage, ConversationMessageInput, VendorName, SpendGroupBy, SpendReport, SpendTimelineGroupBy, ProviderBilling, ReconciliationGroupBy, ReconciliationReport, ModelPricesResult, ModelPrice, ModelPriceInput , SystemPromptSetting, LibraryItem, LibraryItemInput, LibraryItemUpdate, LibraryImportRequest, LibraryImportPreview, LibraryKind, LibraryVisibility, ToolEvent, ToolHostsSetting } from '../types'
+import type { User, ApiKey, ActivityEvent, AliasRouteTest, BackendClass, InferenceEvent, InferencePurpose, UsageBucket, UsageSummary, UserUsageSummary, KeyUsageSummary, Model, AdminModel, AdminModelsResult, ModelAlias, ModelAliasInput, ProviderStatus, Residency, RoutingPolicy, PrincipalPolicy, EffectivePolicy, PolicyPreview, PolicyPrincipalsPage, ConversationSummary, ConversationFull, ConversationMessage, ConversationMessageInput, VendorName, SpendGroupBy, SpendReport, SpendTimelineGroupBy, ProviderBilling, ReconciliationGroupBy, ReconciliationReport, ModelPricesResult, ModelPrice, ModelPriceInput , SystemPromptSetting, LibraryItem, LibraryItemInput, LibraryScope, LibraryFolder, LibraryFolderListing, LibrarySyncResult, LibraryStoreStatus, LibraryItemUpdate, LibraryImportRequest, LibraryImportPreview, LibraryKind, LibraryVisibility, ToolEvent, ToolHostsSetting } from '../types'
 import type { WireMessage } from './attachments'
 import { STREAM_CUT_OFF_CODE, STREAM_CUT_OFF_MESSAGE, readChatStream } from './chatStream'
 import { parseRetryAfter } from './modelRouting'
@@ -59,8 +59,11 @@ export class ApiError extends Error {
    * error.
    */
   code(): string {
-    const d = this.details as { error?: { code?: unknown } } | undefined
-    const code = d?.error?.code
+    // Two shapes: the OpenAI-style {"error":{"code"}} on chat and vendor
+    // routes, and the flat {"error": message, "code"} on the library routes.
+    const d = this.details as { error?: { code?: unknown } | string; code?: unknown } | undefined
+    const nested = typeof d?.error === 'object' && d.error ? d.error.code : undefined
+    const code = nested ?? d?.code
     return typeof code === 'string' ? code : ''
   }
 
@@ -1105,8 +1108,56 @@ export async function streamChat(
 // everyone in the organisation and editable by their owner only.
 // ---------------------------------------------------------------------------
 
-export function listLibrary(params: { kind?: LibraryKind; scope?: 'mine' | 'shared' | 'all'; q?: string } = {}): Promise<LibraryItem[]> {
+export function listLibrary(
+  params: {
+    kind?: LibraryKind
+    /** private/org are the two roots; mine/shared/all are the older names. */
+    scope?: 'private' | 'org' | 'mine' | 'shared' | 'all'
+    /** An exact folder; absent means every folder. */
+    path?: string
+    q?: string
+  } = {},
+): Promise<LibraryItem[]> {
   return request<LibraryItem[]>(ROUTES.listLibrary, { query: params })
+}
+
+/** The direct children of a folder under one root: subfolders with counts,
+ *  and how many items sit in the folder itself. */
+export function listLibraryFolders(scope: LibraryScope, path: string, recursive = false): Promise<LibraryFolderListing> {
+  return request<LibraryFolderListing>(ROUTES.listLibraryFolders, { query: { scope, path, recursive: recursive ? 1 : 0 } })
+}
+
+/** Whether the bucket is reachable and the sync queue healthy. Admins only. */
+export function adminLibraryStatus(): Promise<LibraryStoreStatus> {
+  return request<LibraryStoreStatus>(ROUTES.adminLibraryStatus)
+}
+
+/** Creates a folder (and any missing parents) under a root. */
+export function createLibraryFolder(scope: LibraryScope, path: string): Promise<LibraryFolder> {
+  return request<LibraryFolder>(ROUTES.createLibraryFolder, { body: { scope, path } })
+}
+
+/** Renames or moves a folder with everything in it, within one root. */
+export function moveLibraryFolder(scope: LibraryScope, from: string, to: string): Promise<{ moved: number }> {
+  return request<{ moved: number }>(ROUTES.moveLibraryFolder, { body: { scope, from, to } })
+}
+
+/** Deletes a folder. Without `recursive` a folder that holds anything is refused. */
+export function deleteLibraryFolder(scope: LibraryScope, path: string, recursive: boolean): Promise<{ folders: number; items: number }> {
+  return request<{ folders: number; items: number }>(ROUTES.deleteLibraryFolder, {
+    query: { scope, path, recursive: recursive ? 1 : 0 },
+  })
+}
+
+/** Moves one item to a folder, possibly under the other root: private to
+ *  org is a share, org to private an unshare. */
+export function moveLibraryItem(id: string, body: { scope: LibraryScope; path: string; slug?: string }): Promise<LibraryItem> {
+  return request<LibraryItem>(ROUTES.moveLibraryItem, { params: { id }, body })
+}
+
+/** Reads files added or changed in the bucket into the library. */
+export function syncLibrary(scope: LibraryScope): Promise<LibrarySyncResult> {
+  return request<LibrarySyncResult>(ROUTES.syncLibrary, { body: { scope } })
 }
 
 export function createLibraryItem(body: LibraryItemInput): Promise<LibraryItem> {

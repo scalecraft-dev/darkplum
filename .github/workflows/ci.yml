@@ -118,6 +118,7 @@ jobs:
       - run: pnpm run check:stream
       - run: pnpm run check:attachments
       - run: pnpm run check:names
+      - run: pnpm run check:library
 
   terraform:
     name: Terraform

@@ -91,6 +91,16 @@ spec:
             # Where library tool (MCP server) credentials are mounted.
             - name: TOOL_CREDENTIALS_DIR
               value: /var/run/darkplum/tool-credentials
+            # Where the Library's files are written: s3://<bucket>/library/v1/.
+            # `darkplum deploy` sets it from the Terraform output library_store_url.
+            # Empty keeps the library worker off (the library lives in Postgres only).
+            - name: LIBRARY_STORE_URL
+              value: ""
+            # Region of the library bucket (the install's region). The S3 client
+            # needs it: without it the SDK falls back to us-east-1 and every request
+            # to a bucket elsewhere fails with a redirect. Set by `darkplum deploy`.
+            - name: LIBRARY_S3_REGION
+              value: ""
           # Keep serving while the Service stops sending here; the listener otherwise
           # closes on SIGTERM while traffic still arrives. Fits the 30s grace period,
           # with the 10s the server takes to finish what it is doing.

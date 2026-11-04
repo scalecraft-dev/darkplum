@@ -5,6 +5,7 @@ resources:
   - ../../base
   - resources/postgres.yaml
   - resources/auth-secret.yaml
+  - resources/objectstore.yaml
 
 patches:
   - path: patches/gateway-deployment.yaml

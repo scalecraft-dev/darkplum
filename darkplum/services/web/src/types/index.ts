@@ -817,6 +817,54 @@ export interface ModelPriceInput {
 
 export type LibraryKind = 'skill' | 'context' | 'tool'
 export type LibraryVisibility = 'private' | 'org'
+/** Where an item lives: the person's own tree, or the organisation's. Same
+ *  fact as visibility, named for the two roots the bucket and the page show. */
+export type LibraryScope = 'private' | 'org'
+
+/** One folder as the folders listing reports it: a prefix in the bucket. */
+export interface LibraryFolder {
+  /** Full path from the root, segments joined by '/'; never empty. */
+  path: string
+  /** The last segment, as shown. */
+  name: string
+  /** Direct children only. */
+  folders: number
+  items: number
+  updated_at: string | null
+}
+
+export interface LibraryFolderListing {
+  path: string
+  folders: LibraryFolder[]
+  /** Items directly in this folder. */
+  items: number
+}
+
+export interface LibrarySyncResult {
+  imported: number
+  updated: number
+  skipped: number
+  conflicts: string[]
+  errors: { file_name: string; reason: string }[]
+  /** The listing hit its cap or time budget; run it again for the rest. */
+  truncated?: boolean
+  scanned?: number
+}
+
+/** The admin's view of the bucket and the sync worker. */
+export interface LibraryStoreStatus {
+  reachable: boolean
+  bucket: string
+  queue_depth: number
+  failing: number
+  oldest_queued_seconds: number | null
+  last_reconcile_at: string | null
+  foreign_objects: number
+  /** Items whose file was changed in the bucket and not yet synced. */
+  changed_in_bucket?: number
+  enabled?: boolean
+  error_code?: string
+}
 
 export interface LibraryOwner {
   id: string
@@ -862,6 +910,18 @@ export interface LibraryItem {
   created_at: string
   updated_at: string
   tool?: LibraryToolInfo
+  /** The root it lives under. Absent on an older api: read visibility. */
+  scope?: LibraryScope
+  /** Folder path under its root, '' at the root. Absent on an older api. */
+  path?: string
+  /** The file it is in the bucket, e.g. "nda-review.skill.md". */
+  file_name?: string
+  /** True once the bucket holds this exact version. */
+  synced?: boolean
+  /** The file in the bucket was changed outside the app; Sync adopts it. */
+  bucket_changed?: boolean
+  /** s3://bucket/key when a bucket is configured and the caller may see it. */
+  s3_uri?: string | null
 }
 
 /** The create body. For a tool, `body` is the JSON configuration
@@ -873,6 +933,8 @@ export interface LibraryItemInput {
   description?: string
   body: string
   visibility?: LibraryVisibility
+  /** Folder under the root the visibility picks; '' or absent = the root. */
+  path?: string
 }
 
 /** The update body: kind is fixed once created. */
@@ -886,9 +948,11 @@ export interface LibraryItemUpdate {
 export interface LibraryImportRequest {
   filename: string
   content: string
-  /** The tab the file was imported from; a `kind:` in the file wins. */
+  /** The kind the import was opened for; a `kind:` in the file wins. */
   kind?: LibraryKind
   visibility?: LibraryVisibility
+  /** Destination folder; '' or absent = the root. */
+  path?: string
 }
 
 /** What an import would create (dry run) or did create. `dropped` lists the

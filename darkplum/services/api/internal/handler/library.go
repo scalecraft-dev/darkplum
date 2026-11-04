@@ -18,6 +18,7 @@ package handler
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -26,6 +27,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -36,6 +38,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/scalecraft-dev/darkplum/api/internal/activity"
+	"github.com/scalecraft-dev/darkplum/api/internal/libkey"
+	"github.com/scalecraft-dev/darkplum/api/internal/objectstore"
 )
 
 const (
@@ -72,7 +76,19 @@ type LibraryHandler struct {
 	// tools is the MCP side: verification, credentials, host policy. nil in
 	// tests that never touch a tool item.
 	tools *toolService
+	// store is the object store the library is mirrored to; nil when
+	// LIBRARY_STORE_URL is unset (the library then behaves as before and the
+	// queue just accumulates).
+	store objectstore.Store
+	// syncer is the running worker (nil when no store is configured).
+	syncer *LibrarySyncer
 }
+
+// SetStore wires the object store (nil = none).
+func (h *LibraryHandler) SetStore(s objectstore.Store) { h.store = s }
+
+// SetSyncer wires the worker whose health and queue the admin status reports.
+func (h *LibraryHandler) SetSyncer(s *LibrarySyncer) { h.syncer = s }
 
 // NewLibraryHandler returns a LibraryHandler backed by db.
 func NewLibraryHandler(db *pgxpool.Pool, rec *activity.Recorder, tools *toolService) *LibraryHandler {
@@ -120,6 +136,23 @@ type libraryItem struct {
 	CreatedAt     time.Time        `json:"created_at"`
 	UpdatedAt     time.Time        `json:"updated_at"`
 	Tool          *libraryToolInfo `json:"tool,omitempty"`
+	// Scope is the root the item lives under: "private" or "org".
+	Scope string `json:"scope"`
+	// Path is the folder path under that root, "" at the root, segments
+	// joined by "/". Slugs, not display names.
+	Path string `json:"path"`
+	// FileName is the item's file name in the bucket and in an export.
+	FileName string `json:"file_name"`
+	// Synced is true when the bucket copy is current. Always false when no
+	// object store is configured.
+	Synced bool `json:"synced"`
+	// S3URI is where the copy lives, only when a store is configured and the
+	// caller may see it (the owner for private items, anyone for org items).
+	S3URI *string `json:"s3_uri"`
+	// BucketChanged is true when the object in the bucket was found to differ
+	// from what the app last wrote (edited or replaced there). The app will
+	// not overwrite it until Sync from bucket has been run.
+	BucketChanged bool `json:"bucket_changed"`
 }
 
 // libraryRow is one scanned row; toWire turns it into a libraryItem.
@@ -130,20 +163,31 @@ type libraryRow struct {
 	createdAt, updatedAt                                     time.Time
 	toolCatalog                                              []byte
 	credLast4                                                *string
+	// Location and bucket bookkeeping.
+	folderPath               string
+	ownerSlug                *string
+	s3Key, syncedSHA, objSHA *string
+	previousFolderPath       *string
+	queued                   bool
+	bucketChanged            bool
 }
 
 const librarySelectCols = `
 	li.id, li.kind, li.name, li.slug, li.description, li.body, li.visibility, li.content_sha256,
 	li.owner_user_id::text, u.name, u.email, li.shared_at, li.created_at, li.updated_at,
-	li.tool_catalog, li.tool_catalog_at, li.tool_credential_last4`
+	li.tool_catalog, li.tool_catalog_at, li.tool_credential_last4,
+	COALESCE(fo.path, ''), u.library_slug, li.s3_key, li.s3_synced_sha, li.s3_obj_sha, li.previous_folder_path,
+	EXISTS (SELECT 1 FROM library_sync q WHERE q.item_id = li.id), li.bucket_changed_at IS NOT NULL`
 
-const libraryFrom = ` FROM library_items li LEFT JOIN users u ON u.id = li.owner_user_id `
+const libraryFrom = ` FROM library_items li LEFT JOIN users u ON u.id = li.owner_user_id LEFT JOIN library_folders fo ON fo.id = li.folder_id `
 
-func scanLibraryRow(row pgx.Row) (*libraryRow, error) {
+func scanLibraryRow(row pgx.Row, extra ...any) (*libraryRow, error) {
 	var r libraryRow
-	err := row.Scan(&r.id, &r.kind, &r.name, &r.slug, &r.description, &r.body, &r.visibility, &r.sha,
+	dest := []any{&r.id, &r.kind, &r.name, &r.slug, &r.description, &r.body, &r.visibility, &r.sha,
 		&r.ownerID, &r.ownerName, &r.ownerEmail, &r.sharedAt, &r.createdAt, &r.updatedAt,
-		&r.toolCatalog, &r.catalogAt, &r.credLast4)
+		&r.toolCatalog, &r.catalogAt, &r.credLast4,
+		&r.folderPath, &r.ownerSlug, &r.s3Key, &r.syncedSHA, &r.objSHA, &r.previousFolderPath, &r.queued, &r.bucketChanged}
+	err := row.Scan(append(dest, extra...)...)
 	if err != nil {
 		return nil, err
 	}
@@ -155,6 +199,7 @@ func (r *libraryRow) toWire(me string) libraryItem {
 		ID: r.id, Kind: r.kind, Name: r.name, Slug: r.slug, Description: r.description, Body: r.body,
 		Visibility: r.visibility, ContentSHA256: r.sha, SizeBytes: len(r.body),
 		SharedAt: r.sharedAt, CreatedAt: r.createdAt, UpdatedAt: r.updatedAt,
+		Scope: wireScope(r.visibility), Path: r.folderPath, FileName: r.slug + libkey.Suffix(r.kind),
 	}
 	if r.ownerID != nil {
 		it.Owner = &libraryOwner{ID: *r.ownerID}
@@ -235,6 +280,10 @@ type libraryInput struct {
 	Description string  `json:"description"`
 	Body        string  `json:"body"`
 	Visibility  *string `json:"visibility,omitempty"`
+	// Scope (private|org) and Path place a new item; Scope wins over
+	// Visibility. Missing folders on the path are created.
+	Scope string  `json:"scope,omitempty"`
+	Path  *string `json:"path,omitempty"`
 }
 
 // validateLibraryInput normalises and checks an input; forUpdate skips the
@@ -261,6 +310,13 @@ func validateLibraryInput(in *libraryInput, forUpdate bool) string {
 			in.Slug = &s
 		}
 	}
+	if in.Path != nil {
+		pth := strings.Trim(strings.TrimSpace(*in.Path), "/")
+		if !libkey.ValidFolderPath(pth) {
+			return "folder path is not valid: lowercase letters, digits and hyphens, at most 5 levels"
+		}
+		in.Path = &pth
+	}
 	if in.Visibility != nil && *in.Visibility != libraryVisibilityPrivate && *in.Visibility != libraryVisibilityOrg {
 		return "visibility must be private or org"
 	}
@@ -275,6 +331,12 @@ func validateLibraryInput(in *libraryInput, forUpdate bool) string {
 		if err != nil {
 			return "tool body: " + err.Error()
 		}
+		// The URL lands in the bucket as plain text, so a credential in its
+		// query string would be written there. Userinfo is refused by
+		// parseToolConfig; this refuses the query-string equivalent.
+		if toolURLHasSecretParam(cfg.ServerURL) {
+			return toolURLSecretMsg
+		}
 		// Store the configuration normalised, so what is read back is what
 		// was validated.
 		b, _ := json.Marshal(cfg)
@@ -283,7 +345,101 @@ func validateLibraryInput(in *libraryInput, forUpdate bool) string {
 	return ""
 }
 
-// List handles GET /api/v1/library?kind=&scope=mine|shared|all&q=.
+// wireScope names a root the way the API speaks: "private" or "org".
+func wireScope(visibility string) string {
+	if visibility == libraryVisibilityOrg {
+		return "org"
+	}
+	return "private"
+}
+
+// dbScope maps the API's scope word to library_folders.scope ('user'|'org').
+func dbScope(s string) (string, bool) {
+	switch s {
+	case "private", "user":
+		return "user", true
+	case "org":
+		return "org", true
+	}
+	return "", false
+}
+
+func visibilityOfScope(dbScope string) string {
+	if dbScope == "org" {
+		return libraryVisibilityOrg
+	}
+	return libraryVisibilityPrivate
+}
+
+// writeLibErr answers with {"error": message, "code": code}. Anything that is
+// not a *libError is a 500 with the fallback message (never err.Error()).
+func writeLibErr(c *gin.Context, err error, fallback string) {
+	var le *libError
+	if errors.As(err, &le) {
+		c.JSON(le.status, gin.H{"error": le.msg, "code": le.code})
+		return
+	}
+	slog.ErrorContext(c.Request.Context(), "library request failed", "route", c.FullPath(), "op", fallback)
+	c.JSON(http.StatusInternalServerError, gin.H{"error": fallback})
+}
+
+func isAdmin(c *gin.Context) bool { return c.GetString("user_role") == "admin" }
+
+// wire is toWire plus the bucket-derived fields.
+func (h *LibraryHandler) wire(r *libraryRow, me string) libraryItem {
+	it := r.toWire(me)
+	if h.store != nil {
+		if r.s3Key != nil && *r.s3Key != "" {
+			// Private items are only ever returned to their owner, org items
+			// to everyone, so the location is never shown to someone who
+			// could not already read the item.
+			u := h.store.URI(*r.s3Key)
+			it.S3URI = &u
+		}
+		it.BucketChanged = r.bucketChanged
+		it.Synced = r.s3Key != nil && r.syncedSHA != nil && *r.syncedSHA == r.sha && !r.queued && !r.bucketChanged
+	}
+	return it
+}
+
+// toolURLSecretMsg is the message (and, via libInputError, the code
+// tool_url_secret) for a server_url whose query carries a credential.
+const toolURLSecretMsg = "server_url must not carry a credential in its query string; put the token in the tool's credential field instead"
+
+// secretParamRE matches query parameter names that conventionally carry a
+// credential, whole or as the last word (access_token, x-api-key, apikey).
+var secretParamRE = regexp.MustCompile(`(?i)(^|[_-])(token|key|secret|password|passwd|auth|signature|sig|api_key|apikey|access_key)$`)
+
+func toolURLHasSecretParam(raw string) bool {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return false
+	}
+	for name := range u.Query() {
+		if secretParamRE.MatchString(strings.ReplaceAll(name, "-", "_")) {
+			return true
+		}
+	}
+	return false
+}
+
+// libInputError answers a validateLibraryInput failure; the secret-in-URL
+// case carries a code the UI can show by name.
+func libInputError(c *gin.Context, status int, msg string) {
+	if msg == toolURLSecretMsg {
+		c.JSON(status, gin.H{"error": msg, "code": "tool_url_secret"})
+		return
+	}
+	c.JSON(status, gin.H{"error": msg})
+}
+
+// List handles GET /api/v1/library?scope=&path=&recursive=&kind=&q=.
+//
+// scope: private | org | all (default), plus the older mine (everything I
+// own) and shared (org items that are not mine). path: a non-empty value is
+// that exact folder; empty or absent means every folder, and with
+// recursive=0 only the root. recursive=1 adds descendants of a non-empty
+// path. q matches name, description, slug and folder path.
 func (h *LibraryHandler) List(c *gin.Context) {
 	me := c.GetString("user_id")
 	ctx := c.Request.Context()
@@ -307,17 +463,40 @@ func (h *LibraryHandler) List(c *gin.Context) {
 		where = append(where, "li.owner_user_id = $1")
 	case "shared":
 		where = append(where, "li.visibility = 'org' AND (li.owner_user_id IS DISTINCT FROM $1)")
+	case "private":
+		where = append(where, "li.visibility = 'private' AND li.owner_user_id = $1")
+	case "org":
+		where = append(where, "li.visibility = 'org'")
 	default:
-		c.JSON(http.StatusBadRequest, gin.H{"error": "scope must be mine, shared or all"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "scope must be private, org or all"})
 		return
 	}
 	if kind != "" {
 		args = append(args, kind)
 		where = append(where, fmt.Sprintf("li.kind = $%d", len(args)))
 	}
+	path, hasPath := c.GetQuery("path")
+	path = strings.Trim(strings.TrimSpace(path), "/")
+	recursive := c.Query("recursive") != "0"
+	switch {
+	case hasPath && path != "":
+		if !libkey.ValidFolderPath(path) {
+			writeLibErr(c, errFolderInvalid, "list library failed")
+			return
+		}
+		args = append(args, path)
+		if c.Query("recursive") == "1" {
+			where = append(where, fmt.Sprintf("(fo.path = $%d OR fo.path LIKE $%d || '/%%')", len(args), len(args)))
+		} else {
+			where = append(where, fmt.Sprintf("fo.path = $%d", len(args)))
+		}
+	case hasPath && !recursive:
+		where = append(where, "li.folder_id IS NULL")
+	}
 	if q != "" {
 		args = append(args, "%"+escapeLike(q)+"%")
-		where = append(where, fmt.Sprintf("(li.name ILIKE $%d ESCAPE '\\' OR li.description ILIKE $%d ESCAPE '\\')", len(args), len(args)))
+		n := len(args)
+		where = append(where, fmt.Sprintf("(li.name ILIKE $%d ESCAPE '\\' OR li.description ILIKE $%d ESCAPE '\\' OR li.slug ILIKE $%d ESCAPE '\\' OR fo.path ILIKE $%d ESCAPE '\\')", n, n, n, n))
 	}
 	rows, err := h.db.Query(ctx, `SELECT `+librarySelectCols+libraryFrom+` WHERE `+strings.Join(where, " AND ")+` ORDER BY li.updated_at DESC LIMIT 1000`, args...)
 	if err != nil {
@@ -334,7 +513,7 @@ func (h *LibraryHandler) List(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "list library failed"})
 			return
 		}
-		items = append(items, r.toWire(me))
+		items = append(items, h.wire(r, me))
 	}
 	c.JSON(http.StatusOK, items)
 }
@@ -370,13 +549,8 @@ func (h *LibraryHandler) Get(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "item not found"})
 		return
 	}
-	c.JSON(http.StatusOK, r.toWire(me))
+	c.JSON(http.StatusOK, h.wire(r, me))
 }
-
-var (
-	errLibraryFull = errors.New("library is full")
-	errSlugTaken   = errors.New("slug already in use")
-)
 
 func truncateSlug(s string, n int) string {
 	if len(s) <= n {
@@ -385,34 +559,43 @@ func truncateSlug(s string, n int) string {
 	return strings.TrimRight(s[:n], "-")
 }
 
+// itemVisibility resolves the root an input names: scope (private|org)
+// wins, then visibility, default private.
+func itemVisibility(in *libraryInput) (string, bool) {
+	if in.Scope != "" {
+		s, ok := dbScope(in.Scope)
+		if !ok {
+			return "", false
+		}
+		return visibilityOfScope(s), true
+	}
+	if in.Visibility != nil {
+		return *in.Visibility, true
+	}
+	return libraryVisibilityPrivate, true
+}
+
 // Create handles POST /api/v1/library.
 func (h *LibraryHandler) Create(c *gin.Context) {
 	me := c.GetString("user_id")
 	ctx := c.Request.Context()
 	var in libraryInput
 	if err := c.ShouldBindJSON(&in); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "body must be {kind, name, slug?, description?, body, visibility?}"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "body must be {kind, name, slug?, description?, body, visibility?, scope?, path?}"})
 		return
 	}
 	if msg := validateLibraryInput(&in, false); msg != "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": msg})
+		libInputError(c, http.StatusBadRequest, msg)
 		return
 	}
-	visibility := libraryVisibilityPrivate
-	if in.Visibility != nil {
-		visibility = *in.Visibility
+	visibility, ok := itemVisibility(&in)
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "scope must be private or org"})
+		return
 	}
 	id, _, err := h.createOne(ctx, me, in, visibility)
-	switch {
-	case errors.Is(err, errLibraryFull):
-		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": fmt.Sprintf("your library holds the maximum of %d items", libraryItemsPerUser)})
-		return
-	case errors.Is(err, errSlugTaken):
-		c.JSON(http.StatusConflict, gin.H{"error": "you already have an item with that slug"})
-		return
-	case err != nil:
-		slog.ErrorContext(ctx, "library create failed", "err", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "create item failed"})
+	if err != nil {
+		writeLibErr(c, err, "create item failed")
 		return
 	}
 	evt := activity.FromContext(c, activity.LibraryItemCreated)
@@ -431,10 +614,10 @@ func (h *LibraryHandler) Create(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "create item failed"})
 		return
 	}
-	c.JSON(http.StatusCreated, r.toWire(me))
+	c.JSON(http.StatusCreated, h.wire(r, me))
 }
 
-// createOne runs insertItem in its own transaction, retrying slug
+// createOne runs insertItemOnce in its own transaction, retrying auto-slug
 // collisions with a fresh transaction each time (a unique violation aborts
 // the transaction it happened in).
 func (h *LibraryHandler) createOne(ctx context.Context, me string, in libraryInput, visibility string) (id, slug string, err error) {
@@ -476,6 +659,14 @@ func insertItemOnce(ctx context.Context, tx pgx.Tx, me string, in libraryInput, 
 	if count >= libraryItemsPerUser {
 		return "", "", errLibraryFull
 	}
+	path := ""
+	if in.Path != nil {
+		path = *in.Path
+	}
+	folderID, _, err := ensureFolderPath(ctx, tx, scopeOfVisibility(visibility), me, path)
+	if err != nil {
+		return "", "", err
+	}
 	explicit := in.Slug != nil
 	base := slugify(in.Name)
 	if explicit {
@@ -486,21 +677,41 @@ func insertItemOnce(ctx context.Context, tx pgx.Tx, me string, in libraryInput, 
 		n := attempt + 1
 		slug = fmt.Sprintf("%s-%d", truncateSlug(base, 100-len(fmt.Sprint(n))-1), n)
 	}
+	if !libkey.ValidSlug(slug) {
+		// A reserved device name (con, nul, com1...) cannot be a file name.
+		if explicit {
+			return "", "", &libError{http.StatusBadRequest, "slug_invalid", "that slug cannot be used as a file name"}
+		}
+		slug = truncateSlug(base, 90) + "-item"
+	}
 	err = tx.QueryRow(ctx, `
-		INSERT INTO library_items (kind, owner_user_id, visibility, slug, name, description, body, content_sha256, shared_at, updated_by)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CASE WHEN $3 = 'org' THEN now() END, $2)
+		INSERT INTO library_items (kind, owner_user_id, visibility, slug, name, description, body, content_sha256, shared_at, updated_by, folder_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, CASE WHEN $3 = 'org' THEN now() END, $2, $9)
 		RETURNING id
-	`, in.Kind, me, visibility, slug, in.Name, in.Description, in.Body, contentSHA256(in.Body)).Scan(&id)
+	`, in.Kind, me, visibility, slug, in.Name, in.Description, in.Body, contentSHA256(in.Body), folderID).Scan(&id)
 	if err == nil {
+		if err := enqueueItem(ctx, tx, id); err != nil {
+			return "", "", err
+		}
 		return id, slug, nil
 	}
 	if isUniqueViolation(err) {
 		if explicit {
+			if visibility == libraryVisibilityOrg {
+				return "", "", errSharedPathTaken
+			}
 			return "", "", errSlugTaken
 		}
 		return "", "", errSlugRetry
 	}
 	return "", "", err
+}
+
+func scopeOfVisibility(v string) string {
+	if v == libraryVisibilityOrg {
+		return "org"
+	}
+	return "user"
 }
 
 // Update handles PUT /api/v1/library/:id (owner only; kind is immutable).
@@ -518,8 +729,8 @@ func (h *LibraryHandler) Update(c *gin.Context) {
 		return
 	}
 	// The stored kind decides how the body is validated.
-	var kind, oldBody string
-	err := h.db.QueryRow(ctx, `SELECT kind, body FROM library_items WHERE id = $1 AND owner_user_id = $2`, id, me).Scan(&kind, &oldBody)
+	var kind, oldBody, visibility string
+	err := h.db.QueryRow(ctx, `SELECT kind, body, visibility FROM library_items WHERE id = $1 AND owner_user_id = $2`, id, me).Scan(&kind, &oldBody, &visibility)
 	if errors.Is(err, pgx.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "item not found"})
 		return
@@ -530,7 +741,11 @@ func (h *LibraryHandler) Update(c *gin.Context) {
 	}
 	in.Kind = kind
 	if msg := validateLibraryInput(&in, true); msg != "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": msg})
+		libInputError(c, http.StatusBadRequest, msg)
+		return
+	}
+	if in.Slug != nil && !libkey.ValidSlug(*in.Slug) {
+		writeLibErr(c, &libError{http.StatusBadRequest, "slug_invalid", "that slug cannot be used as a file name"}, "update item failed")
 		return
 	}
 	// A tool whose server changed has a stale catalogue: clear it so the UI
@@ -552,14 +767,24 @@ func (h *LibraryHandler) Update(c *gin.Context) {
 	if clearCatalog {
 		catalogSQL = ", tool_catalog = NULL, tool_catalog_at = NULL"
 	}
-	tag, err := h.db.Exec(ctx, fmt.Sprintf(`
+	tx, err := h.db.Begin(ctx)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "update item failed"})
+		return
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	tag, err := tx.Exec(ctx, fmt.Sprintf(`
 		UPDATE library_items SET name = $1, description = $2, body = $3, content_sha256 = $4,
 			updated_at = now(), updated_by = $5, slug = %s %s
 		WHERE id = $6 AND owner_user_id = $5
 	`, slugSQL, catalogSQL), args...)
 	if err != nil {
 		if isUniqueViolation(err) {
-			c.JSON(http.StatusConflict, gin.H{"error": "you already have an item with that slug"})
+			if visibility == libraryVisibilityOrg {
+				writeLibErr(c, errSharedPathTaken, "update item failed")
+			} else {
+				writeLibErr(c, errSlugTaken, "update item failed")
+			}
 			return
 		}
 		slog.ErrorContext(ctx, "library update failed", "id", id, "err", err)
@@ -568,6 +793,14 @@ func (h *LibraryHandler) Update(c *gin.Context) {
 	}
 	if tag.RowsAffected() == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "item not found"})
+		return
+	}
+	if err := enqueueItem(ctx, tx, id); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "update item failed"})
+		return
+	}
+	if err := tx.Commit(ctx); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "update item failed"})
 		return
 	}
 	evt := activity.FromContext(c, activity.LibraryItemUpdated)
@@ -580,7 +813,30 @@ func (h *LibraryHandler) Update(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "update item failed"})
 		return
 	}
-	c.JSON(http.StatusOK, r.toWire(me))
+	c.JSON(http.StatusOK, h.wire(r, me))
+}
+
+// deleteItemTx deletes one item the SQL predicate allows and queues the
+// removal of its objects (every version) in the same transaction.
+func deleteItemTx(ctx context.Context, tx pgx.Tx, id, ownerOrEmpty string, orgOnly bool) (kind, visibility string, owner *string, hadCred bool, err error) {
+	var k1, k2 *string
+	where := `id = $1`
+	args := []any{id}
+	if ownerOrEmpty != "" {
+		where += ` AND owner_user_id = $2`
+		args = append(args, ownerOrEmpty)
+	}
+	if orgOnly {
+		where += ` AND visibility = 'org'`
+	}
+	err = tx.QueryRow(ctx, `DELETE FROM library_items WHERE `+where+`
+		RETURNING kind, visibility, owner_user_id::text, tool_credential_last4 IS NOT NULL, s3_key, s3_pending_key`, args...).
+		Scan(&kind, &visibility, &owner, &hadCred, &k1, &k2)
+	if err != nil {
+		return
+	}
+	err = enqueueItemDeleted(ctx, tx, id, k1, k2)
+	return
 }
 
 // Delete handles DELETE /api/v1/library/:id (owner only).
@@ -592,15 +848,19 @@ func (h *LibraryHandler) Delete(c *gin.Context) {
 	}
 	me := c.GetString("user_id")
 	ctx := c.Request.Context()
-	var kind, visibility string
-	var hadCred bool
-	err := h.db.QueryRow(ctx, `
-		DELETE FROM library_items WHERE id = $1 AND owner_user_id = $2
-		RETURNING kind, visibility, tool_credential_last4 IS NOT NULL
-	`, id, me).Scan(&kind, &visibility, &hadCred)
+	tx, err := h.db.Begin(ctx)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "delete item failed"})
+		return
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	kind, visibility, _, hadCred, err := deleteItemTx(ctx, tx, id, me, false)
 	if errors.Is(err, pgx.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "item not found"})
 		return
+	}
+	if err == nil {
+		err = tx.Commit(ctx)
 	}
 	if err != nil {
 		slog.ErrorContext(ctx, "library delete failed", "id", id, "err", err)
@@ -623,7 +883,10 @@ type shareRequest struct {
 }
 
 // Share handles POST /api/v1/library/:id/share {visibility: org|private}
-// (owner only).
+// (owner only). It is a thin wrapper over the item move: sharing carries the
+// item's folder path into the org tree (creating missing org folders) and
+// 409s shared_path_taken when the organisation already has a file with that
+// name there; unsharing returns it to the folder it was shared from.
 func (h *LibraryHandler) Share(c *gin.Context) {
 	id := c.Param("id")
 	if !isValidUUID(id) {
@@ -637,33 +900,21 @@ func (h *LibraryHandler) Share(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": `body must be {"visibility": "org" | "private"}`})
 		return
 	}
-	var kind, before string
-	err := h.db.QueryRow(ctx, `
-		UPDATE library_items li SET visibility = $3,
-			shared_at = CASE WHEN $3 = 'org' THEN COALESCE(shared_at, now()) ELSE NULL END,
-			updated_at = now(), updated_by = $2
-		FROM (SELECT visibility AS before FROM library_items WHERE id = $1 AND owner_user_id = $2) prev
-		WHERE li.id = $1 AND li.owner_user_id = $2
-		RETURNING li.kind, prev.before
-	`, id, me, req.Visibility).Scan(&kind, &before)
-	if errors.Is(err, pgx.ErrNoRows) {
-		c.JSON(http.StatusNotFound, gin.H{"error": "item not found"})
-		return
-	}
+	// Admins may not use this route on others' items: AdminUnshare does that.
+	out, err := h.moveItem(ctx, id, me, false, scopeOfVisibility(req.Visibility), nil, "")
 	if err != nil {
-		slog.ErrorContext(ctx, "library share failed", "id", id, "err", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "share item failed"})
+		writeLibErr(c, err, "share item failed")
 		return
 	}
-	if before != req.Visibility {
+	if out.fromVis != out.toVis {
 		typ := activity.LibraryItemShared
-		if req.Visibility == libraryVisibilityPrivate {
+		if out.toVis == libraryVisibilityPrivate {
 			typ = activity.LibraryItemUnshared
 		}
 		evt := activity.FromContext(c, typ)
 		evt.TargetType = activity.StrPtr("library_item")
 		evt.TargetID = activity.StrPtr(id)
-		evt.Detail = map[string]any{"kind": kind}
+		evt.Detail = map[string]any{"kind": out.kind}
 		h.activity.Record(ctx, evt)
 	}
 	r, err := h.loadVisible(ctx, me, id)
@@ -671,19 +922,24 @@ func (h *LibraryHandler) Share(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "share item failed"})
 		return
 	}
-	c.JSON(http.StatusOK, r.toWire(me))
+	c.JSON(http.StatusOK, h.wire(r, me))
 }
 
 // ---------------------------------------------------------------------------
 // Export / import
 // ---------------------------------------------------------------------------
 
-// renderExport renders one item as a portable file: markdown with a
-// name/description/kind front matter for skill and context, JSON (without
-// any credential -- none is ever stored here) for a tool.
+// renderExport renders one item as the file the bucket holds and an export
+// contains: markdown with a darkplum_id/name/description/kind front matter for
+// skill and context, JSON (without any credential -- none is ever stored
+// here) for a tool. This is the ONE serializer: the sync worker writes
+// exactly these bytes, so an export and the bucket are byte-identical.
+// darkplum_id is how Sync from bucket recognises an item that was moved or
+// edited in the bucket.
 func renderExport(it libraryItem) (filename string, contentType string, body []byte) {
 	if it.Kind == libraryKindTool {
 		out := map[string]any{
+			"darkplum_id": it.ID,
 			"kind":        libraryKindTool,
 			"name":        it.Name,
 			"description": it.Description,
@@ -699,6 +955,7 @@ func renderExport(it libraryItem) (filename string, contentType string, body []b
 	}
 	var sb strings.Builder
 	sb.WriteString("---\n")
+	sb.WriteString("darkplum_id: " + it.ID + "\n")
 	sb.WriteString("name: " + yamlScalar(it.Name) + "\n")
 	if it.Description != "" {
 		sb.WriteString("description: " + yamlScalar(it.Description) + "\n")
@@ -710,9 +967,22 @@ func renderExport(it libraryItem) (filename string, contentType string, body []b
 	return it.Slug + ".md", "text/markdown; charset=utf-8", []byte(sb.String())
 }
 
+// normalizeObject makes the bytes of an object comparable: line endings and
+// trailing newlines that a console editor may add or drop do not count as a
+// change. Both the hash the worker records and the hash Sync takes of a
+// bucket object go through this.
+func normalizeObject(b []byte) []byte {
+	return append(bytes.TrimRight(bytes.ReplaceAll(b, []byte("\r\n"), []byte("\n")), "\r\n"), '\n')
+}
+
+func objectSHA256(b []byte) string {
+	sum := sha256.Sum256(normalizeObject(b))
+	return hex.EncodeToString(sum[:])
+}
+
 // yamlScalar quotes a value whenever it could be misread as YAML syntax.
 func yamlScalar(s string) string {
-	if s == "" || strings.ContainsAny(s, ":#\"'\n{}[],&*!|>%@`") || strings.TrimSpace(s) != s {
+	if s == "" || strings.ContainsAny(s, ":#\"'\n\r\t{}[],&*!|>%@`") || strings.TrimSpace(s) != s {
 		b, _ := json.Marshal(s) // JSON string syntax is valid YAML double-quoted
 		return string(b)
 	}
@@ -736,18 +1006,20 @@ func (h *LibraryHandler) ExportOne(c *gin.Context) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "item not found"})
 		return
 	}
-	name, ct, body := renderExport(r.toWire(me))
+	name, ct, body := renderExport(h.wire(r, me))
 	c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=%q", name))
 	c.Data(http.StatusOK, ct, body)
 }
 
 // ExportAll handles GET /api/v1/library/export: a zip of every item the
-// user can see (their own and the organisation's shared ones), one file per
-// item under skills/, context/ and tools/.
+// user can see (their own and the organisation's shared ones). Each entry is
+// named by the item's bucket key (org/<path>/<slug>.<kind>.<ext> or
+// people/<you>/<path>/...) and holds exactly the bytes the bucket holds, so
+// unzipping into the bucket prefix restores the tree.
 func (h *LibraryHandler) ExportAll(c *gin.Context) {
 	me := c.GetString("user_id")
 	ctx := c.Request.Context()
-	rows, err := h.db.Query(ctx, `SELECT `+librarySelectCols+libraryFrom+` WHERE `+visibleSQL(1)+` ORDER BY li.kind, li.slug LIMIT $2`, me, libraryExportMaxItems)
+	rows, err := h.db.Query(ctx, `SELECT `+librarySelectCols+libraryFrom+` WHERE `+visibleSQL(1)+` ORDER BY li.visibility, fo.path NULLS FIRST, li.kind, li.slug LIMIT $2`, me, libraryExportMaxItems)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "export failed"})
 		return
@@ -758,7 +1030,6 @@ func (h *LibraryHandler) ExportAll(c *gin.Context) {
 	c.Status(http.StatusOK)
 	zw := zip.NewWriter(c.Writer)
 	count := 0
-	used := map[string]bool{}
 	var failed error
 	for rows.Next() {
 		r, err := scanLibraryRow(rows)
@@ -766,19 +1037,13 @@ func (h *LibraryHandler) ExportAll(c *gin.Context) {
 			failed = err
 			break
 		}
-		it := r.toWire(me)
-		name, _, body := renderExport(it)
-		dir := map[string]string{libraryKindSkill: "skills/", libraryKindContext: "context/", libraryKindTool: "tools/"}[it.Kind]
-		// Two users' shared items may share a slug; every entry gets a
-		// name nothing else in the archive has.
-		ext := name[strings.LastIndex(name, "."):]
-		stem := strings.TrimSuffix(name, ext)
-		path := dir + name
-		for n := 2; used[path]; n++ {
-			path = fmt.Sprintf("%s%s-%d%s", dir, stem, n, ext)
+		key, err := keyForRow(r)
+		if err != nil {
+			// Cannot be a file name in the tree; skipped, counted.
+			continue
 		}
-		used[path] = true
-		fw, err := zw.CreateHeader(&zip.FileHeader{Name: path, Method: zip.Deflate, Modified: it.UpdatedAt})
+		_, _, body := renderExport(r.toWire(me))
+		fw, err := zw.CreateHeader(&zip.FileHeader{Name: key.String(), Method: zip.Deflate, Modified: r.updatedAt})
 		if err != nil {
 			failed = err
 			break
@@ -796,12 +1061,23 @@ func (h *LibraryHandler) ExportAll(c *gin.Context) {
 		// The status is committed; the archive is closed short and the
 		// failure is logged. A truncated zip fails to open, which is the
 		// honest outcome, rather than a 200 that looks complete.
-		slog.ErrorContext(ctx, "library export interrupted", "user_id", me, "written", count, "err", failed)
+		slog.ErrorContext(ctx, "library export interrupted", "user_id", me, "written", count)
 	}
 	_ = zw.Close()
 	evt := activity.FromContext(c, activity.LibraryExported)
 	evt.Detail = map[string]any{"count": count}
 	h.activity.Record(ctx, evt)
+}
+
+// keyForRow builds the bucket key of a scanned row from Postgres values only.
+func keyForRow(r *libraryRow) (libkey.Key, error) {
+	if r.visibility == libraryVisibilityOrg {
+		return libkey.ForItem(libkey.ScopeOrg, "", r.folderPath, r.kind, r.slug)
+	}
+	if r.ownerSlug == nil {
+		return libkey.Key{}, libkey.ErrInvalid
+	}
+	return libkey.ForItem(libkey.ScopeUser, *r.ownerSlug, r.folderPath, r.kind, r.slug)
 }
 
 // importRequest is the body of POST /api/v1/library/import: one file the
@@ -812,6 +1088,10 @@ type importRequest struct {
 	Content    string  `json:"content"`
 	Kind       string  `json:"kind"`
 	Visibility *string `json:"visibility,omitempty"`
+	// Scope (private|org) and Path say where the item lands; missing folders
+	// are created. Scope wins over Visibility.
+	Scope string `json:"scope,omitempty"`
+	Path  string `json:"path,omitempty"`
 }
 
 type importPreview struct {
@@ -868,7 +1148,7 @@ func frontMatter(content string) (keys map[string]string, dropped []string, body
 			v = v[1 : len(v)-1]
 		}
 		switch k {
-		case "name", "description", "kind":
+		case "name", "description", "kind", "darkplum_id":
 			keys[k] = v
 		default:
 			dropped = append(dropped, k)
@@ -919,7 +1199,7 @@ func parseImport(req importRequest) (libraryInput, importPreview, string) {
 		_ = json.Unmarshal([]byte(trimmed), &all)
 		for k := range all {
 			switch k {
-			case "kind", "name", "description", "server_url", "allowed_tools":
+			case "kind", "name", "description", "server_url", "allowed_tools", "darkplum_id":
 			default:
 				pv.Dropped = append(pv.Dropped, k)
 			}
@@ -982,30 +1262,38 @@ func (h *LibraryHandler) Import(c *gin.Context) {
 	ctx := c.Request.Context()
 	var req importRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "body must be {filename, content, kind?, visibility?}"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "body must be {filename, content, kind?, scope?, path?}"})
 		return
 	}
 	in, pv, msg := parseImport(req)
 	if msg != "" {
-		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": msg, "dropped": pv.Dropped})
+		body := gin.H{"error": msg, "dropped": pv.Dropped}
+		if msg == toolURLSecretMsg {
+			body["code"] = "tool_url_secret"
+		}
+		c.JSON(http.StatusUnprocessableEntity, body)
 		return
 	}
 	if c.Query("dry_run") == "1" {
 		c.JSON(http.StatusOK, pv)
 		return
 	}
-	visibility := libraryVisibilityPrivate
-	if in.Visibility != nil {
-		visibility = *in.Visibility
+	in.Scope = req.Scope
+	if p := strings.Trim(strings.TrimSpace(req.Path), "/"); p != "" {
+		if !libkey.ValidFolderPath(p) {
+			writeLibErr(c, errFolderInvalid, "import failed")
+			return
+		}
+		in.Path = &p
+	}
+	visibility, ok := itemVisibility(&in)
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "scope must be private or org"})
+		return
 	}
 	id, _, err := h.createOne(ctx, me, in, visibility)
-	switch {
-	case errors.Is(err, errLibraryFull):
-		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": fmt.Sprintf("your library holds the maximum of %d items", libraryItemsPerUser)})
-		return
-	case err != nil:
-		slog.ErrorContext(ctx, "library import failed", "err", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "import failed"})
+	if err != nil {
+		writeLibErr(c, err, "import failed")
 		return
 	}
 	evt := activity.FromContext(c, activity.LibraryImported)
@@ -1018,7 +1306,7 @@ func (h *LibraryHandler) Import(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "import failed"})
 		return
 	}
-	it := r.toWire(me)
+	it := h.wire(r, me)
 	pv.Item = &it
 	c.JSON(http.StatusCreated, pv)
 }
@@ -1045,13 +1333,14 @@ func (h *LibraryHandler) ListShared(c *gin.Context) {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "list shared items failed"})
 			return
 		}
-		items = append(items, r.toWire(me))
+		items = append(items, h.wire(r, me))
 	}
 	c.JSON(http.StatusOK, items)
 }
 
 // AdminUnshare handles POST /api/v1/library/shared/:id/unshare (admin):
-// makes an org item private again. It stays with its owner.
+// makes an org item private again. It stays with its owner, in the folder it
+// was shared from (previous_folder_path), or the root of their tree.
 func (h *LibraryHandler) AdminUnshare(c *gin.Context) {
 	id := c.Param("id")
 	if !isValidUUID(id) {
@@ -1059,19 +1348,24 @@ func (h *LibraryHandler) AdminUnshare(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
+	me := c.GetString("user_id")
 	var kind string
 	var owner *string
-	err := h.db.QueryRow(ctx, `
-		UPDATE library_items SET visibility = 'private', shared_at = NULL, updated_at = now()
-		WHERE id = $1 AND visibility = 'org'
-		RETURNING kind, owner_user_id::text
-	`, id).Scan(&kind, &owner)
-	if errors.Is(err, pgx.ErrNoRows) {
-		c.JSON(http.StatusNotFound, gin.H{"error": "shared item not found"})
+	if err := h.db.QueryRow(ctx, `SELECT kind, owner_user_id::text FROM library_items WHERE id = $1 AND visibility = 'org'`, id).Scan(&kind, &owner); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "shared item not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "unshare failed"})
 		return
 	}
-	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "unshare failed"})
+	if _, err := h.moveItem(ctx, id, me, true, "user", nil, ""); err != nil {
+		var le *libError
+		if errors.As(err, &le) && le.code == "not_found" {
+			c.JSON(http.StatusNotFound, gin.H{"error": "shared item not found"})
+			return
+		}
+		writeLibErr(c, err, "unshare failed")
 		return
 	}
 	evt := activity.FromContext(c, activity.LibraryItemUnshared)
@@ -1091,16 +1385,19 @@ func (h *LibraryHandler) AdminDelete(c *gin.Context) {
 		return
 	}
 	ctx := c.Request.Context()
-	var kind string
-	var owner *string
-	var hadCred bool
-	err := h.db.QueryRow(ctx, `
-		DELETE FROM library_items WHERE id = $1 AND visibility = 'org'
-		RETURNING kind, owner_user_id::text, tool_credential_last4 IS NOT NULL
-	`, id).Scan(&kind, &owner, &hadCred)
+	tx, err := h.db.Begin(ctx)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "delete failed"})
+		return
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	kind, _, owner, hadCred, err := deleteItemTx(ctx, tx, id, "", true)
 	if errors.Is(err, pgx.ErrNoRows) {
 		c.JSON(http.StatusNotFound, gin.H{"error": "shared item not found"})
 		return
+	}
+	if err == nil {
+		err = tx.Commit(ctx)
 	}
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "delete failed"})
@@ -1118,55 +1415,102 @@ func (h *LibraryHandler) AdminDelete(c *gin.Context) {
 }
 
 // reassignLibraryOnUserDelete runs inside the user-delete transaction
-// (handler/users.go): the user's private items are removed with them, like
-// their conversations, and their org-shared items pass to the acting
-// administrator so a shared skill never silently vanishes or loses its
-// editor. Returns the ids reassigned (for the audit event) and the ids of
-// removed items that held a tool credential (for Secret cleanup after
-// commit).
+// (handler/users.go), under its admin lock: the user's private items are
+// removed with them, like their conversations, and their org-shared items
+// pass to the acting administrator so a shared skill never silently vanishes
+// or loses its editor. Erasure of the bucket copies runs through the queue:
+// each removed item and each of the person's folder markers gets a
+// library_sync row, in this same transaction, carrying the last key; the
+// worker deletes the objects and purges every version. Returns the ids
+// reassigned (for the audit event) and the ids of removed items that held a
+// tool credential (for Secret cleanup after commit).
 func reassignLibraryOnUserDelete(ctx context.Context, tx pgx.Tx, deletedUserID, adminID string) (reassigned, credentialsToRemove []string, err error) {
 	rows, err := tx.Query(ctx, `
 		DELETE FROM library_items WHERE owner_user_id = $1 AND visibility = 'private'
-		RETURNING id::text, tool_credential_last4 IS NOT NULL
+		RETURNING id::text, tool_credential_last4 IS NOT NULL, s3_key, s3_pending_key
 	`, deletedUserID)
 	if err != nil {
 		return nil, nil, err
 	}
+	type gone struct {
+		id     string
+		k1, k2 *string
+	}
+	var removed []gone
 	for rows.Next() {
-		var id string
+		var g gone
 		var hadCred bool
-		if err := rows.Scan(&id, &hadCred); err != nil {
+		if err := rows.Scan(&g.id, &hadCred, &g.k1, &g.k2); err != nil {
 			rows.Close()
 			return nil, nil, err
 		}
 		if hadCred {
-			credentialsToRemove = append(credentialsToRemove, id)
+			credentialsToRemove = append(credentialsToRemove, g.id)
 		}
+		removed = append(removed, g)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
 		return nil, nil, err
 	}
-	// Shared items pass to the administrator. A slug the administrator
-	// already uses gets the item's id appended so the (owner, slug) key
-	// stays unique and nothing is lost over a name.
+	for _, g := range removed {
+		if err := enqueueItemDeleted(ctx, tx, g.id, g.k1, g.k2); err != nil {
+			return nil, nil, err
+		}
+	}
+	// The person's folders cascade with the user row; queue their markers.
+	frows, err := tx.Query(ctx, `SELECT id::text, s3_key FROM library_folders WHERE owner_user_id = $1`, deletedUserID)
+	if err != nil {
+		return nil, credentialsToRemove, err
+	}
+	type fgone struct {
+		id  string
+		key *string
+	}
+	var folders []fgone
+	for frows.Next() {
+		var f fgone
+		if err := frows.Scan(&f.id, &f.key); err != nil {
+			frows.Close()
+			return nil, credentialsToRemove, err
+		}
+		folders = append(folders, f)
+	}
+	frows.Close()
+	for _, f := range folders {
+		if err := enqueueFolderDeleted(ctx, tx, f.id, f.key); err != nil {
+			return nil, credentialsToRemove, err
+		}
+	}
+	// Shared items pass to the administrator. They sit in the org tree, whose
+	// uniqueness does not involve the owner, so no slug has to change and
+	// their bucket keys are untouched.
 	rows, err = tx.Query(ctx, `
-		UPDATE library_items li SET owner_user_id = $2, updated_at = now(), updated_by = $2,
-			slug = CASE WHEN EXISTS (SELECT 1 FROM library_items o WHERE o.owner_user_id = $2 AND o.slug = li.slug AND o.id <> li.id)
-				THEN left(li.slug, 91) || '-' || left(li.id::text, 8) ELSE li.slug END
-		WHERE li.owner_user_id = $1 AND li.visibility = 'org'
-		RETURNING li.id::text
+		UPDATE library_items SET owner_user_id = $2, updated_at = now(), updated_by = $2
+		WHERE owner_user_id = $1 AND visibility = 'org'
+		RETURNING id::text
 	`, deletedUserID, adminID)
 	if err != nil {
 		return nil, credentialsToRemove, err
 	}
-	defer rows.Close()
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
+			rows.Close()
 			return nil, credentialsToRemove, err
 		}
 		reassigned = append(reassigned, id)
 	}
-	return reassigned, credentialsToRemove, rows.Err()
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, credentialsToRemove, err
+	}
+	// Rewritten with a new updated_by is not a content change, but the
+	// stored previous_folder_path is the dead user's private path: clear it.
+	if len(reassigned) > 0 {
+		if _, err := tx.Exec(ctx, `UPDATE library_items SET previous_folder_path = NULL WHERE id = ANY($1::uuid[])`, reassigned); err != nil {
+			return nil, credentialsToRemove, err
+		}
+	}
+	return reassigned, credentialsToRemove, nil
 }

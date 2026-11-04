@@ -378,3 +378,157 @@
     transition: none;
   }
 }
+
+/* --- Move dialog --- */
+
+.roots {
+  display: flex;
+  gap: var(--space-1);
+  background: var(--bg-surface-raised);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  padding: 3px;
+}
+
+.root {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-sm);
+  color: var(--fg-muted);
+}
+
+.rootActive {
+  background: var(--bg-primary);
+  color: var(--fg-default);
+  box-shadow: var(--shadow-sm);
+}
+
+.crumbs {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: var(--fs-sm);
+}
+
+.crumbPair {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.crumb {
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-sm);
+  color: var(--fg-muted);
+}
+
+.crumb:hover {
+  color: var(--fg-default);
+  background: var(--bg-surface-hover);
+}
+
+.crumb[aria-current='page'] {
+  color: var(--fg-default);
+  font-weight: var(--fw-medium);
+}
+
+.crumbSep {
+  color: var(--fg-subtle);
+}
+
+.folderList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 40vh;
+  overflow-y: auto;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+}
+
+.folderList > li + li {
+  border-top: 1px solid var(--border-muted);
+}
+
+.folderRow {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 40px;
+  padding: 0 var(--space-3);
+  font-size: var(--fs-sm);
+  color: var(--fg-default);
+  text-align: left;
+}
+
+.folderRow:hover {
+  background: var(--bg-surface-hover);
+}
+
+.folderRowName {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.folderRowMeta {
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+}
+
+.folderRowChevron {
+  color: var(--fg-subtle);
+}
+
+.folderNote {
+  padding: var(--space-3);
+  font-size: var(--fs-sm);
+  color: var(--fg-subtle);
+}
+
+.folderNew {
+  width: 100%;
+  min-height: 40px;
+  padding: 0 var(--space-3);
+  font-size: var(--fs-sm);
+  color: var(--brand-fg);
+  text-align: left;
+}
+
+.folderNew:hover {
+  background: var(--bg-surface-hover);
+}
+
+.folderNewForm {
+  display: flex;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+}
+
+.folderNewInput {
+  flex: 1;
+  min-width: 0;
+  padding: var(--space-1) var(--space-2);
+  background: var(--bg-surface-raised);
+  border: 1px solid var(--border-focus);
+  border-radius: var(--radius-sm);
+  color: var(--fg-default);
+  font-size: var(--fs-sm);
+  outline: none;
+}
+
+.hint {
+  margin-right: auto;
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+}

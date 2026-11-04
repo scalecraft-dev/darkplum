@@ -52,6 +52,7 @@ type DestroyCmd struct {
 	ConfirmNoSnapshot string `name:"confirm-no-snapshot" help:"The cluster name again, to delete the database WITHOUT a final snapshot when the install is configured to take none. --confirm does not cover this."`
 	AllowDowngrade    bool   `name:"allow-downgrade" help:"Destroy even though this darkplum is older than (or cannot be ordered against) the release that last applied the install."`
 	ConfirmUnfinished string `name:"confirm-unfinished" help:"The cluster name once more, to destroy an install whose first deploy never finished (the state has resources but no outputs). Without it such a state is refused. You can also finish it with darkplum deploy first."`
+	DeleteLibraryData string `name:"delete-library-data" help:"The cluster name again, to ALSO delete the Library bucket and every version of every file in it. Without it the bucket is kept with its contents (a reinstall adopts it)."`
 	MinSession        int    `name:"min-session" help:"Stop unless the AWS session outlasts this many minutes." default:"30"`
 }
 
@@ -120,6 +121,9 @@ type destroyEnv struct {
 	cluster   func() (clusterTarget, checkResult, error)
 	kube      func(t clusterTarget) *kube.Client
 
+	// account is the account the credentials were checked to belong to; the library
+	// bucket's name is derived from it.
+	account string
 	// protectionOff is set once the database's deletion protection has been turned
 	// off, so a later failure can say so.
 	protectionOff bool
@@ -181,6 +185,11 @@ func (e *destroyEnv) run(ctx context.Context) (err error) {
 			hint:   "use the profile for the install's account. Nothing was deleted"}, "wrong AWS account")
 	}
 	e.row(checkResult{name: "aws account", status: checkPass, detail: "account " + caller})
+	e.account = caller
+	if v := e.flags.DeleteLibraryData; v != "" && v != rec.ClusterName {
+		return e.stop(checkResult{name: "confirmation", status: checkFail, detail: fmt.Sprintf("--delete-library-data %q is not this install's cluster (%s)", v, rec.ClusterName),
+			hint: "nothing was deleted"}, "wrong --delete-library-data")
+	}
 	if r := e.sessionOK(e.flags.MinSession); r.status == checkFail {
 		return e.stop(r, "the AWS session is too short for a teardown")
 	}
@@ -321,6 +330,11 @@ func (e *destroyEnv) run(ctx context.Context) (err error) {
 	e.phase("[3/5] Confirm")
 	e.printf("This permanently deletes cluster %s and everything Terraform built for it in %s (account %s):\n  the EKS cluster and nodes, the VPC, the database, the registries' images and the web address.\n",
 		rec.ClusterName, rec.Region, caller)
+	if lb := libraryBucketName(rec.ClusterName, caller); e.flags.DeleteLibraryData != "" {
+		e.printf("%s\n", sWarn("! --delete-library-data: the Library bucket "+lb+" and EVERY version of every file in it will be deleted too. There is no copy."))
+	} else {
+		e.printf("The Library bucket %s is KEPT, with everything in it (a reinstall adopts it; --delete-library-data=%s deletes it).\n", lb, rec.ClusterName)
+	}
 	if err := e.confirmName(); err != nil {
 		return err
 	}
@@ -374,6 +388,24 @@ func (e *destroyEnv) run(ctx context.Context) (err error) {
 		}
 		e.row(checkResult{name: "audit log group", status: checkPass, detail: "removed from the state so the destroy keeps it"})
 		delete(state, logGroupAddr)
+	}
+
+	// The Library bucket holds customer data: it leaves the state, with its
+	// configuration resources, so the destroy keeps it as it is. (An opt-in purge
+	// deletes it afterwards.) Whatever of it is in the state goes in one command.
+	if kept := libraryInState(state); len(kept) > 0 {
+		mutated = true
+		if _, err := tf.Capture(append([]string{"state", "rm"}, kept...)...); err != nil {
+			printTFDiagnostic(e.out, err)
+			return e.stop(checkResult{name: "library bucket", status: checkFail, detail: firstLine(err.Error()),
+				hint: "it must leave the state or the destroy would try to delete the Library. Kubernetes was not touched"}, "cannot keep the library bucket")
+		}
+		for _, a := range kept {
+			delete(state, a)
+		}
+		e.row(checkResult{name: "library bucket", status: checkPass, detail: "removed from the state so the destroy keeps it"})
+	} else {
+		e.row(checkResult{name: "library bucket", status: checkPass, detail: "not in the state: nothing to keep"})
 	}
 
 	// ---- 5. kubernetes, credentials again, terraform destroy ---------------------
@@ -732,6 +764,18 @@ func (e *destroyEnv) kubePhase(ctx context.Context, kc *kube.Client) error {
 // report lists, from what exists now, what a destroy deliberately leaves, with
 // the command that deletes each. It deletes nothing.
 func (e *destroyEnv) report(tf tfRunner) error {
+	var perr error
+	if e.flags.DeleteLibraryData != "" {
+		perr = e.purgeLibrary()
+	}
+	err := e.reportLeftovers(tf)
+	if err == nil && perr != nil {
+		return perr
+	}
+	return err
+}
+
+func (e *destroyEnv) reportLeftovers(tf tfRunner) error {
 	rec := e.rec
 	// The install is gone: a later deploy here is a first deploy again.
 	if err := os.Remove(filepath.Join(e.in.Dir(), deployClockFile)); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -764,6 +808,18 @@ func (e *destroyEnv) report(tf tfRunner) error {
 		for _, id := range ids {
 			item("Final database snapshot "+id, "(costs storage until deleted)",
 				prof("rds", "delete-db-snapshot", "--region", rec.Region, "--db-snapshot-identifier", id))
+		}
+	}
+	// Library bucket.
+	if b := e.libraryBucket(); b != "" {
+		_, err = e.aws("aws", runner.ProfileArgs(rec.Profile, "s3api", "head-bucket", "--bucket", b, "--expected-bucket-owner", e.account, "--region", rec.Region)...)
+		switch {
+		case err == nil:
+			item("Library bucket s3://"+b, "(every library file and all its versions; a reinstall adopts it)",
+				"darkplum destroy --delete-library-data="+rec.ClusterName)
+		case bucketGone(err):
+		default:
+			check("Library bucket "+b, err)
 		}
 	}
 	// EKS audit log group.
@@ -963,4 +1019,111 @@ func (e *destroyEnv) leftBehindAfterFailure() {
 	if len(found) == 0 && len(unverified) == 0 && !webFound {
 		e.printf("  nothing tagged for the cluster was found\n")
 	}
+}
+
+// ---- the library bucket ---------------------------------------------------------
+
+// libraryAddrs are the library bucket and its configuration resources in the
+// shipped Terraform. They leave the state together: keeping the bucket while the
+// destroy removed its policy or versioning would leave it unprotected.
+var libraryAddrs = []string{
+	libraryBucketAddr,
+	"module.library_bucket.aws_s3_bucket_public_access_block.this",
+	"module.library_bucket.aws_s3_bucket_ownership_controls.this",
+	"module.library_bucket.aws_s3_bucket_versioning.this",
+	"module.library_bucket.aws_s3_bucket_lifecycle_configuration.this",
+	"module.library_bucket.aws_s3_bucket_server_side_encryption_configuration.this",
+	"module.library_bucket.aws_s3_bucket_policy.this",
+}
+
+// libraryInState lists the library addresses the state holds.
+func libraryInState(state map[string]bool) []string {
+	var out []string
+	for _, a := range libraryAddrs {
+		if state[a] {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+// libraryBucket is this install's library bucket name, "" until the account is known.
+func (e *destroyEnv) libraryBucket() string {
+	acct := e.account
+	if acct == "" {
+		acct = libraryAccount(e.rec)
+	}
+	if acct == "" {
+		return ""
+	}
+	return libraryBucketName(e.rec.ClusterName, acct)
+}
+
+// purgeLibrary deletes every version and delete marker in the library bucket, then
+// the bucket. It runs only for --delete-library-data, which names the cluster; the
+// bucket is the one derived from the install, never a name given on the line. Every
+// step is repeatable: a bucket that is already gone is the goal, not a failure.
+func (e *destroyEnv) purgeLibrary() error {
+	rec := e.rec
+	b := e.libraryBucket()
+	if b == "" {
+		return e.stop(checkResult{name: "library data", status: checkFail, detail: "the install is not pinned to one account, so the bucket name is not known"}, "cannot name the library bucket")
+	}
+	prof := func(args ...string) []string {
+		return runner.ProfileArgs(rec.Profile, append(args, "--region", rec.Region)...)
+	}
+	_, err := e.aws("aws", prof("s3api", "head-bucket", "--bucket", b, "--expected-bucket-owner", e.account)...)
+	switch {
+	case err == nil:
+	case bucketGone(err):
+		e.row(checkResult{name: "library data", status: checkPass, detail: "bucket " + b + " is already gone"})
+		return nil
+	default:
+		return e.stop(checkResult{name: "library data", status: checkFail, detail: firstLine(err.Error()),
+			hint: "cannot tell whether the bucket exists; nothing was deleted from it"}, "cannot reach the library bucket")
+	}
+	e.printf("%s\n", sInfo("→ deleting every version in "+b))
+	type ver struct{ Key, VersionId string }
+	deleted := 0
+	for page := 0; ; page++ {
+		if page > 100000 {
+			return e.stop(checkResult{name: "library data", status: checkFail, detail: "the bucket still lists objects after 100000 pages"}, "cannot empty the library bucket")
+		}
+		out, err := e.aws("aws", prof("s3api", "list-object-versions", "--bucket", b, "--max-items", "100", "--output", "json",
+			"--query", "[Versions[].{Key:Key,VersionId:VersionId}, DeleteMarkers[].{Key:Key,VersionId:VersionId}][]")...)
+		if err != nil {
+			return e.stop(checkResult{name: "library data", status: checkFail, detail: firstLine(err.Error()),
+				hint: fmt.Sprintf("%d version(s) deleted so far; re-run to continue", deleted)}, "cannot list the library bucket")
+		}
+		var vs []ver
+		if t := strings.TrimSpace(out); t != "" && t != "null" && t != "None" {
+			if json.Unmarshal([]byte(t), &vs) != nil {
+				return e.stop(checkResult{name: "library data", status: checkFail, detail: "unexpected answer listing the bucket's versions"}, "cannot list the library bucket")
+			}
+		}
+		if len(vs) == 0 {
+			break
+		}
+		objs := make([]map[string]string, 0, len(vs))
+		for _, v := range vs {
+			objs = append(objs, map[string]string{"Key": v.Key, "VersionId": v.VersionId})
+		}
+		body, _ := json.Marshal(map[string]any{"Objects": objs, "Quiet": true})
+		res, err := e.aws("aws", prof("s3api", "delete-objects", "--bucket", b, "--delete", string(body), "--output", "json", "--query", "Errors[0].Code")...)
+		if err != nil {
+			return e.stop(checkResult{name: "library data", status: checkFail, detail: firstLine(err.Error()),
+				hint: fmt.Sprintf("%d version(s) deleted so far; re-run to continue", deleted)}, "cannot delete from the library bucket")
+		}
+		if code := strings.Trim(strings.TrimSpace(res), `"`); code != "" && code != "null" && code != "None" {
+			return e.stop(checkResult{name: "library data", status: checkFail, detail: "S3 refused to delete some versions: " + code,
+				hint: fmt.Sprintf("%d version(s) deleted so far; the bucket is not empty", deleted)}, "cannot empty the library bucket")
+		}
+		deleted += len(vs)
+	}
+	if _, err := e.aws("aws", prof("s3api", "delete-bucket", "--bucket", b)...); err != nil && !bucketGone(err) {
+		return e.stop(checkResult{name: "library data", status: checkFail, detail: firstLine(err.Error()),
+			hint: fmt.Sprintf("%d version(s) deleted; the bucket is empty but still exists", deleted)}, "cannot delete the library bucket")
+	}
+	e.row(checkResult{name: "library data", status: checkPass, detail: fmt.Sprintf("bucket %s deleted with %d version(s)", b, deleted)})
+	return nil
 }

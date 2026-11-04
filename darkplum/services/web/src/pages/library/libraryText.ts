@@ -161,3 +161,33 @@ export function credentialErrorText(err: unknown): string {
   }
   return errorText(err, 'The credential could not be saved.')
 }
+
+/** The library routes' closed codes, in the words the page uses. Anything
+ *  else falls back to the server's own sentence. */
+export function libraryErrorText(err: unknown, fallback: string): string {
+  if (err instanceof ApiError) {
+    switch (err.code()) {
+      case 'folder_exists':
+        return 'A folder with that name is already here.'
+      case 'folder_invalid':
+        return 'Folder names use lowercase letters, numbers and hyphens, up to 64 characters and five levels deep.'
+      case 'folder_not_empty':
+        return 'The folder is not empty.'
+      case 'folder_not_found':
+        return 'That folder no longer exists.'
+      case 'folder_limit':
+        return 'You have reached the limit of 200 folders.'
+      case 'slug_taken':
+        return 'Something with that file name is already in the destination folder. Rename it first.'
+      case 'shared_path_taken':
+        return 'Someone has already shared something with that file name in that folder. Rename it, or pick another folder.'
+      case 'admin_required':
+        return 'Only an administrator can change the Organisation folders.'
+      case 'library_storage_unavailable':
+        return 'The bucket cannot be reached right now. Nothing was changed; try again in a moment.'
+      case 'tool_url_secret':
+        return 'Leave the credential out of the address: it would be written to the bucket in plain text. Set it in the credential field once the tool is saved.'
+    }
+  }
+  return errorText(err, fallback)
+}

@@ -200,6 +200,9 @@ type deployAWS struct {
 	tl        *timeline
 	logGroups string
 	logErr    error
+	// bucketErr answers `s3api head-bucket`; nil means the bucket exists. The default
+	// (set by newDeployHarness) is the 404 of a bucket that is not there.
+	bucketErr error
 	// eksStatus answers `describe-cluster --query cluster.status`; nil means the
 	// base fake's status, ACTIVE when it has none.
 	eksStatus func() (string, error)
@@ -228,6 +231,9 @@ func (a *deployAWS) run(name string, args ...string) (string, error) {
 	if strings.Contains(joined, "logs describe-log-groups") {
 		return a.logGroups, a.logErr
 	}
+	if strings.Contains(joined, "s3api head-bucket") {
+		return "", a.bucketErr
+	}
 	return "", fmt.Errorf("unexpected aws %s", joined)
 }
 
@@ -243,6 +249,9 @@ func (c *fakeClock) sleep(ctx context.Context, d time.Duration) error {
 	c.mu.Unlock()
 	return ctx.Err()
 }
+
+// errNoBucket is what the AWS CLI says for a bucket that does not exist.
+var errNoBucket = errors.New("exit status 254: An error occurred (404) when calling the HeadBucket operation: Not Found")
 
 const (
 	dpAccount  = "123456789012"
@@ -338,7 +347,7 @@ func newDeployHarness(t *testing.T, gpu int) *deployHarness {
 	h.tf = &fakeTF{t: t, tl: h.tl, outputs: outputsJSON(gpu, nil), streamErr: map[string]error{}, streamText: map[string]string{}}
 	base := &fakeAWS{arn: testARN, caller: dpAccount, describeErr: errors.New("ResourceNotFoundException: no such cluster")}
 	h.tf.onApply = func() { base.describeErr = nil }
-	h.awsf = &deployAWS{base: base, tl: h.tl, logGroups: "0"}
+	h.awsf = &deployAWS{base: base, tl: h.tl, logGroups: "0", bucketErr: errNoBucket}
 	h.k = newScriptKube(t)
 	h.k.tl = h.tl
 	h.gpuNode = func() bool { return gpu > 0 }

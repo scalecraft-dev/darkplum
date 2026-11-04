@@ -1,8 +1,9 @@
-// Package iamcheck proves the gateway role's Bedrock allowlist (Layer 1) with
-// IAM policy simulation: the role must be allowed to invoke a model the install
-// permits and must be implicitly denied everything else. Layer 1 is the cloud's
-// own enforcement; this is the evidence that it behaves as configured, and it
-// changes nothing (iam:SimulatePrincipalPolicy is read-only).
+// Package iamcheck proves the install's Layer 1 with IAM policy simulation: the
+// gateway role must be allowed to invoke a model the install permits and must be
+// implicitly denied everything else, and the api role must be able to read the
+// Library bucket and nothing else while the gateway role is explicitly denied it.
+// Layer 1 is the cloud's own enforcement; this is the evidence that it behaves as
+// configured, and it changes nothing (iam:SimulatePrincipalPolicy is read-only).
 //
 // The package is self-contained: Run takes an AWS command function and the
 // install's Terraform outputs, nothing else.
@@ -36,6 +37,10 @@ type Outputs struct {
 	GatewayRoleARN    string   `json:"gateway_role_arn"`
 	InferenceRegion   string   `json:"inference_region"`
 	BedrockInvokeARNs []string `json:"bedrock_invoke_arns"`
+	// The Library checks run when both are present (a state applied before the
+	// Library existed has neither, and they are then skipped, with a note).
+	APIRoleARN      string `json:"api_role_arn"`
+	LibraryStoreURL string `json:"library_store_url"`
 }
 
 // ErrNoRole means the stack has no gateway role output (not applied yet).
@@ -63,11 +68,21 @@ func FromTerraform(raw map[string]json.RawMessage) (Outputs, error) {
 	if err := get("bedrock_invoke_arns", &o.BedrockInvokeARNs); err != nil {
 		return o, err
 	}
+	if err := get("api_role_arn", &o.APIRoleARN); err != nil {
+		return o, err
+	}
+	if err := get("library_store_url", &o.LibraryStoreURL); err != nil {
+		return o, err
+	}
 	return o, nil
 }
 
 // Check is one simulated request.
 type Check struct {
+	// Role and Action are set on the checks that are not the gateway's Bedrock
+	// invoke (the report's role and action).
+	Role     string `json:"role,omitempty"`
+	Action   string `json:"action,omitempty"`
 	Expect   string `json:"expect"`
 	Resource string `json:"resource"`
 	Got      string `json:"got,omitempty"`
@@ -186,13 +201,22 @@ func Run(ctx context.Context, aws runner.AWSFunc, o Outputs) (Report, error) {
 		Check{Expect: ImplicitDeny, Resource: "arn:aws:bedrock:ap-southeast-7::foundation-model/anthropic.claude-example-v1:0"},
 	)
 
+	checks = append(checks, o.libraryChecks(account, &rep)...)
+
 	first := ""
 	for i := range checks {
 		if err := ctx.Err(); err != nil {
 			return rep, err
 		}
 		c := &checks[i]
-		got, err := simulate(aws, o.GatewayRoleARN, c.Resource)
+		role, action := c.Role, c.Action
+		if role == "" {
+			role = o.GatewayRoleARN
+		}
+		if action == "" {
+			action = Action
+		}
+		got, err := simulate(aws, role, action, c.Resource)
 		switch {
 		case err != nil:
 			c.Error = err.Error()
@@ -214,6 +238,58 @@ func Run(ctx context.Context, aws runner.AWSFunc, o Outputs) (Report, error) {
 	return rep, nil
 }
 
+// libraryChecks are the Library bucket's Layer 1: the api role may read the
+// library prefix and nothing else in the account, and the gateway role is denied
+// the bucket by an explicit Deny (so a policy added to it later cannot grant it).
+func (o Outputs) libraryChecks(account string, rep *Report) []Check {
+	note := func(n string) {
+		if rep.NoteLine != "" {
+			n = rep.NoteLine + "; " + n
+		}
+		rep.NoteLine = n
+	}
+	if o.LibraryStoreURL == "" && o.APIRoleARN == "" {
+		return nil // applied before the Library existed; deploy says so
+	}
+	if o.LibraryStoreURL == "" {
+		note("no library_store_url output: the Library bucket checks were skipped (run `darkplum deploy`)")
+		return nil
+	}
+	if o.APIRoleARN == "" {
+		note("no api_role_arn output: the Library bucket checks were skipped (run `darkplum deploy`)")
+		return nil
+	}
+	rest, ok := strings.CutPrefix(o.LibraryStoreURL, "s3://")
+	bucket, _, _ := strings.Cut(rest, "/")
+	if !ok || bucket == "" {
+		note("library_store_url is not an s3:// URL: the Library bucket checks were skipped")
+		return nil
+	}
+	part := "aws"
+	if f := strings.Split(o.GatewayRoleARN, ":"); len(f) > 1 {
+		part = f[1]
+	}
+	obj := "arn:" + part + ":s3:::" + bucket + "/library/v1/org/darkplum-check.skill.md"
+	other := "arn:" + part + ":s3:::darkplum-not-the-library-" + account + "/library/v1/org/darkplum-check.skill.md"
+	outside := "arn:" + part + ":s3:::" + bucket + "/not-the-library/darkplum-check"
+	bkt := "arn:" + part + ":s3:::" + bucket
+	var checks []Check
+	// Everything the api does to the Library. ListBucket is here because a Get or
+	// Head on a missing key is answered 404 only for a caller that holds it; without
+	// it S3 says 403 and the api cannot tell "no such file" from "no access".
+	for _, a := range []string{"s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:DeleteObjectVersion"} {
+		checks = append(checks, Check{Role: o.APIRoleARN, Action: a, Expect: Allowed, Resource: obj})
+	}
+	for _, a := range []string{"s3:ListBucket", "s3:ListBucketVersions"} {
+		checks = append(checks, Check{Role: o.APIRoleARN, Action: a, Expect: Allowed, Resource: bkt})
+	}
+	return append(checks,
+		Check{Role: o.APIRoleARN, Action: "s3:GetObject", Expect: ImplicitDeny, Resource: other},
+		Check{Role: o.APIRoleARN, Action: "s3:GetObject", Expect: ImplicitDeny, Resource: outside},
+		Check{Role: o.GatewayRoleARN, Action: "s3:GetObject", Expect: ExplicitDeny, Resource: obj},
+	)
+}
+
 // trailing is "example-v1:0" when the allowlist ARN ends in a wildcard, so the
 // concrete resource is a model id the wildcard covers; otherwise nothing.
 func trailing(arn string) string {
@@ -223,8 +299,8 @@ func trailing(arn string) string {
 	return ""
 }
 
-func simulate(aws runner.AWSFunc, role, resource string) (string, error) {
-	out, err := aws("iam", "simulate-principal-policy", "--policy-source-arn", role, "--action-names", Action,
+func simulate(aws runner.AWSFunc, role, action, resource string) (string, error) {
+	out, err := aws("iam", "simulate-principal-policy", "--policy-source-arn", role, "--action-names", action,
 		"--resource-arns", resource, "--query", "EvaluationResults[0].EvalDecision", "--output", "text")
 	if err != nil {
 		return "", errors.New(firstLine(err.Error()))
@@ -234,6 +310,14 @@ func simulate(aws runner.AWSFunc, role, resource string) (string, error) {
 		return "", errors.New("IAM returned no evaluation result")
 	}
 	return out, nil
+}
+
+// roleName is the part of a role ARN after "role/".
+func roleName(arn string) string {
+	if _, n, ok := strings.Cut(arn, ":role/"); ok {
+		return n
+	}
+	return arn
 }
 
 func firstLine(s string) string {
@@ -254,13 +338,17 @@ func (r Report) WriteText(w io.Writer) {
 		fmt.Fprintf(w, "  (%s)\n", r.NoteLine)
 	}
 	for _, c := range r.Checks {
+		res := c.Resource
+		if c.Action != "" {
+			res = c.Action + " as " + roleName(c.Role) + "  " + c.Resource
+		}
 		switch {
 		case c.Error != "":
-			fmt.Fprintf(w, "  ERROR expected %s, could not evaluate (%s)  %s\n", c.Expect, c.Error, c.Resource)
+			fmt.Fprintf(w, "  ERROR expected %s, could not evaluate (%s)  %s\n", c.Expect, c.Error, res)
 		case c.Pass:
-			fmt.Fprintf(w, "  ok    %s  %s\n", c.Expect, c.Resource)
+			fmt.Fprintf(w, "  ok    %s  %s\n", c.Expect, res)
 		default:
-			fmt.Fprintf(w, "  FAIL  expected %s, got %s  %s\n", c.Expect, c.Got, c.Resource)
+			fmt.Fprintf(w, "  FAIL  expected %s, got %s  %s\n", c.Expect, c.Got, res)
 			if c.Note != "" {
 				fmt.Fprintf(w, "        (%s)\n", c.Note)
 			}

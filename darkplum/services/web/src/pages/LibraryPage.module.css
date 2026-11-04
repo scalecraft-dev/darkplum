@@ -361,3 +361,516 @@
     transition: none;
   }
 }
+
+/* ============================================================
+   Folders: location row, breadcrumbs, the tree pane, row menus
+   ============================================================ */
+
+.location {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+
+.segment svg {
+  margin-right: var(--space-1);
+  vertical-align: -2px;
+}
+
+.crumbs {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+  font-size: var(--fs-base);
+}
+
+.crumbs ol {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
+}
+
+.crumbPair {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.crumb {
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+  color: var(--fg-muted);
+  max-width: 16ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+a.crumb:hover {
+  color: var(--fg-default);
+  background: var(--bg-surface-hover);
+}
+
+.crumbCurrent {
+  color: var(--fg-default);
+  font-weight: var(--fw-medium);
+  max-width: 32ch;
+}
+
+.crumbSep {
+  color: var(--fg-subtle);
+}
+
+.crumbUp {
+  display: inline-flex;
+  width: 28px;
+  height: 28px;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  color: var(--fg-subtle);
+}
+
+.crumbUp:hover {
+  color: var(--fg-default);
+  background: var(--bg-surface-hover);
+}
+
+.crumbClear {
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-sm);
+  color: var(--brand-fg);
+}
+
+.crumbClear:hover {
+  text-decoration: underline;
+}
+
+.kinds {
+  display: flex;
+  gap: var(--space-1);
+}
+
+.chip {
+  padding: var(--space-1) var(--space-3);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--fg-muted);
+  background: transparent;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-full);
+  white-space: nowrap;
+  transition: background var(--transition-fast), color var(--transition-fast), border-color var(--transition-fast);
+}
+
+.chip:hover {
+  color: var(--fg-default);
+  background: var(--bg-surface);
+}
+
+.chipActive {
+  color: var(--brand-fg);
+  background: var(--brand-muted);
+  border-color: var(--brand-default);
+}
+
+.chip:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
+}
+
+/* The tree beside the folder view, on screens wide enough for both. */
+.body {
+  display: flex;
+  gap: var(--space-5);
+  align-items: flex-start;
+}
+
+.main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+
+.tree {
+  display: none;
+  flex: 0 0 240px;
+  position: sticky;
+  top: var(--space-4);
+  max-height: calc(100vh - 2 * var(--space-4));
+  overflow-y: auto;
+  padding: var(--space-2) 0;
+  background: var(--bg-surface);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-lg);
+}
+
+@media (min-width: 1200px) {
+  .tree {
+    display: block;
+  }
+}
+
+.treeRoot + .treeRoot {
+  margin-top: var(--space-2);
+  padding-top: var(--space-2);
+  border-top: 1px solid var(--border-muted);
+}
+
+.treeList {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.treeRow {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-height: 30px;
+  padding: 0 var(--space-2) 0 var(--space-3);
+  font-size: var(--fs-sm);
+  color: var(--fg-muted);
+  border-radius: 0;
+}
+
+.treeRootRow {
+  width: 100%;
+  gap: var(--space-2);
+  font-weight: var(--fw-medium);
+  color: var(--fg-default);
+  text-align: left;
+}
+
+.treeRootRow:hover,
+.treeName:hover {
+  background: var(--bg-surface-hover);
+  color: var(--fg-default);
+}
+
+.treeRowActive {
+  background: var(--brand-muted);
+}
+
+.treeRowActive .treeName,
+.treeRowActive.treeRootRow {
+  color: var(--fg-default);
+}
+
+.treeToggle {
+  width: 18px;
+  height: 18px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  color: var(--fg-subtle);
+}
+
+.treeChevron {
+  transition: transform var(--transition-fast);
+}
+
+.treeChevronOpen {
+  transform: rotate(90deg);
+}
+
+.treeName {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+  color: inherit;
+  text-align: left;
+}
+
+.treeName span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.treeName:focus-visible,
+.treeRootRow:focus-visible,
+.treeToggle:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: -2px;
+}
+
+/* Rows: the clickable row and its menu are siblings, never nested. */
+.rowLi {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+}
+
+.rowLi .row {
+  grid-column: 1;
+}
+
+.rowMenu {
+  width: 32px;
+  height: 32px;
+  margin-right: var(--space-2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  color: var(--fg-subtle);
+}
+
+.rowMenu:hover {
+  background: var(--bg-surface-raised);
+  color: var(--fg-default);
+}
+
+.rowMenu:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: -2px;
+}
+
+.rowKind {
+  color: var(--fg-muted);
+}
+
+.rowPath {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: var(--fs-sm);
+  color: var(--fg-muted);
+  min-width: 0;
+}
+
+/* The end of a path is the useful end: cut from the left. */
+.rowPathText {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+  max-width: 60ch;
+}
+
+.syncDot {
+  width: 8px;
+  height: 8px;
+  border-radius: var(--radius-full);
+  background: var(--fg-subtle);
+  animation: syncPulse 1.6s ease-in-out infinite;
+}
+
+@keyframes syncPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+.rowInline {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+}
+
+.inlineForm {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.inlineInput {
+  width: min(100%, 360px);
+  padding: var(--space-1) var(--space-2);
+  background: var(--bg-surface-raised);
+  border: 1px solid var(--border-focus);
+  border-radius: var(--radius-sm);
+  color: var(--fg-default);
+  font-size: var(--fs-base);
+  outline: none;
+}
+
+.inlineHint {
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+}
+
+.inlineError {
+  font-size: var(--fs-xs);
+  color: var(--danger-fg);
+}
+
+.resultsNote {
+  font-size: var(--fs-sm);
+  color: var(--fg-subtle);
+}
+
+/* The dropdown menus (rows, New). */
+.menu {
+  min-width: 200px;
+  padding: var(--space-1);
+  background: var(--bg-surface-raised);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-lg);
+  z-index: var(--z-drawer);
+}
+
+.menuItem {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  min-height: 34px;
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-sm);
+  color: var(--fg-default);
+  cursor: pointer;
+  outline: none;
+  text-decoration: none;
+}
+
+.menuItem[data-highlighted] {
+  background: var(--bg-surface-hover);
+}
+
+.menuItem[data-disabled] {
+  color: var(--fg-subtle);
+  cursor: default;
+}
+
+.menuItemDanger {
+  color: var(--danger-fg);
+}
+
+.menuReason {
+  flex-basis: 100%;
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+}
+
+.menuSep {
+  height: 1px;
+  margin: var(--space-1) 0;
+  background: var(--border-muted);
+}
+
+.dialogBody {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  font-size: var(--fs-sm);
+  color: var(--fg-default);
+}
+
+.dialogHint {
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+}
+
+.dialogActions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+@media (max-width: 767px) {
+  .segmented {
+    width: 100%;
+  }
+
+  .segment {
+    flex: 1;
+    text-align: center;
+    min-height: 40px;
+  }
+
+  .rowMenu {
+    width: 44px;
+    height: 44px;
+  }
+
+  .rowPathText {
+    max-width: 100%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .treeChevron,
+  .chip {
+    transition: none;
+  }
+
+  .syncDot {
+    animation: none;
+  }
+}
+
+.rowFile {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+  max-width: 28ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Admin: the bucket or the sync worker needs attention. */
+.storeBanner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  margin-bottom: var(--space-4);
+  background: var(--warning-bg);
+  border: 1px solid var(--warning-border);
+  border-left: 2px solid var(--warning-fg);
+  border-radius: var(--radius-md);
+  font-size: var(--fs-sm);
+  color: var(--fg-default);
+}
+
+.storeBannerDanger {
+  background: var(--danger-bg);
+  border-color: var(--danger-border);
+  border-left-color: var(--danger-fg);
+}
+
+.syncReport {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  font-size: var(--fs-sm);
+}
+
+.syncReport ul {
+  margin: 0;
+  padding-left: var(--space-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+.syncReport code {
+  font-family: var(--font-mono);
+  font-size: var(--fs-xs);
+}

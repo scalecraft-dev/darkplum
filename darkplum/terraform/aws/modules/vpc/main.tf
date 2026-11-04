@@ -55,3 +55,18 @@ resource "aws_ec2_subnet_cidr_reservation" "lb" {
     }
   }
 }
+
+# S3 gateway endpoint on the private route tables: the api's library traffic and
+# the nodes' ECR layer pulls reach S3 over the AWS network instead of the NAT
+# gateway. No endpoint policy on purpose: a restrictive one that omits the
+# buckets ECR serves layers from breaks image pulls.
+data "aws_region" "current" {}
+
+resource "aws_vpc_endpoint" "s3" {
+  vpc_id            = module.vpc.vpc_id
+  service_name      = "com.amazonaws.${data.aws_region.current.name}.s3"
+  vpc_endpoint_type = "Gateway"
+  route_table_ids   = module.vpc.private_route_table_ids
+
+  tags = merge(var.tags, { Name = "${var.name}-s3" })
+}

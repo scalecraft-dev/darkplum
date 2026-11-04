@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom'
 import type { LibraryItem } from '../types'
 import { KindGlyph } from '../components/ui/KindGlyph'
 import { KIND_LABEL } from './library/libraryText'
+import { pathOf, scopeOf } from './library/libraryPath'
 import styles from './LibraryPicker.module.css'
 
 
@@ -38,10 +39,13 @@ export function LibraryPicker({ items, loading, error, attachedIds, onToggle, on
   const attached = useMemo(() => new Set(attachedIds), [attachedIds])
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase()
+    // Typing a folder's name lists the whole folder: that is the picker's
+    // folder navigation, and it costs nothing.
     const match = (it: LibraryItem) =>
-      !q || it.name.toLowerCase().includes(q) || it.description.toLowerCase().includes(q)
-    const mine = items.filter((it) => it.mine && match(it))
-    const shared = items.filter((it) => !it.mine && match(it))
+      !q || it.name.toLowerCase().includes(q) || it.description.toLowerCase().includes(q) || pathOf(it).toLowerCase().includes(q)
+    const byPath = (a: LibraryItem, b: LibraryItem) => pathOf(a).localeCompare(pathOf(b)) || a.name.localeCompare(b.name)
+    const mine = items.filter((it) => scopeOf(it) === 'private' && match(it)).sort(byPath)
+    const shared = items.filter((it) => scopeOf(it) === 'org' && match(it)).sort(byPath)
     return { mine, shared, flat: [...mine, ...shared] }
   }, [items, query])
 
@@ -116,10 +120,10 @@ export function LibraryPicker({ items, loading, error, attachedIds, onToggle, on
               </span>
               <span className={styles.optionText}>
                 <span className={styles.optionName}>{it.name}</span>
-                <span className={styles.optionMeta}>
+                <span className={styles.optionMeta} title={pathOf(it) ? pathOf(it).split('/').join(' / ') : undefined}>
                   {KIND_LABEL[it.kind]}
-                  {!it.mine ? ' · Shared' : ''}
-                  {!it.mine && it.owner ? ` · by ${it.owner.name || it.owner.email}` : ''}
+                  {pathOf(it) ? ` · ${pathOf(it).split('/').slice(-2).join(' / ')}` : ''}
+                  {scopeOf(it) === 'org' && !it.mine && it.owner ? ` · by ${it.owner.name || it.owner.email}` : ''}
                   {why ? ` · ${why}` : ''}
                 </span>
               </span>
@@ -169,15 +173,15 @@ export function LibraryPicker({ items, loading, error, attachedIds, onToggle, on
         ) : items.length === 0 ? (
           <p className={styles.state}>
             Nothing in your library yet.{' '}
-            <Link to="/library?tab=skills">Import instructions from a Markdown file</Link>, or write a skill,
+            <Link to="/library">Import instructions from a Markdown file</Link>, or write a skill,
             add a tool server or save some context on the Library page.
           </p>
         ) : visible.flat.length === 0 ? (
           <p className={styles.state}>No items match “{query}”.</p>
         ) : (
           <>
-            {renderGroup('Mine', visible.mine, 0)}
-            {renderGroup('Shared with me', visible.shared, visible.mine.length)}
+            {renderGroup('Private', visible.mine, 0)}
+            {renderGroup('Organisation', visible.shared, visible.mine.length)}
           </>
         )}
       </div>

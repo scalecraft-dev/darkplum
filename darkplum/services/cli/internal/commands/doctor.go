@@ -28,6 +28,7 @@ type DoctorCheckCmd struct {
 	Region  string `help:"Region to check GPU capacity in — must match the install's region. Defaults per cloud." default:""`
 	Profile string `help:"AWS profile to check against — must match the install's profile, else the check hits the wrong account. Defaults to the standard AWS credential chain." default:""`
 
+	Cluster    string `help:"Cluster name, to check the Library bucket name and whether a bucket kept by an earlier destroy exists. Defaults to the install's." default:""`
 	Tfvars     string `help:"Path to the settings file written by 'darkplum init'. Takes profile, region, GPU type and AZs from it and checks the credentials belong to the account it names. The deploy passes this." default:""`
 	MinSession int    `help:"Fail when the AWS session expires within this many minutes (an SSO login that lapses mid-apply strands a half-built cluster). 0 only reports it." name:"min-session" default:"0"`
 }
@@ -49,7 +50,7 @@ type checkResult struct {
 }
 
 // Run executes `darkplum doctor check --cloud aws|gcp`.
-func (d *DoctorCheckCmd) Run(_ *Globals) error {
+func (d *DoctorCheckCmd) Run(g *Globals) error {
 	var tf tfvarsInfo
 	if d.Tfvars != "" {
 		var err error
@@ -103,6 +104,17 @@ func (d *DoctorCheckCmd) Run(_ *Globals) error {
 		}
 		if wantGPU {
 			checks = append(checks, checkAWSGPUQuota(region, d.Profile, gpuType))
+		}
+		if d.Tfvars != "" {
+			cluster := d.Cluster
+			if cluster == "" {
+				if _, rec, err := openInstall(g.Install); err == nil {
+					cluster = rec.ClusterName
+				}
+			}
+			if cluster != "" && len(tf.AccountIDs) == 1 {
+				checks = append(checks, checkLibraryBucket(runWithStderr, d.Profile, cluster, tf.AccountIDs[0], region)...)
+			}
 		}
 		if d.Tfvars != "" && len(tf.AZs) > 0 {
 			types := []string{defaultCPUInstance}
@@ -331,6 +343,38 @@ func checkOfferings(a *awsCloud, region string, azs, types []string) checkResult
 			hint: "re-run darkplum init to pick zones that offer them"}
 	}
 	return checkResult{name: "instance offerings", status: checkPass, detail: strings.Join(types, ", ") + " in " + strings.Join(azs, ", ")}
+}
+
+// checkLibraryBucket warns about the two things that surprise a deploy: a library
+// bucket name S3 would refuse (over 63 characters), and a bucket that already
+// exists, which is what `darkplum destroy` leaves behind with the Library in it (a
+// reinstall adopts it; on a running install it is simply that install's). Both
+// are warnings: nothing is wrong yet.
+func checkLibraryBucket(aws cmdRunner, profile, cluster, account, region string) []checkResult {
+	name := libraryBucketName(cluster, account)
+	if r, bad := libraryNameCheck(cluster, account); bad {
+		return []checkResult{r}
+	}
+	_, err := aws("aws", awsArgs(profile, "s3api", "head-bucket", "--bucket", name, "--expected-bucket-owner", account, "--region", region)...)
+	switch {
+	case err == nil:
+		return []checkResult{{name: "library bucket", status: checkWarn, detail: name + " exists",
+			hint: "a reinstall adopts it with the Library in it (a running install owns it already). To delete the Library for good: `darkplum destroy --delete-library-data=" + cluster + "`"}}
+	case bucketGone(err):
+		return []checkResult{{name: "library bucket", status: checkPass, detail: name + " (none yet)"}}
+	}
+	return []checkResult{{name: "library bucket", status: checkWarn, detail: "could not check whether " + name + " exists: " + firstLine(err.Error()),
+		hint: "a 403 means the name belongs to another account, or this session may not read it"}}
+}
+
+// libraryNameCheck is the warning for a bucket name over S3's limit; bad says it applies.
+func libraryNameCheck(cluster, account string) (checkResult, bool) {
+	name := libraryBucketName(cluster, account)
+	if len(name) <= libraryBucketMax {
+		return checkResult{}, false
+	}
+	return checkResult{name: "library bucket name", status: checkWarn, detail: fmt.Sprintf("%s is %d characters; S3 allows %d", name, len(name), libraryBucketMax),
+		hint: "the apply would refuse it: use a shorter cluster name"}, true
 }
 
 func checkGCPCreds() checkResult {

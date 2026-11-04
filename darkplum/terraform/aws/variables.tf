@@ -304,3 +304,26 @@ variable "adopt_eks_log_group" {
   type        = bool
   default     = false
 }
+
+variable "library_noncurrent_days" {
+  description = "Days a replaced or deleted version of a library file is kept before S3 expires it (the accidental-delete recovery window)."
+  type        = number
+  default     = 30
+}
+
+variable "library_kms_key_arn" {
+  description = "Encrypt the library bucket with this customer-managed KMS key (ARN) instead of the default SSE-S3. Its key policy must let the api role use it; Darkplum grants the role kms:GenerateDataKey, Decrypt and DescribeKey on it and manages nothing else about it."
+  type        = string
+  default     = null
+}
+
+variable "adopt_library_bucket" {
+  description = <<-EOT
+    Set by `darkplum deploy` (never in terraform.tfvars) when the library bucket
+    <cluster_name>-library-<account_id> exists in the account but is not in the
+    state: `darkplum destroy` keeps it on purpose (it holds the library). The plan
+    then imports it instead of failing to create it.
+  EOT
+  type        = bool
+  default     = false
+}
