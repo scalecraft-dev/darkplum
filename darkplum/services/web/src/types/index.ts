@@ -21,6 +21,9 @@ export interface ApiKey {
 export interface ChatMessage {
   role: 'user' | 'assistant'
   content: string
+  /** User turns: the images and files sent with the words. Stored records
+   *  carry an id; the turn being sent carries its bytes until it is saved. */
+  attachments?: import('../lib/attachments').MessageAttachment[]
   /** Assistant turns read back from history: the model the server recorded as
    *  having produced the reply. Display only — stripped before the turn is sent
    *  back to the gateway. */
@@ -97,6 +100,8 @@ export interface ConversationMessage {
   created_at: string
   /** Assistant turns: the tool calls made for this reply, or null. */
   tool_events: ToolEvent[] | null
+  /** User turns: what was attached, metadata only. The bytes are read by id. */
+  attachments?: import('../lib/attachments').AttachmentMeta[] | null
 }
 
 export interface ConversationFull extends ConversationSummary {
@@ -111,6 +116,8 @@ export interface ConversationMessageInput {
   model?: string
   request_id?: string
   tool_events?: ToolEvent[]
+  /** User turns only: the bytes of each attachment, base64. */
+  attachments?: { kind: 'image' | 'file'; media_type: string; name: string; data: string }[]
 }
 
 /**

@@ -149,7 +149,7 @@ func (p *BedrockProvider) Complete(ctx context.Context, req provider.ChatRequest
 		AdditionalModelRequestFields: additionalModelRequestFields(req),
 	})
 	if err != nil {
-		return nil, p.wrapError(req.Model, err, toolConfig != nil)
+		return nil, p.wrapError(req.Model, err, toolConfig != nil, onlyMediaParam(req), hasMediaParts(req))
 	}
 	p.retention.setRefused(req.Model, false)
 
@@ -190,7 +190,7 @@ func (p *BedrockProvider) Stream(ctx context.Context, req provider.ChatRequest, 
 		AdditionalModelRequestFields: additionalModelRequestFields(req),
 	})
 	if err != nil {
-		return nil, p.wrapError(req.Model, err, toolConfig != nil)
+		return nil, p.wrapError(req.Model, err, toolConfig != nil, onlyMediaParam(req), hasMediaParts(req))
 	}
 	p.retention.setRefused(req.Model, false)
 	defer out.Close()
@@ -242,7 +242,7 @@ loop:
 	// surfaces via Err() after the events channel closes, not as an event —
 	// must not be swallowed.
 	if err := out.Err(); err != nil {
-		return stats, p.wrapError(req.Model, err, toolConfig != nil)
+		return stats, p.wrapError(req.Model, err, toolConfig != nil, onlyMediaParam(req), hasMediaParts(req))
 	}
 	if streamErr != nil {
 		return stats, fmt.Errorf("bedrock: translate error: %w", streamErr)
@@ -292,7 +292,7 @@ func requestMetadata(req provider.ChatRequest) map[string]string {
 // wrapError classifies the data-retention refusal (a typed, scrubbed error and
 // a per-model flag for GET /v1/models availability) and otherwise defers to
 // wrapBedrockError.
-func (p *BedrockProvider) wrapError(model string, err error, hadTools bool) error {
+func (p *BedrockProvider) wrapError(model string, err error, hadTools bool, mediaParam string, hasMedia bool) error {
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) && isDataRetentionValidation(apiErr.ErrorCode(), apiErr.ErrorMessage()) {
 		mode, _ := p.retention.accountMode()
@@ -311,7 +311,7 @@ func (p *BedrockProvider) wrapError(model string, err error, hadTools bool) erro
 		p.retired.markCalled(model)
 		slog.Warn("bedrock: model is retired by AWS (end of life)", "model", model)
 	}
-	return wrapBedrockError(err)
+	return wrapBedrockErrorParam(err, mediaParam, hasMedia)
 }
 
 // isToolsUnsupportedValidation reports whether a Converse error is the
@@ -343,14 +343,49 @@ func (p *BedrockProvider) ParamCaps() provider.ParamCaps {
 // wrapBedrockError converts a Bedrock SDK error into a BedrockAPIError that
 // carries the HTTP status code and OpenAI-compatible body, so the gateway HTTP
 // handler can write them directly without re-translating.
-func wrapBedrockError(err error) error {
+func wrapBedrockError(err error) error { return wrapBedrockErrorParam(err, "", false) }
+
+// hasMediaParts reports whether any message carries an image or file part.
+func hasMediaParts(req provider.ChatRequest) bool {
+	for _, m := range req.Messages {
+		for _, p := range m.Parts {
+			if p.Kind != provider.KindText {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// onlyMediaParam is messages[i].content[j] of the request's single image or
+// document part, or "" when there are none or several (then the part a vendor
+// refusal is about is not known).
+func onlyMediaParam(req provider.ChatRequest) string {
+	param, n := "", 0
+	for i, m := range req.Messages {
+		for j, p := range m.Parts {
+			if p.Kind != provider.KindText {
+				n++
+				param = fmt.Sprintf("messages[%d].content[%d]", i, j)
+			}
+		}
+	}
+	if n != 1 {
+		return ""
+	}
+	return param
+}
+
+// wrapBedrockErrorParam is wrapBedrockError carrying the field an
+// image/document refusal refers to.
+func wrapBedrockErrorParam(err error, mediaParam string, hasMedia bool) error {
 	var apiErr smithy.APIError
 	if errors.As(err, &apiErr) {
 		slog.Error("bedrock: API error",
 			"code", apiErr.ErrorCode(),
 			"message", apiErr.ErrorMessage(),
 			"raw", err.Error())
-		statusCode, body := TranslateBedrockError(apiErr.ErrorCode(), apiErr.ErrorMessage())
+		statusCode, body := translateBedrockError(apiErr.ErrorCode(), apiErr.ErrorMessage(), mediaParam, hasMedia)
 		return &BedrockAPIError{
 			StatusCode: statusCode,
 			Body:       body,

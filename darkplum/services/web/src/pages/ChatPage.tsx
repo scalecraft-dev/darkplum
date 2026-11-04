@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { Link, useNavigate } from 'react-router-dom'
 import { ChatError, exportConversation, listLibrary, streamChat } from '../lib/api'
 import { isCutOffReply } from '../lib/chatStream'
@@ -17,6 +18,7 @@ import {
   importLocalConversations,
   loadConversations,
   openConversation,
+  pendingToMessage,
   renameConversation,
   setConversationLibraryItems,
   setConversationModel,
@@ -27,26 +29,70 @@ import {
   type Conversation,
 } from '../lib/conversations'
 import { saveBlob } from '../lib/download'
-import { chatTagline, pickDefaultModel } from '../lib/modelChoice'
+import { pickDefaultModel, promptDestinationClass } from '../lib/modelChoice'
+import { greeting } from '../lib/greeting'
+import { AttachmentUnavailableError, checkAdd, fromMeta, type AttachmentMeta, type PendingAttachment } from '../lib/attachments'
+import { pastedName, prepareFile, releasePreview } from '../lib/attachmentFiles'
 import type { BackendClass, ChatMessage, LibraryItem, ToolEvent } from '../types'
 import { useAuth } from '../context/AuthContext'
 import { useToast } from '../components/Toast'
 import { useModels } from '../hooks/useModels'
-import { Button } from '../components/ui'
+import { useSidebarSlot } from '../components/SidebarSlot'
+import { Button, PlumMark } from '../components/ui'
 import { Skeleton } from '../components/ui/Skeleton'
 import { ConversationList, type ListState } from './ConversationList'
 import { MessageList, type ChatFailure } from './MessageList'
-import { ChatComposer, type AttachedChip, type ComposerLibrary, type ComposerNotice } from './ChatComposer'
+import {
+  ChatComposer,
+  type AttachedChip,
+  type ComposerAttachments,
+  type ComposerLibrary,
+  type ComposerNotice,
+  type RejectedAttachment,
+} from './ChatComposer'
 import { ModelSelector } from './ModelSelector'
 import { MODEL_RETIRED_CODE } from '../lib/modelRetired'
 import { ModelAccessNotice } from './ModelAccessNotice'
 import styles from './ChatPage.module.css'
 
-const STARTER_PROMPTS = [
-  'Summarize a document for me',
-  'Write a SQL query to find active users',
-  'Explain this error message',
-  'Help me draft a professional email',
+/* One per kind of work, each a sentence the person can send as-is. */
+const STARTER_PROMPTS: { label: string; prompt: string; glyph: React.ReactNode }[] = [
+  {
+    label: 'Summarize',
+    prompt: 'Summarize a document for me',
+    glyph: (
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        <line x1="4" y1="6" x2="20" y2="6" /><line x1="4" y1="12" x2="16" y2="12" /><line x1="4" y1="18" x2="11" y2="18" />
+      </svg>
+    ),
+  },
+  {
+    label: 'Query',
+    prompt: 'Write a SQL query to find active users',
+    glyph: (
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        <ellipse cx="12" cy="5" rx="8" ry="3" /><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5" /><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3" />
+      </svg>
+    ),
+  },
+  {
+    label: 'Debug',
+    prompt: 'Explain this error message',
+    glyph: (
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        <polyline points="16 18 22 12 16 6" /><polyline points="8 6 2 12 8 18" />
+      </svg>
+    ),
+  },
+  {
+    label: 'Draft',
+    prompt: 'Help me draft a professional email',
+    glyph: (
+      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+        <path d="M12 20h9" /><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4z" />
+      </svg>
+    ),
+  },
 ]
 
 /** The model list has five states and each one needs different words. */
@@ -96,7 +142,13 @@ const LIBRARY_MAX_ATTACHED = 8
 
 export function ChatPage() {
   const navigate = useNavigate()
+  // The conversation list is drawn in the sidebar's Recents section, but it
+  // is this page's: its state, loading and edits all stay here.
+  const sidebarSlot = useSidebarSlot()
   const { user } = useAuth()
+  // Chosen once per visit to the page, not once per render: the line must
+  // not change under the person while they type.
+  const [openingLine] = useState(() => greeting(user?.name))
   const { toast } = useToast()
   const isAdmin = user?.role === 'admin'
   const {
@@ -129,6 +181,21 @@ export function ChatPage() {
    *  honoured. Restoring it against an empty list would read as "gone". */
   const [pendingModel, setPendingModel] = useState<string | null>(null)
   const [failure, setFailure] = useState<ChatFailure | null>(null)
+  // Images and files waiting in the composer. Bytes live here, base64, until
+  // the turn is saved; the message then carries the stored record instead.
+  const [pendingAttachments, setPendingAttachments] = useState<PendingAttachment[]>([])
+  const [rejectedAttachments, setRejectedAttachments] = useState<RejectedAttachment[]>([])
+  const [attachmentsBusy, setAttachmentsBusy] = useState(false)
+  // The tray as of the last commit, for the file loop below: each file is
+  // checked against the ones before it without waiting on a render.
+  const pendingRef = useRef<PendingAttachment[]>([])
+  useEffect(() => {
+    pendingRef.current = pendingAttachments
+  }, [pendingAttachments])
+  // Files being dragged over the chat column: counted, so moving across
+  // nested elements does not flicker the overlay.
+  const [dragDepth, setDragDepth] = useState(0)
+  const pastedCount = useRef(0)
   const abortRef = useRef<AbortController | null>(null)
   /** The library, for the composer's picker and for naming chips and the
    *  "used …" line. Read on first visit and whenever the picker opens. */
@@ -281,10 +348,6 @@ export function ChatPage() {
     }),
     [chips, handleRemoveAttachment, handleToggleAttachment, libraryItems, libraryLoading, libraryError, refreshLibrary, attachedIds.length],
   )
-  /** The entry the picker is on, for anything that has to describe it — the
-   *  empty state's tagline above all, which sits one line under the picker's
-   *  own "leaves your cloud account" and must not contradict it. */
-  const selectedModel = models.find((m) => m.id === model) ?? null
   const messages = active?.messages ?? []
   const threadLoading = Boolean(active && loadingId === active.id)
 
@@ -349,7 +412,9 @@ export function ChatPage() {
   }, [])
 
   // First load: move anything still held in this browser to the server, then
-  // read the list and open the most recent conversation.
+  // read the list. Nothing is opened: the page lands on a new chat, and the
+  // recents are one click away in the sidebar. A send with nothing open
+  // starts a draft (see handleSend).
   useEffect(() => {
     let cancelled = false
     void (async () => {
@@ -372,20 +437,6 @@ export function ChatPage() {
         setListState('error')
         setListError(errorText(err, 'Your conversations could not be loaded'))
         return
-      }
-      const first = list[0]
-      if (!first) return
-      setActiveId(first.id)
-      if (first.model) setPendingModel(first.model)
-      setLoadingId(first.id)
-      try {
-        const full = await openConversation(first.id)
-        if (cancelled) return
-        setConversations((prev) => prev.map((c) => (c.id === full.id ? full : c)))
-      } catch (err) {
-        if (!cancelled) setThreadError(errorText(err, 'This conversation could not be loaded'))
-      } finally {
-        if (!cancelled) setLoadingId((prev) => (prev === first.id ? null : prev))
       }
     })()
     return () => {
@@ -544,10 +595,19 @@ export function ChatPage() {
 
       // Saving runs alongside the request: a reply must never wait on our own
       // database, and a database that is down must not cost anyone their answer.
+      // What the server recorded for the turn's attachments, once saved: the
+      // ids the message carries from then on, in place of the bytes.
+      const lastUserAttachments = (full: { role: string; attachments?: AttachmentMeta[] | null }[]) => {
+        for (let i = full.length - 1; i >= 0; i--) {
+          if (full[i].role === 'user') return full[i].attachments ?? undefined
+        }
+        return undefined
+      }
       const saveUserTurn = (async (): Promise<{
         id: string
         stored: boolean
         diverged: boolean
+        attachments?: AttachmentMeta[]
       }> => {
         try {
           if (isDraft) {
@@ -569,10 +629,19 @@ export function ChatPage() {
               ),
             )
             setActiveId((prev) => (prev === DRAFT_ID ? created.id : prev))
-            return { id: created.id, stored: true, diverged: false }
+            return {
+              id: created.id,
+              stored: true,
+              diverged: false,
+              attachments: lastUserAttachments(created.messages.map((m) => ({ role: m.role, attachments: m.attachments?.map((a) => ({ id: a.id as string, kind: a.kind, media_type: a.mediaType, name: a.name, size_bytes: a.size })) }))),
+            }
           }
           if (unsent.length === 0) return { id: liveId, stored: true, diverged: false }
-          const result = await appendTurns(liveId, [userTurn(unsent[unsent.length - 1].content)])
+          const lastUnsent = unsent[unsent.length - 1]
+          const pendingBytes = (lastUnsent.attachments ?? [])
+            .filter((a) => !a.id && a.data)
+            .map((a) => ({ kind: a.kind, mediaType: a.mediaType, name: a.name, size: a.size, data: a.data as string }))
+          const result = await appendTurns(liveId, [userTurn(lastUnsent.content, pendingBytes)])
           const last = result.messages[result.messages.length - 1]
           setConversations((prev) =>
             prev.map((c) =>
@@ -586,7 +655,7 @@ export function ChatPage() {
                 : c,
             ),
           )
-          return { id: liveId, stored: true, diverged: result.diverged }
+          return { id: liveId, stored: true, diverged: result.diverged, attachments: lastUserAttachments(result.messages) }
         } catch {
           setConversations((prev) =>
             prev.map((c) =>
@@ -631,8 +700,18 @@ export function ChatPage() {
                 : c,
             ),
           )
+        let wire
+        try {
+          wire = toWireMessages(messagesToSend)
+        } catch (err) {
+          // A turn names an attachment nobody holds any more. Nothing goes out.
+          attempt.outcome = 'error'
+          attempt.error = err instanceof AttachmentUnavailableError ? err : new Error(String(err))
+          abortRef.current = null
+          return attempt
+        }
         await streamChat(
-          toWireMessages(messagesToSend),
+          wire,
           modelId,
           (token) => {
             accum += token
@@ -674,6 +753,18 @@ export function ChatPage() {
       setStreaming(false)
 
       const target = await saveUserTurn
+
+      // Once stored, the turn carries the records, not the bytes: the
+      // thumbnails read back by id, and the next send names the ids so the
+      // same megabytes do not cross the wire again.
+      if (target.attachments && target.attachments.length > 0) {
+        const li = messagesToSend.length - 1
+        const lastMsg = messagesToSend[li]
+        if (lastMsg.role === 'user' && lastMsg.attachments?.some((a) => !a.id)) {
+          for (const a of lastMsg.attachments) releasePreview(a)
+          messagesToSend[li] = { ...lastMsg, attachments: target.attachments.map(fromMeta) }
+        }
+      }
 
       if (result.outcome === 'error') {
         // The gateway refuses routing failures with a code; keep it so the
@@ -823,7 +914,11 @@ export function ChatPage() {
   )
 
   const handleSend = useCallback(
-    async (text: string) => {
+    async (text: string, attachments: PendingAttachment[] = []) => {
+      // The same two gates sendMessages has, checked here first: the tray is
+      // emptied below, and a turn that never goes out must not take the
+      // files with it.
+      if (streaming || !(model || active?.model)) return
       let conv = active
       if (!conv) {
         conv = createDraft(model, draftLibraryIds)
@@ -831,11 +926,132 @@ export function ChatPage() {
         setConversations((prev) => [draft, ...prev.filter((c) => !c.draft)])
         setActiveId(DRAFT_ID)
       }
-      const messagesToSend: ChatMessage[] = [...conv.messages, { role: 'user', content: text }]
+      const turn: ChatMessage = { role: 'user', content: text }
+      const atts = pendingToMessage(attachments)
+      if (atts) turn.attachments = atts
+      // The tray empties the moment the turn is on screen; the bytes travel
+      // with the message from here on.
+      setPendingAttachments([])
+      setRejectedAttachments([])
+      const messagesToSend: ChatMessage[] = [...conv.messages, turn]
       await sendMessages(conv, messagesToSend)
     },
-    [active, model, sendMessages, draftLibraryIds],
+    [active, model, streaming, sendMessages, draftLibraryIds],
   )
+
+  /** Reads each file, refuses the ones that cannot go, and adds the rest to the
+   *  tray. Refusals stay in the tray by name until removed. */
+  const addFiles = useCallback(
+    async (files: File[]) => {
+      if (files.length === 0) return
+      setAttachmentsBusy(true)
+      try {
+        // Every earlier turn's attachments ride along on each send, so they
+        // count toward what one more file may add.
+        const history = (active?.messages ?? [])
+          .filter((m) => m.role === 'user')
+          .flatMap((m) => m.attachments ?? [])
+          .map((a) => ({ kind: a.kind, size: a.size }))
+        for (const raw of files) {
+          // The clipboard names every image "image.png".
+          const file =
+            /^image\.(png|jpe?g|gif|webp)$/i.test(raw.name)
+              ? new File([raw], pastedName(++pastedCount.current, raw.type || 'image/png'), { type: raw.type })
+              : raw
+          const prepared = await prepareFile(file)
+          if (!prepared.ok) {
+            setRejectedAttachments((prev) => [...prev, { name: prepared.name, error: prepared.error }])
+            continue
+          }
+          const a = prepared.attachment
+          const reason = checkAdd(pendingRef.current, a, history)
+          if (reason) {
+            releasePreview(a)
+            setRejectedAttachments((prev) => [...prev, { name: a.name, error: reason }])
+            continue
+          }
+          pendingRef.current = [...pendingRef.current, a]
+          setPendingAttachments(pendingRef.current)
+        }
+      } finally {
+        setAttachmentsBusy(false)
+      }
+    },
+    [active],
+  )
+
+  const removeAttachment = useCallback((index: number) => {
+    setPendingAttachments((prev) => {
+      const gone = prev[index]
+      if (gone) releasePreview(gone)
+      return prev.filter((_, i) => i !== index)
+    })
+  }, [])
+
+  const dismissRejected = useCallback((index: number) => {
+    setRejectedAttachments((prev) => prev.filter((_, i) => i !== index))
+  }, [])
+
+  // Where the bytes go, said once, next to the tray: the whole point of the
+  // product is that the person knows. In this release only models in the
+  // cloud account (Bedrock) read images and files; every other backend
+  // refuses them by name, so the control is off there rather than letting a
+  // send go out that the gateway will turn away.
+  const { residencyLine, attachmentsDisabledReason } = useMemo(() => {
+    const m = models.find((x) => x.id === model)
+    if (!m) return { residencyLine: undefined, attachmentsDisabledReason: undefined }
+    switch (promptDestinationClass(m)) {
+      case 'cloud_managed':
+        return { residencyLine: 'Attached files stay in your cloud account.', attachmentsDisabledReason: undefined }
+      default:
+        return {
+          residencyLine: undefined,
+          attachmentsDisabledReason: 'This model cannot read images or files yet. Pick a model that runs in your cloud account to attach them.',
+        }
+    }
+  }, [models, model])
+
+  const composerAttachments = useMemo<ComposerAttachments>(
+    () => ({
+      items: pendingAttachments,
+      rejected: rejectedAttachments,
+      busy: attachmentsBusy,
+      onAdd: (files) => void addFiles(files),
+      onRemove: removeAttachment,
+      onDismissRejected: dismissRejected,
+      residency: residencyLine,
+      disabledReason: attachmentsDisabledReason,
+    }),
+    [pendingAttachments, rejectedAttachments, attachmentsBusy, addFiles, removeAttachment, dismissRejected, residencyLine, attachmentsDisabledReason],
+  )
+
+  // Files dragged anywhere over the chat column. Only real file drags count:
+  // dragging text around the page must not raise the overlay.
+  const hasFiles = (e: React.DragEvent) => Array.from(e.dataTransfer.types).includes('Files')
+  // No overlay when a drop would be ignored: an invitation the page will not
+  // honour is worse than none.
+  // A function, not a value: composerDisabled is derived further down.
+  const canDrop = () => !streaming && !composerDisabled && !attachmentsDisabledReason
+  const onDragEnter = (e: React.DragEvent) => {
+    if (!hasFiles(e) || !canDrop()) return
+    e.preventDefault()
+    setDragDepth((d) => d + 1)
+  }
+  const onDragLeave = (e: React.DragEvent) => {
+    if (!hasFiles(e)) return
+    setDragDepth((d) => Math.max(0, d - 1))
+  }
+  const onDragOver = (e: React.DragEvent) => {
+    if (hasFiles(e) && canDrop()) e.preventDefault()
+  }
+  const onDrop = (e: React.DragEvent) => {
+    if (!hasFiles(e)) return
+    e.preventDefault()
+    setDragDepth(0)
+    if (!canDrop()) return
+    const files = Array.from(e.dataTransfer.files)
+    if (files.length > 0) void addFiles(files)
+  }
 
   /** A second answer to the same question replaces the first, on the server as
    *  well as on screen. The stored reply goes first: if it cannot be removed,
@@ -911,26 +1127,48 @@ export function ChatPage() {
   const threadNotReady = Boolean(active && !active.loaded)
   const composerDisabled = modelsState !== 'ready' || threadNotReady
   const canExport = Boolean(active && !active.draft && active.messageCount > 0)
+  // Nothing has been said yet and nothing is on its way: the greeting and the
+  // composer share the middle of the page, as a blank page should.
+  const threadIsNew = !threadLoading && !threadError && messages.length === 0
+
+  const conversationList = (
+    <ConversationList
+      conversations={conversations}
+      activeId={activeId}
+      state={listState}
+      error={listError}
+      importing={importing}
+      importFailed={importFailed}
+      onSelect={handleSelectConversation}
+      onNew={handleNewChat}
+      onDelete={(id) => void handleDeleteConversation(id)}
+      onRename={(id, title) => void handleRenameConversation(id, title)}
+      onRetry={() => void readList()}
+      hasMore={!listComplete}
+      loadingMore={loadingMore}
+      onLoadMore={() => void handleLoadMore()}
+    />
+  )
 
   return (
     <div className={styles.page}>
-      <ConversationList
-        conversations={conversations}
-        activeId={activeId}
-        state={listState}
-        error={listError}
-        importing={importing}
-        importFailed={importFailed}
-        onSelect={handleSelectConversation}
-        onNew={handleNewChat}
-        onDelete={(id) => void handleDeleteConversation(id)}
-        onRename={(id, title) => void handleRenameConversation(id, title)}
-        onRetry={() => void readList()}
-        hasMore={!listComplete}
-        loadingMore={loadingMore}
-        onLoadMore={() => void handleLoadMore()}
-      />
-      <div className={styles.main}>
+      {sidebarSlot && createPortal(conversationList, sidebarSlot)}
+      <div
+        className={`${styles.main} ${threadIsNew ? styles.mainCentered : ''}`}
+        onDragEnter={onDragEnter}
+        onDragLeave={onDragLeave}
+        onDragOver={onDragOver}
+        onDrop={onDrop}
+      >
+        {dragDepth > 0 && (
+          <div className={styles.dropOverlay} aria-hidden="true">
+            <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round">
+              <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+            </svg>
+            <p className={styles.dropTitle}>Drop files to add them</p>
+            <p className={styles.dropHint}>Images, PDF, Word, Excel, CSV, HTML, text or Markdown. Images up to 3.75 MB, documents up to 4.5 MB.</p>
+          </div>
+        )}
         <div className={styles.header}>
           <ModelSelector
             models={models}
@@ -1009,32 +1247,12 @@ export function ChatPage() {
           </div>
         ) : messages.length === 0 ? (
           <div className={styles.emptyState}>
-            <h2 className={styles.emptyTitle}>darkplum</h2>
-            {modelsState !== 'error' && modelsState !== 'empty' && (
-              <p className={styles.emptyTagline}>{chatTagline(selectedModel)}</p>
-            )}
-
-            {modelsState === 'ready' && (
-              <div className={styles.starters}>
-                {STARTER_PROMPTS.map((prompt) => (
-                  <button
-                    key={prompt}
-                    className={styles.starterBtn}
-                    onClick={() => handleStarterPrompt(prompt)}
-                  >
-                    {prompt}
-                  </button>
-                ))}
-              </div>
-            )}
-
-            {modelsState === 'loading' && (
-              <div className={styles.starters} aria-hidden="true">
-                {STARTER_PROMPTS.map((prompt) => (
-                  <Skeleton key={prompt} width="100%" height="46px" borderRadius="var(--radius-md)" />
-                ))}
-              </div>
-            )}
+            <h2 className={styles.greeting}>
+              <span className={styles.greetingMark} aria-hidden="true">
+                <PlumMark size={40} />
+              </span>
+              {openingLine}
+            </h2>
 
             {modelsState === 'error' && (
               <div className={`${styles.notice} ${styles.noticeError}`} role="alert">
@@ -1082,6 +1300,7 @@ export function ChatPage() {
           </div>
         ) : (
           <MessageList
+            conversationId={active && !active.draft ? active.id : null}
             messages={messages}
             streaming={streaming}
             onRegenerate={handleRegenerate}
@@ -1096,11 +1315,12 @@ export function ChatPage() {
         )}
 
         <ChatComposer
-          onSend={handleSend}
+          onSend={(text, atts) => void handleSend(text, atts)}
           onStop={handleStop}
           streaming={streaming}
           disabled={composerDisabled}
           library={composerLibrary}
+          attachments={composerAttachments}
           /* The empty-state card has its own Try again; offer one here only
              when that card is not on screen. */
           notice={
@@ -1116,6 +1336,32 @@ export function ChatPage() {
                 )
           }
         />
+
+        {/* On a new chat the starters sit under the composer, where the hands
+            already are. They go once the first message is sent. */}
+        {threadIsNew && modelsState === 'ready' && (
+          <div className={styles.starters}>
+            {STARTER_PROMPTS.map((s) => (
+              <button
+                key={s.prompt}
+                type="button"
+                className={styles.starterChip}
+                onClick={() => handleStarterPrompt(s.prompt)}
+                title={s.prompt}
+              >
+                {s.glyph}
+                {s.label}
+              </button>
+            ))}
+          </div>
+        )}
+        {threadIsNew && modelsState === 'loading' && (
+          <div className={styles.starters} aria-hidden="true">
+            {STARTER_PROMPTS.map((s) => (
+              <Skeleton key={s.prompt} width="96px" height="32px" borderRadius="var(--radius-full)" />
+            ))}
+          </div>
+        )}
       </div>
     </div>
   )

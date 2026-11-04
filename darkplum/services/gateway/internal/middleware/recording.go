@@ -3,6 +3,7 @@ package middleware
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"time"
@@ -31,6 +32,20 @@ func (sw *statusWriter) WriteHeaderNow() {
 	}
 	sw.ResponseWriter.WriteHeaderNow()
 }
+
+// MaxChatBodyBytes caps a chat completion body; the api's proxy and nginx.conf
+// apply the same 16 MiB so every hop refuses the same request. The handler's
+// own cap and the Recording middleware's buffering share this one number.
+const MaxChatBodyBytes = 16 << 20
+
+// overCapBody stands in for a request body that exceeded MaxChatBodyBytes
+// while Recording buffered it: the handler's first read fails with the same
+// *http.MaxBytesError, so it answers 413 request_too_large exactly as it does
+// for a body it reads itself, instead of seeing a silently truncated body.
+type overCapBody struct{ err error }
+
+func (b overCapBody) Read([]byte) (int, error) { return 0, b.err }
+func (b overCapBody) Close() error             { return nil }
 
 // chatBodyFields holds the fields we parse from the request body.
 type chatBodyFields struct {
@@ -65,8 +80,11 @@ func Recording(rec *recorder.Recorder) gin.HandlerFunc {
 		// restore it for the proxy handler which will read it again.
 		var fields chatBodyFields
 		if c.Request.Body != nil {
-			bodyBytes, err := io.ReadAll(c.Request.Body)
-			if err == nil {
+			bodyBytes, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, MaxChatBodyBytes))
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				c.Request.Body = overCapBody{err: err}
+			} else if err == nil {
 				// Best-effort parse — if it fails, fields stays zero-valued.
 				_ = json.Unmarshal(bodyBytes, &fields)
 				c.Request.Body = io.NopCloser(bytes.NewReader(bodyBytes))

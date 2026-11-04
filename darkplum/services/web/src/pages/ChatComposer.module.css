@@ -1,7 +1,9 @@
+/* No rule between the thread and the composer: the composer is a raised
+   box on the same canvas the thread is read on, and its own edge and shadow
+   are what set it apart. */
 .wrapper {
   flex-shrink: 0;
-  padding: var(--space-3) var(--space-6) var(--space-4);
-  border-top: 1px solid var(--border-default);
+  padding: var(--space-2) var(--space-6) var(--space-4);
   background: var(--bg-primary);
 }
 
@@ -15,6 +17,7 @@
   border: 1px solid var(--border-default);
   border-radius: var(--radius-lg);
   padding: var(--space-3) var(--space-3);
+  box-shadow: var(--shadow-sm);
   transition: border-color var(--transition-fast);
 }
 
@@ -281,6 +284,156 @@
   .stopBtn,
   .attachBtn,
   .reasonAction {
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ============================================================
+   Attachments: the tray above the words, one tile per file
+   ============================================================ */
+
+.fileInput {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.tray {
+  display: flex;
+  gap: var(--space-2);
+  overflow-x: auto;
+  padding-bottom: var(--space-1);
+  scrollbar-width: thin;
+}
+
+/* 112px: 28 steps of the 4px grid; an inner radius of 8 inside the
+   composer's 12 keeps the nesting consistent. */
+.tile {
+  position: relative;
+  flex: 0 0 112px;
+  height: 112px;
+  border-radius: var(--radius-md);
+  background: var(--bg-surface-raised);
+  border: 1px solid var(--border-default);
+  overflow: hidden;
+}
+
+.tileImage img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+/* An edge on a white screenshot, which would otherwise bleed into the tile. */
+.tileImage::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  box-shadow: inset 0 0 0 1px var(--border-default);
+  pointer-events: none;
+}
+
+.tileFile {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  padding: var(--space-3);
+}
+
+.tileName {
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--fg-default);
+  line-height: var(--lh-tight);
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-all;
+}
+
+.tileMeta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: var(--fs-xs);
+  color: var(--fg-subtle);
+}
+
+.typeBadge {
+  padding: 0 var(--space-1);
+  font-weight: var(--fw-medium);
+  color: var(--fg-muted);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-sm);
+  text-transform: uppercase;
+}
+
+.tileRemove {
+  position: absolute;
+  top: var(--space-1);
+  right: var(--space-1);
+  width: 24px;
+  height: 24px;
+  display: grid;
+  place-items: center;
+  border-radius: var(--radius-full);
+  background: var(--bg-primary);
+  border: 1px solid var(--border-default);
+  color: var(--fg-default);
+  opacity: 0;
+  transition: opacity var(--transition-fast);
+}
+
+.tile:hover .tileRemove,
+.tile:focus-within .tileRemove,
+.tileError .tileRemove {
+  opacity: 1;
+}
+
+@media (hover: none) {
+  .tileRemove {
+    opacity: 1;
+  }
+}
+
+.tileRemove:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 1px;
+}
+
+/* A file that was refused keeps its place, in red, until it is removed. */
+.tileError {
+  border-color: var(--danger-border);
+  background: var(--danger-bg);
+}
+
+.tileErrorLabel {
+  color: var(--danger-fg);
+}
+
+.trayErrors {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: var(--fs-xs);
+  line-height: var(--lh-normal);
+  color: var(--fg-muted);
+}
+
+.residency {
+  color: var(--fg-muted);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tileRemove {
     transition-duration: 0.01ms !important;
   }
 }

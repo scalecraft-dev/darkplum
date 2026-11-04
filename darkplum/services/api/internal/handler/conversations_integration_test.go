@@ -51,6 +51,7 @@ func newConversationsTestRouter(h *ConversationHandler, userID string) *gin.Engi
 	r.POST("/api/v1/conversations/:id/messages", h.AppendMessages)
 	r.DELETE("/api/v1/conversations/:id", h.DeleteConversation)
 	r.DELETE("/api/v1/conversations/:id/messages", h.TruncateMessages)
+	r.GET("/api/v1/conversations/:id/attachments/:aid", h.GetAttachment)
 	return r
 }
 
@@ -182,8 +183,10 @@ func TestCreateConversation_ContentOverLimitReturns400(t *testing.T) {
 	resp := doJSON(t, r, http.MethodPost, "/api/v1/conversations", map[string]any{
 		"messages": []map[string]any{{"role": "user", "content": string(huge)}},
 	})
-	if resp.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400; body = %s", resp.Code, resp.Body.String())
+	// A turn over the content cap is also over the 16 MiB body cap, which
+	// refuses it first (413); validMessageInput's own check is the second line.
+	if resp.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413; body = %s", resp.Code, resp.Body.String())
 	}
 }
 
@@ -540,8 +543,10 @@ func TestAppendMessages_ContentOverLimitReturns400(t *testing.T) {
 	resp := doJSON(t, r, http.MethodPost, "/api/v1/conversations/"+full.ID+"/messages", map[string]any{
 		"messages": []map[string]any{{"role": "user", "content": string(huge)}},
 	})
-	if resp.Code != http.StatusBadRequest {
-		t.Fatalf("status = %d, want 400; body = %s", resp.Code, resp.Body.String())
+	// A turn over the content cap is also over the 16 MiB body cap, which
+	// refuses it first (413); validMessageInput's own check is the second line.
+	if resp.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status = %d, want 413; body = %s", resp.Code, resp.Body.String())
 	}
 
 	var count int

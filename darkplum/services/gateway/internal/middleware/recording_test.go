@@ -1,10 +1,16 @@
 package middleware
 
 import (
+	"bytes"
+	"errors"
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/gin-gonic/gin"
+
+	"github.com/scalecraft-dev/darkplum/gateway/internal/recorder"
 )
 
 // TestResolveAttributedUserID_ServiceKeyHonoursHeader mirrors the api
@@ -67,5 +73,45 @@ func TestCacheTokenPointers(t *testing.T) {
 	c.Set("cache_creation_tokens", 30)
 	if r, cc := cacheTokenPointers(c, &one, nil); r == nil || cc == nil || *r != 60 || *cc != 30 {
 		t.Fatalf("split: got %v/%v, want 60/30", r, cc)
+	}
+}
+
+// Recording buffers the body to read model/stream; it must not buffer an
+// unbounded one. A body over the cap reaches the handler as a read that fails
+// with *http.MaxBytesError (so the handler answers 413 request_too_large as
+// it does for a body it reads itself), never as a silently truncated body; a
+// body exactly at the cap arrives whole.
+func TestRecording_BodyCap(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := recorder.New(nil)
+	rec.Drain() // drained: Record drops events, nothing touches the nil pool
+
+	run := func(t *testing.T, n int) (got int, readErr error) {
+		t.Helper()
+		r := gin.New()
+		r.POST("/v1/chat/completions", Recording(rec), func(c *gin.Context) {
+			b, err := io.ReadAll(http.MaxBytesReader(c.Writer, c.Request.Body, MaxChatBodyBytes))
+			got, readErr = len(b), err
+			c.Status(http.StatusOK)
+		})
+		body := append([]byte(`{"model":"m","stream":true,"pad":"`), bytes.Repeat([]byte("a"), n)...)
+		body = body[:n]
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+		r.ServeHTTP(w, req)
+		return got, readErr
+	}
+
+	got, err := run(t, MaxChatBodyBytes)
+	if err != nil || got != MaxChatBodyBytes {
+		t.Errorf("body at the cap: read %d bytes, err %v; want the whole body", got, err)
+	}
+	got, err = run(t, MaxChatBodyBytes+1)
+	var tooLarge *http.MaxBytesError
+	if !errors.As(err, &tooLarge) {
+		t.Errorf("body over the cap: read %d bytes, err %v; want *http.MaxBytesError", got, err)
+	}
+	if got != 0 {
+		t.Errorf("body over the cap: handler saw %d bytes of a truncated body", got)
 	}
 }

@@ -227,7 +227,7 @@ func TestEndOfLifeCallMarksModelRetiredImmediately(t *testing.T) {
 	if availState(p, "us.a.m") == provider.AvailabilityRetired {
 		t.Fatal("precondition")
 	}
-	err := p.wrapError("us.a.m", eolErr(eolText2), false)
+	err := p.wrapError("us.a.m", eolErr(eolText2), false, "", false)
 	var be *BedrockAPIError
 	if !errors.As(err, &be) || be.StatusCode != 404 {
 		t.Fatalf("err = %v", err)
@@ -239,7 +239,7 @@ func TestEndOfLifeCallMarksModelRetiredImmediately(t *testing.T) {
 
 func TestOtherNotFoundDoesNotRetire(t *testing.T) {
 	p := &BedrockProvider{}
-	_ = p.wrapError("us.x", &smithy.GenericAPIError{Code: "ResourceNotFoundException", Message: "Could not resolve the foundation model"}, false)
+	_ = p.wrapError("us.x", &smithy.GenericAPIError{Code: "ResourceNotFoundException", Message: "Could not resolve the foundation model"}, false, "", false)
 	if p.ModelRetired("us.x") {
 		t.Error("an ordinary not-found must not retire the model")
 	}

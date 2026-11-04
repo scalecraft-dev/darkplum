@@ -28,6 +28,12 @@ port 1234 is picked up automatically on Docker Desktop; on Linux kind,
 `host.docker.internal` needs the extra host mapping described in
 `k8s/overlays/dev/patches/gateway-deployment.yaml`.
 
+To iterate on the UI without rebuilding the web image, run the Vite dev
+server against the stack: `cd services/web && pnpm dev` serves
+`http://localhost:5173` with hot reload and proxies `/api`, `/v1` and `/auth`
+to the stack on port 8080. If the stack is on another port, start Vite with
+the same value: `DEV_PORT=8090 pnpm dev`.
+
 The operator CLI builds with the Go toolchain alone. `go build -o darkplum ./cmd`
 in `darkplum/services/cli` gives a development build (channel `dev`): it embeds
 the checkout's Terraform and manifests, prints a development banner, and
@@ -62,8 +68,9 @@ Each test creates its own schema and drops it afterwards.
 - `gofmt`, `go build`, `go vet` and `go test -race` for the gateway, api and
   cli, with the integration tests against a Postgres service container.
 - Web: `pnpm install --frozen-lockfile`, `tsc --noEmit`, `pnpm run build`,
-  the API-to-UI parity check and the policy truth-table check
-  (`pnpm run check:policy`).
+  the API-to-UI parity check, the policy truth-table check
+  (`pnpm run check:policy`), the chat-stream check and the attachment rules
+  check (`pnpm run check:attachments`).
 - Kubernetes manifests and docs: every kustomize overlay builds, the vLLM
   model template renders, `scripts/dev.sh` passes shellcheck and argument
   validation, the repository holds no instructions to run make, and `go run ./cmd/apidoc`

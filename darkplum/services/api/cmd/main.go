@@ -447,6 +447,7 @@ func buildRouter(d routerDeps) *gin.Engine {
 		v1.POST("/conversations/:id/messages", d.conversations.AppendMessages)
 		v1.DELETE("/conversations/:id", d.conversations.DeleteConversation)
 		v1.DELETE("/conversations/:id/messages", d.conversations.TruncateMessages)
+		v1.GET("/conversations/:id/attachments/:aid", d.conversations.GetAttachment)
 
 		// Any session user's own effective routing policy — no "stored" field
 		// (that's admin-only, via the equivalent .../routing-policy/effective

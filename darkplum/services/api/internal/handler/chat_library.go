@@ -390,6 +390,8 @@ type toolLoop struct {
 	chunkID  string
 	model    string
 	started  bool // response headers committed
+	// prepended is the count of messages the api put in front of the browser's.
+	prepended int
 }
 
 // accumulatedCall is a tool call reassembled from streamed fragments.
@@ -401,6 +403,13 @@ type accumulatedCall struct {
 // proxyWithTools runs the tool loop for a turn with tool servers attached.
 // body already carries the platform prompt and the library message.
 func (h *ChatHandler) proxyWithTools(c *gin.Context, body []byte, stream bool, defs []map[string]any, bindings map[string]toolBinding) {
+	h.proxyWithToolsOffset(c, body, stream, defs, bindings, 0)
+}
+
+// proxyWithToolsOffset is proxyWithTools told how many messages the api
+// prepended to the browser's, so a gateway refusal's message index can be
+// mapped back (see shiftMessageIndexes).
+func (h *ChatHandler) proxyWithToolsOffset(c *gin.Context, body []byte, stream bool, defs []map[string]any, bindings map[string]toolBinding, prepended int) {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(body, &fields); err != nil {
 		c.JSON(http.StatusBadRequest, chatProxyError("invalid request body", "invalid_request_error", "invalid_body"))
@@ -418,7 +427,7 @@ func (h *ChatHandler) proxyWithTools(c *gin.Context, body []byte, stream bool, d
 		fields["tool_choice"] = json.RawMessage(`"auto"`)
 	}
 	loop := &toolLoop{
-		h: h, c: c, fields: fields, messages: messages, stream: stream, bindings: bindings,
+		h: h, c: c, fields: fields, messages: messages, stream: stream, bindings: bindings, prepended: prepended,
 		clients: map[string]*mcp.Client{}, policy: h.tools.hostPolicy(c.Request.Context()),
 	}
 	defer func() {
@@ -515,11 +524,22 @@ func (l *toolLoop) writeEvent(ev toolEvent) error {
 	return l.writeFrame(b)
 }
 
+const toolLoopTooLargeMessage = "The conversation, with its tool results and attachments, exceeds the request limit; the reply was stopped. Start a new conversation or attach less."
+
 // relayRefusal passes a gateway refusal to the browser: as the gateway's
 // own JSON body when nothing has been written yet, as an SSE error frame
 // once the stream is committed.
 func (l *toolLoop) relayRefusal(resp *http.Response) {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body = shiftMessageIndexes(body, l.prepended)
+	if l.started && resp.StatusCode == http.StatusRequestEntityTooLarge {
+		// Attachments ride every round and tool results grow the body, so a
+		// later round can pass the limit the first one did not. Say so by name.
+		frame, _ := json.Marshal(chatProxyError(toolLoopTooLargeMessage, "invalid_request_error", "request_too_large"))
+		_ = l.writeFrame(frame)
+		_ = l.writeFrame([]byte("[DONE]"))
+		return
+	}
 	if !l.started {
 		copyProxyHeaders(l.c, resp)
 		l.c.Data(resp.StatusCode, "application/json", body)

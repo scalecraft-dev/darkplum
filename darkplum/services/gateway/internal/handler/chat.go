@@ -45,7 +45,9 @@ type openAIErrorBody struct {
 	// Param names the request field a 400 unsupported_parameter or
 	// invalid_tools response refers to (e.g. "tools", "functions",
 	// "response_format", "messages") — see unsupportedRequestParam and
-	// provider.ValidateTools. Empty/omitted for every other error code.
+	// provider.ValidateTools, or the content part an invalid_content response
+	// refers to (messages[i].content[j]). Empty/omitted for every other error
+	// code.
 	Param string `json:"param,omitempty"`
 }
 
@@ -95,7 +97,7 @@ type responseFormatField struct {
 // nginx.conf apply the same 16 MiB so every hop refuses the same request.
 // 16 MiB is ~4M tokens of text, past any model's context, and small enough
 // that a burst of maximal requests stays inside the gateway's memory limit.
-const chatBodyMaxBytes = 16 << 20
+const chatBodyMaxBytes = middleware.MaxChatBodyBytes
 
 // invalidMessages returns the 400 message for a messages array no backend
 // could accept, or "" when the shape is fine. Content is left to the
@@ -1128,6 +1130,23 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 		return
 	}
 
+	// A content that is neither a string nor a decodable array of parts is
+	// refused here, before anything reads it as text.
+	if param, msg := provider.ValidateContentShape(req.Messages); msg != "" {
+		c.Set("denial_code", "invalid_request")
+		c.Set("resolved_model", req.Model)
+		logDenial(c, "invalid_request", req.Model, "", "")
+		c.JSON(http.StatusBadRequest, openAIError{
+			Error: openAIErrorBody{
+				Message: msg,
+				Type:    "invalid_request_error",
+				Code:    "invalid_request",
+				Param:   param,
+			},
+		})
+		return
+	}
+
 	// Request-shape honesty: functions/function_call/response_format
 	// (json_schema)/non-text content blocks are refused before route
 	// resolution, on EVERY route — not just external_api — because no
@@ -1196,6 +1215,24 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 				Message: msg,
 				Type:    "invalid_request_error",
 				Code:    "invalid_tools",
+				Param:   param,
+			},
+		})
+		return
+	}
+
+	// Image and file parts: shape, type, size and count, decoded once here
+	// (the Bedrock translator reuses the decode). Whether the resolved backend
+	// takes them at all is the registry's call after route resolution.
+	if param, msg := provider.ValidateContent(req.Messages); msg != "" {
+		c.Set("denial_code", "invalid_request")
+		c.Set("resolved_model", req.Model)
+		logDenial(c, "invalid_request", req.Model, "", "")
+		c.JSON(http.StatusBadRequest, openAIError{
+			Error: openAIErrorBody{
+				Message: msg,
+				Type:    "invalid_request_error",
+				Code:    "invalid_content",
 				Param:   param,
 			},
 		})

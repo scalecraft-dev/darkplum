@@ -24,6 +24,8 @@ import { CodeBlock } from '../components/ui/CodeBlock'
 import { CopyButton } from '../components/ui/CopyButton'
 import { EgressGlyph } from '../components/ui'
 import { KindGlyph } from '../components/ui/KindGlyph'
+import { attachmentUrl } from '../lib/api'
+import { formatSize, typeLabel, type MessageAttachment } from '../lib/attachments'
 import styles from './MessageList.module.css'
 
 /** A failed send, kept outside the message history so it is never replayed
@@ -62,6 +64,9 @@ export interface ChatFailure {
 interface Props {
   /** Item id -> name, for the "used …" line under a reply. */
   libraryNames?: Map<string, string>
+  /** The stored conversation these turns belong to; null for a draft. Needed
+   *  to read a sent attachment back. */
+  conversationId?: string | null
   messages: ChatMessage[]
   streaming: boolean
   onRegenerate?: () => void
@@ -226,11 +231,37 @@ function failureCopy(
       // saw — this refusal happens before anything leaves.
       return { title: 'That request could not be sent', hint: '' }
     case 'unsupported_parameter':
+      // A content part (an image or a file) the model's backend cannot take
+      // is refused under this code with the part's path as the param.
+      if (failure.param && /^messages\[\d+\]\.content\[\d+\]$/.test(failure.param)) {
+        return {
+          title: `${failure.model ?? 'This model'} can't read that attachment`,
+          hint: 'Pick a model that accepts images and files, or remove the attachment and send again.',
+        }
+      }
       return {
         title: 'That request used an unsupported option',
         hint: failure.param
           ? `This request used ‘${failure.param}’, which darkplum does not support yet.`
           : 'This request used an option darkplum does not support yet.',
+      }
+    case 'invalid_content':
+      // The gateway's sentence names the part, its type and the limit it broke.
+      return { title: 'An attachment could not be sent', hint: 'Remove it, or send it in a separate message.' }
+    case 'attachment_not_found':
+      return {
+        title: 'An earlier attachment is no longer available',
+        hint: 'It was removed from this conversation. Send the message again without it, or add the file again.',
+      }
+    case 'attachment_unavailable':
+      return {
+        title: 'An earlier attachment could not be read right now',
+        hint: 'Your conversation history is temporarily unavailable. Try again in a moment.',
+      }
+    case 'request_too_large':
+      return {
+        title: 'This message is too large to send',
+        hint: 'The whole conversation goes with every message, files attached earlier included, and it is over the 16 MB limit. Remove attachments or start a new conversation.',
       }
     default:
       return {
@@ -424,11 +455,101 @@ const mdComponents = {
   },
 }
 
-const UserBubble = memo(({ content }: { content: string }) => (
-  <div className={`${styles.message} ${styles.user}`}>
-    <div className={styles.bubble}>{content}</div>
-  </div>
-))
+/** What a sent turn carried, above its words and outside the bubble, as on
+ *  claude.ai. A stored image is read back by id; one not yet saved shows the
+ *  bytes it was sent with; one the server no longer has is named, dashed. */
+const SentAttachments = ({
+  attachments,
+  conversationId,
+}: {
+  attachments: MessageAttachment[]
+  conversationId: string | null
+}) => {
+  const single = attachments.length === 1 && attachments[0].kind === 'image'
+  return (
+    <div className={styles.sentAttachments} role="list" aria-label="Attachments">
+      {attachments.map((a, i) => {
+        const url = a.id && conversationId ? attachmentUrl(conversationId, a.id) : a.previewUrl ?? null
+        if (a.kind === 'image' && url) {
+          return (
+            <a
+              key={a.id ?? `${a.name}-${i}`}
+              role="listitem"
+              className={single ? styles.sentImageSingle : styles.sentTile}
+              href={url}
+              target="_blank"
+              rel="noopener"
+              aria-label={`Open ${a.name}`}
+              title={a.name}
+            >
+              <img src={url} alt={a.name} loading="lazy" decoding="async" />
+            </a>
+          )
+        }
+        const gone = !url && !a.id
+        const inner = (
+          <>
+            <span className={styles.sentTileName}>{a.name}</span>
+            <span className={styles.sentTileMeta}>
+              {gone ? (
+                <span>No longer available</span>
+              ) : (
+                <>
+                  <span className={styles.sentTypeBadge}>{typeLabel(a.mediaType)}</span>
+                  <span>{formatSize(a.size)}</span>
+                </>
+              )}
+            </span>
+          </>
+        )
+        if (a.id && conversationId) {
+          return (
+            <a
+              key={a.id}
+              role="listitem"
+              className={`${styles.sentTile} ${styles.sentTileFile}`}
+              href={attachmentUrl(conversationId, a.id)}
+              download={a.name}
+              aria-label={`Download ${a.name}`}
+              title={a.name}
+            >
+              {inner}
+            </a>
+          )
+        }
+        return (
+          <span
+            key={`${a.name}-${i}`}
+            role="listitem"
+            className={`${styles.sentTile} ${styles.sentTileFile} ${gone ? styles.sentTileGone : ''}`}
+            title={gone ? `${a.name} is no longer available` : 'Sent with this message'}
+          >
+            {inner}
+          </span>
+        )
+      })}
+    </div>
+  )
+}
+
+const UserBubble = memo(
+  ({
+    content,
+    attachments,
+    conversationId,
+  }: {
+    content: string
+    attachments?: MessageAttachment[]
+    conversationId: string | null
+  }) => (
+    <div className={`${styles.message} ${styles.user} ${styles.userTurn}`}>
+      {attachments && attachments.length > 0 && (
+        <SentAttachments attachments={attachments} conversationId={conversationId} />
+      )}
+      {content && <div className={styles.bubble}>{content}</div>}
+    </div>
+  ),
+)
 UserBubble.displayName = 'UserBubble'
 
 const ThinkingIndicator = () => (
@@ -777,6 +898,7 @@ export function MessageList({
   onRetry,
   unsavedFrom,
   libraryNames,
+  conversationId,
 }: Props) {
   const bottomRef = useRef<HTMLDivElement>(null)
   const containerRef = useRef<HTMLDivElement>(null)
@@ -813,7 +935,7 @@ export function MessageList({
           const unsaved = unsavedFrom !== null && unsavedFrom !== undefined && i === unsavedFrom
           const bubble =
             msg.role === 'user' ? (
-              <UserBubble key={i} content={msg.content} />
+              <UserBubble key={i} content={msg.content} attachments={msg.attachments} conversationId={conversationId ?? null} />
             ) : (
               <AssistantBubble
                 key={i}

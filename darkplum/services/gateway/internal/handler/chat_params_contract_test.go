@@ -135,9 +135,31 @@ var samples = map[string]paramSample{
 	k("function_call", "default"):        {body: set("function_call", "none")},
 	k("response_format", "json_schema"):  {body: set("response_format", map[string]any{"type": "json_schema", "json_schema": map[string]any{"name": "x"}}), wantParam: "response_format"},
 	k("response_format", "unknown-type"): {body: set("response_format", map[string]any{"type": "xml"}), wantParam: "response_format"},
-	k("messages", "non-text-content"): {
+	k("messages", "unknown-content"): {
 		body:      set("messages", []map[string]any{{"role": "user", "content": []map[string]any{{"type": "image_url", "image_url": map[string]any{"url": "http://x/y.png"}}}}}),
 		wantParam: "messages[].content",
+	},
+	k("messages", "image-content"): {
+		body: set("messages", []map[string]any{{"role": "user", "content": []map[string]any{
+			{"type": "text", "text": "what is this?"},
+			{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64," + tinyPNGBase64}},
+		}}}),
+		wantParam: "messages[0].content[1]",
+		seen: func(r provider.ChatRequest) bool {
+			return len(r.Messages) == 1 && len(r.Messages[0].Parts) == 2 && r.Messages[0].Parts[1].Kind == provider.KindImage
+		},
+		skipWire: true,
+	},
+	k("messages", "file-content"): {
+		body: set("messages", []map[string]any{{"role": "user", "content": []map[string]any{
+			{"type": "text", "text": "summarise"},
+			{"type": "file", "file": map[string]any{"filename": "x.pdf", "file_data": "data:application/pdf;base64," + tinyPDFBase64}},
+		}}}),
+		wantParam: "messages[0].content[1]",
+		seen: func(r provider.ChatRequest) bool {
+			return len(r.Messages) == 1 && len(r.Messages[0].Parts) == 2 && r.Messages[0].Parts[1].Kind == provider.KindFile
+		},
+		skipWire: true,
 	},
 	k("model", "any"):             {body: set(), seen: func(r provider.ChatRequest) bool { return r.Model == "m" }, skipWire: true},
 	k("messages", "text"):         {body: set(), seen: func(r provider.ChatRequest) bool { return len(r.Messages) == 1 }, needle: "hello"},

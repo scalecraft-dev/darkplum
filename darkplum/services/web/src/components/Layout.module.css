@@ -12,9 +12,9 @@
    ============================================================ */
 
 .sidebar {
-  width: 240px;
+  width: 272px;
   flex-shrink: 0;
-  background: var(--bg-base);
+  background: var(--bg-sidebar);
   border-right: 1px solid var(--border-default);
   display: flex;
   flex-direction: column;
@@ -189,6 +189,73 @@
   background: var(--brand-muted);
 }
 
+/* ============================================================
+   Recents — the chat page's conversations, under the navigation
+   ============================================================ */
+
+/* Takes whatever height the nav has left and scrolls inside itself, so a
+   long history never pushes the account row off the bottom. */
+.recents {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  margin-top: var(--space-2);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border-muted);
+}
+
+.recentsToggle {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-sm);
+  font-size: var(--fs-xs);
+  font-weight: var(--fw-medium);
+  color: var(--fg-subtle);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  text-align: left;
+  white-space: nowrap;
+  transition: color var(--transition-fast);
+}
+
+.recentsToggle:hover {
+  color: var(--fg-default);
+}
+
+.recentsToggle:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: -2px;
+}
+
+.recentsChevron {
+  margin-left: auto;
+  flex-shrink: 0;
+  transition: transform var(--transition-fast);
+}
+
+.recentsChevronOpen {
+  transform: rotate(180deg);
+}
+
+.recentsBody {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.recentsClosed .recentsBody {
+  display: none;
+}
+
+/* Icon-only rail has no room for titles. */
+.collapsed .recents {
+  display: none;
+}
+
 /* Text labels — hidden when collapsed */
 .navLinkText {
   overflow: hidden;
@@ -319,6 +386,8 @@
   .navLink,
   .navLinkText,
   .footerBtn,
+  .recentsToggle,
+  .recentsChevron,
   .version {
     transition-duration: 0.01ms !important;
   }
@@ -342,7 +411,7 @@
     transform: translateX(-100%);
     transition: transform var(--transition-normal), width var(--transition-normal);
     /* Always show full expanded width in overlay mode */
-    width: 240px;
+    width: 272px;
   }
 
   /* Sidebar is open in overlay mode */
@@ -352,7 +421,7 @@
 
   /* Collapsed width override is irrelevant in overlay mode */
   .collapsed {
-    width: 240px;
+    width: 272px;
   }
 
   /* Collapsing is a no-op in the full-width overlay drawer — hide the toggle

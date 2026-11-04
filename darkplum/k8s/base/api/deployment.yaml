@@ -31,6 +31,9 @@ spec:
           env:
             - name: WEB_PORT
               value: "8080"
+            # 80% of the memory limit below.
+            - name: GOMEMLIMIT
+              value: "800MiB"
             - name: DATABASE_URL
               valueFrom:
                 secretKeyRef:
@@ -120,10 +123,15 @@ spec:
             - name: tool-credentials
               mountPath: /var/run/darkplum/tool-credentials
               readOnly: true
+          # The session chat proxy re-marshals a body of up to 16 MiB a few
+          # times over (system prompt, library, stored-attachment expansion),
+          # so it needs a ceiling and a GOMEMLIMIT under it like the gateway.
           resources:
             requests:
-              memory: 128Mi
+              memory: 256Mi
               cpu: 100m
+            limits:
+              memory: 1Gi
       volumes:
         - name: billing-keys
           secret:
