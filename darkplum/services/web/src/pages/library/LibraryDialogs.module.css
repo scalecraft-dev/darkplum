@@ -234,7 +234,6 @@
   border-left: 2px solid var(--border-default);
   border-radius: var(--radius-lg);
   padding: var(--space-5);
-  margin-bottom: var(--space-5);
 }
 
 .hostsHead {

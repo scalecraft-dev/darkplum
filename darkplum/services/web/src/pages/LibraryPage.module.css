@@ -44,19 +44,14 @@
   gap: var(--space-2);
 }
 
-/* --- One tab's list --- */
-
-.list {
-  display: flex;
-  flex-direction: column;
-  gap: var(--space-4);
-}
-
 .toolbar {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
   gap: var(--space-3);
+  /* The folder view sits below; without this the search field's border and
+     the first row's border touch. Same step as .location above it. */
+  margin-bottom: var(--space-4);
 }
 
 /* The segmented filter: ActivityTab's log toggle. */
