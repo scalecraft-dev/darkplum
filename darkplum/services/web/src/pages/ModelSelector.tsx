@@ -118,6 +118,9 @@ export function ModelSelector({ models, isLoading, error, value, onChange }: Pro
    * API" — the class vocabulary is for the administrator writing the policy,
    * not for the person picking something to type at.
    */
+  // Every hook before the early returns below, so the count is the same on
+  // every render.
+  const labels = useMemo(() => optionLabels(models), [models])
   const groups = useMemo(() => {
     const isAlias = (m: Model) => Boolean(m.alias_of) || m.alias_kind === 'routed'
     const aliases = models.filter(isAlias)
@@ -196,7 +199,6 @@ export function ModelSelector({ models, isLoading, error, value, onChange }: Pro
           ? styles.dotCloud
           : styles.dotGreen
 
-  const labels = useMemo(() => optionLabels(models), [models])
   const labelOf = (m: Model) => labels.get(m.id) ?? optionLabel(m)
 
   return (
