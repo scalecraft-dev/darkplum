@@ -70,10 +70,13 @@ gh attestation verify darkplum_<version>_<os>_<arch>.tar.gz --repo scalecraft-de
 tar -xzf darkplum_<version>_<os>_<arch>.tar.gz darkplum
 ```
 
+The attestation check needs the `gh` CLI. Without it the checksum only proves
+the download matches the release, not who built it.
+
 The binary is not notarised by Apple. It is the trust anchor of the install
 (it carries the Terraform and manifests it applies and decides which image
 signatures to accept), so its authenticity is the check that matters most; see
-"What you are trusting" in the [repository README](../README.md#what-you-are-trusting).
+[What you are trusting](docs/TRUST.md).
 
 ## Quick start
 
