@@ -97,7 +97,7 @@ export function LibraryPicker({ items, loading, error, attachedIds, onToggle, on
           const full = !isAttached && remaining <= 0
           // Why it cannot be attached, said on the row itself so keyboard and
           // touch readers see it, not only a mouse hover.
-          const why = blocked ? 'Verify it in the library first' : full ? 'Limit reached' : ''
+          const why = blocked ? 'Check its server in the library first' : full ? 'Limit reached' : ''
           return (
             <button
               key={it.id}

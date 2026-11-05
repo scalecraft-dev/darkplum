@@ -35,6 +35,15 @@
 # db_deletion_protection   = true
 # db_skip_final_snapshot   = false
 
+# Library bucket. The Library lives in Postgres; set this to also keep every
+# item as a plain file in a private, versioned S3 bucket in this account
+# (<cluster_name>-library-<account_id>), browsable with ordinary tools. Off by
+# default. `darkplum destroy` keeps the bucket; turning this off on an install
+# that has one keeps the bucket and its files, outside Terraform.
+# library_bucket_enabled  = false
+# library_noncurrent_days = 30                      # how long a replaced version is kept
+# library_kms_key_arn     = "arn:aws:kms:<region>:<account>:key/<id>"  # optional customer key
+
 # Bedrock (Layer 1 IAM allowlist — the gateway can ONLY invoke models matching
 # these patterns; they also become the gateway's catalog filter). Open-weight
 # families (Llama, Mistral) are included by default alongside Claude. Model

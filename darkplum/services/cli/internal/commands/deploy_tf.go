@@ -351,9 +351,12 @@ type deployOutputs struct {
 	Repos                                     map[string]string // service -> ECR repository URL
 	GatewayRoleARN                            string
 	InvokeARNs                                []string
-	// LibraryStoreURL and APIRoleARN are optional for this release: state applied by
-	// an older darkplum has neither. Empty means "not applied yet".
+	// LibraryStoreURL and APIRoleARN are optional: state applied by an older
+	// darkplum has neither, and an install without a bucket has an empty URL.
 	LibraryStoreURL, APIRoleARN string
+	// LibraryBucketEnabled is the library_bucket_enabled output: nil on a state
+	// applied before the bucket was optional (which always had one).
+	LibraryBucketEnabled *bool
 }
 
 func parseOutputs(raw []byte) (deployOutputs, error) {
@@ -404,6 +407,13 @@ func parseOutputs(raw []byte) (deployOutputs, error) {
 	get("bedrock_invoke_arns", &o.InvokeARNs)
 	optional("library_store_url", &o.LibraryStoreURL)
 	optional("api_role_arn", &o.APIRoleARN)
+	if v, ok := all["library_bucket_enabled"]; ok && len(v.Value) > 0 && string(v.Value) != "null" {
+		var b bool
+		if err := json.Unmarshal(v.Value, &b); err != nil {
+			errs = append(errs, errors.New(`terraform output "library_bucket_enabled" has an unexpected type`))
+		}
+		o.LibraryBucketEnabled = &b
+	}
 	if o.GPUDesired > 0 {
 		get("model_name", &o.ModelName)
 		get("model_revision", &o.ModelRevision)

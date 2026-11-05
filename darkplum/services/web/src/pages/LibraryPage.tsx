@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
 import {
@@ -26,8 +26,7 @@ import { LibraryTree } from './library/LibraryTree'
 import { MoveDialog } from './library/MoveDialog'
 import { ItemDrawer, type DrawerTarget } from './library/ItemDrawer'
 import { ImportModal } from './library/ImportModal'
-import { ToolHostsCard } from './library/ToolHostsCard'
-import { BucketGlyph, FolderGlyph, OrgGlyph, PrivateGlyph } from './library/LibraryGlyphs'
+import { BucketGlyph, OrgGlyph, PrivateGlyph } from './library/LibraryGlyphs'
 import { KIND_LABEL, KIND_NOUN, errorText, libraryErrorText } from './library/libraryText'
 import {
   SCOPE_LABEL,
@@ -74,6 +73,9 @@ function isValidPath(p: string): boolean {
 export function LibraryPage() {
   const { user } = useAuth()
   const isAdmin = user?.role === 'admin'
+  /** The install mirrors the library to a bucket (the default is Postgres
+   *  alone). Absent on an older api, which always had one. */
+  const hasBucket = user?.library_bucket !== false
   const { toast } = useToast()
   const [searchParams, setSearchParams] = useSearchParams()
 
@@ -223,7 +225,6 @@ export function LibraryPage() {
   const [exporting, setExporting] = useState(false)
   const [syncing, setSyncing] = useState(false)
   const [busy, setBusy] = useState(false)
-  const hostsHeading = useRef<HTMLHeadingElement>(null)
 
   // ?item=<id> opens the drawer once the item is known.
   useEffect(() => {
@@ -344,19 +345,6 @@ export function LibraryPage() {
     }
   }
 
-  /** From a refused verify: the drawer has closed; once its focus has gone
-   *  back to the row, move it on to the allowed-servers card. */
-  const showHosts = useCallback(() => {
-    setParams({ kind: 'tool' })
-    window.setTimeout(() => {
-      const el = hostsHeading.current
-      if (!el) return
-      const reduce = window.matchMedia('(prefers-reduced-motion: reduce)').matches
-      el.scrollIntoView({ block: 'start', behavior: reduce ? 'auto' : 'smooth' })
-      el.focus({ preventScroll: true })
-    }, 250)
-  }, [setParams])
-
   const crumbs = segmentsOf(path)
   const searching = query.trim() !== ''
 
@@ -371,55 +359,32 @@ export function LibraryPage() {
           </p>
         </div>
         <div className={styles.headerActions}>
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => void sync()}
-            disabled={syncing || (scope === 'org' && !isAdmin)}
-            title={
-              scope === 'org' && !isAdmin
-                ? 'An administrator syncs the Organisation folder.'
-                : 'Read files added or changed in the bucket into this root'
-            }
-          >
-            <BucketGlyph size={14} />
-            {syncing ? 'Syncing…' : 'Sync from bucket'}
-          </Button>
+          {hasBucket && (
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => void sync()}
+              disabled={syncing || (scope === 'org' && !isAdmin)}
+              title={
+                scope === 'org' && !isAdmin
+                  ? 'An administrator syncs the Organisation folder.'
+                  : 'Read files added or changed in the bucket into this root'
+              }
+            >
+              <BucketGlyph size={14} />
+              {syncing ? 'Syncing…' : 'Sync from bucket'}
+            </Button>
+          )}
           <Button variant="ghost" size="sm" onClick={() => void exportAll()} disabled={exporting} title="Everything you can see, as a zip of .md and .json files in their folders">
             {exporting ? 'Exporting…' : 'Export all'}
           </Button>
           <Button variant="secondary" size="sm" onClick={() => setImportOpen(true)}>
             Import
           </Button>
-          <DropdownMenu.Root modal={false}>
-            <DropdownMenu.Trigger asChild>
-              <Button variant="primary" size="sm">
-                New
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                  <polyline points="6 9 12 15 18 9" />
-                </svg>
-              </Button>
-            </DropdownMenu.Trigger>
-            <DropdownMenu.Portal>
-              <DropdownMenu.Content className={styles.menu} align="end" sideOffset={4}>
-                {(['skill', 'context', 'tool'] as LibraryKind[]).map((k) => (
-                  <DropdownMenu.Item key={k} className={styles.menuItem} onSelect={() => setDrawer({ mode: 'new', kind: k, scope, path })}>
-                    <KindGlyph kind={k} size={14} />
-                    New {KIND_NOUN[k]}
-                  </DropdownMenu.Item>
-                ))}
-                <DropdownMenu.Separator className={styles.menuSep} />
-                <DropdownMenu.Item className={styles.menuItem} onSelect={() => setNewFolder({ active: true, error: null })}>
-                  <FolderGlyph size={14} />
-                  New folder
-                </DropdownMenu.Item>
-              </DropdownMenu.Content>
-            </DropdownMenu.Portal>
-          </DropdownMenu.Root>
         </div>
       </header>
 
-      {storeStatus && (!storeStatus.reachable || storeStatus.failing > 0 || (storeStatus.changed_in_bucket ?? 0) > 0) && (
+      {storeStatus && storeStatus.enabled !== false && (!storeStatus.reachable || storeStatus.failing > 0 || (storeStatus.changed_in_bucket ?? 0) > 0) && (
         <div className={`${styles.storeBanner} ${!storeStatus.reachable ? styles.storeBannerDanger : ''}`} role="status">
           <BucketGlyph size={14} />
           <span>
@@ -524,12 +489,43 @@ export function LibraryPage() {
         <Button variant="secondary" size="sm" onClick={() => setNewFolder({ active: true, error: null })} disabled={searching || newFolder.active || (scope === 'org' && !isAdmin)}>
           New folder
         </Button>
+        {kind !== 'all' ? (
+          <Button
+            variant="primary"
+            size="sm"
+            onClick={() => setDrawer({ mode: 'new', kind, scope, path })}
+            disabled={searching}
+            title={searching ? 'Clear the search to add here' : undefined}
+          >
+            New {KIND_NOUN[kind]}
+          </Button>
+        ) : (
+          <DropdownMenu.Root modal={false}>
+            <DropdownMenu.Trigger asChild>
+              <Button variant="primary" size="sm" disabled={searching} title={searching ? 'Clear the search to add here' : undefined}>
+                New
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <polyline points="6 9 12 15 18 9" />
+                </svg>
+              </Button>
+            </DropdownMenu.Trigger>
+            <DropdownMenu.Portal>
+              <DropdownMenu.Content className={styles.menu} align="end" sideOffset={4}>
+                {(['skill', 'context', 'tool'] as LibraryKind[]).map((k) => (
+                  <DropdownMenu.Item key={k} className={styles.menuItem} onSelect={() => setDrawer({ mode: 'new', kind: k, scope, path })}>
+                    <KindGlyph kind={k} size={14} />
+                    New {KIND_NOUN[k]}
+                  </DropdownMenu.Item>
+                ))}
+              </DropdownMenu.Content>
+            </DropdownMenu.Portal>
+          </DropdownMenu.Root>
+        )}
       </div>
 
       <div className={styles.body}>
         <LibraryTree trees={trees} current={{ scope, path }} onNavigate={navigate} />
         <div className={styles.main}>
-          {kind === 'tool' && isAdmin && <ToolHostsCard ref={hostsHeading} refreshKey={refreshKey} />}
           <FolderView
             scope={scope}
             path={path}
@@ -572,7 +568,6 @@ export function LibraryPage() {
         onClose={closeDrawer}
         onChanged={refresh}
         onOpen={(item) => setDrawer({ mode: 'open', item })}
-        onShowHosts={showHosts}
         onMove={(item) => setMoving(item)}
       />
 

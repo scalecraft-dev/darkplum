@@ -359,7 +359,7 @@ func checkLibraryBucket(aws cmdRunner, profile, cluster, account, region string)
 	switch {
 	case err == nil:
 		return []checkResult{{name: "library bucket", status: checkWarn, detail: name + " exists",
-			hint: "a reinstall adopts it with the Library in it (a running install owns it already). To delete the Library for good: `darkplum destroy --delete-library-data=" + cluster + "`"}}
+			hint: "a reinstall with library_bucket_enabled = true adopts it with the Library in it (a running install with the bucket on owns it already). To delete the Library for good: `darkplum destroy --delete-library-data=" + cluster + "`"}}
 	case bucketGone(err):
 		return []checkResult{{name: "library bucket", status: checkPass, detail: name + " (none yet)"}}
 	}

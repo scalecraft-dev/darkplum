@@ -16,7 +16,14 @@ type tfvarsInfo struct {
 	Profile, Region, GPUType string
 	AccountIDs, AZs          []string
 	GPUDesired               int
-	Raw                      map[string]string
+	// LibraryBucket is library_bucket_enabled: nil when the file does not say
+	// (Terraform's default is then false, and deploy refuses to let that
+	// silently drop a bucket an install already has).
+	LibraryBucket *bool
+	// LibraryBucketRaw is the value when it is not a boolean Terraform would
+	// read as one; deploy refuses it by name rather than treating it as unset.
+	LibraryBucketRaw string
+	Raw              map[string]string
 }
 
 var (
@@ -72,6 +79,19 @@ func readTFVars(path string) (tfvarsInfo, error) {
 	if v, ok := raw["gpu_desired_size"]; ok {
 		if n, err := strconv.Atoi(v); err == nil {
 			info.GPUDesired = n
+		}
+	}
+	if v, ok := raw["library_bucket_enabled"]; ok {
+		// A trailing comment, and the quoted form Terraform also accepts.
+		if i := strings.Index(v, "#"); i >= 0 {
+			v = v[:i]
+		}
+		v = strings.Trim(strings.TrimSpace(v), `"`)
+		if v == "true" || v == "false" {
+			b := v == "true"
+			info.LibraryBucket = &b
+		} else {
+			info.LibraryBucketRaw = v
 		}
 	}
 	return info, nil

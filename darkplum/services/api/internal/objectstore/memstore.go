@@ -176,6 +176,9 @@ func (m *MemStore) Get(_ context.Context, key string) ([]byte, Info, error) {
 	if !ok {
 		return nil, Info{}, ErrNotFound
 	}
+	if int64(len(o.body)) > MaxObjectBytes {
+		return nil, Info{}, ErrTooLarge
+	}
 	return append([]byte(nil), o.body...), m.info(key, o, true), nil
 }
 

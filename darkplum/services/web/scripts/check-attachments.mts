@@ -18,12 +18,31 @@ import {
   toWireContent,
   unsupportedMessage,
 } from '../src/lib/attachments.ts'
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 let failures = 0
 function check(name: string, ok: boolean, detail?: unknown) {
   if (ok) return
   failures++
   console.error(`FAIL ${name}`, detail === undefined ? '' : JSON.stringify(detail))
+}
+
+// --- the page may show its own object URLs -------------------------------
+// The composer's thumbnails, the sent image until it is stored, and the
+// shrink step are blob: URLs the page creates (URL.createObjectURL). The
+// served Content-Security-Policy must admit them under img-src, or the
+// thumbnails show only the file name and large photos are refused unshrunk.
+{
+  const here = dirname(fileURLToPath(import.meta.url))
+  const conf = readFileSync(join(here, '..', 'site.conf'), 'utf8')
+  const policy = conf.match(/^set \$csp "([^"]+)";/m)?.[1] ?? ''
+  const imgSrc = policy.split(';').map((d) => d.trim()).find((d) => d.startsWith('img-src ')) ?? ''
+  const usesObjectUrls = readFileSync(join(here, '..', 'src', 'lib', 'attachmentFiles.ts'), 'utf8').includes('URL.createObjectURL(')
+  check('site.conf declares one CSP', policy !== '')
+  check('attachmentFiles.ts still makes object URLs (or drop this check)', usesObjectUrls)
+  check("CSP img-src admits blob: for the page's own object URLs", imgSrc.split(/\s+/).includes('blob:'), imgSrc)
 }
 
 // --- classify -----------------------------------------------------------

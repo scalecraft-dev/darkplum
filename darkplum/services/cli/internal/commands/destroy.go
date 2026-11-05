@@ -332,8 +332,8 @@ func (e *destroyEnv) run(ctx context.Context) (err error) {
 		rec.ClusterName, rec.Region, caller)
 	if lb := libraryBucketName(rec.ClusterName, caller); e.flags.DeleteLibraryData != "" {
 		e.printf("%s\n", sWarn("! --delete-library-data: the Library bucket "+lb+" and EVERY version of every file in it will be deleted too. There is no copy."))
-	} else {
-		e.printf("The Library bucket %s is KEPT, with everything in it (a reinstall adopts it; --delete-library-data=%s deletes it).\n", lb, rec.ClusterName)
+	} else if len(libraryInState(state)) > 0 {
+		e.printf("The Library bucket %s is KEPT, with everything in it (a reinstall with library_bucket_enabled = true adopts it; --delete-library-data=%s deletes it).\n", lb, rec.ClusterName)
 	}
 	if err := e.confirmName(); err != nil {
 		return err
@@ -1023,18 +1023,32 @@ func (e *destroyEnv) leftBehindAfterFailure() {
 
 // ---- the library bucket ---------------------------------------------------------
 
-// libraryAddrs are the library bucket and its configuration resources in the
-// shipped Terraform. They leave the state together: keeping the bucket while the
-// destroy removed its policy or versioning would leave it unprotected.
-var libraryAddrs = []string{
-	libraryBucketAddr,
-	"module.library_bucket.aws_s3_bucket_public_access_block.this",
-	"module.library_bucket.aws_s3_bucket_ownership_controls.this",
-	"module.library_bucket.aws_s3_bucket_versioning.this",
-	"module.library_bucket.aws_s3_bucket_lifecycle_configuration.this",
-	"module.library_bucket.aws_s3_bucket_server_side_encryption_configuration.this",
-	"module.library_bucket.aws_s3_bucket_policy.this",
+// libraryResources are the library bucket and its configuration resources in
+// the shipped Terraform, relative to the module. They leave the state together:
+// keeping the bucket while the destroy removed its policy or versioning would
+// leave it unprotected.
+var libraryResources = []string{
+	"aws_s3_bucket.this",
+	"aws_s3_bucket_public_access_block.this",
+	"aws_s3_bucket_ownership_controls.this",
+	"aws_s3_bucket_versioning.this",
+	"aws_s3_bucket_lifecycle_configuration.this",
+	"aws_s3_bucket_server_side_encryption_configuration.this",
+	"aws_s3_bucket_policy.this",
 }
+
+// libraryAddrs are every address the library's resources can have in a state:
+// under the counted module, and at the unindexed address a state applied before
+// the bucket was optional still uses.
+var libraryAddrs = func() []string {
+	var out []string
+	for _, prefix := range []string{"module.library_bucket[0].", "module.library_bucket."} {
+		for _, r := range libraryResources {
+			out = append(out, prefix+r)
+		}
+	}
+	return out
+}()
 
 // libraryInState lists the library addresses the state holds.
 func libraryInState(state map[string]bool) []string {

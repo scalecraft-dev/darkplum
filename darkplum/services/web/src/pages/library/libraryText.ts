@@ -1,8 +1,11 @@
 import { ApiError } from '../../lib/api'
 import type { LibraryItem, LibraryKind } from '../../types'
 
-/** The server's body cap (migration 026), in bytes. */
-export const LIBRARY_BODY_MAX_BYTES = 65536
+/** The server's body cap (migration 032), in bytes: 4 MiB. */
+export const LIBRARY_BODY_MAX_BYTES = 4 * 1024 * 1024
+/** Files past this are not read for import: the server takes at most twice
+ *  the body cap (a front-matter block and JSON escaping on top of a body). */
+export const LIBRARY_IMPORT_MAX_BYTES = LIBRARY_BODY_MAX_BYTES * 2
 export const LIBRARY_NAME_MAX = 100
 export const LIBRARY_DESC_MAX = 500
 
@@ -49,7 +52,9 @@ export function runeLength(s: string): number {
 export function formatSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
   const kib = bytes / 1024
-  return `${kib < 10 ? kib.toFixed(1) : Math.round(kib)} KB`
+  if (kib < 1024) return `${kib < 10 ? kib.toFixed(1) : Math.round(kib)} KB`
+  const mib = kib / 1024
+  return `${mib < 10 ? mib.toFixed(1) : Math.round(mib)} MB`
 }
 
 const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' })
@@ -97,7 +102,7 @@ export function parseAllowedTools(raw: string): string[] {
 
 export function hostOf(url: string): string | null {
   try {
-    return new URL(url).hostname.toLowerCase() || null
+    return new URL(url).hostname.toLowerCase().replace(/^\[(.*)\]$/, '$1') || null
   } catch {
     return null
   }
@@ -135,23 +140,23 @@ function refusedHost(err: ApiError): string | null {
  * here, and an administrator and everyone else need different next steps.
  */
 export function verifyErrorText(err: unknown, opts: { isAdmin: boolean; credentialSet: boolean; serverUrl: string }): string {
-  if (!(err instanceof ApiError)) return errorText(err, 'The server could not be verified.')
+  if (!(err instanceof ApiError)) return errorText(err, 'The server could not be checked.')
   const host = refusedHost(err) ?? hostOf(opts.serverUrl) ?? 'This server'
   switch (err.code()) {
     case 'tool_host_not_allowed':
       return opts.isAdmin
-        ? `${host} is not on the list of allowed tool servers. Add it under Allowed tool servers at the top of this tab, then verify again.`
-        : `${host} is not on your organisation's list of allowed tool servers. Ask an administrator to add it, then verify again.`
+        ? `${host} is not an allowed server yet.`
+        : `${host} is not a server your organisation allows yet. An administrator allows it from any tool on it, or by adding one. Then check again.`
     case 'tool_auth_failed':
       return opts.credentialSet
-        ? 'The server refused the saved credential. Set a new one below, then verify again.'
-        : 'The server asked for a credential. Set one below, then verify again.'
+        ? 'The server refused the saved credential. Set a new one below, then check again.'
+        : 'The server asked for a credential. Set one below, then check again.'
     case 'tool_server_unreachable':
-      return `${err.message} Check the address and that the server is running, then verify again.`
+      return `${err.message} Confirm the address and that the server is running, then check again.`
     case 'tool_server_error':
-      return `${err.message} Check the server's logs, then verify again.`
+      return `${err.message} Look at the server's logs, then check again.`
     default:
-      return err.message || 'The server could not be verified.'
+      return err.message || 'The server could not be checked.'
   }
 }
 
@@ -184,7 +189,9 @@ export function libraryErrorText(err: unknown, fallback: string): string {
       case 'admin_required':
         return 'Only an administrator can change the Organisation folders.'
       case 'library_storage_unavailable':
-        return 'The bucket cannot be reached right now. Nothing was changed; try again in a moment.'
+        return 'This installation has no Library bucket, or it cannot be reached right now. Nothing was changed.'
+      case 'library_body_too_large':
+        return `That is larger than a library item can be (${formatSize(LIBRARY_BODY_MAX_BYTES)}).`
       case 'tool_url_secret':
         return 'Leave the credential out of the address: it would be written to the bucket in plain text. Set it in the credential field once the tool is saved.'
     }

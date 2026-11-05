@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -38,6 +39,16 @@ func TestParseOutputsReadsTheLibraryOutputsAndTheirAbsenceIsNotAnError(t *testin
 	o, err = parseOutputs([]byte(outputsJSON(0, func(v map[string]any) { v["library_store_url"] = nil })))
 	if err != nil || o.LibraryStoreURL != "" {
 		t.Fatalf("null output: %+v %v", o, err)
+	}
+	if o.LibraryBucketEnabled != nil {
+		t.Fatalf("library_bucket_enabled absent: want nil, got %v", *o.LibraryBucketEnabled)
+	}
+	o, err = parseOutputs([]byte(outputsJSON(0, func(v map[string]any) { v["library_bucket_enabled"] = false })))
+	if err != nil || o.LibraryBucketEnabled == nil || *o.LibraryBucketEnabled {
+		t.Fatalf("library_bucket_enabled=false: %+v %v", o, err)
+	}
+	if _, err = parseOutputs([]byte(outputsJSON(0, func(v map[string]any) { v["library_bucket_enabled"] = "yes" }))); err == nil {
+		t.Fatal("a non-boolean library_bucket_enabled was accepted")
 	}
 	if _, err = parseOutputs([]byte(outputsJSON(0, func(v map[string]any) { v["library_store_url"] = []string{"x"} }))); err == nil {
 		t.Error("a library_store_url of the wrong type was accepted")
@@ -91,8 +102,15 @@ func apiEnv(t *testing.T, h *deployHarness, name string) (string, bool) {
 	return "", false
 }
 
+// bucketOn is terraform.tfvars saying library_bucket_enabled = true (the
+// harness reads the file at construction; this is the parsed result).
+func bucketOn(h *deployHarness) { on := true; h.env.tfv.LibraryBucket = &on }
+
+func bucketOff(h *deployHarness) { off := false; h.env.tfv.LibraryBucket = &off }
+
 func TestDeployGivesTheAPIItsLibraryStore(t *testing.T) {
 	h := newDeployHarness(t, 0)
+	bucketOn(h)
 	h.tf.outputs = outputsJSON(0, func(v map[string]any) {
 		v["library_store_url"] = libURL
 		v["api_role_arn"] = "arn:aws:iam::123456789012:role/dp-trial-api"
@@ -118,6 +136,140 @@ func TestDeployWithoutTheLibraryOutputWarnsAndLeavesTheStoreEmpty(t *testing.T) 
 		t.Errorf("api LIBRARY_STORE_URL = %q (set=%v), want set and empty", v, ok)
 	}
 	h.mustContain("no library_store_url output", "Postgres only")
+}
+
+// The default install: Terraform says there is no bucket, and that is a pass,
+// not a warning. The api's LIBRARY_STORE_URL stays empty.
+func TestDeployWithoutABucketIsTheDefaultAndNotAWarning(t *testing.T) {
+	h := newDeployHarness(t, 0)
+	h.tf.outputs = outputsJSON(0, func(v map[string]any) {
+		v["library_bucket_enabled"] = false
+		v["library_store_url"] = ""
+		v["api_role_arn"] = "arn:aws:iam::123456789012:role/dp-trial-api"
+	})
+	var got iamcheck.Outputs
+	h.env.iam = func(_ context.Context, o iamcheck.Outputs) (iamcheck.Report, error) {
+		got = o
+		return h.iamRep, nil
+	}
+	if err := h.run(); err != nil {
+		t.Fatalf("%v\n%s", err, h.out.String())
+	}
+	if v, ok := apiLibraryEnv(t, h); !ok || v != "" {
+		t.Errorf("api LIBRARY_STORE_URL = %q (set=%v), want set and empty", v, ok)
+	}
+	h.mustContain("Postgres (no bucket")
+	if strings.Contains(h.out.String(), "no library_store_url output") {
+		t.Errorf("an install without a bucket was warned about:\n%s", h.out.String())
+	}
+	if got.LibraryBucketEnabled == nil || *got.LibraryBucketEnabled {
+		t.Errorf("iamcheck was not told there is no bucket: %+v", got)
+	}
+	// With terraform.tfvars silent (what init writes), a bucket a previous
+	// install kept is looked for once, so the operator hears about it; here
+	// there is none, and nothing is adopted.
+	if h.tl.count("s3api head-bucket") != 1 || strings.Contains(h.out.String(), "exists from a previous install") {
+		t.Errorf("kept-bucket check: %d lookups\n%s", h.tl.count("s3api head-bucket"), h.out.String())
+	}
+}
+
+// A bucket is never dropped by a default. An install that has one in its state
+// and a terraform.tfvars that does not say is stopped before the plan; saying
+// false takes the bucket out of the state (kept, with its files) before the plan,
+// the way destroy keeps it.
+func TestDeployNeverLetsTheDefaultDeleteAnExistingBucket(t *testing.T) {
+	for name, addr := range map[string]string{"counted module": libraryBucketAddr, "pre-optional state": libraryBucketAddrLegacy} {
+		t.Run(name+": tfvars silent: refused before anything is planned", func(t *testing.T) {
+			h := newDeployHarness(t, 0)
+			h.tf.stateOut = "module.vpc.aws_vpc.this\n" + addr + "\n"
+			if !IsReported(h.run()) {
+				t.Fatalf("deployed over a bucket the tfvars would drop:\n%s", h.out.String())
+			}
+			if h.tf.ran("plan") || h.tf.ran("apply") || h.writes() != 0 {
+				t.Errorf("something was planned or written:\n%s", h.tl)
+			}
+			for _, c := range rmCommandsOf(h.tf) {
+				t.Errorf("the state was changed: %s", c)
+			}
+			h.mustContain("library_bucket_enabled = true", "library_bucket_enabled = false", "Nothing was applied", h.env.in.TFVars())
+		})
+		t.Run(name+": tfvars false: the bucket leaves the state and is kept", func(t *testing.T) {
+			h := newDeployHarness(t, 0)
+			bucketOff(h)
+			h.tf.stateOut = "module.vpc.aws_vpc.this\n" + addr + "\n" + strings.Replace(addr, "aws_s3_bucket.this", "aws_s3_bucket_policy.this", 1) + "\n"
+			h.tf.outputs = outputsJSON(0, func(v map[string]any) { v["library_bucket_enabled"] = false; v["library_store_url"] = "" })
+			if err := h.run(); err != nil {
+				t.Fatalf("%v\n%s", err, h.out.String())
+			}
+			rm := rmCommandsOf(h.tf)
+			if len(rm) != 1 || !strings.Contains(rm[0], addr) || !strings.Contains(rm[0], "aws_s3_bucket_policy.this") {
+				t.Fatalf("state rm = %v, want the bucket and its policy in one command", rm)
+			}
+			if i := h.tl.first("terraform state rm"); i < 0 || i > h.tl.first("terraform plan") {
+				t.Errorf("the bucket left the state after the plan:\n%s", h.tl)
+			}
+			if h.tl.count("s3api head-bucket") != 0 || h.tl.count("delete-bucket")+h.tl.count("delete-objects") != 0 {
+				t.Errorf("the bucket was looked for or touched:\n%s", h.tl)
+			}
+			if v, ok := apiLibraryEnv(t, h); !ok || v != "" {
+				t.Errorf("api LIBRARY_STORE_URL = %q (set=%v), want set and empty", v, ok)
+			}
+			h.mustContain("kept with its files")
+		})
+	}
+	t.Run("tfvars silent and no bucket in the state: nothing to decide", func(t *testing.T) {
+		h := newDeployHarness(t, 0)
+		if err := h.run(); err != nil {
+			t.Fatalf("%v\n%s", err, h.out.String())
+		}
+		if len(rmCommandsOf(h.tf)) != 0 {
+			t.Error("the state was changed")
+		}
+		h.mustContain("the Library lives in Postgres")
+	})
+}
+
+func TestTFVarsReadsLibraryBucketEnabled(t *testing.T) {
+	for raw, want := range map[string]string{
+		"library_bucket_enabled = true\n":            "true",
+		"library_bucket_enabled = false\n":           "false",
+		"library_bucket_enabled = true  # keep it\n": "true",
+		"library_bucket_enabled = \"false\"\n":       "false",
+		"library_bucket_enabled = yes\n":             "raw:yes",
+		"library_bucket_enabled = 1\n":               "raw:1",
+		"library_bucket_enabled = True\n":            "raw:True",
+		"":                                           "unset",
+	} {
+		dir := t.TempDir()
+		p := filepath.Join(dir, "terraform.tfvars")
+		if err := os.WriteFile(p, []byte(pinnedTFVars+raw), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		tf, err := readTFVars(p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := "unset"
+		switch {
+		case tf.LibraryBucketRaw != "":
+			got = "raw:" + tf.LibraryBucketRaw
+		case tf.LibraryBucket != nil:
+			got = strconv.FormatBool(*tf.LibraryBucket)
+		}
+		if got != want {
+			t.Errorf("%q: got %s, want %s", raw, got, want)
+		}
+	}
+}
+
+func rmCommandsOf(tf *fakeTF) []string {
+	var out []string
+	for _, c := range tf.cmds {
+		if len(c) > 1 && c[0] == "state" && c[1] == "rm" {
+			out = append(out, strings.Join(c, " "))
+		}
+	}
+	return out
 }
 
 func TestDeployRefusesAMalformedLibraryStoreBeforeAnythingReachesKubernetes(t *testing.T) {
@@ -161,17 +313,52 @@ func TestDeployLibraryBucketAdoption(t *testing.T) {
 		return false
 	}
 	t.Run("already in the state: not looked for", func(t *testing.T) {
+		for _, addr := range []string{libraryBucketAddr, libraryBucketAddrLegacy} {
+			h := newDeployHarness(t, 0)
+			bucketOn(h)
+			h.tf.stateOut = "module.vpc.aws_vpc.this\n" + addr + "\n"
+			if err := h.run(); err != nil {
+				t.Fatal(err)
+			}
+			if adopts(h) || h.tl.count("s3api head-bucket") != 0 || len(rmCommandsOf(h.tf)) != 0 {
+				t.Errorf("%s: looked for, imported or removed a bucket that is already managed", addr)
+			}
+		}
+	})
+	t.Run("tfvars silent: a kept bucket is noticed, never adopted", func(t *testing.T) {
 		h := newDeployHarness(t, 0)
-		h.tf.stateOut = "module.vpc.aws_vpc.this\n" + libraryBucketAddr + "\n"
+		h.awsf.bucketErr = nil // it exists in the account
+		if err := h.run(); err != nil {
+			t.Fatal(err)
+		}
+		if adopts(h) || h.tl.count("s3api head-bucket") != 1 {
+			t.Error("adopted, or did not look for, a bucket a previous install kept")
+		}
+		h.mustContain(libBucket+" exists from a previous install", "library_bucket_enabled = true", "terraform.tfvars")
+	})
+	t.Run("tfvars false: a kept bucket is not looked for", func(t *testing.T) {
+		h := newDeployHarness(t, 0)
+		bucketOff(h)
+		h.awsf.bucketErr = nil
 		if err := h.run(); err != nil {
 			t.Fatal(err)
 		}
 		if adopts(h) || h.tl.count("s3api head-bucket") != 0 {
-			t.Error("looked for or imported a bucket that is already managed")
+			t.Error("looked for or adopted a bucket the install turned off")
 		}
+		h.mustContain("the Library lives in Postgres")
+	})
+	t.Run("tfvars unreadable: refused by name before anything is planned", func(t *testing.T) {
+		h := newDeployHarness(t, 0)
+		h.env.tfv.LibraryBucketRaw = "yes"
+		if !IsReported(h.run()) || h.tf.ran("plan") {
+			t.Fatal("deployed with an unreadable library_bucket_enabled")
+		}
+		h.mustContain(`"yes"`, "not true or false")
 	})
 	t.Run("kept by an earlier destroy: the plan imports it, owner-checked", func(t *testing.T) {
 		h := newDeployHarness(t, 0)
+		bucketOn(h)
 		h.awsf.bucketErr = nil
 		if err := h.run(); err != nil {
 			t.Fatalf("%v\n%s", err, h.out.String())
@@ -189,6 +376,7 @@ func TestDeployLibraryBucketAdoption(t *testing.T) {
 	})
 	t.Run("not there: nothing to adopt", func(t *testing.T) {
 		h := newDeployHarness(t, 0)
+		bucketOn(h)
 		if err := h.run(); err != nil {
 			t.Fatal(err)
 		}
@@ -198,6 +386,7 @@ func TestDeployLibraryBucketAdoption(t *testing.T) {
 	})
 	t.Run("forbidden (another account's name, or no access): abort, nothing applied", func(t *testing.T) {
 		h := newDeployHarness(t, 0)
+		bucketOn(h)
 		h.awsf.bucketErr = errors.New("exit status 254: An error occurred (403) when calling the HeadBucket operation: Forbidden")
 		if !IsReported(h.run()) || h.tf.ran("plan") || h.tf.ran("apply") {
 			t.Fatal("a 403 was read as 'not there'")
@@ -206,23 +395,28 @@ func TestDeployLibraryBucketAdoption(t *testing.T) {
 	})
 	t.Run("an expired session while looking: abort", func(t *testing.T) {
 		h := newDeployHarness(t, 0)
+		bucketOn(h)
 		h.awsf.bucketErr = errors.New("ExpiredToken")
 		if !IsReported(h.run()) || h.tf.ran("plan") {
 			t.Fatal("a failed lookup was read as 'not there'")
 		}
 	})
 	t.Run("the plan would replace the kept bucket: refused even with --confirm-plan", func(t *testing.T) {
-		h := newDeployHarness(t, 0)
-		h.awsf.bucketErr = nil
-		h.env.flags.ConfirmPlan = true
-		h.tf.planJSON = `{"resource_changes":[{"address":"` + libraryBucketAddr + `","change":{"actions":["delete","create"],"importing":{"id":"` + libBucket + `"}}}]}`
-		if !IsReported(h.run()) || h.tf.ran("apply") {
-			t.Fatalf("applied a plan that deletes the library:\n%s", h.out.String())
+		for _, addr := range []string{libraryBucketAddr, libraryBucketAddrLegacy} {
+			h := newDeployHarness(t, 0)
+			bucketOn(h)
+			h.awsf.bucketErr = nil
+			h.env.flags.ConfirmPlan = true
+			h.tf.planJSON = `{"resource_changes":[{"address":"` + addr + `","change":{"actions":["delete","create"],"importing":{"id":"` + libBucket + `"}}}]}`
+			if !IsReported(h.run()) || h.tf.ran("apply") {
+				t.Fatalf("%s: applied a plan that deletes the library:\n%s", addr, h.out.String())
+			}
+			h.mustContain("the Library in it")
 		}
-		h.mustContain("the Library in it")
 	})
 	t.Run("the import is the only change: it is applied", func(t *testing.T) {
 		h := newDeployHarness(t, 0)
+		bucketOn(h)
 		h.awsf.bucketErr = nil
 		h.tf.planJSON = `{"resource_changes":[{"address":"` + libraryBucketAddr + `","change":{"actions":["no-op"],"importing":{"id":"` + libBucket + `"}}}]}`
 		if err := h.run(); err != nil {
@@ -249,13 +443,28 @@ func TestTerraformAndTheCLIAgreeOnTheLibraryBucket(t *testing.T) {
 		}
 	}
 	for _, want := range []string{
-		`(?m)^\s*for_each\s*=\s*var\.adopt_library_bucket\b`,
+		`(?m)^\s*for_each\s*=\s*var\.adopt_library_bucket\s*&&\s*var\.library_bucket_enabled\b`,
 		`(?m)^\s*to\s*=\s*` + regexp.QuoteMeta(libraryBucketAddr) + `\s*$`,
 		`(?m)^\s*id\s*=\s*local\.library_bucket_name\s*$`,
 	} {
 		if !regexp.MustCompile(want).MatchString(block) {
 			t.Errorf("the library import block does not match %s:\n%s", want, block)
 		}
+	}
+	// The bucket is opt-in (a counted module), and a state from before that is
+	// moved to the counted address rather than replaced: the CLI's legacy address
+	// is what such a state holds until then.
+	for _, want := range []string{
+		`(?ms)^module "library_bucket" \{.*?^\s*count\s*=\s*var\.library_bucket_enabled \? 1 : 0\s*$`,
+		`(?ms)^moved \{\s*from\s*=\s*module\.library_bucket\s*to\s*=\s*module\.library_bucket\[0\]\s*\}`,
+		`(?m)^variable "library_bucket_enabled" \{`,
+	} {
+		if !regexp.MustCompile(want).Match(append(append([]byte{}, b...), mustRead(t, filepath.Join(terraformDir, "variables.tf"))...)) {
+			t.Errorf("the shipped Terraform does not match %s", want)
+		}
+	}
+	if !strings.HasPrefix(libraryBucketAddr, "module.library_bucket[0].") || !strings.HasPrefix(libraryBucketAddrLegacy, "module.library_bucket.") {
+		t.Errorf("addresses: %s %s", libraryBucketAddr, libraryBucketAddrLegacy)
 	}
 	if !strings.Contains(string(b), `library_bucket_name = "${var.cluster_name}-library-${data.aws_caller_identity.current.account_id}"`) {
 		t.Error("main.tf no longer names the bucket <cluster_name>-library-<account_id>, which libraryBucketName derives")
@@ -271,6 +480,7 @@ func TestTerraformAndTheCLIAgreeOnTheLibraryBucket(t *testing.T) {
 	}
 	declared := map[string]bool{}
 	for _, m := range regexp.MustCompile(`(?m)^resource "(aws_s3_bucket[a-z_]*)" "(\w+)"`).FindAllStringSubmatch(string(mod), -1) {
+		declared["module.library_bucket[0]."+m[1]+"."+m[2]] = true
 		declared["module.library_bucket."+m[1]+"."+m[2]] = true
 	}
 	listed := map[string]bool{}
@@ -373,13 +583,28 @@ func libraryDestroy(t *testing.T, b *fakeLibraryBucket) *destroyHarness {
 	return h
 }
 
-var libraryState = func() string {
-	s := destroyState
+// libraryState is a state holding the bucket under the counted module;
+// legacyLibraryState one applied before the bucket was optional.
+var libraryState, legacyLibraryState = func() (string, string) {
+	s, l := destroyState, destroyState
 	for _, a := range libraryAddrs {
-		s += a + "\n"
+		if strings.HasPrefix(a, "module.library_bucket[0].") {
+			s += a + "\n"
+		} else {
+			l += a + "\n"
+		}
 	}
-	return s
+	return s, l
 }()
+
+func mustRead(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
 
 func rmCommands(h *destroyHarness) []string {
 	var out []string
@@ -411,9 +636,14 @@ func TestDestroyKeepsTheLibraryBucketByDefault(t *testing.T) {
 	if lib == "" {
 		t.Fatalf("the bucket was not removed from the state: %v", rm)
 	}
-	for _, a := range libraryAddrs {
+	for _, a := range strings.Fields(strings.TrimPrefix(libraryState, destroyState)) {
 		if !strings.Contains(lib, a) {
 			t.Errorf("%s was not removed from the state with the bucket: %s", a, lib)
+		}
+	}
+	for _, a := range libraryAddrs {
+		if strings.HasPrefix(a, "module.library_bucket.") && strings.Contains(lib, a) {
+			t.Errorf("state rm names %s, which the state does not hold", a)
 		}
 	}
 	if i := h.tl.first("terraform state rm " + libraryBucketAddr); i < 0 || i > h.tl.first("terraform destroy") {
@@ -427,6 +657,30 @@ func TestDestroyKeepsTheLibraryBucketByDefault(t *testing.T) {
 		t.Errorf("versions left = %d, want 2", len(b.versions))
 	}
 	h.contains("KEPT", "Library bucket s3://"+libBucket, "darkplum destroy --delete-library-data=dp-trial", "removed from the state so the destroy keeps it")
+}
+
+// A state applied before the bucket was optional holds it at the unindexed
+// address; destroy keeps that bucket too.
+func TestDestroyKeepsALegacyLibraryBucket(t *testing.T) {
+	b := &fakeLibraryBucket{exists: true, versions: []libVersion{{"library/v1/org/a.skill.md", "v1"}}}
+	h := libraryDestroy(t, b)
+	h.tf.stateOut = legacyLibraryState
+	if err := h.run(); err != nil {
+		t.Fatalf("%v\n%s", err, h.out.String())
+	}
+	var lib string
+	for _, c := range rmCommands(h) {
+		if strings.Contains(c, "library_bucket") {
+			lib = c
+		}
+	}
+	if lib == "" || !strings.Contains(lib, libraryBucketAddrLegacy) || strings.Contains(lib, "[0]") || !strings.Contains(lib, "aws_s3_bucket_policy.this") {
+		t.Fatalf("state rm = %q", lib)
+	}
+	if b.did("delete-objects")+b.did("delete-bucket") != 0 {
+		t.Errorf("the bucket was touched: %v", b.calls)
+	}
+	h.contains("KEPT", "removed from the state so the destroy keeps it")
 }
 
 func TestDestroyEmptyBucketIsStillKept(t *testing.T) {
@@ -456,6 +710,9 @@ func TestDestroyBucketAlreadyRemovedFromTheState(t *testing.T) {
 		}
 	}
 	h.contains("not in the state: nothing to keep", "Library bucket s3://"+libBucket)
+	if strings.Contains(h.out.String(), "is KEPT") {
+		t.Errorf("the confirmation promised to keep a bucket the state does not hold:\n%s", h.out.String())
+	}
 
 	// And with no bucket at all there is nothing to report.
 	b2 := &fakeLibraryBucket{exists: false}
@@ -472,7 +729,7 @@ func TestDestroyBucketAlreadyRemovedFromTheState(t *testing.T) {
 func TestDestroyOnlyRemovesTheLibraryResourcesTheStateHolds(t *testing.T) {
 	b := &fakeLibraryBucket{exists: true}
 	h := libraryDestroy(t, b)
-	h.tf.stateOut = destroyState + libraryBucketAddr + "\nmodule.library_bucket.aws_s3_bucket_policy.this\n"
+	h.tf.stateOut = destroyState + libraryBucketAddr + "\nmodule.library_bucket[0].aws_s3_bucket_policy.this\n"
 	if err := h.run(); err != nil {
 		t.Fatal(err)
 	}
@@ -717,6 +974,12 @@ func TestStatusLibraryRow(t *testing.T) {
 		}
 		if f.closed != 1 {
 			t.Errorf("tunnel closed %d times", f.closed)
+		}
+	})
+	t.Run("no bucket: Postgres, and no reachability to report", func(t *testing.T) {
+		out, _, _ := libraryRow(t, 200, `{"enabled":false,"reachable":false,"bucket":"","queue_depth":3,"failing":0,"oldest_queued_seconds":null,"last_reconcile_at":null,"foreign_objects":0}`)
+		if !strings.Contains(out, "Postgres") || !strings.Contains(out, "no bucket") || strings.Contains(out, "NOT reachable") || strings.Contains(out, "queue") {
+			t.Errorf("%s", out)
 		}
 	})
 	t.Run("nulls and an unreachable bucket", func(t *testing.T) {

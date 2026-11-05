@@ -174,11 +174,14 @@ func (s *s3Store) Get(ctx context.Context, key string) ([]byte, Info, error) {
 		return nil, Info{}, wrap("get", err, true)
 	}
 	defer out.Body.Close()
-	// The library's objects are at most ~130 KiB; cap defensively so a
-	// foreign huge object in the bucket cannot exhaust memory.
-	b, err := io.ReadAll(io.LimitReader(out.Body, 1<<20))
+	// Read one byte past the bound: an object over it is refused by name,
+	// never returned cut short.
+	b, err := io.ReadAll(io.LimitReader(out.Body, MaxObjectBytes+1))
 	if err != nil {
 		return nil, Info{}, wrap("get", err, false)
+	}
+	if int64(len(b)) > MaxObjectBytes {
+		return nil, Info{}, ErrTooLarge
 	}
 	return b, Info{Key: key, Size: int64(len(b)), LastModified: aws.ToTime(out.LastModified), ETag: strings.Trim(aws.ToString(out.ETag), `"`), Meta: lowerMeta(out.Metadata)}, nil
 }

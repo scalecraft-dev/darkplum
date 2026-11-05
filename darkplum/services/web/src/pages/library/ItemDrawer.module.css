@@ -1,6 +1,6 @@
 /* The library item drawer. Overlay, slide and close button follow
    ActivityDrawer; the body is a column of header, scroll area and a fixed
-   action footer, because a 64 KB skill is longer than any screen and Save
+   action footer, because a long skill is longer than any screen and Save
    must not scroll away with it. */
 
 .overlay {

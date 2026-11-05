@@ -225,9 +225,9 @@ Measured on one account with the default 7B model. A larger model takes longer t
 | `darkplum init` | Create an install, or show an existing one and change its settings (`--dry-run` previews) |
 | `darkplum deploy` | Create or update the install: infrastructure, verified images, the platform. Safe to re-run; also the upgrade path |
 | `darkplum configure` | First run: first admin, models, a test chat, open the web UI |
-| `darkplum status` | Show cluster, node, pod and GPU status, and the Library bucket (reachable, sync queue, failures, foreign objects) |
+| `darkplum status` | Show cluster, node, pod and GPU status, and the Library bucket when there is one (reachable, sync queue, failures, foreign objects) |
 | `darkplum doctor check` | Check this machine can run an install (tools, credentials, GPU quota; warns about a kept Library bucket and a bucket name over 63 characters) |
-| `darkplum verify` | Prove the gateway's IAM role allows only the configured Bedrock models, and that only the api role can read the Library bucket (the gateway is explicitly denied) |
+| `darkplum verify` | Prove the gateway's IAM role allows only the configured Bedrock models, and, on an install with a Library bucket, that only the api role can read it (the gateway is explicitly denied) |
 | `darkplum models add <name> --hf <id>` | Add another self-hosted open-source model (one GPU each) |
 | `darkplum models remove <name>` / `list` / `test <name>` | Remove a model added with `models add`; list models and gateway upstreams; send a test chat to one |
 | `darkplum keys set huggingface` | Store a Hugging Face token for gated models |
@@ -238,7 +238,7 @@ Measured on one account with the default 7B model. A larger model takes longer t
 | `darkplum sso configure` / `darkplum admin create` | Configure OIDC sign-in; create a local break-glass admin |
 | `darkplum kubeconfig` | Point this shell's kubectl at the install's cluster (`eval "$(darkplum kubeconfig)"`) |
 | `darkplum version` | The release, the digests it deploys, the third-party images it pins |
-| `darkplum destroy` | Tear down all resources (type the cluster name to confirm). The Library bucket is kept with its contents; `--delete-library-data=<cluster_name>` deletes it and every version |
+| `darkplum destroy` | Tear down all resources (type the cluster name to confirm). A Library bucket is kept with its contents; `--delete-library-data=<cluster_name>` deletes it and every version |
 | `pnpm run check:parity` (in `services/web`) | Verify every API route has a UI and vice versa against `docs/api-routes.json` |
 
 Working on darkplum itself (local kind stack, rebuilding one service) uses
@@ -703,13 +703,23 @@ can move it back or remove it. Administrators never see private items in the
 app. Deleting a user removes their private items and passes their shared ones
 to the acting administrator.
 
-**The library is a folder in your own S3 bucket.** The app's index is its
-Postgres; every item is also written, as a plain file, to the install's
-Library bucket (`<cluster_name>-library-<account_id>`) under `library/v1/`:
-`org/<folders>/<slug>.skill.md`, `.context.md` or `.tool.json` for shared
-items, `people/<person>/<folders>/...` for private ones, with the name,
-description, kind and a stable id in the front matter, and never a tool's
-credential. The bucket is versioned, so earlier versions of a file can be
+**The library lives in the install's Postgres.** An item holds up to 4 MiB
+of Markdown or tool JSON, enough for a long reference document; what a chat
+turn can carry is bounded separately (400,000 characters of attached skills
+and context, refused by name past that). Export produces every item as a
+plain file in a zip (`org/<folders>/<slug>.skill.md`, `.context.md` or
+`.tool.json` for shared items, `people/<person>/<folders>/...` for private
+ones, with the name, description, kind and a stable id in the front matter,
+and never a tool's credential); Import reads the instruction text of a
+Markdown file (a Claude `SKILL.md`'s scripts and resources are never imported
+or run) into the folder you are in and lists what it dropped before anything
+is written.
+
+**Optionally, the library is also a folder in your own S3 bucket.** Set
+`library_bucket_enabled = true` in `terraform.tfvars` and run `darkplum
+deploy`: every item is then also written, as the same plain file, to the
+install's Library bucket (`<cluster_name>-library-<account_id>`) under
+`library/v1/`. The bucket is versioned, so earlier versions of a file can be
 read back; a rename or move starts a fresh history at the new key. Open it in
 the S3 console, back it up, `aws s3 sync` it to disk, put it in git. The app
 is the writer: a file edited, added or deleted in the bucket is not seen until
@@ -717,18 +727,20 @@ someone presses **Sync from bucket** (own files; an administrator for the
 Organisation root), which imports new files and adopts edited ones, leaves a
 file alone when it changed in the app as well (the app's version wins, the
 bucket's stays in version history), and never treats a deleted file as a
-deletion (the app writes it back). Export still produces the same files as a
-zip, byte for byte; Import reads the instruction text of a Markdown file (a
-Claude `SKILL.md`'s scripts and resources are never imported or run) into the
-folder you are in and lists what it dropped before anything is written. The
-dev stack runs an in-cluster object store so the same code path runs locally
-(see CONTRIBUTING.md).
+deletion (the app writes it back). Setting it back to `false` takes the bucket
+out of Terraform and keeps it with its files; the app stops writing to it. An
+install made before the bucket was optional has one: its next `darkplum
+deploy` asks you to write `library_bucket_enabled = true` or `false` into
+`terraform.tfvars` rather than let a default drop it. The dev stack runs an
+in-cluster object store so the same code path runs locally (see
+CONTRIBUTING.md).
 
 **Tools do nothing until an administrator allows their hosts.** The
-allowlist (Library > Tools > Allowed tool servers, or `PUT
-/api/v1/settings/tool-hosts`) is empty on every install. A tool server's host
-must be listed (`mcp.corp.example`, `*.svc.cluster.local`) before it can be
-verified or called; link-local and other reserved addresses can never be
+allowlist is empty on every install. An administrator saving a tool allows
+its server, and takes it away again from the tool's own drawer; the list
+itself is `PUT /api/v1/settings/tool-hosts`, which also takes wildcards
+(`*.svc.cluster.local`). A tool server's host must be listed before it can be
+checked or called; link-local and other reserved addresses can never be
 listed, and redirects are never followed. A server's bearer token, if it
 needs one, is written to the cluster Secret `darkplum-tool-credentials` by
 the api (never to Postgres) and read back from its file mount, like the
@@ -769,11 +781,13 @@ were stored but never enforced. Now they are, so:
 The EKS control-plane log group is kept after `darkplum destroy` (Kubernetes
 audit logs) and re-adopted by the next `darkplum deploy`.
 
-The Library bucket (`<cluster_name>-library-<account_id>`, every library file
-under `library/v1/`) is kept too, with all its versions: `darkplum destroy`
-takes it and its configuration out of Terraform's state, prints it in the
-leftovers report, and the next `darkplum deploy` with the same cluster name
-imports it back. To delete the Library for good, run
+A Library bucket (`<cluster_name>-library-<account_id>`, every library file
+under `library/v1/`, on an install with `library_bucket_enabled`) is kept too,
+with all its versions: `darkplum destroy` takes it and its configuration out
+of Terraform's state, prints it in the leftovers report, and the next
+`darkplum deploy` with the same cluster name and `library_bucket_enabled =
+true` imports it back. The Library itself is in the database, and goes with
+its final snapshot. To delete the bucket for good, run
 `darkplum destroy --delete-library-data=<cluster_name>`: it deletes every
 version and delete marker, then the bucket, after the infrastructure is gone. It
 is repeatable, and also works on a later run once the install is already

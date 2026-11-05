@@ -250,7 +250,7 @@ func toolErrorJSON(c *gin.Context, err error, host string) {
 	case errors.Is(err, mcp.ErrNotAllowed):
 		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": gin.H{
 			"code":    "tool_host_not_allowed",
-			"message": fmt.Sprintf("%s is not on the list of allowed tool servers. An administrator can add it under Allowed tool servers on the Library page's Tools tab.", host),
+			"message": fmt.Sprintf("%s is not an allowed tool server. An administrator allows it from the tool's page in the Library, or with PUT /api/v1/settings/tool-hosts.", host),
 			"host":    host,
 		}})
 	case errors.As(err, &rpc):

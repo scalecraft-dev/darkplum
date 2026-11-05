@@ -50,10 +50,17 @@ const (
 	libraryVisibilityPrivate = "private"
 	libraryVisibilityOrg     = "org"
 
-	// libraryBodyMaxBytes matches the CHECK constraint in migration 026.
-	libraryBodyMaxBytes = 65536
-	libraryNameMaxChars = 100
-	libraryDescMaxChars = 500
+	// libraryBodyMaxBytes matches the CHECK constraint in migration 032
+	// (4 MiB). The library lives in Postgres; a reference document is far
+	// longer than a page of instructions. The per-turn injection cap
+	// (chat_library.go) is still the binding limit on what reaches a model.
+	libraryBodyMaxBytes = 4 << 20
+	// libraryRequestMaxBytes bounds a create, update or import request: a
+	// body at the cap, JSON-escaped (an import carries front matter too),
+	// with room for the other fields.
+	libraryRequestMaxBytes = libraryBodyMaxBytes*2 + 1<<20
+	libraryNameMaxChars    = 100
+	libraryDescMaxChars    = 500
 	// libraryItemsPerUser bounds one person's library. Enforced inside the
 	// insert transaction so concurrent creates cannot overshoot.
 	libraryItemsPerUser = 500
@@ -143,9 +150,10 @@ type libraryItem struct {
 	Path string `json:"path"`
 	// FileName is the item's file name in the bucket and in an export.
 	FileName string `json:"file_name"`
-	// Synced is true when the bucket copy is current. Always false when no
-	// object store is configured.
-	Synced bool `json:"synced"`
+	// Synced is true when the bucket copy is current, false while it is
+	// not, and null when the installation has no bucket (the library then
+	// lives in Postgres alone and there is nothing to be in sync with).
+	Synced *bool `json:"synced"`
 	// S3URI is where the copy lives, only when a store is configured and the
 	// caller may see it (the owner for private items, anyone for org items).
 	S3URI *string `json:"s3_uri"`
@@ -170,14 +178,32 @@ type libraryRow struct {
 	previousFolderPath       *string
 	queued                   bool
 	bucketChanged            bool
+	// size is octet_length(body) as Postgres counts it, read separately so a
+	// listing can report it without carrying the body.
+	size int
 }
 
-const librarySelectCols = `
-	li.id, li.kind, li.name, li.slug, li.description, li.body, li.visibility, li.content_sha256,
+// libraryColsWith is the column list scanLibraryRow reads; bodyExpr is what
+// stands in for the body column.
+func libraryColsWith(bodyExpr string) string {
+	return `
+	li.id, li.kind, li.name, li.slug, li.description, ` + bodyExpr + `, li.visibility, li.content_sha256,
 	li.owner_user_id::text, u.name, u.email, li.shared_at, li.created_at, li.updated_at,
 	li.tool_catalog, li.tool_catalog_at, li.tool_credential_last4,
 	COALESCE(fo.path, ''), u.library_slug, li.s3_key, li.s3_synced_sha, li.s3_obj_sha, li.previous_folder_path,
-	EXISTS (SELECT 1 FROM library_sync q WHERE q.item_id = li.id), li.bucket_changed_at IS NOT NULL`
+	EXISTS (SELECT 1 FROM library_sync q WHERE q.item_id = li.id), li.bucket_changed_at IS NOT NULL,
+	octet_length(li.body)`
+}
+
+// librarySelectCols reads one item in full: a single read, an export, the
+// sync worker.
+var librarySelectCols = libraryColsWith("li.body")
+
+// libraryListCols is what a listing reads. A skill or context body can be
+// 4 MiB and a listing holds up to a thousand items, so it carries only the
+// tool bodies (the small JSON configuration the row's tool block is built
+// from); the row still reports size_bytes, and GET /library/:id has the body.
+var libraryListCols = libraryColsWith("CASE WHEN li.kind = 'tool' THEN li.body ELSE '' END")
 
 const libraryFrom = ` FROM library_items li LEFT JOIN users u ON u.id = li.owner_user_id LEFT JOIN library_folders fo ON fo.id = li.folder_id `
 
@@ -186,7 +212,7 @@ func scanLibraryRow(row pgx.Row, extra ...any) (*libraryRow, error) {
 	dest := []any{&r.id, &r.kind, &r.name, &r.slug, &r.description, &r.body, &r.visibility, &r.sha,
 		&r.ownerID, &r.ownerName, &r.ownerEmail, &r.sharedAt, &r.createdAt, &r.updatedAt,
 		&r.toolCatalog, &r.catalogAt, &r.credLast4,
-		&r.folderPath, &r.ownerSlug, &r.s3Key, &r.syncedSHA, &r.objSHA, &r.previousFolderPath, &r.queued, &r.bucketChanged}
+		&r.folderPath, &r.ownerSlug, &r.s3Key, &r.syncedSHA, &r.objSHA, &r.previousFolderPath, &r.queued, &r.bucketChanged, &r.size}
 	err := row.Scan(append(dest, extra...)...)
 	if err != nil {
 		return nil, err
@@ -197,7 +223,7 @@ func scanLibraryRow(row pgx.Row, extra ...any) (*libraryRow, error) {
 func (r *libraryRow) toWire(me string) libraryItem {
 	it := libraryItem{
 		ID: r.id, Kind: r.kind, Name: r.name, Slug: r.slug, Description: r.description, Body: r.body,
-		Visibility: r.visibility, ContentSHA256: r.sha, SizeBytes: len(r.body),
+		Visibility: r.visibility, ContentSHA256: r.sha, SizeBytes: r.size,
 		SharedAt: r.sharedAt, CreatedAt: r.createdAt, UpdatedAt: r.updatedAt,
 		Scope: wireScope(r.visibility), Path: r.folderPath, FileName: r.slug + libkey.Suffix(r.kind),
 	}
@@ -324,7 +350,7 @@ func validateLibraryInput(in *libraryInput, forUpdate bool) string {
 		return "body is required"
 	}
 	if len(in.Body) > libraryBodyMaxBytes {
-		return fmt.Sprintf("body must be at most %d bytes", libraryBodyMaxBytes)
+		return bodyTooLargeMsg
 	}
 	if in.Kind == libraryKindTool {
 		cfg, err := parseToolConfig(in.Body)
@@ -397,9 +423,31 @@ func (h *LibraryHandler) wire(r *libraryRow, me string) libraryItem {
 			it.S3URI = &u
 		}
 		it.BucketChanged = r.bucketChanged
-		it.Synced = r.s3Key != nil && r.syncedSHA != nil && *r.syncedSHA == r.sha && !r.queued && !r.bucketChanged
+		synced := r.s3Key != nil && r.syncedSHA != nil && *r.syncedSHA == r.sha && !r.queued && !r.bucketChanged
+		it.Synced = &synced
 	}
 	return it
+}
+
+// HasStore says whether the installation mirrors the library to a bucket.
+func (h *LibraryHandler) HasStore() bool { return h.store != nil }
+
+// limitRequest bounds a request that carries an item body, so a client
+// cannot make the api read without end. Past the bound, binding fails and
+// bindError names the limit.
+func limitRequest(c *gin.Context) {
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, libraryRequestMaxBytes)
+}
+
+// bindError is the 400 for a request that did not bind: the body limit by
+// name when that is why, otherwise the route's shape.
+func bindError(c *gin.Context, err error, shape string) {
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		c.JSON(http.StatusRequestEntityTooLarge, gin.H{"error": fmt.Sprintf("request body exceeds %d bytes; an item body is at most %d bytes", libraryRequestMaxBytes, libraryBodyMaxBytes), "code": "library_body_too_large"})
+		return
+	}
+	c.JSON(http.StatusBadRequest, gin.H{"error": shape})
 }
 
 // toolURLSecretMsg is the message (and, via libInputError, the code
@@ -426,12 +474,19 @@ func toolURLHasSecretParam(raw string) bool {
 // libInputError answers a validateLibraryInput failure; the secret-in-URL
 // case carries a code the UI can show by name.
 func libInputError(c *gin.Context, status int, msg string) {
-	if msg == toolURLSecretMsg {
+	switch msg {
+	case toolURLSecretMsg:
 		c.JSON(status, gin.H{"error": msg, "code": "tool_url_secret"})
-		return
+	case bodyTooLargeMsg:
+		c.JSON(status, gin.H{"error": msg, "code": "library_body_too_large"})
+	default:
+		c.JSON(status, gin.H{"error": msg})
 	}
-	c.JSON(status, gin.H{"error": msg})
 }
+
+// bodyTooLargeMsg is the message (and, via libInputError, the code
+// library_body_too_large) for a body over the cap.
+var bodyTooLargeMsg = fmt.Sprintf("body must be at most %d bytes", libraryBodyMaxBytes)
 
 // List handles GET /api/v1/library?scope=&path=&recursive=&kind=&q=.
 //
@@ -498,7 +553,7 @@ func (h *LibraryHandler) List(c *gin.Context) {
 		n := len(args)
 		where = append(where, fmt.Sprintf("(li.name ILIKE $%d ESCAPE '\\' OR li.description ILIKE $%d ESCAPE '\\' OR li.slug ILIKE $%d ESCAPE '\\' OR fo.path ILIKE $%d ESCAPE '\\')", n, n, n, n))
 	}
-	rows, err := h.db.Query(ctx, `SELECT `+librarySelectCols+libraryFrom+` WHERE `+strings.Join(where, " AND ")+` ORDER BY li.updated_at DESC LIMIT 1000`, args...)
+	rows, err := h.db.Query(ctx, `SELECT `+libraryListCols+libraryFrom+` WHERE `+strings.Join(where, " AND ")+` ORDER BY li.updated_at DESC LIMIT 1000`, args...)
 	if err != nil {
 		slog.ErrorContext(ctx, "library list failed", "err", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "list library failed"})
@@ -579,9 +634,10 @@ func itemVisibility(in *libraryInput) (string, bool) {
 func (h *LibraryHandler) Create(c *gin.Context) {
 	me := c.GetString("user_id")
 	ctx := c.Request.Context()
+	limitRequest(c)
 	var in libraryInput
 	if err := c.ShouldBindJSON(&in); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "body must be {kind, name, slug?, description?, body, visibility?, scope?, path?}"})
+		bindError(c, err, "body must be {kind, name, slug?, description?, body, visibility?, scope?, path?}")
 		return
 	}
 	if msg := validateLibraryInput(&in, false); msg != "" {
@@ -723,9 +779,10 @@ func (h *LibraryHandler) Update(c *gin.Context) {
 	}
 	me := c.GetString("user_id")
 	ctx := c.Request.Context()
+	limitRequest(c)
 	var in libraryInput
 	if err := c.ShouldBindJSON(&in); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "body must be {name, slug?, description?, body}"})
+		bindError(c, err, "body must be {name, slug?, description?, body}")
 		return
 	}
 	// The stored kind decides how the body is validated.
@@ -1260,9 +1317,10 @@ func humanize(stem string) string {
 func (h *LibraryHandler) Import(c *gin.Context) {
 	me := c.GetString("user_id")
 	ctx := c.Request.Context()
+	limitRequest(c)
 	var req importRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "body must be {filename, content, kind?, scope?, path?}"})
+		bindError(c, err, "body must be {filename, content, kind?, scope?, path?}")
 		return
 	}
 	in, pv, msg := parseImport(req)
@@ -1320,7 +1378,7 @@ func (h *LibraryHandler) Import(c *gin.Context) {
 func (h *LibraryHandler) ListShared(c *gin.Context) {
 	me := c.GetString("user_id")
 	ctx := c.Request.Context()
-	rows, err := h.db.Query(ctx, `SELECT `+librarySelectCols+libraryFrom+` WHERE li.visibility = 'org' ORDER BY li.updated_at DESC LIMIT 1000`)
+	rows, err := h.db.Query(ctx, `SELECT `+libraryListCols+libraryFrom+` WHERE li.visibility = 'org' ORDER BY li.updated_at DESC LIMIT 1000`)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "list shared items failed"})
 		return

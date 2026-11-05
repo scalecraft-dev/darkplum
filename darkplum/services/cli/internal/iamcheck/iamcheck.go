@@ -41,6 +41,10 @@ type Outputs struct {
 	// Library existed has neither, and they are then skipped, with a note).
 	APIRoleARN      string `json:"api_role_arn"`
 	LibraryStoreURL string `json:"library_store_url"`
+	// LibraryBucketEnabled is false on an install without a bucket (the
+	// Library is in Postgres alone, and there is no bucket boundary to prove);
+	// nil on a state applied before the bucket was optional.
+	LibraryBucketEnabled *bool `json:"library_bucket_enabled"`
 }
 
 // ErrNoRole means the stack has no gateway role output (not applied yet).
@@ -72,6 +76,9 @@ func FromTerraform(raw map[string]json.RawMessage) (Outputs, error) {
 		return o, err
 	}
 	if err := get("library_store_url", &o.LibraryStoreURL); err != nil {
+		return o, err
+	}
+	if err := get("library_bucket_enabled", &o.LibraryBucketEnabled); err != nil {
 		return o, err
 	}
 	return o, nil
@@ -247,6 +254,10 @@ func (o Outputs) libraryChecks(account string, rep *Report) []Check {
 			n = rep.NoteLine + "; " + n
 		}
 		rep.NoteLine = n
+	}
+	if o.LibraryBucketEnabled != nil && !*o.LibraryBucketEnabled {
+		note("no Library bucket (library_bucket_enabled is false; the Library is in Postgres): no bucket boundary to check")
+		return nil
 	}
 	if o.LibraryStoreURL == "" && o.APIRoleARN == "" {
 		return nil // applied before the Library existed; deploy says so

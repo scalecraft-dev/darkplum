@@ -9,6 +9,9 @@ interface AuthUser {
   role: 'admin' | 'reader'
   picture?: string | null
   has_password?: boolean
+  /** Whether the install mirrors the library to a bucket. Absent on an
+   *  older api, which always had one. */
+  library_bucket?: boolean
 }
 
 interface AuthContextValue {

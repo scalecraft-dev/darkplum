@@ -33,6 +33,32 @@ func runContract(t *testing.T, s Store, prefix string) {
 		}
 	})
 
+	t.Run("an object over the bound is ErrTooLarge, never cut short", func(t *testing.T) {
+		saved := MaxObjectBytes
+		MaxObjectBytes = 64 << 10
+		defer func() { MaxObjectBytes = saved }()
+		big := bytes.Repeat([]byte("x"), int(MaxObjectBytes)+1)
+		if err := s.Put(ctx, k("a/big.context.md"), big, nil); err != nil {
+			t.Fatal(err)
+		}
+		if got, _, err := s.Get(ctx, k("a/big.context.md")); !errors.Is(err, ErrTooLarge) || got != nil {
+			t.Fatalf("get over the bound = %d bytes, %v; want ErrTooLarge and no bytes", len(got), err)
+		}
+		if h, err := s.Head(ctx, k("a/big.context.md")); err != nil || h.Size != int64(len(big)) {
+			t.Errorf("head = %+v, %v", h, err)
+		}
+		exact := bytes.Repeat([]byte("y"), int(MaxObjectBytes))
+		if err := s.Put(ctx, k("a/exact.context.md"), exact, nil); err != nil {
+			t.Fatal(err)
+		}
+		if got, _, err := s.Get(ctx, k("a/exact.context.md")); err != nil || !bytes.Equal(got, exact) {
+			t.Errorf("get at the bound: %d bytes, %v", len(got), err)
+		}
+		if Code(ErrTooLarge) != "TooLarge" {
+			t.Errorf("Code(ErrTooLarge) = %q", Code(ErrTooLarge))
+		}
+	})
+
 	t.Run("missing is ErrNotFound", func(t *testing.T) {
 		if _, err := s.Head(ctx, k("nope")); !errors.Is(err, ErrNotFound) {
 			t.Errorf("head: %v", err)

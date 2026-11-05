@@ -896,7 +896,9 @@ export interface LibraryItem {
   name: string
   slug: string
   description: string
-  /** Markdown for a skill or context item; the JSON configuration for a tool. */
+  /** Markdown for a skill or context item; the JSON configuration for a tool.
+   *  A listing leaves it empty for skills and context (a body can be 4 MiB);
+   *  getLibraryItem() has it. A tool's small JSON body is always present. */
   body: string
   visibility: LibraryVisibility
   /** Null only for an item whose owner was removed before ownership passed to
@@ -916,8 +918,9 @@ export interface LibraryItem {
   path?: string
   /** The file it is in the bucket, e.g. "nda-review.skill.md". */
   file_name?: string
-  /** True once the bucket holds this exact version. */
-  synced?: boolean
+  /** True once the bucket holds this exact version; null when the install
+   *  has no bucket (nothing to be in sync with). */
+  synced?: boolean | null
   /** The file in the bucket was changed outside the app; Sync adopts it. */
   bucket_changed?: boolean
   /** s3://bucket/key when a bucket is configured and the caller may see it. */

@@ -244,6 +244,7 @@ func run() error {
 	chat.WithTools(toolSvc)
 	library := handler.NewLibraryHandler(pool, activityRecorder, toolSvc)
 	startLibraryStore(ctx, pool, library)
+	localProvider.LibraryBucket = library.HasStore
 	users.SetToolCredentialCleanup(toolSvc.RemoveCredentialsQuietly)
 
 	// Vendor usage/cost reconciliation (separate billing keys; see
@@ -874,14 +875,14 @@ func csrfProtection() gin.HandlerFunc {
 	}
 }
 
-// startLibraryStore wires the library's object store copy. With
-// LIBRARY_STORE_URL unset the worker is off, the library behaves from
-// Postgres alone, and library_sync rows simply accumulate (one per item or
-// folder at most) until a store is configured.
+// startLibraryStore wires the library's optional bucket copy. Postgres is
+// the library; with LIBRARY_STORE_URL unset (the default install) the worker
+// is off and library_sync rows simply accumulate (one per item or folder at
+// most), so a bucket configured later is filled from the queue.
 func startLibraryStore(ctx context.Context, pool *pgxpool.Pool, library *handler.LibraryHandler) {
 	cfg := objectstore.S3ConfigFromEnv()
 	if cfg.URL == "" {
-		slog.Info("library object store disabled: LIBRARY_STORE_URL is unset; the sync worker is off and queued changes accumulate until it is set")
+		slog.Info("library bucket not configured: the library lives in Postgres alone; set LIBRARY_STORE_URL to mirror it to a bucket")
 		return
 	}
 	store, err := objectstore.NewS3(ctx, cfg)

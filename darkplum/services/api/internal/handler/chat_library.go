@@ -49,11 +49,17 @@ import (
 )
 
 const (
-	libraryItemsHeader   = "X-Darkplum-Library-Items"
-	libraryUsedHeader    = "X-Darkplum-Library"
-	libraryToolsHeader   = "X-Darkplum-Tools"
-	libraryMaxAttached   = 8
-	libraryMaxInjected   = 100_000 // characters of skill/context text per turn
+	libraryItemsHeader = "X-Darkplum-Library-Items"
+	libraryUsedHeader  = "X-Darkplum-Library"
+	libraryToolsHeader = "X-Darkplum-Tools"
+	libraryMaxAttached = 8
+	// libraryMaxInjected bounds the skill and context text one turn carries,
+	// in characters: roughly 100k tokens. It is the api's bound, not the
+	// model's: a model with a smaller window (a self-hosted model at its
+	// default max-model-len, say) still refuses upstream. The stored cap
+	// (library.go) is larger: a long reference document is kept whole and
+	// refused by name (library_too_large) when a turn cannot carry it.
+	libraryMaxInjected   = 400_000
 	libraryResolveWait   = 2 * time.Second
 	toolMaxRounds        = 8
 	toolCallTimeout      = 60 * time.Second
@@ -859,7 +865,7 @@ func toolErrorText(err error, serverURL string) string {
 	var rpc *mcp.Error
 	switch {
 	case errors.Is(err, mcp.ErrNotAllowed):
-		return fmt.Sprintf("the tool server %s is not on the organisation's allowed list; an administrator can add it under Allowed tool servers on the Library page's Tools tab", host)
+		return fmt.Sprintf("the tool server %s is not an allowed tool server; an administrator allows it from the tool's page in the Library, or with PUT /api/v1/settings/tool-hosts", host)
 	case errors.As(err, &rpc):
 		return fmt.Sprintf("the tool server answered with an error (code %d)", rpc.Code)
 	case errors.Is(err, context.DeadlineExceeded):

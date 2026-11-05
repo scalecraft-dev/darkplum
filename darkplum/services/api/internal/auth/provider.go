@@ -31,6 +31,10 @@ type SessionManager struct {
 	DB         *pgxpool.Pool
 	Secret     []byte
 	SecureCook bool
+	// LibraryBucket says whether the installation mirrors the library to a
+	// bucket; /auth/me carries it so the UI shows the bucket's controls only
+	// where there is one. nil means no.
+	LibraryBucket func() bool
 }
 
 func (s *SessionManager) SetCookie(c *gin.Context, name, value string, maxAge int, path string) {
@@ -132,12 +136,13 @@ func (s *SessionManager) HandleMe(c *gin.Context) {
 		claims.UserID).Scan(&picture, &hasPassword)
 
 	c.JSON(http.StatusOK, gin.H{
-		"id":           claims.UserID,
-		"email":        claims.Email,
-		"name":         claims.Name,
-		"role":         claims.Role,
-		"picture":      picture,
-		"has_password": hasPassword,
+		"id":             claims.UserID,
+		"email":          claims.Email,
+		"name":           claims.Name,
+		"role":           claims.Role,
+		"picture":        picture,
+		"has_password":   hasPassword,
+		"library_bucket": s.LibraryBucket != nil && s.LibraryBucket(),
 	})
 }
 

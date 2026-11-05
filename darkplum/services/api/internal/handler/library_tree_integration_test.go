@@ -592,7 +592,7 @@ func TestTree_WorkerWritesExportBytesAndIsIdempotent(t *testing.T) {
 	w = e.do(a, http.MethodGet, "/api/v1/library/"+tool.ID, nil)
 	var got libraryItem
 	_ = json.Unmarshal(w.Body.Bytes(), &got)
-	if !got.Synced || got.S3URI == nil || !strings.HasPrefix(*got.S3URI, "s3://mem-bucket/") {
+	if got.Synced == nil || !*got.Synced || got.S3URI == nil || !strings.HasPrefix(*got.S3URI, "s3://mem-bucket/") {
 		t.Errorf("wire = synced %v uri %v", got.Synced, got.S3URI)
 	}
 }
@@ -976,7 +976,9 @@ func TestTree_NoStoreBehavesAsBefore(t *testing.T) {
 	alice := e.user("alice")
 	a := e.router(alice, false)
 	it := e.mustItem(a, map[string]any{"kind": "skill", "name": "Plain", "body": "x"})
-	if it.Synced || it.S3URI != nil {
+	// Without a bucket there is nothing to be in sync with: synced is null,
+	// not false, so the UI shows no "not synced yet" mark.
+	if it.Synced != nil || it.S3URI != nil {
 		t.Errorf("synced/uri without a store: %+v", it)
 	}
 	w := e.do(a, http.MethodGet, "/api/v1/library", nil)
@@ -1396,4 +1398,99 @@ func TestTree_ListFoldersRecursive(t *testing.T) {
 	if w := e.do(b, http.MethodGet, "/api/v1/library/folders?scope=private&path=a&recursive=1", nil); w.Code != 404 {
 		t.Errorf("bob into alice's path: %d", w.Code)
 	}
+}
+
+// A listing never carries a skill or context body: a body can be 4 MiB and a
+// listing a thousand items. It reports the size; the single read has the body;
+// a tool's small JSON body is always present (the row's tool block is built
+// from it).
+func TestTree_ListingsCarrySizeNotBody(t *testing.T) {
+	pool := setupTestDB(t)
+	h := newLibraryHandlerForTest(pool)
+	e := &treeEnv{t: t, pool: pool, h: h}
+	alice := e.user("alice")
+	a := e.router(alice, false)
+	admin := e.router(e.user("admin"), true)
+
+	// Well over the old 64 KiB cap: the document is kept whole.
+	big := strings.Repeat("reference text\n", 10_000) // 150,000 bytes
+	doc := e.mustItem(a, map[string]any{"kind": "context", "name": "Big doc", "body": big, "scope": "org"})
+	if doc.SizeBytes != len(big) || doc.Body != big {
+		t.Fatalf("create: size %d body %d", doc.SizeBytes, len(doc.Body))
+	}
+	tool := e.mustItem(a, map[string]any{"kind": "tool", "name": "Jira", "body": `{"server_url":"https://mcp.example/jira"}`})
+
+	for _, tc := range []struct {
+		name string
+		r    *gin.Engine
+		path string
+	}{
+		{"list", a, "/api/v1/library?scope=org"},
+		{"shared (admin)", admin, "/api/v1/library/shared"},
+	} {
+		w := e.do(tc.r, http.MethodGet, tc.path, nil)
+		if w.Code != 200 {
+			t.Fatalf("%s: %d %s", tc.name, w.Code, w.Body.String())
+		}
+		var rows []libraryItem
+		if err := json.Unmarshal(w.Body.Bytes(), &rows); err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for _, r := range rows {
+			if r.ID != doc.ID {
+				continue
+			}
+			found = true
+			if r.Body != "" || r.SizeBytes != len(big) || r.ContentSHA256 != doc.ContentSHA256 {
+				t.Errorf("%s: body %d bytes, size %d, sha %q", tc.name, len(r.Body), r.SizeBytes, r.ContentSHA256)
+			}
+		}
+		if !found {
+			t.Errorf("%s: the item is not listed", tc.name)
+		}
+		if w.Body.Len() > len(big)/2 {
+			t.Errorf("%s: the listing is %d bytes; it carries the body", tc.name, w.Body.Len())
+		}
+	}
+	w := e.do(a, http.MethodGet, "/api/v1/library?scope=private", nil)
+	var rows []libraryItem
+	_ = json.Unmarshal(w.Body.Bytes(), &rows)
+	toolListed := false
+	for _, r := range rows {
+		if r.ID == tool.ID {
+			toolListed = true
+			if r.Body == "" || r.Tool == nil || r.Tool.ServerURL != "https://mcp.example/jira" {
+				t.Errorf("tool row lost its configuration: %+v", r)
+			}
+		}
+	}
+	if !toolListed {
+		t.Error("the tool is not listed")
+	}
+
+	// The single read has the body.
+	w = e.do(a, http.MethodGet, "/api/v1/library/"+doc.ID, nil)
+	var got libraryItem
+	_ = json.Unmarshal(w.Body.Bytes(), &got)
+	if w.Code != 200 || got.Body != big || got.SizeBytes != len(big) {
+		t.Errorf("get: %d size %d body %d", w.Code, got.SizeBytes, len(got.Body))
+	}
+
+	// The cap is enforced by name, and the request bound past it.
+	over := map[string]any{"kind": "context", "name": "Too big", "body": strings.Repeat("x", libraryBodyMaxBytes+1)}
+	if w := e.do(a, http.MethodPost, "/api/v1/library", over); w.Code != 400 || e.code(w) != "library_body_too_large" {
+		t.Errorf("over the cap: %d %s", w.Code, firstN(w.Body.String(), 200))
+	}
+	huge := map[string]any{"kind": "context", "name": "Huge", "body": strings.Repeat("x", libraryRequestMaxBytes+1)}
+	if w := e.do(a, http.MethodPost, "/api/v1/library", huge); w.Code != 413 || e.code(w) != "library_body_too_large" {
+		t.Errorf("over the request bound: %d %s", w.Code, firstN(w.Body.String(), 200))
+	}
+}
+
+func firstN(s string, n int) string {
+	if len(s) > n {
+		return s[:n]
+	}
+	return s
 }
