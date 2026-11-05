@@ -20,7 +20,7 @@ The tag is the decision to release. One reviewer approves the gate before anythi
 3. **CLI** for four platforms with the release manifest baked in.
 4. **Verify**: the freshly built linux CLI runs `darkplum verify-release`, anonymously, against the images just pushed. This is the same verifier a customer's machine runs, so what CI accepts is what customers will accept.
 5. **Release**: the published GitHub release, marked latest, with generated notes and the archives, `checksums.txt` and `release.json` attached.
-6. **Tap** (`environment: release-publish`, product repository only). It runs straight after the release: checks the release is public, checks the downloaded archives against `checksums.txt` and `gh attestation verify`, renders `.github/packaging/homebrew/darkplum.rb.tmpl` with `.github/scripts/render-formula.py` (every archive's SHA-256 goes into the formula, which is what lets Homebrew check the download) and pushes `Formula/darkplum.rb` to `scalecraft-dev/homebrew-tap` on `main`. If it fails, fix the cause and use **Re-run failed jobs**; without it the tap is not bumped.
+6. **Tap** (`environment: release-publish`, product repository only). It runs straight after the release: checks the release is public, checks the downloaded archives against `checksums.txt` and `gh attestation verify`, renders `.github/packaging/homebrew/darkplum.rb.tmpl` with `.github/scripts/render-formula.py` (every archive's SHA-256 goes into the formula, which is what lets Homebrew check the download) and pushes `Formula/darkplum.rb` to `scalecraft-dev/homebrew-tap` on `main`. If it fails, fix the cause and use **Re-run failed jobs**; without it the tap is not bumped. If the **release** job failed partway through uploading assets, a draft for the tag can be left behind and the re-run refuses to create a second release: delete the draft (`gh release delete vX.Y.Z`) and re-run the failed jobs.
 
 If an image job has to be re-run, that job gets a new attempt number and the others keep theirs. `release.json` carries the attempt per image and the CLI matches each image's signing certificate against its own, so a partial re-run still verifies.
 
@@ -44,9 +44,9 @@ These cannot be set from code and the workflows assume them:
 
 1. Tag protection (a ruleset) for `v*`: only maintainers can create them, no deletes, no updates.
 2. Environments:
-   - `release` with at least one required reviewer. The gate job waits on it.
+   - `release` with at least one required reviewer and deployments allowed from `v*` tags only. The gate job waits on it; nothing on a branch can even ask.
    - `prerelease`, with deployment branches restricted to `prerelease/**`.
-   - `release-publish` with **no** required reviewer (the gate is the one approval), holding the secret **`HOMEBREW_TAP_TOKEN`**: a fine-grained personal access token (or a GitHub App token) limited to `scalecraft-dev/homebrew-tap` with Contents: read and write, and nothing else. It is an environment secret, so only the `tap` job can read it, and only after approval. The repository `scalecraft-dev/homebrew-tap` must exist with a `Formula/` directory (or an empty `main`).
+   - `release-publish` with **no** required reviewer (the gate is the one approval) and deployments allowed from `v*` tags only, holding the secret **`HOMEBREW_TAP_TOKEN`**: a fine-grained personal access token (or a GitHub App token) limited to `scalecraft-dev/homebrew-tap` with Contents: read and write, and nothing else. It is an environment secret, so only a job running on a `v*` tag can read it, and the tag ruleset means only a maintainer can create one; a workflow on a branch, whoever pushes it, cannot reach the token. Without the tag-only policy, removing the reviewer would hand the token to any branch. The repository `scalecraft-dev/homebrew-tap` must exist with a `Formula/` directory (or an empty `main`).
 3. Actions may create packages, and the six GHCR packages (`darkplum-{gateway,api,web}`, `darkplum-rc-{gateway,api,web}`) are made **public after their first push**. The anonymous verify job, and every customer's verification, read the signatures without credentials; a private package fails verification, which is the right outcome until it is public.
 4. Branch protection on `main` requiring the `Go (*)`, `Web`, `Bundle`, `Terraform`, `Kubernetes manifests and docs` and `Release plumbing` checks. The gate refuses a tag whose commit lacks any of them, and it reads the CI workflow's own run for the commit as the authority.
 5. Workflow permissions default to read-only; every job declares what it needs.
@@ -93,9 +93,9 @@ The rc build uses the prerelease identity, so it does not prove the release path
 6. Publish to a scratch brew tap by hand (the `tap` job is skipped outside `scalecraft-dev/darkplum`): render the formula with `render-formula.py` from the release's `checksums.txt` and your scratch repository, push it to the scratch tap, `brew install` with a clean `HOME`; record the quarantine behaviour of the curl path.
 7. Attach logs, digests and the verification output to the PR.
 
-## After the tag: smoke gate before anyone is told
+## After the tag: the smoke checklist
 
-The workflow publishes the release and bumps the tap. Before the version is announced or the README's status line is bumped, run this on the published release; if a row fails, the remedy is a fix-forward release, since a published version is never rewritten:
+The workflow publishes the release and bumps the tap, so Homebrew users receive the release as soon as the `tap` job finishes, before this checklist runs. What the pipeline proves before publishing is that the images are signed by this repository's release workflow (checked by the freshly built linux CLI) and that the archives are attested. It does not deploy anything. This checklist catches the rest after the fact; a row that fails is fixed forward with a new version, since a published version is never rewritten. Run it before the version is announced or the README's status line is bumped:
 
 - [ ] Download the release's artifacts with a clean `HOME` (no `~/.darkplum`, no `~/.terraform.d`, no `~/.kube`).
 - [ ] `darkplum version` shows channel `release`, the tag, and three digests.

@@ -81,8 +81,7 @@ that they fail when they should; it does not prove Darkplum.
 | 21 | Release smoke before anyone is told | [RELEASING.md](RELEASING.md), "After the tag", then `brew install` + `brew test` | the checklist, ticked |
 
 Rows 0 to 10 need only the rc. Rows 20 and 21 are the only ones that need a real
-release; until they have run, the install instructions in the READMEs say the
-release does not exist yet.
+release.
 
 ## Known limits of the interrupted-install handling
 
