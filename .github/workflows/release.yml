@@ -56,14 +56,10 @@ jobs:
           git fetch --no-tags origin main
           git merge-base --is-ancestor "$SHA" origin/main || { echo "$SHA is not on main: releases are cut from main only"; exit 1; }
           # The release is published and the tap bumped without a person in
-          # between, so a version must be newer than every version released
-          # before it: an older tag would otherwise become Latest and downgrade
-          # every brew user.
+          # between, so a version must be newer than every existing vX.Y.Z tag:
+          # an older tag would otherwise become Latest and downgrade brew users.
           git fetch --tags --quiet origin
-          highest="$(git tag -l 'v[0-9]*.[0-9]*.[0-9]*' | grep -vx "v${BASH_REMATCH[1]}" | sort -V | tail -1)"
-          if [ -n "$highest" ] && [ "$(printf '%s\n%s\n' "$highest" "v${BASH_REMATCH[1]}" | sort -V | tail -1)" != "v${BASH_REMATCH[1]}" ]; then
-            echo "v${BASH_REMATCH[1]} is not newer than $highest, the highest released version; tag a higher version"; exit 1
-          fi
+          bash .github/scripts/require-newer-version.sh "${BASH_REMATCH[1]}"
       # Waits (up to an hour) for the CI run of this exact commit, then requires it
       # green. Tag after CI is green, but a tag pushed a little early just waits.
       - name: CI is green on this commit

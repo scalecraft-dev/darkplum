@@ -78,7 +78,7 @@ that they fail when they should; it does not prove Darkplum.
 | 18 | Providers on a customer machine | `init -lockfile=readonly` works on darwin/arm64, darwin/amd64 and linux/amd64 with a clean plugin cache | init logs |
 | 19 | The README path from nothing | Follow the README from a clean machine, once with Homebrew and once with the manual download and its attestation check | the transcript |
 | 20 | Production identity | A scratch-organisation `v0.0.1` release, including the negatives and the Homebrew round trip ([RELEASING.md](RELEASING.md), "Before the first release is merged") | logs, digests |
-| 21 | Release smoke before anyone is told | [RELEASING.md](RELEASING.md), "After the tag", then `brew install` + `brew test` | the checklist, ticked |
+| 21 | Release smoke checklist (brew users already have the release) | [RELEASING.md](RELEASING.md), "After the tag", then `brew install` + `brew test` | the checklist, ticked |
 
 Rows 0 to 10 need only the rc. Rows 20 and 21 are the only ones that need a real
 release.
