@@ -1,15 +1,16 @@
 name: Release
 
-# A vX.Y.Z tag on a commit that is already on main and green becomes a DRAFT
-# release: signed images in GHCR, the darkplum CLI for four platforms with the
-# release manifest (image digests, repository, this workflow's identity) baked
-# in, and a checksums file with its own attestation.
+# A vX.Y.Z tag on a commit that is already on main and green becomes a
+# published release: signed images in GHCR, the darkplum CLI for four platforms
+# with the release manifest (image digests, repository, this workflow's
+# identity) baked in, and a checksums file with its own attestation.
 #
-# Nothing is published from here. The draft is smoke-tested by a human (see
-# darkplum/docs/RELEASING.md) and only then published; docs and any
-# announcement wait for that. The Homebrew tap is bumped by the last job, which
-# waits for a reviewer on the release-publish environment and refuses to run
-# until the release is public.
+# The one human decision is the gate: a reviewer approves the release
+# environment before anything is built. Everything after it is automatic,
+# including the release itself and the Homebrew tap bump (see
+# darkplum/docs/RELEASING.md). Publishing happens only after the freshly built
+# CLI has verified the signed images, so a release that exists is one a
+# customer's machine will accept.
 
 on:
   push:
@@ -166,8 +167,8 @@ jobs:
           fi
           ./dist/darkplum verify-release
 
-  draft:
-    name: Draft release
+  release:
+    name: Publish the release
     needs: [gate, images, cli, verify]
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -201,24 +202,25 @@ jobs:
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-checksums: dist/checksums.txt
-      - name: Create the draft release
+      - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          gh release create "$TAG" --draft --verify-tag --title "$TAG" --generate-notes \
+          gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes --latest \
             dist/darkplum_*.tar.gz dist/checksums.txt dist/release.json
 
-  # Bumps scalecraft-dev/homebrew-tap to this release. Not part of the draft: it
-  # waits on the release-publish environment (a reviewer approves it AFTER the
-  # smoke gate and after the draft has been published), then checks that the
-  # release is public, that the archives match checksums.txt and carry a
+  # Bumps scalecraft-dev/homebrew-tap to this release. It runs in the
+  # release-publish environment because that is where the tap token lives (an
+  # environment secret only this job can read); the environment has no required
+  # reviewer, so the job follows the release without waiting. It checks that
+  # the release is public, that the archives match checksums.txt and carry a
   # provenance attestation from this workflow, and only then writes the formula.
   # Product repository only: a scratch organisation has no tap to bump.
   tap:
     name: Update the Homebrew tap
-    needs: [gate, draft]
+    needs: [gate, release]
     if: github.repository == 'scalecraft-dev/darkplum'
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -231,15 +233,15 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: The release is published, not a draft
+      - name: The release is public
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           draft="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" \
-            || { echo "cannot read release $TAG: publish the draft first, then re-run this job"; exit 1; }
-          [ "$draft" = "false" ] || { echo "$TAG is still a draft: publish it after the smoke gate, then re-run this job"; exit 1; }
+            || { echo "cannot read release $TAG: the release job should have created it; re-run the failed jobs"; exit 1; }
+          [ "$draft" = "false" ] || { echo "$TAG is a draft: the tap only ever points at a public release"; exit 1; }
       - name: The archives are the ones the pipeline attested
         env:
           GH_TOKEN: ${{ github.token }}
