@@ -314,6 +314,15 @@ func TestLibraryChecksAreSkippedWithANoteWhenHalfTheOutputsAreMissing(t *testing
 			t.Errorf("%s: %v passed=%v checks=%d note=%q", name, err, rep.Passed(), len(rep.Checks), rep.NoteLine)
 		}
 	}
+	// No bucket (the default install): the checks do not apply, and the note
+	// says the Library is in Postgres rather than telling the operator to deploy.
+	no := false
+	o := libOutputs
+	o.LibraryBucketEnabled, o.LibraryStoreURL = &no, ""
+	if rep, err := Run(context.Background(), libraryBehaviour().run, o); err != nil || !rep.Passed() || len(rep.Checks) != 4 ||
+		!strings.Contains(rep.NoteLine, "Postgres") || strings.Contains(rep.NoteLine, "darkplum deploy") {
+		t.Errorf("no bucket: %v passed=%v checks=%d note=%q", err, rep.Passed(), len(rep.Checks), rep.NoteLine)
+	}
 	// neither output: applied before the Library existed, nothing to say here
 	f := allowedBehaviour()
 	if rep, err := Run(context.Background(), f.run, outputs); err != nil || len(rep.Checks) != 4 || rep.NoteLine != "" {
@@ -323,11 +332,16 @@ func TestLibraryChecksAreSkippedWithANoteWhenHalfTheOutputsAreMissing(t *testing
 
 func TestFromTerraformReadsTheLibraryOutputs(t *testing.T) {
 	raw := map[string]json.RawMessage{
-		"api_role_arn":      json.RawMessage(`"` + apiRole + `"`),
-		"library_store_url": json.RawMessage(`"s3://b/library/v1/"`),
+		"api_role_arn":           json.RawMessage(`"` + apiRole + `"`),
+		"library_store_url":      json.RawMessage(`"s3://b/library/v1/"`),
+		"library_bucket_enabled": json.RawMessage(`true`),
 	}
 	o, err := FromTerraform(raw)
-	if err != nil || o.APIRoleARN != apiRole || o.LibraryStoreURL != "s3://b/library/v1/" {
+	if err != nil || o.APIRoleARN != apiRole || o.LibraryStoreURL != "s3://b/library/v1/" || o.LibraryBucketEnabled == nil || !*o.LibraryBucketEnabled {
 		t.Errorf("%+v %v", o, err)
+	}
+	delete(raw, "library_bucket_enabled")
+	if o, err := FromTerraform(raw); err != nil || o.LibraryBucketEnabled != nil {
+		t.Errorf("absent library_bucket_enabled must stay nil: %+v %v", o, err)
 	}
 }

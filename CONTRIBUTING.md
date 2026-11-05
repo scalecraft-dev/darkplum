@@ -28,11 +28,12 @@ port 1234 is picked up automatically on Docker Desktop; on Linux kind,
 `host.docker.internal` needs the extra host mapping described in
 `k8s/overlays/dev/patches/gateway-deployment.yaml`.
 
-The Library's files are written to an S3-compatible store. The dev stack
-runs RustFS for that (`k8s/overlays/dev/resources/objectstore.yaml`, bucket
-`darkplum-library`, console at `kubectl port-forward svc/objectstore 9001`
-with `darkplum-dev` / `darkplum-dev-minio-secret`), so the api's real S3 code
-path runs locally. To write to a bucket of your own in AWS instead, create it
+The Library lives in Postgres; an install can also mirror it to an
+S3-compatible store (`library_bucket_enabled`, off by default). The dev stack
+always runs RustFS for that (`k8s/overlays/dev/resources/objectstore.yaml`,
+bucket `darkplum-library`, console at `kubectl port-forward svc/objectstore
+9001` with `darkplum-dev` / `darkplum-dev-minio-secret`), so the api's real
+S3 code path runs locally. To write to a bucket of your own in AWS instead, create it
 beforehand and start the stack with `DEV_AWS=1 DEV_LIBRARY_BUCKET=<bucket>`;
 the api then reaches it through the mounted profile. Never point two
 developers at the same bucket.

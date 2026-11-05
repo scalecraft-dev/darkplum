@@ -33,12 +33,14 @@ you configured.
   and STS endpoints. The cluster needs Docker Hub, nvcr.io and ghcr.io for the
   third-party images and `huggingface.co` for model weights.
 
-## The Library bucket
+## The Library bucket (optional)
 
-Every library item is written to an S3 bucket in your account as a plain file
-(`library/v1/org/...` for shared items, `library/v1/people/<person>/...` for
-private ones, the person segment derived from the email at the time the
-account was created). Inside the app, administrators never see private items.
+The Library lives in the install's Postgres, like conversations. With
+`library_bucket_enabled` (off by default), every library item is also written
+to an S3 bucket in your account as a plain file (`library/v1/org/...` for
+shared items, `library/v1/people/<person>/...` for private ones, the person
+segment derived from the email at the time the account was created). Inside
+the app, administrators never see private items.
 In your cloud account, anyone your IAM grants `s3:GetObject` on the bucket can
 read every file, private ones included; the bucket is private to the account,
 encrypted at rest (SSE-S3 by default, or a key you name), reachable only over
@@ -50,4 +52,8 @@ Inventory) if you turn those on; nothing darkplum logs carries a key, a name
 or a path. The bucket is versioned: a deleted item or user has every version
 of its files purged; a rename or move starts a new history at the new key and
 purges the old one. `darkplum destroy` keeps the bucket and its contents
-unless you pass `--delete-library-data=<cluster_name>`.
+unless you pass `--delete-library-data=<cluster_name>`. Turning the bucket
+off (`library_bucket_enabled = false`) also keeps it, and the app stops
+writing to it: files already there, private ones included, stay until the
+bucket is turned on again (the queue then catches up, deletions included) or
+deleted with that command.

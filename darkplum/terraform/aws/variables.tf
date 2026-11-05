@@ -317,6 +317,21 @@ variable "library_kms_key_arn" {
   default     = null
 }
 
+variable "library_bucket_enabled" {
+  description = <<-EOT
+    Also write the Library to an S3 bucket, <cluster_name>-library-<account_id>,
+    one plain file per item under library/v1/, so it can be browsed, backed up
+    and synced with ordinary tools. Off by default: the Library lives in the
+    install's Postgres and needs nothing else. Turning it on creates the bucket
+    and grants the api role (and only it) access; the bucket is filled from the
+    app's queue. Turning it off on an install that has one: `darkplum deploy`
+    takes the bucket out of the state and keeps it with its files, and the app
+    stops writing to it.
+  EOT
+  type        = bool
+  default     = false
+}
+
 variable "adopt_library_bucket" {
   description = <<-EOT
     Set by `darkplum deploy` (never in terraform.tfvars) when the library bucket

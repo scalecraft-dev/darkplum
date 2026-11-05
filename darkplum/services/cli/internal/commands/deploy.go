@@ -451,8 +451,11 @@ func (e *deployEnv) run(ctx context.Context) (err error) {
 			hint: "nothing was applied; fix the above and re-run"}, "cannot check the audit log group")
 	}
 
-	adoptLib, err := e.adoptLibraryBucket(state)
+	adoptLib, err := e.libraryBucketStep(tf, state)
 	if err != nil {
+		if IsReported(err) {
+			return err
+		}
 		return e.stop(checkResult{name: "library bucket", status: checkFail, detail: firstLine(err.Error()),
 			hint: "nothing was applied; fix the above and re-run"}, "cannot check the library bucket")
 	}
@@ -481,13 +484,16 @@ func (e *deployEnv) run(ctx context.Context) (err error) {
 			hint:   "the state backend does not belong to this install; check backend.hcl"}, "state and install disagree")
 	}
 	e.row(checkResult{name: "outputs", status: checkPass, detail: fmt.Sprintf("cluster %s · %d GPU node(s)", out.ClusterName, out.GPUDesired)})
-	if out.LibraryStoreURL == "" {
-		// Optional for this release: the api keeps the Library in Postgres only while
-		// LIBRARY_STORE_URL is empty.
-		e.row(checkResult{name: "library store", status: checkWarn, detail: "terraform printed no library_store_url output: the Library stays in Postgres only",
-			hint: "the bucket is applied by the Terraform step; run `darkplum deploy` again if the apply was skipped or stopped"})
-	} else {
+	switch {
+	case out.LibraryStoreURL != "":
 		e.row(checkResult{name: "library store", status: checkPass, detail: out.LibraryStoreURL})
+	case out.LibraryBucketEnabled != nil && !*out.LibraryBucketEnabled:
+		// The default: the Library lives in the install's Postgres and the api's
+		// LIBRARY_STORE_URL stays empty.
+		e.row(checkResult{name: "library store", status: checkPass, detail: "Postgres (no bucket; library_bucket_enabled = true in terraform.tfvars adds one)"})
+	default:
+		e.row(checkResult{name: "library store", status: checkWarn, detail: "terraform printed no library_store_url output: the Library stays in Postgres only",
+			hint: "the outputs are written by the Terraform step; run `darkplum deploy` again if the apply was skipped or stopped"})
 	}
 	if imgs.Unsigned() {
 		if err := e.unsignedSources(imgs, out); err != nil {
@@ -1155,8 +1161,68 @@ func (e *deployEnv) adoptLogGroup(state map[string]bool) (bool, error) {
 	return true, nil
 }
 
-// libraryBucketAddr is the library bucket in the shipped Terraform.
-const libraryBucketAddr = "module.library_bucket.aws_s3_bucket.this"
+// libraryBucketAddr is the library bucket in the shipped Terraform (the module
+// is counted, so the bucket is opt-in); libraryBucketAddrLegacy is where a state
+// applied before that holds it, until the next apply's moved block.
+const (
+	libraryBucketAddr       = "module.library_bucket[0].aws_s3_bucket.this"
+	libraryBucketAddrLegacy = "module.library_bucket.aws_s3_bucket.this"
+)
+
+// isLibraryBucketAddr says whether a state or plan address is the bucket, at
+// either address.
+func isLibraryBucketAddr(a string) bool {
+	return a == libraryBucketAddr || a == libraryBucketAddrLegacy
+}
+
+// libraryBucketStep settles the bucket before the plan. The bucket is opt-in
+// (library_bucket_enabled in terraform.tfvars; off for a new install, the Library
+// lives in Postgres). It returns whether the plan must adopt a kept bucket.
+//
+// An install that has a bucket in its state and a terraform.tfvars that does
+// not say is refused: the Terraform default would make the plan delete the
+// bucket, and the Library in it is not something to lose to a default. Turning
+// the bucket off is explicit, and keeps it: the bucket and its configuration
+// leave the state (as destroy does) and the api stops writing to it.
+func (e *deployEnv) libraryBucketStep(tf tfRunner, state map[string]bool) (bool, error) {
+	held := libraryInState(state)
+	enabled := e.tfv.LibraryBucket
+	tfvars := e.in.TFVars()
+	switch {
+	case e.tfv.LibraryBucketRaw != "":
+		return false, e.stop(checkResult{name: "library bucket", status: checkFail,
+			detail: fmt.Sprintf("library_bucket_enabled = %q in %s is not true or false", e.tfv.LibraryBucketRaw, tfvars),
+			hint:   "write `library_bucket_enabled = true` or `library_bucket_enabled = false`, then re-run `darkplum deploy`. Nothing was applied"},
+			"the library bucket setting is not readable")
+	case enabled == nil && len(held) > 0:
+		return false, e.stop(checkResult{name: "library bucket", status: checkFail,
+			detail: "this install has a Library bucket in its state and " + tfvars + " does not say whether to keep it",
+			hint:   "add `library_bucket_enabled = true` to " + tfvars + " to keep writing the Library to the bucket, or `library_bucket_enabled = false` to stop (the bucket and its files are kept in the account, outside Terraform; the Library stays in Postgres). Then re-run `darkplum deploy`. Nothing was applied"},
+			"the library bucket needs a decision")
+	case enabled == nil || !*enabled:
+		if len(held) == 0 {
+			if enabled == nil {
+				e.noticeKeptBucket(tfvars)
+			} else {
+				e.row(checkResult{name: "library bucket", status: checkPass, detail: "none: the Library lives in Postgres"})
+			}
+			return false, nil
+		}
+		if _, err := tf.Capture(append([]string{"state", "rm"}, held...)...); err != nil {
+			printTFDiagnostic(e.out, err)
+			return false, e.stop(checkResult{name: "library bucket", status: checkFail, detail: firstLine(err.Error()),
+				hint: "library_bucket_enabled = false must take the bucket out of the state, or the plan would delete it with the Library in it. Nothing was applied"},
+				"cannot keep the library bucket")
+		}
+		for _, a := range held {
+			delete(state, a)
+		}
+		e.mutated = true
+		e.row(checkResult{name: "library bucket", status: checkPass, detail: "library_bucket_enabled = false: the bucket left the state and is kept with its files; the api stops writing to it"})
+		return false, nil
+	}
+	return e.adoptLibraryBucket(state)
+}
 
 // libraryBucketName is <cluster_name>-library-<account_id>, as the Terraform names
 // it (main.tf, local.library_bucket_name).
@@ -1179,6 +1245,30 @@ func bucketGone(err error) bool {
 	return strings.Contains(m, "(404)") || strings.Contains(m, "Not Found") || strings.Contains(m, "NoSuchBucket")
 }
 
+// noticeKeptBucket is the default install's look for a bucket a previous
+// install of this name left behind (destroy keeps it with the Library in it):
+// nothing is adopted without library_bucket_enabled, so the operator is told
+// it is there. Not being able to look is a warning, never a stop.
+func (e *deployEnv) noticeKeptBucket(tfvars string) {
+	acct := libraryAccount(e.rec)
+	if acct == "" {
+		e.row(checkResult{name: "library bucket", status: checkPass, detail: "none: the Library lives in Postgres"})
+		return
+	}
+	b := libraryBucketName(e.rec.ClusterName, acct)
+	_, err := e.aws("aws", runner.ProfileArgs(e.rec.Profile, "s3api", "head-bucket", "--bucket", b, "--expected-bucket-owner", acct, "--region", e.rec.Region)...)
+	switch {
+	case err == nil:
+		e.row(checkResult{name: "library bucket", status: checkWarn, detail: b + " exists from a previous install and is not used: the Library lives in Postgres",
+			hint: "to adopt it with the files in it, add `library_bucket_enabled = true` to " + tfvars + " and re-run; to delete it, `darkplum destroy --delete-library-data=" + e.rec.ClusterName + "` once the install is gone"})
+	case bucketGone(err):
+		e.row(checkResult{name: "library bucket", status: checkPass, detail: "none: the Library lives in Postgres"})
+	default:
+		e.row(checkResult{name: "library bucket", status: checkWarn, detail: "could not check whether " + b + " was kept by a previous install: " + firstLine(err.Error()),
+			hint: "the Library lives in Postgres either way; a 403 means the name belongs to another account, or this session may not read it"})
+	}
+}
+
 // adoptLibraryBucket says whether the plan must import the library bucket: it
 // exists but is not managed, because destroy keeps it on purpose (it holds the
 // Library), and a reinstall would otherwise fail creating it. The import is an
@@ -1192,7 +1282,7 @@ func (e *deployEnv) adoptLibraryBucket(state map[string]bool) (bool, error) {
 		return false, nil
 	}
 	b := libraryBucketName(e.rec.ClusterName, acct)
-	if state[libraryBucketAddr] {
+	if state[libraryBucketAddr] || state[libraryBucketAddrLegacy] {
 		e.row(checkResult{name: "library bucket", status: checkPass, detail: b + " (in the state)"})
 		return false, nil
 	}
@@ -1286,7 +1376,7 @@ func (e *deployEnv) planAndApply(ctx context.Context, tf tfRunner, adoptLogGroup
 	if adoptLibrary {
 		// Replacing the bucket while adopting it deletes the library destroy kept.
 		for _, c := range dangerous {
-			if c.Address == libraryBucketAddr {
+			if isLibraryBucketAddr(c.Address) {
 				return e.stop(checkResult{name: "library bucket", status: checkFail, detail: "the plan would delete the library bucket kept from a previous install, and the Library in it",
 					hint: "see the plan above for what forces the replacement. Nothing was applied"}, "the plan would delete the library")
 			}
@@ -2028,7 +2118,7 @@ func gpuAllocatable(kc *kube.Client) bool {
 // says is a failure; being unable to ask IAM is a warning.
 func (e *deployEnv) layer1(ctx context.Context, out deployOutputs) (failed bool) {
 	rep, err := e.iam(ctx, iamcheck.Outputs{GatewayRoleARN: out.GatewayRoleARN, InferenceRegion: out.InferenceRegion, BedrockInvokeARNs: out.InvokeARNs,
-		APIRoleARN: out.APIRoleARN, LibraryStoreURL: out.LibraryStoreURL})
+		APIRoleARN: out.APIRoleARN, LibraryStoreURL: out.LibraryStoreURL, LibraryBucketEnabled: out.LibraryBucketEnabled})
 	var sim *iamcheck.SimulationError
 	if errors.As(err, &sim) || (err != nil && len(rep.Checks) == 0) {
 		e.row(checkResult{name: "layer 1 (IAM)", status: checkWarn, detail: firstLine(err.Error()),

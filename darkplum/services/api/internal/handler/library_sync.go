@@ -347,6 +347,11 @@ func (s *LibrarySyncer) bucketChangedSince(ctx context.Context, key, recorded st
 	if errors.Is(err, objectstore.ErrNotFound) {
 		return false, nil
 	}
+	if errors.Is(err, objectstore.ErrTooLarge) {
+		// Not something the app wrote: hold the item back rather than
+		// overwrite whatever someone put there.
+		return true, nil
+	}
 	if err != nil {
 		return false, err
 	}

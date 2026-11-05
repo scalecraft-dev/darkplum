@@ -308,13 +308,13 @@ func TestToolLoop_HostNotAllowedBecomesToolError(t *testing.T) {
 	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	h.proxyWithTools(c, []byte(`{"model":"m","stream":true,"messages":[{"role":"user","content":"x"}]}`), true, defs, bindings)
 	out := w.Body.String()
-	if !strings.Contains(out, `"is_error":true`) || !strings.Contains(out, "allowed list") || !strings.Contains(out, "The tool said hi.") {
+	if !strings.Contains(out, `"is_error":true`) || !strings.Contains(out, "not an allowed tool server") || !strings.Contains(out, "The tool said hi.") {
 		t.Errorf("stream = %s", out)
 	}
 	// The model was told about the failure as the tool result.
 	var second []map[string]any
 	_ = json.Unmarshal(gw.requests[1]["messages"], &second)
-	if !strings.Contains(fmt.Sprint(second[len(second)-1]["content"]), "allowed list") {
+	if !strings.Contains(fmt.Sprint(second[len(second)-1]["content"]), "not an allowed tool server") {
 		t.Errorf("tool error not relayed to the model: %+v", second)
 	}
 }
@@ -540,5 +540,22 @@ func TestToolLoop_LaterRound413IsANamedErrorFrame(t *testing.T) {
 	}
 	if !strings.Contains(out, "Let me check. ") {
 		t.Errorf("round 1 text missing: %s", out)
+	}
+}
+
+// Both refusals for a host that is not allowed, at verify and at chat
+// time, name where an administrator allows it. The Library has no separate
+// "allowed servers" screen: it is done from the tool, or by the API route.
+func TestHostNotAllowedTextsNameTheWayIn(t *testing.T) {
+	chat := toolErrorText(mcp.ErrNotAllowed, "https://mcp.example/mcp")
+	for _, s := range []string{"mcp.example", "not an allowed tool server", "PUT /api/v1/settings/tool-hosts"} {
+		if !strings.Contains(chat, s) {
+			t.Errorf("chat refusal lacks %q: %s", s, chat)
+		}
+	}
+	for _, stale := range []string{"Allowed tool servers", "Tools tab"} {
+		if strings.Contains(chat, stale) {
+			t.Errorf("chat refusal names a screen that no longer exists (%q): %s", stale, chat)
+		}
 	}
 }

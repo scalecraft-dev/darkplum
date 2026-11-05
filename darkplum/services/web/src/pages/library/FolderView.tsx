@@ -355,7 +355,13 @@ export function FolderView(p: FolderViewProps) {
       </ul>
       {folders.length === 0 && items.length === 0 && !p.newFolder.active && (
         <div className={styles.emptySmall}>
-          <p>{p.kind !== 'all' ? `No ${KIND_LABEL[p.kind].toLowerCase()} items in ${nameOf(p.path) || displayPath('', p.scope)}.` : `Nothing in ${nameOf(p.path)} yet.`}</p>
+          <p>
+            {p.kind === 'tool'
+              ? `No tools in ${nameOf(p.path) || displayPath('', p.scope)}. A tool is an MCP server the model may call: add its address and it is checked when you save.${p.isAdmin ? '' : ' A server nobody has used yet needs an administrator to allow it.'}`
+              : p.kind !== 'all'
+                ? `No ${KIND_LABEL[p.kind].toLowerCase()} items in ${nameOf(p.path) || displayPath('', p.scope)}.`
+                : `Nothing in ${nameOf(p.path)} yet.`}
+          </p>
           {p.kind !== 'all' ? (
             <Button variant="secondary" size="sm" onClick={p.onClearKind}>
               Show all kinds

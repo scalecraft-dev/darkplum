@@ -2,8 +2,13 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/gin-gonic/gin"
 )
 
 func TestSlugify(t *testing.T) {
@@ -146,5 +151,27 @@ func TestToolHostTooBroad(t *testing.T) {
 		if got := toolHostTooBroad(host) != ""; got != bad {
 			t.Errorf("toolHostTooBroad(%q) refused=%v, want %v", host, got, bad)
 		}
+	}
+}
+
+func TestBindErrorNamesTheRequestLimit(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	// Past the request bound: 413 with a closed code, never the route's shape.
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	bindError(c, &http.MaxBytesError{Limit: libraryRequestMaxBytes}, "body must be {x}")
+	if w.Code != http.StatusRequestEntityTooLarge || !strings.Contains(w.Body.String(), `"code":"library_body_too_large"`) {
+		t.Errorf("too large: %d %s", w.Code, w.Body.String())
+	}
+	// Any other binding failure is the route's shape.
+	w = httptest.NewRecorder()
+	c, _ = gin.CreateTestContext(w)
+	bindError(c, errors.New("unexpected EOF"), "body must be {x}")
+	if w.Code != http.StatusBadRequest || !strings.Contains(w.Body.String(), "body must be {x}") {
+		t.Errorf("malformed: %d %s", w.Code, w.Body.String())
+	}
+	// The bound leaves room for a body at the cap once JSON-escaped.
+	if libraryRequestMaxBytes < libraryBodyMaxBytes*2 {
+		t.Errorf("request bound %d cannot carry an escaped body of %d", libraryRequestMaxBytes, libraryBodyMaxBytes)
 	}
 }

@@ -134,9 +134,14 @@ output "web_allowed_cidrs" {
   value       = var.web_domain != "" ? module.web_access[0].allowed_cidrs : []
 }
 
+output "library_bucket_enabled" {
+  description = "Whether the install has a Library bucket (library_bucket_enabled). The Library itself is in Postgres either way."
+  value       = var.library_bucket_enabled
+}
+
 output "library_store_url" {
-  description = "Where the Library's files live: s3://<bucket>/library/v1/ (gs://... on GCP). The api writes every item there as a plain file."
-  value       = module.library_bucket.store_url
+  description = "Where the Library's bucket copy lives when library_bucket_enabled: s3://<bucket>/library/v1/ (gs://... on GCP). Empty without a bucket; the api then keeps the Library in Postgres alone."
+  value       = var.library_bucket_enabled ? module.library_bucket[0].store_url : ""
 }
 
 output "api_role_arn" {

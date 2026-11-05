@@ -10,12 +10,14 @@ import {
   deleteLibraryItem,
   exportLibraryItem,
   getLibraryItem,
+  getToolHosts,
   shareLibraryItem,
   updateLibraryItem,
+  updateToolHosts,
 } from '../../lib/api'
 import { saveBlob } from '../../lib/download'
 import type { LibraryItem, LibraryKind, LibraryScope } from '../../types'
-import { Button, CodeBlock, CopyButton, Input } from '../../components/ui'
+import { Button, CodeBlock, CopyButton, Input, Skeleton } from '../../components/ui'
 import { useToast } from '../../components/Toast'
 import { KindGlyph } from '../../components/ui/KindGlyph'
 import { ToolSection } from './ToolSection'
@@ -34,6 +36,8 @@ import {
   formatFull,
   formatRelative,
   formatSize,
+  hostAllowed,
+  hostOf,
   ownerName,
   parseAllowedTools,
   runeLength,
@@ -53,8 +57,6 @@ interface Props {
   onChanged: () => void
   /** Open another item in place of this one (a fresh copy). */
   onOpen: (item: LibraryItem) => void
-  /** Admin: take the reader to the allowed-servers card. */
-  onShowHosts: () => void
   /** Opens the Move dialog for this item. */
   onMove?: (item: LibraryItem) => void
 }
@@ -116,7 +118,7 @@ const mdComponents = {
  * else reads it, and may copy it into their own library. An administrator
  * reading someone else's shared item also gets the two governance actions.
  */
-export function ItemDrawer({ target, isAdmin, onClose, onChanged, onOpen, onShowHosts, onMove }: Props) {
+export function ItemDrawer({ target, isAdmin, onClose, onChanged, onOpen, onMove }: Props) {
   const { toast } = useToast()
   const ids = useId()
   const nameRef = useRef<HTMLInputElement>(null)
@@ -132,9 +134,35 @@ export function ItemDrawer({ target, isAdmin, onClose, onChanged, onOpen, onShow
   const [askDiscard, setAskDiscard] = useState(false)
   const [shareOpen, setShareOpen] = useState(false)
   const [credentialOpen, setCredentialOpen] = useState(false)
+  /** A listing carries no skill or context body (it can be megabytes); the
+   *  body arrives with the fresh read. Until then the editor is closed and
+   *  the view shows a placeholder, so a save can never replace a body that
+   *  was never shown. */
+  const [bodyLoaded, setBodyLoaded] = useState(true)
+  /** Why the fresh read failed, shown where the body would be, with a retry. */
+  const [bodyError, setBodyError] = useState<string | null>(null)
+  const [bodyAttempt, setBodyAttempt] = useState(0)
+  /** Admin only: the servers tools may call, read once per tool drawer so
+   *  the form can say whether the address is allowed and saving can allow
+   *  it. null until read, or for everyone else. */
+  const [hosts, setHosts] = useState<string[] | null>(null)
+  /** Set after a save that set or changed a tool's server: the server
+   *  section checks that item on its own, so saving is the only step. Tied
+   *  to the item id so opening another tool never runs a check. */
+  const [checkFor, setCheckFor] = useState<{ itemId: string; run: number } | null>(null)
 
   const open = target !== null
   const targetItemId = target?.mode === 'open' ? target.item.id : null
+  const toolDrawer = open && (target.mode === 'new' ? target.kind === 'tool' : target.item.kind === 'tool')
+
+  useEffect(() => {
+    if (!toolDrawer || !isAdmin) return
+    let cancelled = false
+    getToolHosts()
+      .then((s) => { if (!cancelled) setHosts(s.hosts) })
+      .catch(() => { /* the form then says nothing about the host; verify still answers */ })
+    return () => { cancelled = true }
+  }, [toolDrawer, isAdmin])
 
   // A new target resets the drawer to it, then reads the item again so what
   // is edited is what the server has now, not what the list had.
@@ -142,8 +170,10 @@ export function ItemDrawer({ target, isAdmin, onClose, onChanged, onOpen, onShow
     setSaveError(null)
     setActionError(null)
     setAskDiscard(false)
+    setCheckFor(null)
     if (!target) return
     if (target.mode === 'new') {
+      setBodyLoaded(true)
       setItem(null)
       setKind(target.kind)
       setDraft(EMPTY)
@@ -152,20 +182,27 @@ export function ItemDrawer({ target, isAdmin, onClose, onChanged, onOpen, onShow
     setItem(target.item)
     setKind(target.item.kind)
     setDraft(draftOf(target.item))
+    setBodyLoaded(target.item.kind === 'tool')
+    setBodyError(null)
     let cancelled = false
     getLibraryItem(target.item.id)
       .then((fresh) => {
         if (cancelled) return
         setItem(fresh)
-        setDraft((d) => (sameDraft(d, draftOf(target.item)) ? draftOf(fresh) : d))
+        // An untouched draft takes the fresh item whole. A draft already
+        // edited keeps its edits, but its body was never shown (listings
+        // carry none), so the fresh body always comes in: a save must never
+        // replace a document with an empty one.
+        setDraft((d) => (sameDraft(d, draftOf(target.item)) ? draftOf(fresh) : { ...d, body: fresh.body }))
+        setBodyLoaded(true)
       })
       .catch((err) => {
-        if (!cancelled) setActionError(errorText(err, 'The latest version could not be read.'))
+        if (!cancelled) setBodyError(errorText(err, 'The latest version could not be read.'))
       })
     return () => { cancelled = true }
     // Keyed on the id: a re-render with the same item must not reset edits.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [targetItemId, target?.mode, target?.mode === 'new' ? target.kind : null])
+  }, [targetItemId, target?.mode, target?.mode === 'new' ? target.kind : null, bodyAttempt])
 
   const editable = item === null || item.mine
   const baseline = useMemo(() => (item ? draftOf(item) : EMPTY), [item])
@@ -200,6 +237,7 @@ export function ItemDrawer({ target, isAdmin, onClose, onChanged, onOpen, onShow
   const descError = descLen > LIBRARY_DESC_MAX ? `At most ${LIBRARY_DESC_MAX} characters.` : null
   const bodyOver = bodyBytes > LIBRARY_BODY_MAX_BYTES
   const valid =
+    bodyLoaded &&
     nameLen > 0 &&
     !nameError &&
     !descError &&
@@ -211,6 +249,14 @@ export function ItemDrawer({ target, isAdmin, onClose, onChanged, onOpen, onShow
     setSaveError(null)
     const body = kind === 'tool' ? toolBody(draft.serverUrl, allowedList) : draft.body
     try {
+      // A tool's save is the whole job: the item, then (an administrator
+      // saving a new or changed server) the server allowed, then the server
+      // checked. The item goes first so a refused host never loses the
+      // edit; a refused allow shows in the server section with the Allow
+      // button, and the check that follows says the same thing.
+      const host = kind === 'tool' ? hostOf(draft.serverUrl) : null
+      let serverChanged = false
+      let saved: LibraryItem | null = null
       if (item === null) {
         const created = await createLibraryItem({
           kind,
@@ -222,14 +268,10 @@ export function ItemDrawer({ target, isAdmin, onClose, onChanged, onOpen, onShow
         })
         setItem(created)
         setDraft(draftOf(created))
-        toast(
-          kind === 'tool'
-            ? 'Tool saved. Verify it to see what it offers.'
-            : `${KIND_LABEL[kind]} saved. Attach it to a chat from the composer.`,
-          'success',
-        )
+        saved = created
+        serverChanged = kind === 'tool'
       } else {
-        const urlChanged = kind === 'tool' && item.tool?.server_url !== draft.serverUrl.trim()
+        serverChanged = kind === 'tool' && item.tool?.server_url !== draft.serverUrl.trim()
         const updated = await updateLibraryItem(item.id, {
           name: draft.name.trim(),
           description: draft.description.trim(),
@@ -237,9 +279,42 @@ export function ItemDrawer({ target, isAdmin, onClose, onChanged, onOpen, onShow
         })
         setItem(updated)
         setDraft(draftOf(updated))
-        toast(urlChanged ? 'Saved. The address changed, so verify the server again.' : 'Saved. Used from the next turn.', 'success')
+        saved = updated
       }
       onChanged()
+      let allowedNow = false
+      let allowFailed: string | null = null
+      if (serverChanged && host && isAdmin && hosts !== null) {
+        // Read the list again right before writing it: another
+        // administrator may have changed it since the drawer opened.
+        try {
+          const current = (await getToolHosts()).hosts
+          if (!hostAllowed(host, current)) {
+            const s = await updateToolHosts([...current, host])
+            setHosts(s.hosts)
+            allowedNow = true
+          } else {
+            setHosts(current)
+          }
+        } catch (err) {
+          allowFailed = errorText(err, `${host} could not be allowed.`)
+        }
+      }
+      if (kind === 'tool') {
+        if (allowFailed) {
+          toast(`Tool saved, but ${allowFailed} Allow it from the Server section.`, 'error')
+        } else {
+          toast(
+            item === null
+              ? allowedNow ? `Tool saved and ${host} allowed. Checking the server…` : 'Tool saved. Checking the server…'
+              : serverChanged ? 'Saved. Checking the new address…' : 'Saved. Used from the next turn.',
+            'success',
+          )
+        }
+        if (serverChanged && saved) setCheckFor((prev) => ({ itemId: saved.id, run: (prev?.run ?? 0) + 1 }))
+      } else {
+        toast(item === null ? `${KIND_LABEL[kind]} saved. Attach it to a chat from the composer.` : 'Saved. Used from the next turn.', 'success')
+      }
     } catch (err) {
       setSaveError(errorText(err, 'The item could not be saved.'))
     } finally {
@@ -421,6 +496,24 @@ export function ItemDrawer({ target, isAdmin, onClose, onChanged, onOpen, onShow
                         error={urlError ?? undefined}
                         aria-invalid={urlError ? true : undefined}
                       />
+                      {(() => {
+                        const host = urlError ? null : hostOf(draft.serverUrl)
+                        if (!host) return null
+                        if (isAdmin && hosts !== null) {
+                          return hostAllowed(host, hosts) ? (
+                            <span className={styles.hint}><span className={styles.mono}>{host}</span> is an allowed server.</span>
+                          ) : (
+                            <span className={styles.hint}>
+                              <span className={styles.mono}>{host}</span> is not an allowed server yet. Saving allows it for every tool and checks it.
+                            </span>
+                          )
+                        }
+                        return (
+                          <span className={styles.hint}>
+                            Saving checks the server and lists what it offers.{!isAdmin && ' A server nobody has used yet needs an administrator to allow it.'}
+                          </span>
+                        )
+                      })()}
                       <div className={styles.field}>
                         <Input
                           label="Allowed tools"
@@ -450,19 +543,32 @@ export function ItemDrawer({ target, isAdmin, onClose, onChanged, onOpen, onShow
                         onChange={(e) => set({ body: e.target.value })}
                         rows={16}
                         spellCheck={false}
-                        disabled={saving}
+                        disabled={saving || !bodyLoaded}
                         required
                         aria-invalid={bodyOver ? true : undefined}
                         aria-describedby={`${ids}-count`}
-                        placeholder={kind === 'skill' ? 'Markdown. Tell the model how to do the task.' : 'Markdown. Background the model should know.'}
+                        placeholder={
+                          !bodyLoaded
+                            ? 'Loading…'
+                            : kind === 'skill'
+                              ? 'Markdown. Tell the model how to do the task.'
+                              : 'Markdown. Background the model should know.'
+                        }
                       />
                       <span
                         id={`${ids}-count`}
                         className={`${styles.count} ${bodyOver ? styles.countOver : bodyBytes > LIBRARY_BODY_MAX_BYTES * 0.9 ? styles.countNear : ''}`}
                       >
-                        {bodyChars.toLocaleString()} characters, {formatSize(bodyBytes)} of 64 KB
+                        {bodyLoaded
+                          ? `${bodyChars.toLocaleString()} characters, ${formatSize(bodyBytes)} of ${formatSize(LIBRARY_BODY_MAX_BYTES)}`
+                          : bodyError ?? 'Loading the current version…'}
                         {bodyOver ? '. Shorten it to save.' : ''}
                       </span>
+                      {!bodyLoaded && bodyError && (
+                        <Button variant="secondary" size="sm" onClick={() => setBodyAttempt((n) => n + 1)}>
+                          Try again
+                        </Button>
+                      )}
                     </div>
                   )}
 
@@ -485,11 +591,24 @@ export function ItemDrawer({ target, isAdmin, onClose, onChanged, onOpen, onShow
                           : 'Every tool the server offers'}
                       </dd>
                     </dl>
-                  ) : (
+                  ) : bodyLoaded ? (
                     <div className={styles.markdown}>
                       <ReactMarkdown remarkPlugins={remarkPlugins} rehypePlugins={rehypePlugins} components={mdComponents}>
                         {item.body}
                       </ReactMarkdown>
+                    </div>
+                  ) : bodyError ? (
+                    <div className={styles.alert} role="alert">
+                      <span>{bodyError}</span>
+                      <Button variant="secondary" size="sm" onClick={() => setBodyAttempt((n) => n + 1)}>
+                        Try again
+                      </Button>
+                    </div>
+                  ) : (
+                    <div className={styles.markdown} aria-busy="true" aria-label="Loading">
+                      <Skeleton height="1rem" />
+                      <Skeleton height="1rem" width="80%" />
+                      <Skeleton height="1rem" width="60%" />
                     </div>
                   )}
                 </div>
@@ -497,25 +616,19 @@ export function ItemDrawer({ target, isAdmin, onClose, onChanged, onOpen, onShow
 
               {item && item.kind === 'tool' && (
                 <ToolSection
+                  key={item.id}
                   item={item}
                   isAdmin={isAdmin}
                   urlUnsaved={editable && draft.serverUrl.trim() !== (item.tool?.server_url ?? '')}
+                  checkRun={checkFor?.itemId === item.id ? checkFor.run : 0}
+                  hosts={hosts}
+                  onHosts={setHosts}
                   onItem={(next) => { setItem(next); onChanged() }}
                   onSetCredential={() => setCredentialOpen(true)}
-                  onShowHosts={() => {
-                    // Same guard as the close button: unsaved edits are
-                    // never dropped on the way to the allowed-servers card.
-                    if (dirty) {
-                      setAskDiscard(true)
-                      return
-                    }
-                    onClose()
-                    onShowHosts()
-                  }}
                 />
               )}
               {item === null && kind === 'tool' && (
-                <p className={styles.hint}>Save the tool to verify its server and set a credential.</p>
+                <p className={styles.hint}>A credential, if the server needs one, is set after the first save.</p>
               )}
 
               {item && (

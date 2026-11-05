@@ -16,7 +16,7 @@ package handler
 //     another person's item. A file with no id and no known key becomes a NEW
 //     item named from the file name. Imported items are owned by the caller
 //     (the acting admin for org).
-//   - The 64 KiB body cap and the tool rules (no userinfo in server_url) apply.
+//   - The 4 MiB body cap and the tool rules (no userinfo in server_url) apply.
 //     A changed tool server clears the verified catalogue; credentials are
 //     never read or written.
 //   - CONFLICT: if Postgres changed since the last sync (content differs from
@@ -249,6 +249,10 @@ func (h *LibraryHandler) syncScope(ctx context.Context, me, scope string) (*sync
 		}
 		data, info, gerr := h.store.Get(ctx, o.Key)
 		if errors.Is(gerr, objectstore.ErrNotFound) {
+			continue
+		}
+		if errors.Is(gerr, objectstore.ErrTooLarge) {
+			addErr(base, "file is too large")
 			continue
 		}
 		if gerr != nil {

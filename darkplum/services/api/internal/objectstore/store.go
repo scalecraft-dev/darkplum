@@ -21,6 +21,17 @@ import (
 // ErrNotFound is returned by Head and Get for a missing object.
 var ErrNotFound = errors.New("objectstore: not found")
 
+// ErrTooLarge is returned by Get for an object over MaxObjectBytes. A Get
+// never returns a body cut short: a truncated library file would be adopted
+// as the item, and the whole one left to expire in version history.
+var ErrTooLarge = errors.New("objectstore: object too large")
+
+// MaxObjectBytes bounds what Get reads: the largest library file (a 4 MiB
+// body with front matter, JSON-escaped at most twice over) with room, and
+// small enough that a foreign object cannot exhaust the api's memory. A var
+// so the contract test can lower it.
+var MaxObjectBytes int64 = 16 << 20
+
 // Meta is user metadata (x-amz-meta-* on S3). Keys are stored lowercase.
 type Meta map[string]string
 
@@ -40,7 +51,8 @@ type Store interface {
 	Put(ctx context.Context, key string, body []byte, meta Meta) error
 	// Head returns ErrNotFound for a missing object.
 	Head(ctx context.Context, key string) (Info, error)
-	// Get returns the object's bytes; ErrNotFound if missing.
+	// Get returns the object's bytes; ErrNotFound if missing, ErrTooLarge
+	// (and no bytes) past MaxObjectBytes.
 	Get(ctx context.Context, key string) ([]byte, Info, error)
 	// Delete removes the current version. A missing object is not an error.
 	Delete(ctx context.Context, key string) error
@@ -80,6 +92,9 @@ func Code(err error) string {
 	}
 	if errors.Is(err, ErrNotFound) {
 		return "NotFound"
+	}
+	if errors.Is(err, ErrTooLarge) {
+		return "TooLarge"
 	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		return "Timeout"

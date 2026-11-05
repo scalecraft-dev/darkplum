@@ -54,9 +54,9 @@ Upgrading an existing install: all three apply in place without a restart (`terr
 
 Restore is manual and not yet scripted: there is no variable to build a new install from a snapshot, and a point-in-time restore creates an instance Terraform does not track. Until that lands, restore from the console or CLI and point the cluster's `DATABASE_URL` at the result.
 
-## The Library bucket (AWS)
+## The Library bucket (AWS, optional)
 
-`modules/library-bucket` creates `<cluster_name>-library-<account_id>`: the Library's files, one plain file per item under `library/v1/`, written by the api. What it is built from:
+The Library lives in the RDS database. `library_bucket_enabled` (default `false`) adds a bucket copy: `modules/library-bucket` then creates `<cluster_name>-library-<account_id>`, the Library's files, one plain file per item under `library/v1/`, written by the api. The module is counted on the variable; a state from before it was optional holds the bucket at `module.library_bucket` and a `moved` block carries it to `module.library_bucket[0]`. Turning the variable off on an install that has the bucket: `darkplum deploy` removes the bucket and its configuration from the state first (kept, with its files), so the plan never deletes it. What the module builds:
 
 - All four public-access blocks, ACLs disabled (`BucketOwnerEnforced`), versioning on, no Object Lock. A lifecycle rule expires noncurrent versions after `library_noncurrent_days` (default 30; the accidental-delete recovery window), removes orphaned delete markers and aborts multipart uploads after 7 days.
 - Encryption is SSE-S3. Set `library_kms_key_arn` (a key ARN, not an alias) to use your own customer-managed key instead; the api role is then granted `kms:GenerateDataKey`, `kms:Decrypt` and `kms:DescribeKey` on it and nothing else about the key is managed here, so its key policy must allow that role.
@@ -91,8 +91,9 @@ nothing branches yet; the key exists so the seam is ready when `vertex` lands.
 | `inference_region` | Region the hosted-model backend is called in |
 | `bedrock_model_filter` | Catalog globs for the gateway, derived from the hosted-model IAM allowlist (AWS: `bedrock_model_patterns`) |
 | `model_name` / `served_model_name` | Self-hosted vLLM model |
-| `library_store_url` | Where the Library's files live: `s3://<bucket>/library/v1/` (`gs://...` on GCP); `darkplum deploy` gives it to the api as `LIBRARY_STORE_URL` (optional for one release: empty keeps the library in Postgres only) |
-| `api_role_arn` | The api's Pod Identity role (`darkplum verify` simulates it against the Library bucket) |
+| `library_bucket_enabled` | Whether the install has a Library bucket; the Library itself is in Postgres either way |
+| `library_store_url` | The Library's bucket copy when enabled: `s3://<bucket>/library/v1/` (`gs://...` on GCP); `darkplum deploy` gives it to the api as `LIBRARY_STORE_URL`. Empty without a bucket |
+| `api_role_arn` | The api's Pod Identity role (`darkplum verify` simulates it against the Library bucket when there is one) |
 | `web_url` / `web_hostname` | The team's private HTTPS address (empty without `web_domain`) |
 | `web_lb_private_ips` | The internal NLB's pinned addresses; `darkplum configure` trusts only these to pass client addresses |
 | `web_name_servers` | Name servers of a zone Terraform created for the address |

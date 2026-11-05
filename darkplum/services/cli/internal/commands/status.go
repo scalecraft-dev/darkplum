@@ -155,6 +155,10 @@ func oidcConfigured(b64 string) bool {
 
 // libraryStatus is GET /api/v1/admin/library/status.
 type libraryStatus struct {
+	// Enabled is false on an install without a bucket (the Library is in
+	// Postgres alone); nil on an api that predates the field, which always
+	// had one.
+	Enabled             *bool   `json:"enabled"`
 	Reachable           bool    `json:"reachable"`
 	Bucket              string  `json:"bucket"`
 	QueueDepth          int     `json:"queue_depth"`
@@ -214,6 +218,10 @@ func (e *statusEnv) library() {
 }
 
 func (e *statusEnv) printLibrary(s libraryStatus) {
+	if s.Enabled != nil && !*s.Enabled {
+		fmt.Fprintf(e.out, "  %s Postgres %s\n", sSuccess("✓"), sDim("no bucket (library_bucket_enabled = true in terraform.tfvars adds one)"))
+		return
+	}
 	mark, state := sSuccess("✓"), "reachable"
 	if !s.Reachable {
 		mark, state = sWarn("!"), "NOT reachable"

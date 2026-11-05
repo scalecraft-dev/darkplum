@@ -50,12 +50,33 @@ variables {
   cluster_name        = "acme"
 }
 
+run "default_is_postgres_only" {
+  command = plan
+
+  assert {
+    condition     = output.library_store_url == "" && output.library_bucket_enabled == false
+    error_message = "By default the Library lives in Postgres: no bucket, an empty library_store_url, library_bucket_enabled false."
+  }
+  assert {
+    condition     = length(module.library_bucket) == 0
+    error_message = "The library bucket module must not be instantiated unless library_bucket_enabled."
+  }
+}
+
 run "library_store_url_is_one_normalized_output" {
   command = plan
+
+  variables {
+    library_bucket_enabled = true
+  }
 
   assert {
     condition     = output.library_store_url == "s3://acme-library-123456789012/library/v1/"
     error_message = "library_store_url must be s3://<cluster>-library-<account>/library/v1/ (the CLI derives the same bucket name)."
+  }
+  assert {
+    condition     = output.library_bucket_enabled == true
+    error_message = "library_bucket_enabled must be reported so the CLI can tell 'no bucket' from an old state."
   }
 }
 
@@ -66,11 +87,27 @@ run "customer_key_plans" {
   command = plan
 
   variables {
-    library_kms_key_arn = "arn:aws:kms:us-east-2:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab"
+    library_bucket_enabled = true
+    library_kms_key_arn    = "arn:aws:kms:us-east-2:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab"
   }
 
   assert {
     condition     = output.library_store_url == "s3://acme-library-123456789012/library/v1/"
     error_message = "a customer key must not change where the library lives."
+  }
+}
+
+# Adoption only matters when there is a bucket to adopt; without one the import
+# block must stay empty so a plan against an empty state does not fail.
+run "adopt_without_a_bucket_is_a_no_op" {
+  command = plan
+
+  variables {
+    adopt_library_bucket = true
+  }
+
+  assert {
+    condition     = output.library_store_url == ""
+    error_message = "adopt_library_bucket without library_bucket_enabled must not create or import a bucket."
   }
 }

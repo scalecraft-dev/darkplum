@@ -196,7 +196,19 @@ module "pod_identity_api" {
   account_id           = data.aws_caller_identity.current.account_id
   namespace            = "darkplum-system"
   service_account_name = "darkplum-api"
-  inline_policies = {
+  inline_policies = merge({
+    cost-explorer-read = jsonencode({
+      Version = "2012-10-17"
+      Statement = [
+        {
+          Sid      = "ReadBedrockSpend"
+          Effect   = "Allow"
+          Action   = ["ce:GetCostAndUsage"]
+          Resource = "*"
+        }
+      ]
+    })
+    }, var.library_bucket_enabled ? {
     library-store = jsonencode({
       Version = "2012-10-17"
       Statement = concat(
@@ -229,18 +241,7 @@ module "pod_identity_api" {
         ]
       )
     })
-    cost-explorer-read = jsonencode({
-      Version = "2012-10-17"
-      Statement = [
-        {
-          Sid      = "ReadBedrockSpend"
-          Effect   = "Allow"
-          Action   = ["ce:GetCostAndUsage"]
-          Resource = "*"
-        }
-      ]
-    })
-  }
+  } : {})
   tags = local.tags
 }
 
@@ -287,12 +288,15 @@ module "ecr" {
   tags         = local.tags
 }
 
-# The Library's bucket (library/v1/ holds every item as a plain file). A reinstall
-# finds the bucket `darkplum destroy` kept: it is imported in the normal plan, like
-# the EKS log group. Only the bucket needs importing: its configuration resources
-# are re-applied over it, and those are idempotent.
+# The Library's optional bucket (library/v1/ holds every item as a plain file;
+# the Library itself is in Postgres). Off by default; library_bucket_enabled
+# creates it. A reinstall finds the bucket `darkplum destroy` kept: it is
+# imported in the normal plan, like the EKS log group. Only the bucket needs
+# importing: its configuration resources are re-applied over it, and those are
+# idempotent.
 module "library_bucket" {
   source = "./modules/library-bucket"
+  count  = var.library_bucket_enabled ? 1 : 0
 
   bucket_name       = local.library_bucket_name
   partition         = data.aws_partition.current.partition
@@ -302,8 +306,14 @@ module "library_bucket" {
   tags              = local.tags
 }
 
+# Installs made before the bucket was optional hold it at the unindexed address.
+moved {
+  from = module.library_bucket
+  to   = module.library_bucket[0]
+}
+
 import {
-  for_each = var.adopt_library_bucket ? toset(["library"]) : toset([])
-  to       = module.library_bucket.aws_s3_bucket.this
+  for_each = var.adopt_library_bucket && var.library_bucket_enabled ? toset(["library"]) : toset([])
+  to       = module.library_bucket[0].aws_s3_bucket.this
   id       = local.library_bucket_name
 }

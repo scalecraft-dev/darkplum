@@ -3,12 +3,8 @@ import { importLibraryItem } from '../../lib/api'
 import type { LibraryImportPreview, LibraryKind, LibraryScope, LibraryVisibility } from '../../types'
 import { Button, Modal } from '../../components/ui'
 import { KindGlyph } from '../../components/ui/KindGlyph'
-import { KIND_LABEL, KIND_PLURAL, errorText, formatSize } from './libraryText'
+import { KIND_LABEL, KIND_PLURAL, LIBRARY_BODY_MAX_BYTES, LIBRARY_IMPORT_MAX_BYTES, errorText, formatSize } from './libraryText'
 import styles from './LibraryDialogs.module.css'
-
-/** Files this large are not read at all: the body cap is 64 KiB, and a
- *  front-matter block does not take a file anywhere near this. */
-const READ_LIMIT_BYTES = 1024 * 1024
 
 type Row = {
   key: string
@@ -81,8 +77,8 @@ export function ImportModal({ open, kind, scope, path, onClose, onImported }: Pr
     for (let i = 0; i < files.length; i++) {
       const file = files[i]
       const row = fresh[i]
-      if (file.size > READ_LIMIT_BYTES) {
-        update(row.key, { status: 'failed', error: `This file is ${formatSize(file.size)}. A library item holds at most 64 KB.` })
+      if (file.size > LIBRARY_IMPORT_MAX_BYTES) {
+        update(row.key, { status: 'failed', error: `This file is ${formatSize(file.size)}. A library item holds at most ${formatSize(LIBRARY_BODY_MAX_BYTES)}.` })
         continue
       }
       try {
