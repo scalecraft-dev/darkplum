@@ -42,7 +42,7 @@ Early release, AWS only. Read [Status](#status) before you install.
 
 ## Status
 
-**v0.1.0, early.** 
+**v0.2.0, early.**
 
 | Area | State | Notes |
 |------|-------|-------|

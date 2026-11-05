@@ -5,7 +5,7 @@ this list is run, executed against a real cloud and a real signed release. This 
 that list. Run it on an rc build (`prerelease.yml` on a `prerelease/**` branch,
 channel `rc`, images `ghcr.io/scalecraft-dev/darkplum-rc-*`) against a **throwaway
 AWS account** with a clean `HOME`, before the change that touches the install
-path is merged, and again on the real release's draft (see
+path is merged, and again on the real release (see
 [RELEASING.md](RELEASING.md)).
 
 A row is done when the pull request says which rc it ran on and what it showed, in
@@ -78,11 +78,10 @@ that they fail when they should; it does not prove Darkplum.
 | 18 | Providers on a customer machine | `init -lockfile=readonly` works on darwin/arm64, darwin/amd64 and linux/amd64 with a clean plugin cache | init logs |
 | 19 | The README path from nothing | Follow the README from a clean machine, once with Homebrew and once with the manual download and its attestation check | the transcript |
 | 20 | Production identity | A scratch-organisation `v0.0.1` release, including the negatives and the Homebrew round trip ([RELEASING.md](RELEASING.md), "Before the first release is merged") | logs, digests |
-| 21 | Draft smoke before anyone is told | [RELEASING.md](RELEASING.md), "After merge", then approve the `tap` job and `brew install` + `brew test` | the checklist, ticked |
+| 21 | Release smoke checklist (brew users already have the release) | [RELEASING.md](RELEASING.md), "After the tag", then `brew install` + `brew test` | the checklist, ticked |
 
 Rows 0 to 10 need only the rc. Rows 20 and 21 are the only ones that need a real
-release; until they have run, the install instructions in the READMEs say the
-release does not exist yet.
+release.
 
 ## Known limits of the interrupted-install handling
 
