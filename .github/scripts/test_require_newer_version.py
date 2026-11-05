@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """Tests for require-newer-version.sh against throwaway git repositories."""
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parent / "require-newer-version.sh"
+REPOS = []
 
 
 def repo_with_tags(tags):
+    """A throwaway repository with one commit and the given tags; removed with the test case."""
     d = tempfile.mkdtemp()
+    REPOS.append(d)
     env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@x", "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@x"}
     subprocess.run(["git", "init", "-q", d], check=True, env=env)
     subprocess.run(["git", "-C", d, "commit", "-q", "--allow-empty", "-m", "x"], check=True, env=env)
@@ -25,6 +29,10 @@ def run(tags, version):
 
 
 class RequireNewerVersion(unittest.TestCase):
+    def tearDown(self):
+        while REPOS:
+            shutil.rmtree(REPOS.pop(), ignore_errors=True)
+
     def test_the_first_tag_in_a_repository_passes(self):
         p = run(["v0.0.1"], "0.0.1")
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
