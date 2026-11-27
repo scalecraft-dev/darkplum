@@ -198,8 +198,24 @@ jobs:
       # mix-ups, and the workflow files must at least parse.
       - run: python3 -I -m unittest discover -s .github/scripts -p 'test_*.py' -v
       - run: python3 -I .github/scripts/check-pinned-actions.py
-      # The router chart is rendered to plain objects in CI (helm is on the runner);
-      # the committed rendering must be what the pinned chart and values produce.
+      # The router chart is rendered to plain objects in CI; the committed rendering
+      # must be what the pinned chart and values produce. helm is installed here at
+      # a pinned version and checksum rather than taken from the runner image:
+      # ubuntu-latest moves to a new Ubuntu release without notice and its helm with
+      # it, and the committed rendering is compared byte for byte.
+      - name: Install helm (pinned)
+        env:
+          HELM_VERSION: v3.22.1
+          HELM_SHA256: 896cf63684a42a723d61c980369d6e588330927deb13676ca0d85006dd6da0ea
+        run: |
+          set -euo pipefail
+          tarball="helm-${HELM_VERSION}-linux-amd64.tar.gz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$tarball" "https://get.helm.sh/$tarball"
+          echo "${HELM_SHA256}  $RUNNER_TEMP/$tarball" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/helm"
+          tar -xzf "$RUNNER_TEMP/$tarball" -C "$RUNNER_TEMP/helm" --strip-components=1 linux-amd64/helm
+          test "$("$RUNNER_TEMP/helm/helm" version --template '{{.Version}}')" = "$HELM_VERSION"
+          echo "$RUNNER_TEMP/helm" >> "$GITHUB_PATH"
       - name: Semantic router render is current
         run: bash .github/scripts/render-semantic-router.sh --check
       # The CLI runs terraform with -lockfile=readonly on the customer's machine,

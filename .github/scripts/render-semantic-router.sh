@@ -19,10 +19,13 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 dir="$root/darkplum/k8s/semantic-router"
 out="$dir/rendered.yaml"
 
-command -v helm >/dev/null || { echo "helm is required to render the semantic router (it is preinstalled on GitHub-hosted runners)"; exit 1; }
-case "$(helm version --template '{{.Version}}')" in
+command -v helm >/dev/null || { echo "helm 3 is required to render the semantic router (CI installs a pinned one; see the plumbing job in .github/workflows/ci.yml)"; exit 1; }
+# CI renders with the exact helm pinned in ci.yml; use the same one if another 3.x
+# produces a diff here.
+helm_version="$(helm version --template '{{.Version}}' || true)"
+case "$helm_version" in
   v3.*) ;;
-  *) echo "helm 3 is required"; exit 1 ;;
+  *) echo "helm 3 is required to render the semantic router; found '${helm_version}' at $(command -v helm)"; exit 1 ;;
 esac
 
 render() {
