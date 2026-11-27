@@ -53,7 +53,7 @@ type PolicyRow struct {
 // set a non-null value for it — PrincipalTypeOrg/User/APIKey, or SourceNone
 // if no level set it. This is a single value even for AllowedModels'
 // set-intersection merge: the UI copy this drives ("your key's own
-// allowlist", "your organisation's policy") is most useful naming the
+// allowlist", "your organization's policy") is most useful naming the
 // closest contributor to the principal being viewed, not every level that
 // happened to also restrict the same field.
 type PolicySources struct {

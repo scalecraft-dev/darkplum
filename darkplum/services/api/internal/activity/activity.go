@@ -51,7 +51,7 @@ const (
 	RoutingPolicyPrincipalChanged EventType = "routing_policy.principal_changed"
 	// RoutingPolicyParamsModeChanged is recorded when PUT
 	// /api/v1/routing-policy changes params_mode (lenient|strict), the
-	// organisation-wide switch between dropping-and-recording a request
+	// organization-wide switch between dropping-and-recording a request
 	// parameter a backend cannot honour and refusing it. Detail carries
 	// {previous, new}. It is recorded in addition to routing_policy.org_changed.
 	RoutingPolicyParamsModeChanged EventType = "routing_policy.params_mode_changed"

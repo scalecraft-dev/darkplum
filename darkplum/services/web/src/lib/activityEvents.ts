@@ -50,7 +50,7 @@ export const EVENT_LABELS: Record<string, { label: string; variant: EventVariant
   'model_alias.deleted':    { label: 'Alias Deleted',          variant: 'info'    },
   'routing_policy.changed': { label: 'Routing Policy Changed', variant: 'warning' },
 
-  // Per-principal policy. The organisation event and the per-principal one are
+  // Per-principal policy. The organization event and the per-principal one are
   // named apart: one moves everybody, the other moves one user or one key.
   'routing_policy.org_changed':       { label: 'Org Policy Changed',       variant: 'warning' },
   'settings.system_prompt_changed':   { label: 'System Prompt Changed',    variant: 'warning' },
@@ -72,7 +72,7 @@ export const EVENT_LABELS: Record<string, { label: string; variant: EventVariant
   'provider.key_rotated':   { label: 'Vendor Key Rotated',   variant: 'warning' },
   'provider.key_removed':   { label: 'Vendor Key Removed',   variant: 'warning' },
   // The billing key is its own credential (an admin key that can list the
-  // organisation's workspaces and keys), so it gets its own three rows rather
+  // organization's workspaces and keys), so it gets its own three rows rather
   // than sharing the inference key's. Amber for the same reason.
   'provider.billing_key_installed': { label: 'Vendor Billing Key Installed', variant: 'warning' },
   'provider.billing_key_rotated':   { label: 'Vendor Billing Key Rotated',   variant: 'warning' },

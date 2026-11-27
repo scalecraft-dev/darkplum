@@ -92,7 +92,7 @@ export function vendorLabel(name: string | null | undefined): string {
   return VENDOR_LABELS[name.toLowerCase()] ?? name.charAt(0).toUpperCase() + name.slice(1)
 }
 
-/** The two vendors Darkplum can hold an organisation-wide key for, in the
+/** The two vendors Darkplum can hold an organization-wide key for, in the
  *  order the Models tab lists them. Always both, configured or not. */
 export const VENDORS: VendorName[] = ['anthropic', 'openai']
 
@@ -126,7 +126,7 @@ export function providerLabel(provider: string): string {
   return PROVIDER_LABELS[provider] ?? provider
 }
 
-/** Reading order for provider groups: what runs closest to the organisation
+/** Reading order for provider groups: what runs closest to the organization
  *  first, what leaves it last. Anything unlisted sorts alphabetically after. */
 const PROVIDER_ORDER = ['vllm', 'lmstudio', 'bedrock', 'anthropic', 'openai']
 
@@ -140,7 +140,7 @@ export function compareProviders(a: string, b: string): number {
 }
 
 /** True for a provider kind that is a vendor API rather than infrastructure
- *  the organisation runs or owns. */
+ *  the organization runs or owns. */
 export function isVendorProvider(provider: string): provider is VendorName {
   return provider === 'anthropic' || provider === 'openai'
 }
@@ -167,7 +167,7 @@ export function backendClassLabel(c: DisplayClass): string {
  *  appears. Said the same way every time, because an administrator deciding
  *  whether to allow it is deciding on exactly this. */
 export const EXTERNAL_API_TOOLTIP =
-  "Called at the vendor's own API with your organisation's key. Prompts leave your cloud account."
+  "Called at the vendor's own API with your organization's key. Prompts leave your cloud account."
 
 /** What a class badge's tooltip says, or undefined when the label says it all. */
 export function backendClassTooltip(c: DisplayClass): string | undefined {
@@ -200,7 +200,7 @@ export function backendClassChatLabel(c: DisplayClass, vendor?: string | null): 
   }
 }
 
-/** True when a prompt on this class leaves the organisation's cloud account.
+/** True when a prompt on this class leaves the organization's cloud account.
  *  The one test behind every egress marker in the product. */
 export function isEgress(c: DisplayClass): boolean {
   return c === 'external_api'
@@ -235,7 +235,7 @@ export function ranOnSuffix(
  * picker and the alias table cannot each pick their own.
  *
  * Self-hosted is the unremarkable case and is neutral. Cloud-managed is
- * informational: it is somewhere else, but somewhere the organisation owns.
+ * informational: it is somewhere else, but somewhere the organization owns.
  * External API is amber — not because it is broken, but because it is the one
  * class where a prompt crosses the account boundary, and that is exactly what
  * amber means everywhere else in this product. Unknown is neutral and wears a
@@ -763,11 +763,11 @@ export function denialLabel(code: string): string {
 /**
  * Who to name in a vendor failure, ready to open a sentence.
  *
- * Only the two vendors Darkplum holds an organisation-wide key for are named:
+ * Only the two vendors Darkplum holds an organization-wide key for are named:
  * those messages are about that key, and nothing else has one. A provider kind
- * that is infrastructure the organisation runs, a routed alias's own owner
+ * that is infrastructure the organization runs, a routed alias's own owner
  * ('darkplum'), or nothing at all, all read as the unnamed vendor rather than
- * as a title-cased guess — "Vllm rejected your organisation's key" is worse
+ * as a title-cased guess — "Vllm rejected your organization's key" is worse
  * than saying less.
  */
 export function failedVendorLabel(name: string | null | undefined): string {

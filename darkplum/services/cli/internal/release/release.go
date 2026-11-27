@@ -32,7 +32,7 @@ var encoded string
 // A manifest naming any other repository is refused, so a binary built from
 // someone's fork, or a manifest edited to point elsewhere, deploys nothing.
 // release.yml and prerelease.yml never set it. The only override is a build-time
-// -X flag on a binary an engineer builds by hand for the scratch-organisation
+// -X flag on a binary an engineer builds by hand for the scratch-organization
 // exercise (docs/RELEASING.md); `darkplum version` says loudly when it is not the
 // default, and nothing at run time can change it.
 var trustedRepository = defaultTrustedRepository

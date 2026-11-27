@@ -21,7 +21,7 @@ interface Props {
 
 /**
  * The composer's "+" menu: everything the person can attach, searchable,
- * grouped into theirs and the organisation's. A tool that has never been
+ * grouped into theirs and the organization's. A tool that has never been
  * verified is listed but cannot be attached: the server's tools are unknown
  * until then, and the chat would refuse the turn.
  */
@@ -181,7 +181,7 @@ export function LibraryPicker({ items, loading, error, attachedIds, onToggle, on
         ) : (
           <>
             {renderGroup('Private', visible.mine, 0)}
-            {renderGroup('Organisation', visible.shared, visible.mine.length)}
+            {renderGroup('Organization', visible.shared, visible.mine.length)}
           </>
         )}
       </div>

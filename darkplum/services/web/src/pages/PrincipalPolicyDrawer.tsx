@@ -229,8 +229,8 @@ export function PrincipalPolicyDrawer({ principal, models, aliases, onClose, onS
 
   /** Who this principal inherits from, named the same way in every sentence on
    *  the drawer — mid-sentence and at the start of one. */
-  const inheritFrom = isUser ? 'the organisation' : "this key's owner"
-  const inheritFromCapitalised = isUser ? 'The organisation' : "This key's owner"
+  const inheritFrom = isUser ? 'the organization' : "this key's owner"
+  const inheritFromCapitalised = isUser ? 'The organization' : "This key's owner"
 
   // --- load -----------------------------------------------------------------
 
@@ -411,7 +411,7 @@ export function PrincipalPolicyDrawer({ principal, models, aliases, onClose, onS
     try {
       await endpoints.remove(principal.id)
       toast(
-        `${principal.title} inherits ${isUser ? "the organisation's policy" : "its owner's policy"} again`,
+        `${principal.title} inherits ${isUser ? "the organization's policy" : "its owner's policy"} again`,
         'success',
       )
       onSaved?.()

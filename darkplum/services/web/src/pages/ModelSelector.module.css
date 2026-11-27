@@ -91,7 +91,7 @@
   background: var(--danger-fg);
 }
 
-/* The prompt will leave the organisation's cloud account. Amber, like every
+/* The prompt will leave the organization's cloud account. Amber, like every
    other egress marker — and the only dot with a ring, because this is the one
    state the person typing needs to notice without being told to look. It does
    not pulse: this is a standing fact about the model they chose, not something

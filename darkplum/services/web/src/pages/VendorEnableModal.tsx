@@ -38,11 +38,11 @@ interface Props {
   vendor: VendorName
   /** Every catalogue row for this vendor. */
   models: AdminModel[]
-  /** The organisation's policy as stored, all three fields — the write below
+  /** The organization's policy as stored, all three fields — the write below
    *  is a PUT, so it must carry the fields it is not changing. */
   policy: { residency: Residency; allowed_models: string[] | null; default_model: string | null }
   onClose: () => void
-  /** Writes the organisation's policy. Rejects with the API's own message. */
+  /** Writes the organization's policy. Rejects with the API's own message. */
   onSavePolicy: (residency: Residency) => Promise<void>
   /** Enables one model. Rejects with the API's own message. */
   onEnable: (model: AdminModel) => Promise<void>
@@ -174,7 +174,7 @@ export function VendorEnableModal({
                     multimodal signal. */}
                 <p className={styles.boundaryChange}>
                   Where requests may run changes from "{residencyLabel(opening.residency)}" to "
-                  {residencyLabel('any')}". That applies to the whole organisation, not only to
+                  {residencyLabel('any')}". That applies to the whole organization, not only to
                   these models.
                 </p>
               </div>
@@ -227,7 +227,7 @@ export function VendorEnableModal({
                 for. Said plainly so the enable does not look broken. */}
             {policy.allowed_models !== null && chosen.length > 0 && (
               <p className={styles.caveat}>
-                The organisation also has an allowed list. Models enabled here are still refused
+                The organization also has an allowed list. Models enabled here are still refused
                 until they are added to it on the Policy tab.
               </p>
             )}

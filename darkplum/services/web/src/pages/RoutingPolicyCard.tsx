@@ -16,6 +16,7 @@ import {
   residencyPermits,
   residencyRank,
 } from '../lib/policy'
+import { isOrgLockOut } from '../lib/lockOut'
 import {
   PARAMS_MODE_NOTE,
   PARAMS_MODE_OPTIONS,
@@ -30,7 +31,7 @@ import { ModelAllowlistPicker } from './ModelAllowlistPicker'
 import { ResidencyLadder } from './ResidencyLadder'
 import styles from './RoutingPolicyCard.module.css'
 
-/** The fields of the organisation's policy, as the card edits them. */
+/** The fields of the organization's policy, as the card edits them. */
 export interface OrgPolicyDraft {
   residency: Residency
   allowed_models: string[] | null
@@ -57,7 +58,7 @@ interface Props {
     /** Principals with a policy of their own whose reachable set actually
      *  shrank — not merely how many have a row. */
     affectedPrincipals: number
-    /** Whether everyone who simply inherits the organisation's policy now
+    /** Whether everyone who simply inherits the organization's policy now
      *  reaches fewer models too. Independent of affectedPrincipals. */
     orgNarrowed: boolean
     /** Enabled, allowed models no backend has reported yet (class unknown)
@@ -81,7 +82,7 @@ interface Props {
  */
 type ConfirmKind = 'none' | 'tighten' | 'loosen' | 'strict' | 'warnings'
 
-/** The organisation may stand on any rung. Nothing above it can forbid one. */
+/** The organization may stand on any rung. Nothing above it can forbid one. */
 const ORG_RUNGS = RESIDENCY_LADDER.map((r) => ({ value: r.value, deadReason: null }))
 
 /** Which classes a refusal covers, named. A count on its own leaves an
@@ -144,7 +145,7 @@ export function RoutingPolicyCard({
   /** How many users and keys with a policy of their own reach less than they
    *  did. Written by the API. */
   const [affected, setAffected] = useState<number | null>(null)
-  /** Whether everyone who inherits the organisation's policy reaches less too.
+  /** Whether everyone who inherits the organization's policy reaches less too.
    *  Independent of `affected` — a principal with its own row is never
    *  counted here even if the org narrowed under it as well. */
   const [orgNarrowed, setOrgNarrowed] = useState(false)
@@ -236,7 +237,7 @@ export function RoutingPolicyCard({
 
   /**
    * Loosening the rung is its own kind of change, and the only one in the
-   * product where saying yes sends prompts out of the organisation's cloud
+   * product where saying yes sends prompts out of the organization's cloud
    * account. It is confirmed even though nobody loses anything — a
    * confirmation is not a punishment for narrowing, it is for a decision that
    * is hard to see and hard to undo. Widening an allowlist is neither, and is
@@ -246,7 +247,7 @@ export function RoutingPolicyCard({
 
   /** Only the step onto the loosest rung crosses the account boundary. Dropping
    *  from self-hosted-only to cloud-account-only is a widening, but everything
-   *  it opens is still inside the organisation's own account, so it does not
+   *  it opens is still inside the organization's own account, so it does not
    *  get the danger treatment. */
   const leavingAccount = loosening && residencyRank(draft.residency) === 0
 
@@ -311,7 +312,7 @@ export function RoutingPolicyCard({
         <div>
           <h2 id="routing-policy-heading" className={styles.title}>Routing policy</h2>
           <p className={styles.subtitle}>
-            What the whole organisation may reach. Users and keys can be narrowed further, never
+            What the whole organization may reach. Users and keys can be narrowed further, never
             widened.
           </p>
         </div>
@@ -358,7 +359,7 @@ export function RoutingPolicyCard({
             rungs={ORG_RUNGS}
             disabled={saving}
             showDefault
-            /* The organisation has nothing to inherit from, so no `inherit`
+            /* The organization has nothing to inherit from, so no `inherit`
                option is offered and the ladder can never emit null here. */
             onChange={(residency) => {
               if (residency !== null) setDraft((p) => ({ ...p, residency }))
@@ -453,11 +454,11 @@ export function RoutingPolicyCard({
                   aliases={aliases}
                   value={draft.allowed_models}
                   onChange={(next) => setDraft((p) => ({ ...p, allowed_models: next }))}
-                  label="the organisation"
+                  label="the organization"
                 />
                 {emptyAllowlist && (
                   <p className={styles.fieldError} role="alert">
-                    Tick at least one model. An organisation that allows nothing cannot chat — use
+                    Tick at least one model. An organization that allows nothing cannot chat — use
                     "Every enabled model" and disable models instead.
                   </p>
                 )}
@@ -473,7 +474,7 @@ export function RoutingPolicyCard({
             </p>
             <select
               className={styles.select}
-              aria-label="Default model for the organisation"
+              aria-label="Default model for the organization"
               value={draft.default_model ?? ''}
               disabled={saving}
               onChange={(e) => setDraft((p) => ({ ...p, default_model: e.target.value || null }))}
@@ -553,7 +554,7 @@ export function RoutingPolicyCard({
               failed one leaves the form ahead of the stored policy. */}
           {affected !== null && !changed && (orgNarrowed || affected > 0) && (
             <p className={styles.affected} role="status">
-              {orgNarrowed && "Everyone who inherits the organisation's policy is now allowed fewer models."}
+              {orgNarrowed && "Everyone who inherits the organization's policy is now allowed fewer models."}
               {orgNarrowed && affected > 0 && ' '}
               {affected > 0 &&
                 (affected === 1
@@ -602,13 +603,13 @@ export function RoutingPolicyCard({
             <div className={styles.blocked} role="alert">
               <p className={styles.warningsTitle}>
                 Not saved.{' '}
-                {lockedOut.length === 1 && lockedOut[0] === '(organisation)'
-                  ? 'This policy would leave the whole organisation with no model.'
+                {isOrgLockOut(lockedOut)
+                  ? 'This policy would leave the whole organization with no model.'
                   : lockedOut.length === 1
                     ? 'This policy would leave one user or key with no model it may use:'
                     : `This policy would leave ${lockedOut.length} users or keys with no model they may use:`}
               </p>
-              {!(lockedOut.length === 1 && lockedOut[0] === '(organisation)') && (
+              {!isOrgLockOut(lockedOut) && (
                 <ul className={styles.warningsList}>
                   {lockedOut.map((name) => (
                     <li key={name}>{name}</li>
@@ -617,8 +618,8 @@ export function RoutingPolicyCard({
               )}
               <p className={styles.warningsHint}>
                 Their own allowed lists have nothing in common with this one. Widen the
-                organisation's list, or change their policies in Users &amp; Keys first — a key can
-                never reach more than its owner, and nobody more than the organisation.
+                organization's list, or change their policies in Users &amp; Keys first — a key can
+                never reach more than its owner, and nobody more than the organization.
               </p>
             </div>
           )}
@@ -671,18 +672,18 @@ export function RoutingPolicyCard({
                 : 'Widen where requests may run?'
               : confirmKind === 'strict'
                 ? PARAMS_MODE_STRICT_CONFIRM.title
-                : 'Narrow what the organisation can reach?'
+                : 'Narrow what the organization can reach?'
         }
         description={
           confirmKind === 'warnings'
             ? 'The policy has changed. These routes need your attention.'
             : confirmKind === 'loosen'
               ? leavingAccount
-                ? "Requests will be allowed to run at a model vendor's own API, using your organisation's key."
+                ? "Requests will be allowed to run at a model vendor's own API, using your organization's key."
                 : 'More of what is already enabled will be allowed to answer.'
               : confirmKind === 'strict'
                 ? PARAMS_MODE_STRICT_CONFIRM.description
-                : 'Everyone inherits this. A user or key that already has its own policy keeps it, but can never reach past the organisation.'
+                : 'Everyone inherits this. A user or key that already has its own policy keeps it, but can never reach past the organization.'
         }
       >
         <div className={styles.confirmBody}>

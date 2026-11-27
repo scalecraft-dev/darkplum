@@ -17,7 +17,7 @@ import pageStyles from './PageLayout.module.css'
  * in chat, the routes behind them, and the classifier that picks a route.
  *
  * It reads three things and writes one. The catalogue is what a route can
- * point at; the organisation's policy is what every route's health is judged
+ * point at; the organization's policy is what every route's health is judged
  * against; the aliases are what this page edits. All three are read here
  * rather than borrowed from Admin > Models, so this page is correct when it is
  * the first one opened (a link from a refused chat message lands here).

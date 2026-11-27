@@ -163,7 +163,7 @@ interface UnifiedEvent {
   route: string | null
   reason: string | null
   /** Requests only, and only when the class was recorded: this one left the
-   *  organisation's cloud account, to the vendor named here. */
+   *  organization's cloud account, to the vendor named here. */
   egress: string | null
   /** Requests only: the request parameters the gateway did not send as asked,
    *  as the badge says them ("Dropped · seed, logprobs +2") and in full for
@@ -1073,12 +1073,12 @@ export function ActivityTab() {
                           <Badge
                             variant="warning"
                             bordered
-                            title={`This request ran at ${e.egress}'s own API, using your organisation's key. It left your cloud account.`}
+                            title={`This request ran at ${e.egress}'s own API, using your organization's key. It left your cloud account.`}
                           >
                             <EgressGlyph />
                             Left cloud account · {e.egress}
                             <span className={styles.srOnly}>
-                              {`. This request ran at ${e.egress}'s own API, using your organisation's key. It left your cloud account.`}
+                              {`. This request ran at ${e.egress}'s own API, using your organization's key. It left your cloud account.`}
                             </span>
                           </Badge>
                         )}

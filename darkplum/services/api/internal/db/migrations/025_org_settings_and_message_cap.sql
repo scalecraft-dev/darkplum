@@ -7,7 +7,7 @@ ALTER TABLE conversation_messages DROP CONSTRAINT IF EXISTS conversation_message
 ALTER TABLE conversation_messages ADD CONSTRAINT conversation_messages_content_check
     CHECK (octet_length(content) <= 16777216);  -- 16 MiB per turn, = the chat body cap
 
--- 2. Organisation-wide settings an admin edits from the UI/API. The first is
+-- 2. Organization-wide settings an admin edits from the UI/API. The first is
 --    the platform system prompt the api prepends to every webchat turn, which
 --    was a compile-time constant with no way to change it.
 CREATE TABLE IF NOT EXISTS org_settings (

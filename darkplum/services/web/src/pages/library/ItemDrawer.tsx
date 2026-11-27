@@ -686,7 +686,7 @@ export function ItemDrawer({ target, isAdmin, onClose, onChanged, onOpen, onMove
                   {item.visibility === 'org' ? (
                     <>
                       <p className={styles.sectionText}>
-                        Everyone in your organisation can read and attach this. Only you can edit it.
+                        Everyone in your organization can read and attach this. Only you can edit it.
                       </p>
                       <div className={styles.inlineActions}>
                         <Button variant="secondary" size="sm" onClick={unshare.click} disabled={busy}>
@@ -699,7 +699,7 @@ export function ItemDrawer({ target, isAdmin, onClose, onChanged, onOpen, onMove
                       <p className={styles.sectionText}>Only you can see this.</p>
                       <div className={styles.inlineActions}>
                         <Button variant="secondary" size="sm" onClick={() => setShareOpen(true)} disabled={busy || dirty}>
-                          Share with organisation
+                          Share with organization
                         </Button>
                         {dirty && <span className={styles.hint}>Save your changes first.</span>}
                       </div>
@@ -769,7 +769,7 @@ export function ItemDrawer({ target, isAdmin, onClose, onChanged, onOpen, onMove
         onShared={(next) => {
           setItem(next)
           setShareOpen(false)
-          toast('Shared with your organisation.', 'success')
+          toast('Shared with your organization.', 'success')
           onChanged()
         }}
       />

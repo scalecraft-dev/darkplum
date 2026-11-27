@@ -261,7 +261,7 @@ export function VendorBillingKeyModal({ open, vendor, mode, transportOk, onClose
                 one thing to know about this credential is how much it can do. */}
             <div className={styles.boundary}>
               <p className={styles.boundaryText}>
-                An {keyName} can list your organisation's workspaces, projects and keys. Darkplum uses
+                An {keyName} can list your organization's workspaces, projects and keys. Darkplum uses
                 it only to read usage and cost reports, but it can do more than that — treat it like
                 the admin credential it is.
               </p>

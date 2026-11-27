@@ -351,7 +351,7 @@ export function PricesTab() {
                           {r.source === 'seed' ? (
                             <Badge variant="neutral" bordered title="Published list price, shipped with Darkplum. Read-only: replace it to change it.">Seed</Badge>
                           ) : (
-                            <Badge variant="info" title="Added by an administrator in this organisation.">Admin</Badge>
+                            <Badge variant="info" title="Added by an administrator in this organization.">Admin</Badge>
                           )}
                         </td>
                         <td className={styles.notes} title={r.notes ?? undefined}>{r.notes || <span className={styles.muted}>—</span>}</td>

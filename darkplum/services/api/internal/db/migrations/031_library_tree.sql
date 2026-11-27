@@ -1,5 +1,5 @@
 -- The library as a navigable tree, with a complete write-through copy in the
--- organisation's own object store (S3 first; the bucket layout is
+-- organization's own object store (S3 first; the bucket layout is
 -- library/v1/{org,people/<person>}/<folders>/<slug>.<kind>.{md,json}).
 --
 -- Postgres stays canonical: identity, ACL, folders, metadata and the body.
@@ -118,7 +118,7 @@ UPDATE library_items SET slug = left(slug, 91) || '-' || left(id::text, 8)
  WHERE slug ~ '^(con|prn|aux|nul|com[1-9]|lpt[1-9])$';
 
 -- Uniqueness moves from (owner, slug) to the item's location. Items shared
--- with the organisation could collide (two people each shared a "code-review"
+-- with the organization could collide (two people each shared a "code-review"
 -- skill): every duplicate after the oldest keeps its slug plus -<id8>.
 UPDATE library_items li SET slug = left(li.slug, 91) || '-' || left(li.id::text, 8)
   FROM (

@@ -1,5 +1,5 @@
 -- The library: skills, context and tools a person keeps in their own
--- organisation's database instead of inside one AI vendor's account, shares
+-- organization's database instead of inside one AI vendor's account, shares
 -- with colleagues, attaches to chats, and can export again.
 --
 -- One table for all three kinds. A skill and a context item are both text

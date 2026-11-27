@@ -150,7 +150,7 @@ export function TabPanel({ id, scope, active, children }: TabPanelProps) {
       aria-labelledby={tabDomId(scope, id)}
       hidden={!active}
       // Every panel here opens on prose — a heading, or the note about the
-      // organisation's policy — before it reaches a control. The pattern asks
+      // organization's policy — before it reaches a control. The pattern asks
       // for a tab stop in exactly that case, so that tabbing out of the tab
       // row lands on the panel and reads it, rather than skipping past it into
       // the first input.

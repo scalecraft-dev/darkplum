@@ -146,7 +146,7 @@ export function verifyErrorText(err: unknown, opts: { isAdmin: boolean; credenti
     case 'tool_host_not_allowed':
       return opts.isAdmin
         ? `${host} is not an allowed server yet.`
-        : `${host} is not a server your organisation allows yet. An administrator allows it from any tool on it, or by adding one. Then check again.`
+        : `${host} is not a server your organization allows yet. An administrator allows it from any tool on it, or by adding one. Then check again.`
     case 'tool_auth_failed':
       return opts.credentialSet
         ? 'The server refused the saved credential. Set a new one below, then check again.'
@@ -187,7 +187,7 @@ export function libraryErrorText(err: unknown, fallback: string): string {
       case 'shared_path_taken':
         return 'Someone has already shared something with that file name in that folder. Rename it, or pick another folder.'
       case 'admin_required':
-        return 'Only an administrator can change the Organisation folders.'
+        return 'Only an administrator can change the Organization folders.'
       case 'library_storage_unavailable':
         return 'This installation has no Library bucket, or it cannot be reached right now. Nothing was changed.'
       case 'library_body_too_large':

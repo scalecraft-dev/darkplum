@@ -182,7 +182,7 @@ export function ImportModal({ open, kind, scope, path, onClose, onImported }: Pr
             </label>
             <label className={styles.radio}>
               <input type="radio" name={`${inputId}-vis`} checked={visibility === 'org'} onChange={() => setVisibility('org')} />
-              <span>Everyone in your organisation. Only you can edit them.</span>
+              <span>Everyone in your organization. Only you can edit them.</span>
             </label>
           </fieldset>
         )}

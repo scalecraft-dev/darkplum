@@ -73,7 +73,7 @@ export function promptDestinationClass(m: ChoosableModel): DisplayClass {
  * The entry chat opens on.
  *
  * An administrator's default — whatever the API resolved walking key → user →
- * organisation — wins whenever it is still on offer, including when it is a
+ * organization — wins whenever it is still on offer, including when it is a
  * vendor model: someone chose that deliberately and this is not the place to
  * second-guess it. A conversation's own model is handled by its caller and
  * outranks this entirely; this only answers the first visit.
@@ -103,7 +103,7 @@ export function pickDefaultModel(
 
 /** What the empty state says when it cannot place the selected entry: true of
  *  every install, and claims no boundary the prompt may not stay inside. */
-const NEUTRAL_TAGLINE = 'Private AI for your organisation.'
+const NEUTRAL_TAGLINE = 'Private AI for your organization.'
 
 /**
  * The one line under the wordmark on an empty thread.

@@ -8,7 +8,7 @@ import type { ProviderState, ProviderStatus, VendorName } from '../types'
  * these functions decide something a component cannot check for itself:
  *
  *   - which patterns are written into a vendor's model filter, which decides
- *     which models the organisation is billed for;
+ *     which models the organization is billed for;
  *   - what the key entry line says about a key nobody can see;
  *   - whether a vendor is still installing or has stopped trying.
  *
@@ -441,7 +441,7 @@ export function vendorErrorCopy(
   const lead = serverMessage.trim()
     ? serverMessage.trim()
     : `${vendorName} answered ${statusText} (${type}) to the key check. Nothing was stored.`
-  return `${lead} This is ${vendorName}'s answer to this key, not a network problem \u2014 check the key's organisation and permissions in ${vendorName}'s console.`
+  return `${lead} This is ${vendorName}'s answer to this key, not a network problem \u2014 check the key's organization and permissions in ${vendorName}'s console.`
 }
 
 /**
@@ -472,9 +472,9 @@ export function vendorKeyProblem(key: string): string | null {
 /**
  * Whether a vendor's key form asks for a workspace id.
  *
- * Anthropic refuses an organisation-level key unless every request names the
+ * Anthropic refuses an organization-level key unless every request names the
  * workspace it is to be billed and scoped to (`anthropic-workspace-id`). A key
- * created inside a workspace needs nothing. OpenAI's organisation and project
+ * created inside a workspace needs nothing. OpenAI's organization and project
  * headers are a different mechanism and are not asked for here.
  */
 export function vendorTakesWorkspaceId(vendor: VendorName): boolean {

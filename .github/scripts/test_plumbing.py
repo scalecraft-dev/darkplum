@@ -51,7 +51,7 @@ class ReleaseJSON(unittest.TestCase):
         self.assertEqual(doc["images"]["api"]["repository"], "ghcr.io/scalecraft-dev/darkplum-rc-api")
 
     def test_images_live_under_the_building_repositorys_owner(self):
-        # A release cut from a scratch organisation names that organisation's images;
+        # A release cut from a scratch organization names that organization's images;
         # whether the CLI TRUSTS that repository is decided in the CLI (its baked
         # trusted repository), never here.
         doc = rj.build(**good_release(repo="Scratch-Org/darkplum-release"))

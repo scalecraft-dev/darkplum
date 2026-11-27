@@ -1,6 +1,6 @@
 /**
  * Request parameters the gateway did not pass on as sent (GitHub #3), and the
- * organisation-wide switch that decides whether it drops them or refuses.
+ * organization-wide switch that decides whether it drops them or refuses.
  *
  * The usage log's `dropped_params` holds the entries of the
  * X-Darkplum-Dropped-Params response header, verbatim:
@@ -39,7 +39,7 @@ export const PARAMS_MODE_OPTIONS: ReadonlyArray<{
     value: 'strict',
     label: 'Refuse requests that include them',
     consequence:
-      'Every key and user in the organisation gets a 400 naming the parameter instead. Clients that send SDK extras will start failing.',
+      'Every key and user in the organization gets a 400 naming the parameter instead. Clients that send SDK extras will start failing.',
   },
 ]
 
@@ -53,7 +53,7 @@ export const PARAMS_MODE_NOTE =
  *  added to a residency or allowlist confirmation saved in the same go. */
 export const PARAMS_MODE_STRICT_CONFIRM = {
   title: "Refuse requests with parameters a model can't use?",
-  description: 'This applies to every API key and every user in the organisation at once.',
+  description: 'This applies to every API key and every user in the organization at once.',
   body: [
     "A request that sends a parameter its model can't use (seed or a penalty to an Anthropic model, a key the gateway does not know, an SDK extra) gets a 400 naming that parameter instead of an answer.",
     'Requests that are answered today can start failing. The Activity log marks every request that had something dropped, so check it for who sends them first.',

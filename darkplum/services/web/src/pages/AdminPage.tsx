@@ -83,7 +83,7 @@ export function AdminPage() {
 
   /** Which users and keys carry their own policy. A failure here costs a
    *  badge, not the page, so it is not worth a toast. Pages through the whole
-   *  set at the API's cap of 200 per call — an organisation can have more
+   *  set at the API's cap of 200 per call — an organization can have more
    *  principals with a policy of their own than that, and a row past the
    *  first page must not silently read as "inherits org". */
   const loadPrincipals = useCallback(async () => {

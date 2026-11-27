@@ -231,7 +231,7 @@ Measured on one account with the default 7B model. A larger model takes longer t
 | `darkplum models add <name> --hf <id>` | Add another self-hosted open-source model (one GPU each) |
 | `darkplum models remove <name>` / `list` / `test <name>` | Remove a model added with `models add`; list models and gateway upstreams; send a test chat to one |
 | `darkplum keys set huggingface` | Store a Hugging Face token for gated models |
-| `darkplum keys set anthropic --models 'claude-*'` | Install or rotate the organisation's Anthropic API key and set its catalog filter |
+| `darkplum keys set anthropic --models 'claude-*'` | Install or rotate the organization's Anthropic API key and set its catalog filter |
 | `darkplum keys set openai --models 'gpt-*'` | Same for OpenAI |
 | `darkplum keys remove anthropic\|openai` / `keys list` | Remove a vendor key and its filter (its models stop answering); show which keys are installed |
 | `darkplum init --semantic-router on\|off` | Turn the open-source intent classifier for routed aliases on or off; `darkplum deploy` applies it |
@@ -312,7 +312,7 @@ conversations permanently (hard delete, no undo); deleting a user deletes all of
 their conversations. Existing browser-local history is moved to the server the
 first time a user signs in after this upgrade.
 
-Not yet built: an organisation retention policy and supervised eDiscovery
+Not yet built: an organization retention policy and supervised eDiscovery
 access (dual control, audited). Both are planned as explicit features rather
 than by weakening the owner-only rule.
 
@@ -330,7 +330,7 @@ or policy-blocked model gets an error, never a silent redirect.
   called under your own AWS account through the gateway's IAM role. Prompts leave
   the cluster and stay inside your cloud account.
 - **External API** — Anthropic and OpenAI models called directly at the vendor's
-  own API with your organisation's key. Prompts leave your cluster **and** your
+  own API with your organization's key. Prompts leave your cluster **and** your
   cloud account, under your contract with that vendor. Off until you install a
   key, and refused by the default routing policy until an administrator allows
   it (see *Anthropic and OpenAI* below).
@@ -409,13 +409,13 @@ changed:
 
 ```bash
 darkplum keys set anthropic --models 'claude-*'   # --models = catalog filter (globs)
-# add --workspace wrkspc_... if the key was created at organisation level (see below)
+# add --workspace wrkspc_... if the key was created at organization level (see below)
 
 darkplum keys set openai --models 'gpt-*'
 ```
 
 **Create the Anthropic key inside a workspace.** Anthropic requires every request
-made with a key created at *organisation* level to name a workspace
+made with a key created at *organization* level to name a workspace
 (`anthropic-workspace-id`); darkplum sends that header when you give it a
 workspace ID — the optional field on the install form, or `--workspace wrkspc_…`
 on the command — and the key check tells you when a key needs one. A key
@@ -438,7 +438,7 @@ which of them the filter admits.
 
 Then choose **Review and enable** on the vendor's card.
 Two things stand between an installed key and an answer, deliberately: the
-organisation's residency must be loosened to *Any model, including outside your
+organization's residency must be loosened to *Any model, including outside your
 account* (a confirmed, audited change — every install, new or existing, sits at
 *Your cloud account only*), and each model must be enabled. The same dialog does
 both. After that a vendor model is an ordinary model: pick it in chat, put it in
@@ -482,7 +482,7 @@ Limits to know, because this backend is different in kind from the other two:
   set on the key at the vendor — an Anthropic workspace key with a spend limit,
   an OpenAI project key with a model allowlist and a budget. darkplum cannot see
   or verify that scope. Set it.
-- **The key is organisation-wide.** Every permitted user and API key spends
+- **The key is organization-wide.** Every permitted user and API key spends
   against the same vendor key; there is no per-principal vendor credential.
   Anyone who can read Secrets in `darkplum-system` can read it — which is whoever
   administers the cluster. Any darkplum administrator can replace or remove it
@@ -531,8 +531,8 @@ What is *not* configurable from the product: deploying self-hosted models
 (`darkplum models add`) and the Bedrock model patterns (Terraform) are still set at
 deploy time.
 
-**Who may use which models** — policy per organisation, per user and per API
-key (Admin > Models for the organisation; Admin > Users & Keys, "Routing
+**Who may use which models** — policy per organization, per user and per API
+key (Admin > Models for the organization; Admin > Users & Keys, "Routing
 policy" on each row). Each level carries the same three settings:
 
 - *Allowed models* — a list of models (inherit = whatever the level above
@@ -540,17 +540,17 @@ policy" on each row). Each level carries the same three settings:
   expands an alias when you click it, so adding a route later never widens
   anyone's access.
 - *Residency* — inherit, or tighten to *your cloud account only* or *self-hosted
-  only*. Below the organisation it can never loosen.
+  only*. Below the organization it can never loosen.
 - *Default model* — preselected in the chat picker; used by an API key whose
   request names no model.
 
 They merge most-restrictive-wins: **a key can never reach more than its owner,
-and a user never more than the organisation.** The gateway checks the model that
+and a user never more than the organization.** The gateway checks the model that
 actually serves the request — including the target a routed alias picks — and
 refuses with `model_not_allowed`. Every refusal is recorded on its usage-log row
 as `denial_code` and shown in Admin > Activity (filter by reason, export with
 the same filter), so "did my rule fire, and on whom" has an answer in the
-product, not in `kubectl logs`. A save at any level — organisation included —
+product, not in `kubectl logs`. A save at any level — organization included —
 that would leave a user or key with no allowed model is refused by the API
 (`409`, naming who), not just greyed out in the UI, and the editor names which
 of the user's keys lose access, and what they lose, before you save. Every user
@@ -576,7 +576,7 @@ reserves room for them.
   permits all three kinds of backend; *Your cloud account only* (the default)
   refuses external-API models; *Self-hosted only* refuses cloud-managed and
   external-API models alike. A model whose backend class the gateway does not
-  recognise is refused at every step. Set for the organisation here — loosening
+  recognise is refused at every step. Set for the organization here — loosening
   it asks for confirmation and is recorded in the audit log — and tightened per
   user or per key from Users & Keys.
 - *Aliases* — stable names such as `default-chat` that point at a model, so
@@ -694,10 +694,10 @@ darkplum models add llama --hf meta-llama/Llama-3.1-8B-Instruct --revision <comm
 ## Library: skills, tools and context
 
 Every signed-in person has a Library: a tree of folders under two roots,
-**Private** (theirs alone) and **Organisation** (shared with everyone), holding
+**Private** (theirs alone) and **Organization** (shared with everyone), holding
 skills, context and tools as files. A skill is instructions in Markdown,
 context is reference text, a tool is an MCP server (streamable HTTP) the model
-may call during a chat. Moving an item from Private to Organisation shares it:
+may call during a chat. Moving an item from Private to Organization shares it:
 everyone can read and attach it, the owner alone edits it, and administrators
 can move it back or remove it. Administrators never see private items in the
 app. Deleting a user removes their private items and passes their shared ones
@@ -724,7 +724,7 @@ read back; a rename or move starts a fresh history at the new key. Open it in
 the S3 console, back it up, `aws s3 sync` it to disk, put it in git. The app
 is the writer: a file edited, added or deleted in the bucket is not seen until
 someone presses **Sync from bucket** (own files; an administrator for the
-Organisation root), which imports new files and adopts edited ones, leaves a
+Organization root), which imports new files and adopts edited ones, leaves a
 file alone when it changed in the app as well (the app's version wins, the
 bucket's stays in version history), and never treats a deleted file as a
 deletion (the app writes it back). Setting it back to `false` takes the bucket

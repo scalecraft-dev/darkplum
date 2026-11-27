@@ -29,7 +29,7 @@ Early release, AWS only. Read [Status](#status) before you install.
   Vendor-key models leave it, are off by default, and every request records
   which class answered.
 - **One endpoint, policy on every request.** The gateway enforces the
-  organisation's residency ladder and each user's or API key's allowlist, and
+  organization's residency ladder and each user's or API key's allowlist, and
   records every request, including refusals. Optional intent routing runs
   in-cluster, never through a third party.
 - **Chat and admin UI.** Streaming chat with server-side history only its

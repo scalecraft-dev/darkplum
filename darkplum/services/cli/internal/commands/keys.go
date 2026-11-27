@@ -37,7 +37,7 @@ type KeysCmd struct {
 type KeysSetCmd struct {
 	Vendor      string `arg:"" enum:"anthropic,openai,huggingface" help:"anthropic, openai or huggingface."`
 	Models      string `help:"Catalog filter: comma-separated globs of model ids that may ever be enabled, e.g. 'claude-*'. Required the first time; kept after that."`
-	Workspace   string `help:"Anthropic workspace id (wrkspc_...) for a key created at organisation level. Kept from the last run when omitted."`
+	Workspace   string `help:"Anthropic workspace id (wrkspc_...) for a key created at organization level. Kept from the last run when omitted."`
 	NoWorkspace bool   `name:"no-workspace" help:"Clear the stored Anthropic workspace id."`
 	AllowAll    bool   `name:"allow-all" help:"Allow a filter that admits every model the key can reach, including ones not yet released."`
 	SkipVerify  bool   `name:"skip-verify" help:"Do not check the key against the vendor first."`
@@ -338,7 +338,7 @@ func (e *keysEnv) setInference(ctx context.Context, info vendor.Info, c *KeysSet
 		ids, err := e.check.Models(ctx, info.Name, key, workspace)
 		switch {
 		case errors.Is(err, vendor.ErrWorkspaceNeeded):
-			return fmt.Errorf("this key was created at organisation level, so %s needs a workspace id with it:\n"+
+			return fmt.Errorf("this key was created at organization level, so %s needs a workspace id with it:\n"+
 				"       darkplum keys set %s --workspace wrkspc_...   (Anthropic console > Workspaces), or use a key created inside a workspace.\n"+
 				"       Nothing was changed.", info.Display, info.Name)
 		case err != nil:
@@ -412,7 +412,7 @@ func (e *keysEnv) setInference(ctx context.Context, info vendor.Info, c *KeysSet
 	}
 	fmt.Fprintf(e.out, "\n%s key stored in %s/%s. It is org-wide: darkplum cannot see or verify what it is\n"+
 		"scoped to, and has no spend cap of its own. Use %s.\n\n", info.Display, e.kc.Namespace(), vendor.ProviderKeysSecret, info.Console)
-	fmt.Fprintln(e.out, "Nothing can answer yet. New models start disabled, and the organisation's routing policy keeps prompts")
+	fmt.Fprintln(e.out, "Nothing can answer yet. New models start disabled, and the organization's routing policy keeps prompts")
 	fmt.Fprintln(e.out, "inside your cloud account until an administrator allows otherwise:")
 	fmt.Fprintln(e.out, "  Open Admin > Models and choose \"Review and enable\".")
 	return nil
@@ -492,7 +492,7 @@ func (e *keysEnv) setBilling(ctx context.Context, info vendor.Info, c *KeysSetCm
 	}
 	fmt.Fprintf(e.out, "\n%s billing key stored in %s/%s. The api picks it up within about two minutes and\n"+
 		"pulls %s's usage and cost reports once a day (and now); see Admin > Activity > Spend.\n"+
-		"This key can read your organisation's workspaces and keys: keep it separate from the inference key, and revoke it at\n"+
+		"This key can read your organization's workspaces and keys: keep it separate from the inference key, and revoke it at\n"+
 		"%s if you remove it here.\n", info.Display, e.kc.Namespace(), vendor.BillingKeysSecret, info.Display, info.Display)
 	return nil
 }

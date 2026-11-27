@@ -232,7 +232,7 @@ export function ChatPage() {
         : 'empty'
 
   /** The first visit starts on the model the policy nominates — the first
-   *  non-null default walking key → user → organisation. Without one,
+   *  non-null default walking key → user → organization. Without one,
    *  pickDefaultModel chooses by where the prompt goes rather than by where the
    *  entry happens to fall in the list. Once this has fired, an empty selection
    *  is a deliberate one and stays empty. */

@@ -405,7 +405,7 @@ func TestKeysSetUnreachableVendorAndSkipVerify(t *testing.T) {
 	}
 }
 
-func TestKeysSetOrganisationKeyNeedsWorkspace(t *testing.T) {
+func TestKeysSetOrganizationKeyNeedsWorkspace(t *testing.T) {
 	f := newFakeCluster()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("anthropic-workspace-id") == "" {
@@ -637,7 +637,7 @@ func TestKeysBilling(t *testing.T) {
 	f2 := newFakeCluster()
 	env.kc = f2.client()
 	err := env.set(context.Background(), &KeysSetCmd{Vendor: "openai", Billing: true})
-	if err == nil || !strings.Contains(err.Error(), "OpenAI answered HTTP 403 to a usage query with this key. It needs an organisation admin key") {
+	if err == nil || !strings.Contains(err.Error(), "OpenAI answered HTTP 403 to a usage query with this key. It needs an organization admin key") {
 		t.Errorf("err = %v", err)
 	}
 	if len(f2.writes()) != 0 {

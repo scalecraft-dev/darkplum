@@ -1,5 +1,5 @@
 -- Images and files a person attaches to a chat turn: the bytes live here, in
--- the organisation's own database, next to the conversation they belong to.
+-- the organization's own database, next to the conversation they belong to.
 --
 -- Privacy: an attachment is readable ONLY by the owner of its conversation.
 -- There is no user_id column on purpose (like conversation_messages); every

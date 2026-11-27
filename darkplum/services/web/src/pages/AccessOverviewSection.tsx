@@ -49,7 +49,7 @@ function ReachableCell({ ids, models }: { ids?: string[]; models: AdminModel[] }
 
 /**
  * Every user and key that has been narrowed, with what it can actually reach.
- * Principals that inherit are not listed: they are the organisation, and the
+ * Principals that inherit are not listed: they are the organization, and the
  * card above already says what that is.
  */
 export function AccessOverviewSection({
@@ -69,7 +69,7 @@ export function AccessOverviewSection({
           <h2 id="access-overview-heading" className={styles.title}>Access overview</h2>
           <p className={styles.subtitle}>
             Users and keys with a routing policy of their own. Everyone else inherits the
-            organisation's.
+            organization's.
           </p>
         </div>
         {!loading && !error && principals.length > 0 && (
@@ -113,7 +113,7 @@ export function AccessOverviewSection({
                     <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
                       <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
                     </svg>
-                    <span className={styles.emptyTitle}>Everyone inherits the organisation</span>
+                    <span className={styles.emptyTitle}>Everyone inherits the organization</span>
                     <span className={styles.emptyHint}>
                       {POLICY_RULE} Narrow a single user or key from the shield button on its row in
                       Users &amp; Keys.

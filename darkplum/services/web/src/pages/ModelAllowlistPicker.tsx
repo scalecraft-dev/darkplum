@@ -28,7 +28,7 @@ interface Props {
 }
 
 /**
- * The one control for writing a model allowlist — used by the organisation's
+ * The one control for writing a model allowlist — used by the organization's
  * policy card and by the per-principal drawer, so the two never drift apart.
  *
  * An allowlist stores concrete model ids and never an alias. The alias buttons

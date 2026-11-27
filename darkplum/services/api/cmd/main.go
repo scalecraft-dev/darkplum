@@ -531,7 +531,7 @@ func buildRouter(d routerDeps) *gin.Engine {
 
 			// Versioned price book behind the spend estimates. PUT with an id
 			// closes the old row and inserts a new one; DELETE retires.
-			// Organisation settings (migration 025): the platform system
+			// Organization settings (migration 025): the platform system
 			// prompt the webchat proxy prepends to every turn.
 			adminOnly.GET("/settings/system-prompt", d.settings.GetSystemPrompt)
 			adminOnly.PUT("/settings/system-prompt", d.settings.PutSystemPrompt)

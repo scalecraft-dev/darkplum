@@ -18,7 +18,7 @@ interface Props {
   /** Opens the routing-policy drawer for one user. */
   onEditPolicy?: (user: User) => void
   /** Each user's own routing-policy row, by id. Absent means it inherits the
-   *  organisation's — the "Model access" cell reads this either way. */
+   *  organization's — the "Model access" cell reads this either way. */
   policyById?: ReadonlyMap<string, PrincipalPolicy>
 }
 
@@ -184,7 +184,7 @@ function PolicyCell({
   label: string
   onClick?: () => void
 }) {
-  const summary = policy ? storedSummary(policy, models) : 'Inherits organisation'
+  const summary = policy ? storedSummary(policy, models) : 'Inherits organization'
   if (!onClick) {
     return <span className={styles.muted}>{summary}</span>
   }
@@ -408,7 +408,7 @@ export function UsersTab({ users, models, isAdmin, currentUserId, onCreate, onDe
             <option value="admin">Admin — everything, including users, models and policy</option>
           </Select>
           <p className={styles.roleNote}>
-            A new user inherits the organisation's routing policy. Narrow it for them from the
+            A new user inherits the organization's routing policy. Narrow it for them from the
             Model access cell on their row.
           </p>
           <div className={styles.formFooter}>

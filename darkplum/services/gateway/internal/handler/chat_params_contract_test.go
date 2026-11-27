@@ -3,7 +3,7 @@ package handler
 // The chat parameter contract (GitHub #3, Phase B): for EVERY row of the
 // registry (internal/chatparams, pinned to docs/chat-params.json by its own
 // test) and every backend, the handler does what the row says -- in default
-// mode and in an organisation's strict mode:
+// mode and in an organization's strict mode:
 //
 //	forward / translate  reaches the provider request (and, for the three
 //	                     HTTP backends, the wire)

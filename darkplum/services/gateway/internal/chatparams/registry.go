@@ -13,7 +13,7 @@
 //	accept-default  the caller sent the backend's default value; silent and
 //	                not recorded (null for any key is the same)
 //	drop-recorded   not sent; named in X-Darkplum-Dropped-Params and in
-//	                inference_events.dropped_params. In an organisation's
+//	                inference_events.dropped_params. In an organization's
 //	                strict mode it is refused (400 unsupported_parameter)
 //	                instead
 //	contract-refuse 400 unsupported_parameter naming the field, in every mode,
@@ -87,7 +87,7 @@ type Row struct {
 	When string `json:"when"`
 	// Backends is the disposition per backend, in default (lenient) mode.
 	Backends map[Backend]Disposition `json:"backends"`
-	// Strict is the disposition per backend in an organisation's strict mode:
+	// Strict is the disposition per backend in an organization's strict mode:
 	// identical to Backends except that drop-recorded becomes
 	// contract-refuse.
 	Strict map[Backend]Disposition `json:"strict"`

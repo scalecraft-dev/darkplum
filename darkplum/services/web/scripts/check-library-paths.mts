@@ -54,7 +54,7 @@ check('file name context', fileNameOf({ slug: 'style', kind: 'context' }), 'styl
 check('file name tool', fileNameOf({ slug: 'jira', kind: 'tool' }), 'jira.tool.json')
 check('file name from api wins', fileNameOf({ slug: 'x', kind: 'tool', file_name: 'given.tool.json' }), 'given.tool.json')
 check('display path', displayPath('legal/contracts', 'private'), 'Private / legal / contracts')
-check('display path root', displayPath('', 'org'), 'Organisation')
+check('display path root', displayPath('', 'org'), 'Organization')
 check('display path no root', displayPath('a/b'), 'a / b')
 
 const tree = buildTree(['legal/contracts', 'legal', 'ops/runbooks/aws', 'legal/contracts'])

@@ -13,8 +13,8 @@ import { WEB_PORT_FORWARD_URL } from './vendorKeys.ts'
  * Vendor billing keys and the reconciliation they feed.
  *
  * A billing key is NOT the inference key. Anthropic's usage and cost reports
- * need an Admin API key; OpenAI's need an organisation admin key. Both can list
- * the organisation's workspaces/projects and keys, so Darkplum holds them in
+ * need an Admin API key; OpenAI's need an organization admin key. Both can list
+ * the organization's workspaces/projects and keys, so Darkplum holds them in
  * their own Secret, read only by the api's daily reconciliation job and never
  * by the gateway. Every sentence here keeps that line visible. Bedrock needs
  * no key: it reconciles through AWS Cost Explorer with the api's own role.
@@ -23,13 +23,13 @@ import { WEB_PORT_FORWARD_URL } from './vendorKeys.ts'
 /** What each vendor calls the credential, in its console's own words. */
 export const BILLING_KEY_NAME: Record<VendorName, string> = {
   anthropic: 'Admin API key',
-  openai: 'organisation admin key',
+  openai: 'organization admin key',
 }
 
 /** The one-line explanation under the "Billing key (optional)" heading. */
 export function billingKeyExplanation(vendor: VendorName): string {
   const name = providerLabel(vendor)
-  return `Reconciles Darkplum's estimates against ${name}'s own usage and cost reports. Needs an ${BILLING_KEY_NAME[vendor]} — a different, broader credential than the inference key above: it can list your organisation's workspaces and keys. It is held by Darkplum's api only, used by one daily job, and never by the gateway.`
+  return `Reconciles Darkplum's estimates against ${name}'s own usage and cost reports. Needs an ${BILLING_KEY_NAME[vendor]} — a different, broader credential than the inference key above: it can list your organization's workspaces and keys. It is held by Darkplum's api only, used by one daily job, and never by the gateway.`
 }
 
 /** Where to make one, said in the modal beside the field. */
@@ -94,7 +94,7 @@ export function billingStateCopy(vendor: ReconciliationVendor, state: BillingSta
         variant: 'danger',
         detail:
           vendor === 'openai'
-            ? 'This is a project key. The reports need an organisation admin key created under Organization settings > Admin keys.'
+            ? 'This is a project key. The reports need an organization admin key created under Organization settings > Admin keys.'
             : 'This is an inference key. The reports need an Admin API key created under Settings > Admin keys.',
       }
     case 'pending_mount':

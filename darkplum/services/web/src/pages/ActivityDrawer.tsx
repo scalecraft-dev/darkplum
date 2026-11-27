@@ -417,12 +417,12 @@ export function ActivityDrawer({ open, onClose, user, apiKey, timeRange }: Drawe
                       <Badge
                         variant="warning"
                         bordered
-                        title={`This request ran at ${e.egress}'s own API, using your organisation's key. It left your cloud account.`}
+                        title={`This request ran at ${e.egress}'s own API, using your organization's key. It left your cloud account.`}
                       >
                         <EgressGlyph />
                         Left cloud account · {e.egress}
                         <span className={styles.srOnly}>
-                          {`. This request ran at ${e.egress}'s own API, using your organisation's key. It left your cloud account.`}
+                          {`. This request ran at ${e.egress}'s own API, using your organization's key. It left your cloud account.`}
                         </span>
                       </Badge>
                     )}

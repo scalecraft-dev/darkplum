@@ -171,7 +171,7 @@ func resolvedSystemPrompt(text string) string {
 }
 
 // effectiveSystemPrompt is the text prepended to this request: the
-// organisation's custom prompt when an admin set one, else the built-in.
+// organization's custom prompt when an admin set one, else the built-in.
 func (h *ChatHandler) effectiveSystemPrompt(ctx context.Context) string {
 	if custom, ok := systemPromptCache.get(ctx, h.db); ok {
 		return resolvedSystemPrompt(custom)
@@ -199,7 +199,7 @@ func peekStream(body []byte) bool {
 
 // ProxyChat handles POST /v1/chat/completions.
 //
-// Session (webchat) requests get the organisation system prompt prepended and
+// Session (webchat) requests get the organization system prompt prepended and
 // the service API key, then are proxied to the gateway, streaming the
 // response back to the browser. The org prompt is session-only: Bearer
 // (API-key) requests are forwarded to the gateway byte for byte, with the

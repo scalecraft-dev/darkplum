@@ -46,7 +46,7 @@ export interface ChatFailure {
   modelGone?: boolean
   /** Who served, or would have served, the turn: the gateway's own provider
    *  header when it got that far, else the picked entry's owner. Only the two
-   *  vendors with an organisation key are ever named — see failedVendorLabel. */
+   *  vendors with an organization key are ever named — see failedVendorLabel. */
   vendor?: string | null
   /** unsupported_parameter only: the request field the gateway refused. */
   param?: string | null
@@ -99,7 +99,7 @@ const ROUTE_UNAVAILABLE_FOR_USERS =
   'The model that would answer this message is not available right now. Nothing was sent anywhere else instead.'
 
 /** Headline and next step for each refusal the gateway can return — a routing
- *  decision of the organisation's own, or a failure at the vendor.
+ *  decision of the organization's own, or a failure at the vendor.
  *  When a re-read of the list has confirmed the model is gone, the next step is
  *  the same for everyone — choose another one — so it replaces the per-role
  *  advice, which would otherwise point at a model that no longer exists. */
@@ -169,8 +169,8 @@ function failureCopy(
       return {
         title: 'That model is not allowed for you',
         hint: isAdmin
-          ? "This model is enabled for the organisation, but your own policy — or the policy on the key being used — does not include it. Change it under Users & Keys, or pick a model from the list."
-          : 'Your organisation limits which models you can use. Pick one from the list at the top of the page.',
+          ? "This model is enabled for the organization, but your own policy — or the policy on the key being used — does not include it. Change it under Users & Keys, or pick a model from the list."
+          : 'Your organization limits which models you can use. Pick one from the list at the top of the page.',
       }
     case 'model_residency_violation':
       // The gateway's own message names the rung in force and the class that
@@ -182,7 +182,7 @@ function failureCopy(
         title: 'Blocked by where-it-runs policy',
         hint: isAdmin
           ? 'Pick a model the policy permits, or change where requests may run under Models → Policy. Nothing is sent to a different model instead.'
-          : 'Your organisation limits where models may run. Pick another model from the list at the top of the page.',
+          : 'Your organization limits where models may run. Pick another model from the list at the top of the page.',
       }
     case DATA_RETENTION_CODE: {
       // The gateway's sentence (printed above, verbatim) already says what
@@ -202,17 +202,17 @@ function failureCopy(
           ? 'The gateway has no routing policy it can trust, so it is temporarily refusing every request rather than guessing. Try again shortly, and check the gateway’s database connectivity if it persists.'
           : 'The service is temporarily refusing requests for safety. Try again shortly.',
       }
-    // --- Vendor failures. Nothing in the organisation's own configuration is
+    // --- Vendor failures. Nothing in the organization's own configuration is
     // wrong in any of these, so none of them sends anyone to the Models page
     // to change a policy — the key, or the vendor, is the subject.
     case 'provider_rate_limited':
       return {
-        title: `${vendor} is rate-limiting your organisation’s key`,
-        hint: 'Everyone in your organisation shares this key. Wait a moment before trying again.',
+        title: `${vendor} is rate-limiting your organization’s key`,
+        hint: 'Everyone in your organization shares this key. Wait a moment before trying again.',
       }
     case 'provider_auth_failed':
       return {
-        title: `${vendor} rejected your organisation’s key`,
+        title: `${vendor} rejected your organization’s key`,
         hint: isAdmin
           ? 'The key darkplum holds for this vendor is no longer accepted — set it again under Model vendors. Other models still work.'
           : 'An administrator needs to fix this. Other models still work.',
@@ -312,13 +312,13 @@ const FailureNotice = ({
       failure.code === MODEL_RETIRED_CODE)
   // Retrying sends the same message to the same retired model.
   const retiredRelated = failure.code === MODEL_RETIRED_CODE
-  // Fixed in the organisation's routing policy, which is its own tab on the
+  // Fixed in the organization's routing policy, which is its own tab on the
   // Models page — the model is enabled, the policy is what refuses it.
   const orgPolicyRelated = failure.code === 'model_residency_violation'
   // A per-principal refusal is fixed where per-principal policy is written, not
   // on the Models page: the model itself is enabled and allowed for the org.
   const principalPolicyRelated = failure.code === 'model_not_allowed'
-  // Fixed by setting the organisation's key again, which is the vendor block
+  // Fixed by setting the organization's key again, which is the vendor block
   // of the Models page rather than the catalogue or any policy.
   const vendorKeyRelated = failure.code === 'provider_auth_failed'
   // Fixed in AWS, not here: a retry is refused again until the account's
@@ -624,7 +624,7 @@ const Provenance = ({
           {egress && (
             <span
               className={styles.provenanceEgress}
-              title={`This message was sent to ${vendor}'s API using your organisation's key, and left your cloud account.`}
+              title={`This message was sent to ${vendor}'s API using your organization's key, and left your cloud account.`}
             >
               <EgressGlyph />
               sent to {vendor}

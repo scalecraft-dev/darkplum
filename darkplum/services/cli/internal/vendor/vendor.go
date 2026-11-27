@@ -69,7 +69,7 @@ func Get(n Name) (Info, bool) {
 		return Info{Name: OpenAI, Display: "OpenAI", KeyFile: "openai-api-key", BillingFile: "openai-billing-key",
 			FilterKey: "OPENAI_MODEL_FILTER", EnvKey: "OPENAI_API_KEY", EnvBilling: "OPENAI_ADMIN_KEY", Example: "gpt-*",
 			Console:     "a project-scoped key with a model allowlist and a project budget (platform.openai.com > Projects)",
-			BillingHint: "an organisation admin key from platform.openai.com > Settings > Organization > Admin keys; a project key is refused by the costs endpoint"}, true
+			BillingHint: "an organization admin key from platform.openai.com > Settings > Organization > Admin keys; a project key is refused by the costs endpoint"}, true
 	}
 	return Info{}, false
 }
@@ -192,7 +192,7 @@ type RejectedError struct{ Code int }
 func (e *RejectedError) Error() string { return fmt.Sprintf("HTTP %d", e.Code) }
 
 // ErrWorkspaceNeeded means Anthropic wants an anthropic-workspace-id header with
-// this (organisation-level) key.
+// this (organization-level) key.
 var ErrWorkspaceNeeded = errors.New("the key needs an Anthropic workspace id")
 
 func (c *Checker) get(ctx context.Context, target string, header http.Header) (int, []byte, error) {

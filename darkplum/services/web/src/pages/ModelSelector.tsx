@@ -113,7 +113,7 @@ export function ModelSelector({ models, isLoading, error, value, onChange }: Pro
   /**
    * Four groups, in the order a person cares about them: the names their
    * administrator invented, then the three places a model can run, closest to
-   * the organisation first. A vendor's models sit in a group named after the
+   * the organization first. A vendor's models sit in a group named after the
    * vendor, because "OpenAI" is a more useful heading in a menu than "External
    * API" — the class vocabulary is for the administrator writing the policy,
    * not for the person picking something to type at.

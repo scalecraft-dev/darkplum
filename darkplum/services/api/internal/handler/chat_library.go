@@ -9,7 +9,7 @@ package handler
 //
 //   - skill and context items become one extra system message, after the
 //     platform prompt, inside a delimited block the model can tell apart from
-//     the organisation's own instructions;
+//     the organization's own instructions;
 //   - tool items (MCP servers) become the request's `tools`, and the proxy
 //     runs the tool loop: when the model answers with tool_calls, the api
 //     calls the server, reports the call and its result to the browser as

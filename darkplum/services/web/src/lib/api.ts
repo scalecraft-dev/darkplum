@@ -689,7 +689,7 @@ export function deleteModelAlias(alias: string): Promise<void> {
   return request<void>(ROUTES.deleteModelAlias, { params: { alias } })
 }
 
-// Routing policy — organisation (admin)
+// Routing policy — organization (admin)
 
 export function getRoutingPolicy(): Promise<RoutingPolicy> {
   return request<RoutingPolicy>(ROUTES.getRoutingPolicy)
@@ -1105,7 +1105,7 @@ export async function streamChat(
 //
 // Session-scoped like conversations: a private item that is not the signed-in
 // person's comes back as a 404, never a 403. Shared items are readable by
-// everyone in the organisation and editable by their owner only.
+// everyone in the organization and editable by their owner only.
 // ---------------------------------------------------------------------------
 
 export function listLibrary(
@@ -1176,7 +1176,7 @@ export function deleteLibraryItem(id: string): Promise<void> {
   return request<void>(ROUTES.deleteLibraryItem, { params: { id } })
 }
 
-/** `org` shares with everyone in the organisation; `private` takes it back. */
+/** `org` shares with everyone in the organization; `private` takes it back. */
 export function shareLibraryItem(id: string, visibility: LibraryVisibility): Promise<LibraryItem> {
   return request<LibraryItem>(ROUTES.shareLibraryItem, { params: { id }, body: { visibility } })
 }

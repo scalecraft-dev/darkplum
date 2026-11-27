@@ -80,7 +80,7 @@ spec:
                   key: ANTHROPIC_MODEL_FILTER_SET_AT
                   optional: true
             # Sent as anthropic-workspace-id on every Anthropic request. Needed
-            # only for a key created at organisation level rather than inside a
+            # only for a key created at organization level rather than inside a
             # workspace; set from Admin > Models or `darkplum keys set anthropic
             # --workspace ...`, same last-writer rule as the filter.
             - name: ANTHROPIC_WORKSPACE_ID
@@ -112,7 +112,7 @@ spec:
             - name: provider-keys
               mountPath: /var/run/darkplum/provider-keys
               readOnly: true
-            # Per-organisation HMAC secret (files user-hmac-key, user-hmac-key-id)
+            # Per-organization HMAC secret (files user-hmac-key, user-hmac-key-id)
             # used to pseudonymise the OpenAI `user` field before it is sent to
             # Anthropic / Bedrock, which must never receive the raw identifier.
             # Generated at install by `darkplum deploy` and read from files

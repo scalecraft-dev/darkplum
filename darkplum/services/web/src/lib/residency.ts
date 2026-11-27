@@ -72,7 +72,7 @@ export const RESIDENCY_LADDER: ResidencyRung[] = [
     value: 'any',
     label: 'Any model, including outside your account',
     consequence:
-      "Requests may also go to a vendor's own API — Anthropic or OpenAI — using your organisation's key. Those prompts leave your cloud account.",
+      "Requests may also go to a vendor's own API — Anthropic or OpenAI — using your organization's key. Those prompts leave your cloud account.",
   },
   {
     value: 'cloud_account_only',
@@ -102,7 +102,7 @@ const DISPLAY_CLASSES: DisplayClass[] = [
 ]
 
 /**
- * Choosing order for classes: what is held closest to the organisation first,
+ * Choosing order for classes: what is held closest to the organization first,
  * what leaves it last. Lower sorts earlier.
  *
  * Derived from the ladder above rather than typed out a second time, so the UI
@@ -145,11 +145,11 @@ export function residencyLabel(residency: Residency | string | null | undefined)
 }
 
 /** The same fact said to the person it limits, in chat. Shorter, and about
- *  where their words go rather than about what the organisation permits. */
+ *  where their words go rather than about what the organization permits. */
 export function residencyLabelForSelf(residency: Residency | string | null | undefined): string {
   switch (residencyRank(residency)) {
     case RESIDENCY_RANK.any:
-      return 'Anywhere the organisation has enabled, including vendor APIs outside your cloud account'
+      return 'Anywhere the organization has enabled, including vendor APIs outside your cloud account'
     case RESIDENCY_RANK.cloud_account_only:
       return 'Inside your cloud account — nothing is sent to a model vendor'
     default:
@@ -158,11 +158,11 @@ export function residencyLabelForSelf(residency: Residency | string | null | und
 }
 
 /**
- * Whether the organisation has narrowed itself past what Darkplum ships.
+ * Whether the organization has narrowed itself past what Darkplum ships.
  *
  * `cloud_account_only` is the shipped default and the state every install
  * starts in, so it is NOT a restriction — marking it as one would put a
- * warning on the policy card of every organisation that has never touched it,
+ * warning on the policy card of every organization that has never touched it,
  * and a warning everyone sees is a warning nobody reads. Only a deliberate
  * move to self-hosted only, or an allowlist, counts.
  *
@@ -191,7 +191,7 @@ export function orgPolicyRestricted(
  * the two things that are knowable without the catalogue — a rung stricter
  * than the shipped default, and a rung set on this person or their key rather
  * than inherited. Both are deliberate narrowings someone chose; the default,
- * inherited from the organisation, is not, and does not raise the notice.
+ * inherited from the organization, is not, and does not raise the notice.
  */
 export function policyLimits(
   effective: EffectivePolicy | null,

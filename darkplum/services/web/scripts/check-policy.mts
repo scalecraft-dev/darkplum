@@ -47,6 +47,7 @@ import {
   residencyRank,
 } from '../src/lib/residency.ts'
 import { chatTagline, pickDefaultModel, type ChoosableModel } from '../src/lib/modelChoice.ts'
+import { ORG_LOCKED_OUT, isOrgLockOut } from '../src/lib/lockOut.ts'
 import {
   DENIAL_CODES,
   RETRY_AFTER_DEFAULT_SECONDS,
@@ -254,7 +255,7 @@ for (let i = 1; i < RESIDENCY_LADDER.length; i += 1) {
 // --- "restricted" is a narrowing past the default, not the default itself ----
 //
 // Every install starts on the default rung. If that counted as restricted, the
-// policy card and the catalogue would carry a warning in every organisation
+// policy card and the catalogue would carry a warning in every organization
 // that has never touched them, which is the same as carrying it in none.
 
 check(
@@ -403,9 +404,9 @@ check(
   chatTagline(vendor),
   'This model is called at Anthropic. Your message leaves your cloud account.',
 )
-check('chatTagline(unreported class)', chatTagline(unreported), 'Private AI for your organisation.')
-check('chatTagline(routed, mixed)', chatTagline(mixedAlias), 'Private AI for your organisation.')
-check('chatTagline(nothing selected)', chatTagline(null), 'Private AI for your organisation.')
+check('chatTagline(unreported class)', chatTagline(unreported), 'Private AI for your organization.')
+check('chatTagline(routed, mixed)', chatTagline(mixedAlias), 'Private AI for your organization.')
+check('chatTagline(nothing selected)', chatTagline(null), 'Private AI for your organization.')
 for (const claimant of [bedrock, vendor, unreported, mixedAlias]) {
   if (chatTagline(claimant).includes('your infrastructure')) {
     failures.push(`chatTagline(${claimant.id}) claims "your infrastructure" for a ${
@@ -416,7 +417,7 @@ for (const claimant of [bedrock, vendor, unreported, mixedAlias]) {
 
 // --- how long chat waits after a vendor rate limit ---------------------------
 //
-// A 429 on the one organisation-wide key is the likeliest vendor failure there
+// A 429 on the one organization-wide key is the likeliest vendor failure there
 // is, and the wrong answer to it is a UI that invites everyone to press Try
 // again immediately. The interval comes from the vendor's own Retry-After,
 // relayed by the gateway and the api; everything unusable about that header
@@ -454,7 +455,7 @@ check('formatRetryCountdown(negative) never shows a minus', formatRetryCountdown
 
 // --- who a vendor failure names ----------------------------------------------
 //
-// These messages are about the organisation's one shared key, and only two
+// These messages are about the organization's one shared key, and only two
 // vendors have one. Naming anything else — a local runtime, a routed alias's
 // own owner — invents a party that has no key and no rate limit.
 
@@ -471,7 +472,7 @@ check('failedVendorLabel("")', failedVendorLabel(''), 'The model vendor')
 // --- installing a vendor key from the UI --------------------------------------
 //
 // The model filter these functions produce decides which of a vendor's models
-// the organisation is billed for, and it is written without anyone seeing the
+// the organization is billed for, and it is written without anyone seeing the
 // pattern. That makes serialiseModelFilter the one function on this surface
 // worth pinning cell by cell: a glob that admits one model nobody ticked is a
 // recurring charge with no screen it appears on.
@@ -1820,15 +1821,15 @@ check(
 // non-colour cue, and the Pull now cooldown.
 {
   check('billing key name anthropic', BILLING_KEY_NAME.anthropic, 'Admin API key')
-  check('billing key name openai', BILLING_KEY_NAME.openai, 'organisation admin key')
+  check('billing key name openai', BILLING_KEY_NAME.openai, 'organization admin key')
   check(
     'billingKeyExplanation anthropic',
     billingKeyExplanation('anthropic'),
-    "Reconciles Darkplum's estimates against Anthropic's own usage and cost reports. Needs an Admin API key — a different, broader credential than the inference key above: it can list your organisation's workspaces and keys. It is held by Darkplum's api only, used by one daily job, and never by the gateway.",
+    "Reconciles Darkplum's estimates against Anthropic's own usage and cost reports. Needs an Admin API key — a different, broader credential than the inference key above: it can list your organization's workspaces and keys. It is held by Darkplum's api only, used by one daily job, and never by the gateway.",
   )
   check(
     'billingKeyExplanation openai names the org admin key',
-    billingKeyExplanation('openai').includes('Needs an organisation admin key'),
+    billingKeyExplanation('openai').includes('Needs an organization admin key'),
     true,
   )
   check(
@@ -2005,6 +2006,21 @@ check(
 
 // --- report ------------------------------------------------------------------
 
+// --- the whole-organization lock-out name --------------------------------------
+// The api sends it as the one locked_out entry of a routing-policy 409 and the
+// card compares it exactly. A spelling change on one side alone would list
+// "(organization)" as if it were a user's name.
+{
+  const ROUTING_GO = fileURLToPath(new URL('../../api/internal/handler/routing.go', import.meta.url))
+  const sent = /const orgLockedOutName = "([^"]+)"/.exec(readFileSync(ROUTING_GO, 'utf8'))?.[1]
+  check('the api\'s orgLockedOutName is the web\'s ORG_LOCKED_OUT', sent, ORG_LOCKED_OUT)
+  check('isOrgLockOut(what the api sends)', isOrgLockOut([ORG_LOCKED_OUT]), true)
+  check('isOrgLockOut(what an api up to v0.2.0 sends)', isOrgLockOut(['(organisation)']), true)
+  check('isOrgLockOut(one named user)', isOrgLockOut(['ada@example.com']), false)
+  check('isOrgLockOut(the name beside a user)', isOrgLockOut([ORG_LOCKED_OUT, 'ada@example.com']), false)
+  check('isOrgLockOut(nobody)', isOrgLockOut([]), false)
+}
+
 if (failures.length > 0) {
   console.error('Residency truth table does not hold:\n')
   for (const f of failures) console.error(`  ${f}`)
@@ -2015,5 +2031,5 @@ if (failures.length > 0) {
 }
 
 console.log(
-  `Residency truth table holds (${table.cells.length} cells from ${RESIDENCY_TRUTH_TABLE_PATH} + ladder order + restricted rule + class rank, model fallback, empty-state claim, vendor rate-limit wait, who a vendor failure names, and the vendor-key helpers: glob matching, filter serialisation over every subset of a catalogue, the checklist's headings, what a Replace opens on, the key entry line, the installing and removing windows, the transport gate, which of the two transport faults each refusal names, the admitted diff, the Bedrock data-retention opt-in copy, and the routed-alias on_route_unavailable rule: reason text, the setting x class outcome matrix, route hints, the classification-failure warning, the route_target_unavailable refusal, and what a disable does to each alias; and the spend helpers: cost display, exact CSV dollars, $/MTok, price input, shares, coverage caption, grouping labels, chart buckets, the one-read class timeline; and the billing-key helpers: state copy, verify errors, the signed difference, the Pull now cooldown, the audit labels; and the request-parameter helpers: the dropped badge and its title, the params-mode copy and audit labels).`,
+  `Residency truth table holds (${table.cells.length} cells from ${RESIDENCY_TRUTH_TABLE_PATH} + ladder order + restricted rule + class rank, model fallback, empty-state claim, vendor rate-limit wait, who a vendor failure names, and the vendor-key helpers: glob matching, filter serialisation over every subset of a catalogue, the checklist's headings, what a Replace opens on, the key entry line, the installing and removing windows, the transport gate, which of the two transport faults each refusal names, the admitted diff, the Bedrock data-retention opt-in copy, and the routed-alias on_route_unavailable rule: reason text, the setting x class outcome matrix, route hints, the classification-failure warning, the route_target_unavailable refusal, and what a disable does to each alias; and the spend helpers: cost display, exact CSV dollars, $/MTok, price input, shares, coverage caption, grouping labels, chart buckets, the one-read class timeline; and the billing-key helpers: state copy, verify errors, the signed difference, the Pull now cooldown, the audit labels; and the request-parameter helpers: the dropped badge and its title, the params-mode copy and audit labels; and the whole-organization lock-out name the api sends).`,
 )

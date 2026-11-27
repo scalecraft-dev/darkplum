@@ -113,14 +113,14 @@ export function ModelAccessNotice({ models, suppressError = false }: Props) {
         open={open}
         onClose={() => setOpen(false)}
         title="Why your model list is what it is"
-        description="Your organisation decides which models can answer. This is the policy as it applies to you right now."
+        description="Your organization decides which models can answer. This is the policy as it applies to you right now."
       >
         <div className={styles.body}>
           <dl className={styles.grid}>
             <dt>Models you can use</dt>
             <dd>
               {policy.allowed_models === null ? (
-                'Every model the organisation has enabled'
+                'Every model the organization has enabled'
               ) : policy.allowed_models.length === 0 ? (
                 <span className={styles.none}>None — ask an administrator</span>
               ) : (
@@ -159,9 +159,9 @@ export function ModelAccessNotice({ models, suppressError = false }: Props) {
                 is narrow, which usually means they are not the administrator
                 who could follow the link. */}
             {principalSourced && orgSourced
-              ? "Some of this comes from the organisation's policy, widened under Admin → Models → Policy; the rest is set on you or your key, in Admin → Users & Keys."
+              ? "Some of this comes from the organization's policy, widened under Admin → Models → Policy; the rest is set on you or your key, in Admin → Users & Keys."
               : principalSourced
-                ? 'An administrator can widen it from Admin → Users & Keys — this is set on you or your key, not on the organisation.'
+                ? 'An administrator can widen it from Admin → Users & Keys — this is set on you or your key, not on the organization.'
                 : 'An administrator can widen it under Admin → Models → Policy.'}
           </p>
 

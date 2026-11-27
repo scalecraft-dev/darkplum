@@ -65,7 +65,7 @@ export function pathOf(item: LibraryItem): string {
   return item.path ?? ''
 }
 
-export const SCOPE_LABEL: Record<LibraryScope, string> = { private: 'Private', org: 'Organisation' }
+export const SCOPE_LABEL: Record<LibraryScope, string> = { private: 'Private', org: 'Organization' }
 
 /** The file an item is in the bucket, when the api has not said. */
 export function fileNameOf(item: Pick<LibraryItem, 'slug' | 'kind' | 'file_name'>): string {

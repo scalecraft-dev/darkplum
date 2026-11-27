@@ -1538,7 +1538,7 @@ func (h *ChatHandler) HandleChatCompletions(c *gin.Context) {
 	}
 
 	// Everything the gateway did not pass on as sent, decided before the first
-	// byte goes out. In an organisation's strict mode a dropped parameter is a
+	// byte goes out. In an organization's strict mode a dropped parameter is a
 	// refusal instead: nothing has been sent to the provider yet.
 	acts := append(append(append([]paramAction(nil), reasoning.Dropped...), plan.acts...), userActs...)
 	if snap.ParamsMode == paramsModeStrict {
@@ -2111,7 +2111,7 @@ type policyImpactPrincipal struct {
 // policyImpactResponse is the body of a 200 from POST /v1/policy/impact.
 type policyImpactResponse struct {
 	// OrgLockedOut is true when the proposed org policy itself has an empty
-	// allowlist: every principal in the organisation, explicit row or not,
+	// allowlist: every principal in the organization, explicit row or not,
 	// would then be locked out, so LockedOut is not enumerated (it would be
 	// every user and key there is).
 	OrgLockedOut bool `json:"org_locked_out"`
@@ -2125,7 +2125,7 @@ type policyImpactResponse struct {
 	// OrgNarrowed is true when the org's own allowed set (allowed ∧ enabled
 	// ∧ residency-ok — policy only, not backend health) under the override
 	// loses a model it has now: everyone who simply inherits the
-	// organisation's policy is allowed fewer models than before.
+	// organization's policy is allowed fewer models than before.
 	OrgNarrowed bool `json:"org_narrowed"`
 	// Narrowed lists every principal WITH A POLICY ROW OF ITS OWN whose
 	// allowed set under the override loses a model it has now. Principals

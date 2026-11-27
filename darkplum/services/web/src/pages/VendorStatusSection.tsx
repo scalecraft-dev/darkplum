@@ -19,7 +19,7 @@ import styles from './VendorStatusSection.module.css'
 
 /**
  * Model vendors — whether Darkplum can currently reach Anthropic and OpenAI
- * with the organisation's keys, and the place those keys are set.
+ * with the organization's keys, and the place those keys are set.
  *
  * Both vendors are always listed, configured or not. A row that appears only
  * once something exists cannot be used to find out that nothing does, and
@@ -35,7 +35,7 @@ import styles from './VendorStatusSection.module.css'
  * the gateway a minute or two later, so the modal closes and the progress
  * lives here: it is derived from the api's `installing_until` rather than from
  * a timer started in the browser, which is what makes it survive a reload, a
- * second tab, and somebody else in the same organisation watching it.
+ * second tab, and somebody else in the same organization watching it.
  */
 
 interface Props {

@@ -90,7 +90,7 @@ export function UnreachableGlyph({ size = 11, className }: GlyphProps) {
 }
 
 /**
- * Prompts on this model leave the organisation's cloud account. An arrow
+ * Prompts on this model leave the organization's cloud account. An arrow
  * crossing out of a boundary — the same shape wherever egress is marked, so an
  * administrator learns it once on the Models page and reads it again without
  * thinking in the picker, the usage log and under a reply.

@@ -88,7 +88,7 @@ func (e *libError) Error() string { return e.code }
 var (
 	errLibraryFull      = &libError{http.StatusUnprocessableEntity, "library_full", "your library holds the maximum number of items"}
 	errSlugTaken        = &libError{http.StatusConflict, "slug_taken", "an item with that slug already exists there"}
-	errSharedPathTaken  = &libError{http.StatusConflict, "shared_path_taken", "the organisation already has a file with that name in that folder"}
+	errSharedPathTaken  = &libError{http.StatusConflict, "shared_path_taken", "the organization already has a file with that name in that folder"}
 	errFolderExists     = &libError{http.StatusConflict, "folder_exists", "a folder with that name already exists"}
 	errFolderInvalid    = &libError{http.StatusBadRequest, "folder_invalid", "folder names use lowercase letters, digits and hyphens (1-64 characters), at most 5 levels deep"}
 	errFolderNotEmpty   = &libError{http.StatusConflict, "folder_not_empty", "the folder is not empty"}

@@ -1,4 +1,4 @@
-// The library: skills, context and tools a person keeps in the organisation's
+// The library: skills, context and tools a person keeps in the organization's
 // own database (migration 026), shares with colleagues, attaches to chats and
 // exports again -- so their AI configuration is theirs, not one vendor's.
 //
@@ -10,7 +10,7 @@
 // 'org' in their SQL: there is NO admin read path over private items anywhere
 // in this codebase, the same rule conversations.go keeps for chat history.
 //
-// Writes are owner-only. Sharing to the organisation is a decision the owner
+// Writes are owner-only. Sharing to the organization is a decision the owner
 // makes (POST share); an administrator may undo it or remove the item, and
 // both leave an activity event. Nothing here ever records an item's body in
 // the activity log.
@@ -942,7 +942,7 @@ type shareRequest struct {
 // Share handles POST /api/v1/library/:id/share {visibility: org|private}
 // (owner only). It is a thin wrapper over the item move: sharing carries the
 // item's folder path into the org tree (creating missing org folders) and
-// 409s shared_path_taken when the organisation already has a file with that
+// 409s shared_path_taken when the organization already has a file with that
 // name there; unsharing returns it to the folder it was shared from.
 func (h *LibraryHandler) Share(c *gin.Context) {
 	id := c.Param("id")
@@ -1069,7 +1069,7 @@ func (h *LibraryHandler) ExportOne(c *gin.Context) {
 }
 
 // ExportAll handles GET /api/v1/library/export: a zip of every item the
-// user can see (their own and the organisation's shared ones). Each entry is
+// user can see (their own and the organization's shared ones). Each entry is
 // named by the item's bucket key (org/<path>/<slug>.<kind>.<ext> or
 // people/<you>/<path>/...) and holds exactly the bytes the bucket holds, so
 // unzipping into the bucket prefix restores the tree.

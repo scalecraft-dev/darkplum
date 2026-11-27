@@ -12,7 +12,7 @@
 --       customer's account). NULL when nothing was dropped.
 --
 --   principal_routing_policies.params_mode
---       The organisation-wide switch, on the org row only. NULL and 'lenient'
+--       The organization-wide switch, on the org row only. NULL and 'lenient'
 --       mean the same thing: drop and record. 'strict' turns every drop into a
 --       400 unsupported_parameter. A contract refusal (n>1, tools on a backend
 --       that cannot take them, ...) is a 400 in both modes. The gateway reads
@@ -36,7 +36,7 @@ ALTER TABLE principal_routing_policies ADD CONSTRAINT principal_routing_policies
     CHECK (params_mode IS NULL OR params_mode IN ('lenient', 'strict'));
 
 -- Only the org row carries it: a user or key cannot opt itself out of (or
--- into) the organisation's choice.
+-- into) the organization's choice.
 ALTER TABLE principal_routing_policies DROP CONSTRAINT IF EXISTS principal_routing_policies_params_mode_org_only;
 ALTER TABLE principal_routing_policies ADD CONSTRAINT principal_routing_policies_params_mode_org_only
     CHECK (principal_type = 'org' OR params_mode IS NULL);

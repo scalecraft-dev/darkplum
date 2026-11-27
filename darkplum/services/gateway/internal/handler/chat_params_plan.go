@@ -437,14 +437,14 @@ func (h *ChatHandler) publishParamActions(c *gin.Context, acts []paramAction, ba
 	}
 }
 
-// strictRefusal is the 400 an organisation in strict mode gets for the first
+// strictRefusal is the 400 an organization in strict mode gets for the first
 // dropped parameter.
 func strictRefusal(acts []paramAction) *paramRefusal {
 	for _, a := range acts {
 		if a.Action == actionDropped {
 			return &paramRefusal{
 				Param:  a.Param,
-				Reason: "this backend does not honour it and this organisation's parameter mode is strict, so it is refused instead of dropped",
+				Reason: "this backend does not honour it and this organization's parameter mode is strict, so it is refused instead of dropped",
 			}
 		}
 	}

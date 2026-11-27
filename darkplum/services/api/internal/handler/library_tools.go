@@ -532,7 +532,7 @@ func (h *LibraryHandler) PutToolHosts(c *gin.Context) {
 }
 
 // toolHostTooBroad refuses allowlist entries that would admit far more than
-// one organisation's servers: a wildcard over a whole top-level domain
+// one organization's servers: a wildcard over a whole top-level domain
 // ("*.com"), and address literals for link-local (the cloud metadata
 // service lives there), unspecified and multicast ranges. A loopback
 // literal or a specific private address is allowed: listing one is the

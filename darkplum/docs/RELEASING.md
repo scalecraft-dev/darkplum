@@ -36,7 +36,7 @@ If an image job has to be re-run, that job gets a new attempt number and the oth
 
 A release-channel CLI therefore rejects rc images and an rc CLI rejects release images.
 
-The CLI also **only trusts one repository**, compiled in, and checks `release.json` against it. The workflows build the CLI with `-X ...release.trustedRepository=$GITHUB_REPOSITORY`, so in `scalecraft-dev/darkplum` it is the product's repository (the compiled-in default) and in a fork or a scratch organisation it is that repository: a fork's binary trusts only the fork's own images. `darkplum version` prints `NON-DEFAULT TRUST` whenever the trusted repository is not the product's, the release `verify` job asserts that banner is absent in the product repository (and present anywhere else), and nothing at run time can change it.
+The CLI also **only trusts one repository**, compiled in, and checks `release.json` against it. The workflows build the CLI with `-X ...release.trustedRepository=$GITHUB_REPOSITORY`, so in `scalecraft-dev/darkplum` it is the product's repository (the compiled-in default) and in a fork or a scratch organization it is that repository: a fork's binary trusts only the fork's own images. `darkplum version` prints `NON-DEFAULT TRUST` whenever the trusted repository is not the product's, the release `verify` job asserts that banner is absent in the product repository (and present anywhere else), and nothing at run time can change it.
 
 ## One-time repository settings (owner)
 
@@ -77,12 +77,12 @@ There is no SBOM attestation yet, on purpose. buildx would produce it (and its o
 
 ## Before the first release is merged: exercise the production identity path
 
-The rc build uses the prerelease identity, so it does not prove the release path. Cut one real signed release from a scratch repository **in a separate GitHub organisation** with the same workflow files, so nothing can be mistaken for a product artifact: its images live under that organisation's own namespace, and the CLI that trusts them has to be built by hand with the matching trusted repository.
+The rc build uses the prerelease identity, so it does not prove the release path. Cut one real signed release from a scratch repository **in a separate GitHub organization** with the same workflow files, so nothing can be mistaken for a product artifact: its images live under that organization's own namespace, and the CLI that trusts them has to be built by hand with the matching trusted repository.
 
-1. The owner creates a scratch organisation and a repository in it (for example `darkplum-scratch/darkplum-release`), and applies the settings above (tag protection, `release` environment, packages public).
+1. The owner creates a scratch organization and a repository in it (for example `darkplum-scratch/darkplum-release`), and applies the settings above (tag protection, `release` environment, packages public).
 2. Push this branch's `.github/`, `darkplum/`, `LICENSE` and `NOTICE` to the scratch repo's `main`, unmodified. Nothing in the workflows hard-codes the repository: the manifest records `github.repository` of the run, and images are named under its owner.
-3. The scratch repo's `main` has no CI history, so for this exercise only, let its own CI run on `main` first (the same workflow files run there), then tag `v0.0.1`, approve the `release` environment, and let the workflow finish into a release. Plain `vX.Y.Z` tags are fine in the scratch organisation.
-4. In the scratch organisation the workflow builds the CLI trusting the scratch repository, so its own anonymous `verify` job exercises the production identity path end to end (`NON-DEFAULT TRUST` is expected there). Download the release's linux archive with a clean `HOME` and run it by hand too:
+3. The scratch repo's `main` has no CI history, so for this exercise only, let its own CI run on `main` first (the same workflow files run there), then tag `v0.0.1`, approve the `release` environment, and let the workflow finish into a release. Plain `vX.Y.Z` tags are fine in the scratch organization.
+4. In the scratch organization the workflow builds the CLI trusting the scratch repository, so its own anonymous `verify` job exercises the production identity path end to end (`NON-DEFAULT TRUST` is expected there). Download the release's linux archive with a clean `HOME` and run it by hand too:
    ```bash
    tar -xzf darkplum_0.0.1_linux_amd64.tar.gz darkplum
    ./darkplum version           # NON-DEFAULT TRUST: scratch-org/repo, channel release

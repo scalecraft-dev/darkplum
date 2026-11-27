@@ -16,7 +16,7 @@ import (
 	"github.com/scalecraft-dev/darkplum/api/internal/activity"
 )
 
-// Organisation settings: a key/value table (migration 025) an admin edits
+// Organization settings: a key/value table (migration 025) an admin edits
 // from Admin > Models > Policy or the API. The first setting is the platform
 // system prompt; the built-in text (system-prompt.md) is the default when no
 // row is set.

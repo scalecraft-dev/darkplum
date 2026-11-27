@@ -8,7 +8,7 @@ const SLOW_POLL_MS = 60_000
 interface UseModelsResult {
   models: Model[]
   /** What the picker should start on: the first non-null default walking the
-   *  key → user → organisation chain, as the API resolved it. Empty when
+   *  key → user → organization chain, as the API resolved it. Empty when
    *  nothing anywhere sets one, or on an older API that does not send it. */
   defaultModel: string
   /** True only until the first fetch settles. Later fetches keep the list on

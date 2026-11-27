@@ -126,7 +126,7 @@ export interface ConversationMessageInput {
  *
  *   self_hosted   in your own cluster (vLLM, LM Studio)
  *   cloud_managed your cloud account (AWS Bedrock)
- *   external_api  the vendor's own API, called with your organisation's key
+ *   external_api  the vendor's own API, called with your organization's key
  */
 export type BackendClass = 'self_hosted' | 'cloud_managed' | 'external_api'
 
@@ -139,7 +139,7 @@ export type BackendClass = 'self_hosted' | 'cloud_managed' | 'external_api'
  */
 export type DisplayClass = BackendClass | 'unknown'
 
-/** A vendor Darkplum can hold an organisation-wide API key for. */
+/** A vendor Darkplum can hold an organization-wide API key for. */
 export type VendorName = 'anthropic' | 'openai'
 
 /**
@@ -199,7 +199,7 @@ export interface ProviderStatus {
    *  none is set. Not a secret. Absent on an api that predates it. */
   workspace_id?: string | null
   /** The vendor billing key: a separate, broader credential (Anthropic Admin
-   *  API key / OpenAI organisation admin key) held by the api alone for the
+   *  API key / OpenAI organization admin key) held by the api alone for the
    *  daily reconciliation job. Undefined on an api that predates it — the card
    *  then offers nothing for it rather than a form whose routes would 404. */
   billing?: ProviderBilling
@@ -469,7 +469,7 @@ export interface RoutingPolicy {
   /** Used when a request names no model, and preselected in the chat picker.
    *  May be an alias. Absent on older APIs — treat as null. */
   default_model?: string | null
-  /** The organisation-wide switch for request parameters a backend cannot
+  /** The organization-wide switch for request parameters a backend cannot
    *  use: 'lenient' drops and records them, 'strict' refuses the request.
    *  Absent on an api older than migration 029 — the card then hides the
    *  control and never sends it. */
@@ -484,7 +484,7 @@ export interface RoutingPolicy {
    *  anything, or the gateway could not be asked. */
   affected_principals?: number
   /** Returned alongside `affected_principals`: whether everyone who simply
-   *  inherits the organisation's policy — no row of their own — now reaches
+   *  inherits the organization's policy — no row of their own — now reaches
    *  fewer models too. `affected_principals` never counts these people. */
   org_narrowed?: boolean
   /** Enabled, allowed models no backend has reported yet when the new
@@ -496,10 +496,10 @@ export interface RoutingPolicy {
 // ---------------------------------------------------------------------------
 // Per-principal routing policy
 //
-// The same three fields exist at the organisation, user and API-key level. A
+// The same three fields exist at the organization, user and API-key level. A
 // null field inherits from the level above; a set field only ever narrows.
 // A key can never reach more than its owner. A user never more than the
-// organisation.
+// organization.
 // ---------------------------------------------------------------------------
 
 export type PrincipalType = 'org' | 'user' | 'api_key'
@@ -811,13 +811,13 @@ export interface ModelPriceInput {
 }
 
 // ---------------------------------------------------------------------------
-// The library: skills, context and tools a person keeps in the organisation's
+// The library: skills, context and tools a person keeps in the organization's
 // own database, shares with colleagues, attaches to chats and exports again.
 // ---------------------------------------------------------------------------
 
 export type LibraryKind = 'skill' | 'context' | 'tool'
 export type LibraryVisibility = 'private' | 'org'
-/** Where an item lives: the person's own tree, or the organisation's. Same
+/** Where an item lives: the person's own tree, or the organization's. Same
  *  fact as visibility, named for the two roots the bucket and the page show. */
 export type LibraryScope = 'private' | 'org'
 

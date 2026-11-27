@@ -121,7 +121,7 @@ Some rules the codebase holds that a reviewer will hold you to:
 
 - **Nothing a user types is ever logged or recorded by an administrator
   path.** Conversation content and library bodies are readable only by their
-  owner (or, for shared library items, the organisation). Audit rows carry
+  owner (or, for shared library items, the organization). Audit rows carry
   metadata only.
 - **Refuse by name, never drop silently.** A request field the gateway cannot
   honour is refused with a 400 naming it.

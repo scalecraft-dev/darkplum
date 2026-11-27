@@ -11,7 +11,7 @@ import styles from './LibraryDialogs.module.css'
 interface Props {
   item: LibraryItem | null
   /** Only an owner may cross roots; an administrator moves another person's
-   *  shared item within Organisation. */
+   *  shared item within Organization. */
   canCrossRoots: boolean
   onClose: () => void
   /** `item` is null when the move took it out of the caller's sight (an
@@ -21,7 +21,7 @@ interface Props {
 
 /**
  * Where an item goes: a root, then a folder, chosen by browsing. No drag and
- * drop: a drop from Private into Organisation would share something with the
+ * drop: a drop from Private into Organization would share something with the
  * whole company by accident, and a phone has no drag anyway.
  */
 export function MoveDialog({ item, canCrossRoots, onClose, onMoved }: Props) {
@@ -121,7 +121,7 @@ export function MoveDialog({ item, canCrossRoots, onClose, onMoved }: Props) {
                 className={`${styles.root} ${scope === s ? styles.rootActive : ''}`}
                 aria-pressed={scope === s}
                 // The mirrored folder is the first guess: sharing Private/legal/
-                // contracts/x lands it in Organisation/legal/contracts, created
+                // contracts/x lands it in Organization/legal/contracts, created
                 // if missing. The person can still pick another folder.
                 onClick={() => {
                   setScope(s)
@@ -217,7 +217,7 @@ export function MoveDialog({ item, canCrossRoots, onClose, onMoved }: Props) {
 
         {shares && (
           <p className={styles.notice}>
-            Moving it to Organisation shares it. Everyone at your organisation can read and attach it. Only you can edit it.
+            Moving it to Organization shares it. Everyone at your organization can read and attach it. Only you can edit it.
             {item.kind === 'tool' ? ' People who attach it call its server with the credential you saved.' : ''}
           </p>
         )}

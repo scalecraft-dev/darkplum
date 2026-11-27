@@ -5,14 +5,14 @@ import { residencyLabel } from './residency'
 
 /**
  * The words used wherever per-principal policy appears — the drawer, the
- * organisation card, the access overview and the chat explanation. Said the
+ * organization card, the access overview and the chat explanation. Said the
  * same way every time, because four different phrasings of one rule reads as
  * four different rules.
  */
 
 /** The rule, in one line. Shown wherever a policy is being written. */
 export const POLICY_RULE =
-  'A key can never reach more than its owner. A user never more than the organisation.'
+  'A key can never reach more than its owner. A user never more than the organization.'
 
 /**
  * When a change starts being enforced. The gateway holds a snapshot of the
@@ -52,7 +52,7 @@ export type { ResidencyRung } from './residency'
 export function sourceLabel(source: PolicySource): string {
   switch (source) {
     case 'org':
-      return 'From the organisation'
+      return 'From the organization'
     case 'user':
       return "From this user's policy"
     case 'api_key':
@@ -67,7 +67,7 @@ export function sourceLabel(source: PolicySource): string {
 export function sourceLabelForSelf(source: PolicySource): string {
   switch (source) {
     case 'org':
-      return 'Set by the organisation'
+      return 'Set by the organization'
     case 'user':
       return 'Set on you'
     case 'api_key':
@@ -81,7 +81,7 @@ export function sourceLabelForSelf(source: PolicySource): string {
 export function sourceChip(source: PolicySource): string {
   switch (source) {
     case 'org':
-      return 'Organisation'
+      return 'Organization'
     case 'user':
       return 'User'
     case 'api_key':
@@ -139,7 +139,7 @@ export function storedSummary(policy: PrincipalPolicy, models: AdminModel[]): st
   }
   if (policy.default_model) parts.push(`Default ${modelLabel(policy.default_model, models)}`)
   // A row with every field null narrows nothing: it inherits, same as no row.
-  return parts.length > 0 ? parts.join(' · ') : 'Inherits organisation'
+  return parts.length > 0 ? parts.join(' · ') : 'Inherits organization'
 }
 
 /**

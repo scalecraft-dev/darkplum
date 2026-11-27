@@ -222,7 +222,7 @@ jobs:
   # reviewer, so the job follows the release without waiting. It checks that
   # the release is public, that the archives match checksums.txt and carry a
   # provenance attestation from this workflow, and only then writes the formula.
-  # Product repository only: a scratch organisation has no tap to bump.
+  # Product repository only: a scratch organization has no tap to bump.
   tap:
     name: Update the Homebrew tap
     needs: [gate, release]

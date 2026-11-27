@@ -24,7 +24,7 @@ otherwise. There is no bug bounty.
 
 - Any way for one user to read another user's conversations or private
   library items, or for an administrator to read them through the product.
-- Any way a request reaches a backend class above the organisation's
+- Any way a request reaches a backend class above the organization's
   residency setting (self-hosted only, your cloud account only, any), or a
   model or tool server that a user's or key's allowlist or the tool-host
   allowlist does not permit. Residency is the product's core promise.

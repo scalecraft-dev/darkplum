@@ -81,7 +81,7 @@ export const ROUTES = {
   putProviderFilter: { method: 'PUT',    path: '/api/v1/providers/:vendor/filter' },
   deleteProviderKey: { method: 'DELETE', path: '/api/v1/providers/:vendor/key' },
   // The vendor BILLING key — a separate, broader credential (it can list the
-  // organisation's workspaces and keys), held by the api for its daily
+  // organization's workspaces and keys), held by the api for its daily
   // reconciliation job and never by the gateway. Same rule: key on the body.
   verifyProviderBillingKey: { method: 'POST',   path: '/api/v1/providers/:vendor/billing-key/verify' },
   putProviderBillingKey:    { method: 'PUT',    path: '/api/v1/providers/:vendor/billing-key' },
@@ -93,7 +93,7 @@ export const ROUTES = {
   testModelAlias:   { method: 'POST',   path: '/api/v1/model-aliases/:alias/test' },
   deleteModelAlias: { method: 'DELETE', path: '/api/v1/model-aliases/:alias' },
 
-  // --- Routing policy: organisation ---
+  // --- Routing policy: organization ---
   getRoutingPolicy:    { method: 'GET', path: '/api/v1/routing-policy' },
   updateRoutingPolicy: { method: 'PUT', path: '/api/v1/routing-policy' },
   /** The platform system prompt the webchat proxy prepends to every turn. */

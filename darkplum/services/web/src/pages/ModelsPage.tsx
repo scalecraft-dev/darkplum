@@ -164,7 +164,7 @@ function rowFlag(
     if (!onAllowlist) {
       return {
         kind: 'disabled_by_policy',
-        hint: "Turning this on is not enough: it is not on the organisation's allowed list.",
+        hint: "Turning this on is not enough: it is not on the organization's allowed list.",
       }
     }
     // Off, and AWS would refuse it once on — the same "turning this on is not
@@ -185,7 +185,7 @@ function rowFlag(
   if (!onAllowlist) {
     return {
       kind: 'blocked',
-      hint: "Enabled, but not on the organisation's allowed list, so refused.",
+      hint: "Enabled, but not on the organization's allowed list, so refused.",
     }
   }
   // Precedence: Blocked by policy > Needs AWS opt-in > Not reachable. A policy
@@ -924,7 +924,7 @@ function ModelsPageBody() {
     { vendor: VendorName; mode: BillingKeyMode } | null
   >(null)
   /** Which vendor's "Review and enable" is open, or null. One at a time: it
-   *  writes the organisation's policy, and two of those racing is not a state
+   *  writes the organization's policy, and two of those racing is not a state
    *  worth supporting. */
   const [enablingVendor, setEnablingVendor] = useState<VendorName | null>(null)
   const [loading, setLoading] = useState(true)
@@ -964,7 +964,7 @@ function ModelsPageBody() {
    * must not be the loosest rung: that would paint a vendor model as permitted
    * for the first frame after a reload, which is the one thing the class
    * labelling exists to prevent. The api's own default is the safe assumption,
-   * and it never returns null for the organisation.
+   * and it never returns null for the organization.
    */
   const residency: Residency = policy?.residency ?? DEFAULT_RESIDENCY
   const allowedModels: string[] | null = policy?.allowed_models ?? null
@@ -1288,7 +1288,7 @@ function ModelsPageBody() {
       if (!groups.has(m.provider)) groups.set(m.provider, [])
       groups.get(m.provider)!.push(m)
     }
-    // Closest to the organisation first, furthest last — the same order the
+    // Closest to the organization first, furthest last — the same order the
     // residency ladder reads in, so the two screens agree about which end of
     // the range is which.
     return [...groups.entries()].sort(([a], [b]) => compareProviders(a, b))
@@ -1915,7 +1915,7 @@ function ModelsTab({
         <p className={styles.policyNote}>
           <LockGlyph />
           <span>
-            The organisation's policy limits what is reachable —{' '}
+            The organization's policy limits what is reachable —{' '}
             <Link
               className={styles.policyNoteLink}
               to={{ search: '?tab=policy' }}

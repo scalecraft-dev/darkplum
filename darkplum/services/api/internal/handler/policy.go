@@ -79,19 +79,19 @@ type policyObject struct {
 	AllowedModels *[]string `json:"allowed_models"`
 	DefaultModel  *string   `json:"default_model"`
 	// ParamsMode exists only so a user or key policy that carries it can be
-	// refused by name (400): the setting belongs to the organisation row. It
+	// refused by name (400): the setting belongs to the organization row. It
 	// is never stored from here and omitted when nil.
 	ParamsMode *string `json:"params_mode,omitempty"`
 }
 
 // rejectParamsMode answers 400 when a user or api_key policy body sets
-// params_mode, which is an organisation-level setting. It reports whether it
+// params_mode, which is an organization-level setting. It reports whether it
 // responded.
 func rejectParamsMode(c *gin.Context, req policyObject) bool {
 	if req.ParamsMode == nil {
 		return false
 	}
-	c.JSON(http.StatusBadRequest, gin.H{"error": "params_mode is an organisation setting; set it with PUT /api/v1/routing-policy, not on a user or key policy"})
+	c.JSON(http.StatusBadRequest, gin.H{"error": "params_mode is an organization setting; set it with PUT /api/v1/routing-policy, not on a user or key policy"})
 	return true
 }
 

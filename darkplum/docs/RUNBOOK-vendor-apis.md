@@ -54,7 +54,7 @@ into the ConfigMap; `darkplum keys set` writes the ConfigMap. Each write carries
 last (stamps only ever move forward, so a laptop clock cannot make a write lose).
 The backstop under all of this: a filter only decides which vendor models are
 *catalogued*. Every newly catalogued model arrives **disabled**, and the
-organisation's residency still refuses vendor models until an administrator
+organization's residency still refuses vendor models until an administrator
 allows them — so a filter that is briefly broader than intended produces
 disabled rows in Admin > Models, never a reachable model.
 
@@ -76,10 +76,10 @@ filter.
 
 What migration 016 changes for an existing install:
 
-- Organisation residency gains a middle step. Every install whose organisation
+- Organization residency gains a middle step. Every install whose organization
   residency was *Any model* is moved to *Your cloud account only*. No traffic
   changes: before this release nothing outside the cloud account was reachable.
-  An organisation already at *Self-hosted only* is untouched. `updated_at` is
+  An organization already at *Self-hosted only* is untouched. `updated_at` is
   not changed, so the policy card does not claim someone edited it — and for the
   same reason there is no row for it in Admin > Activity. Put it in your own
   release notes so an administrator who notices the new label knows why.
@@ -109,7 +109,7 @@ darkplum keys set anthropic --models 'claude-*'    # the key is asked for at a h
 
 1. Create the key at the vendor **scoped and capped first**: an Anthropic key
    created *inside* a workspace, with a workspace spend limit (a key created at
-   organisation level works too, but Anthropic then requires a workspace ID on
+   organization level works too, but Anthropic then requires a workspace ID on
    every request — give it on the install form or with `WORKSPACE=wrkspc_…`;
    the key check says "not scoped to an Anthropic workspace" when it is
    missing); an OpenAI project key with a model
@@ -122,7 +122,7 @@ darkplum keys set anthropic --models 'claude-*'    # the key is asked for at a h
    stores the key, and restarts the gateway once (first install or filter change
    only).
 4. In **Admin > Models**, *Model vendors* shows the vendor as configured. Choose
-   **Review and enable**: it loosens the organisation's residency to *Any model,
+   **Review and enable**: it loosens the organization's residency to *Any model,
    including outside your account* (confirmed and written to the audit log) and
    enables the models you tick. Tighten individual users or API keys back to
    *Your cloud account only* under Users & Keys where needed.
@@ -190,7 +190,7 @@ compromise or a policy requirement.
 
 By default a request parameter a backend cannot honour is dropped and reported in `X-Darkplum-Dropped-Params`, the Activity `dropped_params` column and a first-time audit event. An admin can set `params_mode: "strict"` on `PUT /api/v1/routing-policy` so every drop becomes a 400 `unsupported_parameter` instead.
 
-- Strict only takes effect on gateways running the release that reads it. Until migration 029 is applied the gateway treats every organisation as lenient and logs `principal_routing_policies.params_mode does not exist yet`.
+- Strict only takes effect on gateways running the release that reads it. Until migration 029 is applied the gateway treats every organization as lenient and logs `principal_routing_policies.params_mode does not exist yet`.
 - `darkplum deploy` rolls the api, then the gateway, in one run. A strict value set before the gateway has rolled is ignored by the old gateways; verify with a request carrying an unknown key (strict answers 400 naming it).
 - In strict mode a `user` that cannot be pseudonymised (no `darkplum-user-hmac` secret, e.g. the dev overlay) is a 400 naming `user`, because the field would otherwise be dropped. Install the secret (3b) before enabling strict mode.
 
@@ -205,8 +205,8 @@ Model vendors** shows the same state:
 | `filter_missing` | key present, no catalog filter | re-run `darkplum keys set <vendor> --models …`. A hand-edited ConfigMap does nothing until the gateway restarts: `kubectl rollout restart -n darkplum-system deploy/darkplum-gateway` |
 | `filter_matched_nothing` | the filter admits none of the models the key can reach | widen `--models`, or widen the key's scope at the vendor |
 | `auth_failed` | the vendor rejected the key, or the key file is empty/unreadable | rotate (section 3) |
-| *key check:* `workspace_required` | an organisation-level Anthropic key with no workspace ID | enter the workspace ID (Anthropic console > Workspaces), or use a key created inside a workspace |
-| *key check:* `vendor_error` | the vendor answered the check with a non-auth HTTP error (status and error type shown) | the vendor's answer to this key: check its organisation, billing and permissions in the vendor console |
+| *key check:* `workspace_required` | an organization-level Anthropic key with no workspace ID | enter the workspace ID (Anthropic console > Workspaces), or use a key created inside a workspace |
+| *key check:* `vendor_error` | the vendor answered the check with a non-auth HTTP error (status and error type shown) | the vendor's answer to this key: check its organization, billing and permissions in the vendor console |
 | `unreachable` | network, DNS, proxy or vendor outage | check egress (`gateway-egress` allows `:443`), `HTTPS_PROXY`, the vendor's status page |
 | `ok` | discovery succeeded | — |
 
@@ -215,7 +215,7 @@ Model vendors** shows the same state:
 1. The form said *Nothing was stored* — verification failed, and the message
    says which way: *rejected this key* (auth), *not scoped to an Anthropic
    workspace* (add the workspace ID), *answered HTTP nnn* (the vendor's own
-   objection to this key or organisation — billing, permissions), or *could not
+   objection to this key or organization — billing, permissions), or *could not
    be reached* (a real transport failure: the gateway, not the api, makes that
    call, so check its egress, DNS and `HTTPS_PROXY`). The gateway log carries the
    same outcome with the vendor's HTTP status and a transport class, never the
@@ -305,11 +305,11 @@ curl -X PUT --aws-sigv4 "aws:amz:us-east-1:bedrock" --user "$AWS_ACCESS_KEY_ID:$
 (`aws configure export-credentials --format env` prints those three variables for
 an SSO profile; a current AWS CLI exposes the same as `aws bedrock
 put-account-data-retention`.) The change applies immediately; the badge clears
-on the next discovery tick. If your organisation's policy is zero or default
+on the next discovery tick. If your organization's policy is zero or default
 retention, the alternative is to route around these models: point the alias's
 routes at models that do not require review, or do not enable them. An SCP
 denying `bedrock:PutAccountDataRetention` unless the mode is `none` enforces that
-organisation-wide — see the AWS data-retention documentation.
+organization-wide — see the AWS data-retention documentation.
 
 ## 4c. Usage, cost and the billing key
 
@@ -325,10 +325,10 @@ project, key and model.
 **Reconciling against the vendor's own numbers is optional and uses a separate
 credential.** Anthropic's usage and cost reports need an **Admin API key**
 (`sk-ant-admin01-…`, Console > Settings > Admin keys); the inference key —
-even the organisation-level one — is refused, and a workspace key cannot read
+even the organization-level one — is refused, and a workspace key cannot read
 them at all. OpenAI's `/organization/usage` and `/organization/costs` need an
-organisation **admin key**, not a project key. These keys can list your
-organisation's workspaces, projects and keys, so Darkplum treats them as a
+organization **admin key**, not a project key. These keys can list your
+organization's workspaces, projects and keys, so Darkplum treats them as a
 different thing from the inference key:
 
 - They live in their own Secret (`darkplum-system/darkplum-billing-keys`),
@@ -369,7 +369,7 @@ gateway; the UI removes the key without a restart. The vendor's models
 keep their settings, stop answering (`404 model_not_found`), and show as
 unreachable in Admin > Models within about two minutes. Then revoke the key at
 the vendor — removing it here does not invalidate it. To stop all vendor traffic
-immediately without touching keys, set the organisation's residency back to
+immediately without touching keys, set the organization's residency back to
 *Your cloud account only*; it takes effect within seconds.
 
 ## 6. Rolling back — read before `kubectl rollout undo`
@@ -384,7 +384,7 @@ catalog.**
 
 1. Remove both keys — *Remove key* on each vendor card, or
    `darkplum keys remove anthropic && darkplum keys remove openai`
-2. In **Admin > Models > Policy**, set the organisation's residency back to
+2. In **Admin > Models > Policy**, set the organization's residency back to
    *Your cloud account only*.
 3. In **Admin > Models**, disable every model under the Anthropic and OpenAI
    cards. The summary line at the top of the tab must show no enabled

@@ -39,7 +39,7 @@ export function ShareModal({ item, onClose, onShared }: Props) {
     >
       <div className={styles.body}>
         <p className={styles.text}>
-          Everyone in your organisation can read and attach this. Only you can edit it.
+          Everyone in your organization can read and attach this. Only you can edit it.
           Administrators can unshare it.
         </p>
         {item?.kind === 'tool' && (
@@ -51,7 +51,7 @@ export function ShareModal({ item, onClose, onShared }: Props) {
         <div className={styles.actions}>
           <Button variant="secondary" onClick={onClose} disabled={busy}>Cancel</Button>
           <Button variant="primary" onClick={() => void share()} disabled={busy}>
-            {busy ? 'Sharing…' : 'Share with organisation'}
+            {busy ? 'Sharing…' : 'Share with organization'}
           </Button>
         </div>
       </div>

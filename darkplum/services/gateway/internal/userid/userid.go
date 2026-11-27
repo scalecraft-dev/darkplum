@@ -2,7 +2,7 @@
 // not receive it raw (Anthropic metadata.user_id, Bedrock requestMetadata).
 //
 // The value sent is "<key id>:<hex HMAC-SHA256(secret, user)>". The secret is a
-// per-organisation Kubernetes Secret (darkplum-user-hmac) in the customer's
+// per-organization Kubernetes Secret (darkplum-user-hmac) in the customer's
 // namespace, generated at install and mounted into the gateway as files, the
 // same way vendor keys are. It never lives
 // in Postgres or the control plane, is never read from an env var, and is never

@@ -1,4 +1,4 @@
-/** Folder and organisation marks, in the nav's 24-unit, stroke-2 style. */
+/** Folder and organization marks, in the nav's 24-unit, stroke-2 style. */
 
 export function FolderGlyph({ size = 16, open = false }: { size?: number; open?: boolean }) {
   return (

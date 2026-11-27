@@ -10,7 +10,7 @@ import styles from './ResidencyLadder.module.css'
  * Three rungs, loosest first, in the order the ladder actually is — a range
  * reads outward-in, and reversing it on one screen and not the other is how two
  * administrators end up describing the same policy differently. The
- * organisation's card and the per-principal drawer both render this, so the
+ * organization's card and the per-principal drawer both render this, so the
  * words and the order cannot drift apart.
  *
  * A rung a principal may not reach is disabled rather than hidden. Hiding it
@@ -37,7 +37,7 @@ interface Props {
   /**
    * Offers "inherit" as the first choice, above the rungs. Present in the
    * per-principal drawer, where not deciding is itself a decision worth being
-   * able to make and to return to; absent on the organisation's card, which
+   * able to make and to return to; absent on the organization's card, which
    * has nothing above it to inherit from.
    */
   inherit?: { label: string; hint?: string }

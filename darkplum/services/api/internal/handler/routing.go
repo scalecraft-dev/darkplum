@@ -22,6 +22,12 @@ import (
 	"github.com/scalecraft-dev/darkplum/api/internal/activity"
 )
 
+// orgLockedOutName is the single locked_out entry of a routing-policy 409 that
+// locks out everyone rather than named users and keys. The web compares it
+// exactly (services/web/src/lib/lockOut.ts, held to this value by check:policy),
+// so it is a wire value, not prose.
+const orgLockedOutName = "(organization)"
+
 // aliasRe mirrors the CHECK constraint on model_aliases.alias in migration
 // 010_model_routing.sql: lowercase alphanumeric, '.', '_', '-', starting with
 // an alphanumeric character, 1-63 characters total.
@@ -1047,7 +1053,7 @@ func (h *RoutingHandler) TestAlias(c *gin.Context) {
 // orgPolicyTightened) and the gateway could evaluate it: AffectedPrincipals
 // is the number of users and keys WITH A POLICY OF THEIR OWN whose reachable
 // set actually shrank (not "has a row", the earlier approximation), and
-// OrgNarrowed says whether the organisation's own reachable set shrank --
+// OrgNarrowed says whether the organization's own reachable set shrank --
 // i.e. whether everyone who simply inherits now reaches fewer models. Both
 // come from the gateway's POST /v1/policy/impact, the same merge that
 // enforces.
@@ -1279,8 +1285,8 @@ func (h *RoutingHandler) PutRoutingPolicy(c *gin.Context) {
 	// lock anyone out, so it proceeds without the counts.
 	if req.AllowedModels != nil && len(*req.AllowedModels) == 0 {
 		c.JSON(http.StatusConflict, gin.H{
-			"error":      "an empty organisation allowlist would lock every user and key out of every model",
-			"locked_out": []string{"(organisation)"},
+			"error":      "an empty organization allowlist would lock every user and key out of every model",
+			"locked_out": []string{orgLockedOutName},
 		})
 		return
 	}
@@ -1301,7 +1307,7 @@ func (h *RoutingHandler) PutRoutingPolicy(c *gin.Context) {
 		if impact.OrgLockedOut {
 			c.JSON(http.StatusConflict, gin.H{
 				"error":      "this policy would lock every user and key out of every model",
-				"locked_out": []string{"(organisation)"},
+				"locked_out": []string{orgLockedOutName},
 			})
 			return
 		}

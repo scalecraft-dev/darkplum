@@ -314,7 +314,7 @@ export function VendorInstallModal({
         setAnnouncement(copy)
         return
       }
-      // An organisation-level Anthropic key with no workspace named. The
+      // An organization-level Anthropic key with no workspace named. The
       // answer is the workspace field, so that is where it is said and where
       // focus goes; the key field is left exactly as it was.
       case 'workspace_required': {
@@ -721,7 +721,7 @@ export function VendorInstallModal({
               type="password"
               label={mode === 'replace' ? `New ${vendorName} API key` : `${vendorName} API key`}
               // Nothing about this field is a credential a manager should
-              // offer to fill or offer to save: it is an organisation's key
+              // offer to fill or offer to save: it is an organization's key
               // being typed once into an admin screen.
               autoComplete="new-password"
               name="vendor-key-entry"
@@ -778,7 +778,7 @@ export function VendorInstallModal({
         )}
 
         {/* --- the workspace field ----------------------------------------
-            Anthropic only, and optional: an organisation-level key is refused
+            Anthropic only, and optional: an organization-level key is refused
             unless every request names a workspace. Disabled past the check
             for the same reason the key field is — what the vendor said was
             said about this key in this workspace. */}
@@ -811,7 +811,7 @@ export function VendorInstallModal({
                 }}
               />
               <p className={styles.hint} id={`${vendor}-workspace-help`}>
-                Only needed when the key was created at organisation level rather than inside a
+                Only needed when the key was created at organization level rather than inside a
                 workspace. Find it under Workspaces in {vendorName}'s console (
                 <code className={styles.itemId}>wrkspc_…</code>).
               </p>
