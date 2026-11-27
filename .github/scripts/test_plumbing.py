@@ -139,6 +139,58 @@ class PinnedActions(unittest.TestCase):
                     self.assertRegex(line, r"#\s*v\d", f"{path.name}:{n} pinned action needs a '# vX.Y.Z' comment")
 
 
+class PinnedHelm(unittest.TestCase):
+    """The router render is compared byte for byte, so every job that runs it
+    installs the pinned helm first instead of using the runner image's."""
+
+    JOB = re.compile(r"^  [A-Za-z0-9_-]+:\s*(#.*)?$")
+
+    def unpinned(self, text):
+        """Line numbers of render steps with no install-helm.sh earlier in their job."""
+        bad, installed = [], False
+        for n, line in enumerate(text.splitlines(), 1):
+            if line.lstrip().startswith("#"):
+                continue
+            if self.JOB.match(line):
+                installed = False
+            elif "install-helm.sh" in line:
+                installed = True
+            elif "render-semantic-router.sh" in line and not installed:
+                bad.append(n)
+        return bad
+
+    def test_every_workflow_that_renders_installs_the_pinned_helm(self):
+        workflows = sorted((HERE.parent / "workflows").glob("*.yml"))
+        rendering = [w for w in workflows if "render-semantic-router.sh" in w.read_text()]
+        self.assertEqual(
+            sorted(w.name for w in rendering), ["ci.yml", "prerelease.yml", "release.yml"],
+            "the set of workflows that render the router changed; update this test")
+        for w in rendering:
+            self.assertEqual(self.unpinned(w.read_text()), [], f"{w.name} renders the router with the runner's helm")
+
+    def test_a_render_without_the_install_is_caught(self):
+        job = "jobs:\n  cli:\n    steps:\n      - run: bash .github/scripts/render-semantic-router.sh --check\n"
+        self.assertEqual(self.unpinned(job), [4])
+        other_job = ("jobs:\n  a:\n    steps:\n      - run: bash .github/scripts/install-helm.sh\n"
+                     "  b:\n    steps:\n      - run: bash .github/scripts/render-semantic-router.sh --check\n")
+        self.assertEqual(self.unpinned(other_job), [7])
+        after = ("jobs:\n  a:\n    steps:\n      - run: bash .github/scripts/render-semantic-router.sh --check\n"
+                 "      - run: bash .github/scripts/install-helm.sh\n")
+        self.assertEqual(self.unpinned(after), [4])
+        header_comment = ("jobs:\n  a:\n    steps:\n      - run: bash .github/scripts/install-helm.sh\n"
+                          "  b:  # cli\n    steps:\n      - run: bash .github/scripts/render-semantic-router.sh --check\n")
+        self.assertEqual(self.unpinned(header_comment), [7])
+        commented = ("jobs:\n  a:\n    steps:\n      # bash .github/scripts/install-helm.sh\n"
+                     "      - run: bash .github/scripts/render-semantic-router.sh --check\n")
+        self.assertEqual(self.unpinned(commented), [5])
+
+    def test_the_install_script_pins_a_version_and_a_checksum(self):
+        sh = (HERE / "install-helm.sh").read_text()
+        self.assertRegex(sh, r"(?m)^HELM_VERSION=v3\.\d+\.\d+$")
+        self.assertRegex(sh, r"(?m)^HELM_SHA256=[0-9a-f]{64}\b")
+        self.assertIn("sha256sum -c -", sh)
+
+
 class LockPlatforms(unittest.TestCase):
     def test_shipped_lock_covers_four_platforms(self):
         self.assertEqual(lock.main([]), 0)

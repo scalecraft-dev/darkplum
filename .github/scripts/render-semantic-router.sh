@@ -19,8 +19,8 @@ root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 dir="$root/darkplum/k8s/semantic-router"
 out="$dir/rendered.yaml"
 
-command -v helm >/dev/null || { echo "helm 3 is required to render the semantic router (CI installs a pinned one; see the plumbing job in .github/workflows/ci.yml)"; exit 1; }
-# CI renders with the exact helm pinned in ci.yml; use the same one if another 3.x
+command -v helm >/dev/null || { echo "helm 3 is required to render the semantic router (workflows install a pinned one with .github/scripts/install-helm.sh)"; exit 1; }
+# Workflows render with the exact helm pinned in install-helm.sh; use the same one if another 3.x
 # produces a diff here.
 helm_version="$(helm version --template '{{.Version}}' || true)"
 case "$helm_version" in
