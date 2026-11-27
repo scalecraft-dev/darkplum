@@ -5,8 +5,8 @@ import type { LibraryFolder, LibraryItem, LibraryKind, LibraryScope } from '../.
 import { Badge, Button, Skeleton } from '../../components/ui'
 import { KindGlyph } from '../../components/ui/KindGlyph'
 import { FolderGlyph } from './LibraryGlyphs'
-import { KIND_LABEL, formatFull, formatRelative, formatSize, ownerName } from './libraryText'
-import { displayPath, fileNameOf, folderNameProblem, nameOf, pathOf, scopeOf, segmentsOf, toSegment } from './libraryPath'
+import { KIND_LABEL, formatFull, formatRelative, ownerName } from './libraryText'
+import { displayPath, folderNameProblem, nameOf, pathOf, scopeOf, segmentsOf, toSegment } from './libraryPath'
 import styles from '../LibraryPage.module.css'
 
 export interface FolderViewProps {
@@ -223,11 +223,11 @@ export function FolderView(p: FolderViewProps) {
           </span>
           <h2 className={styles.emptyTitle}>Nothing private yet</h2>
           <p className={styles.emptyText}>
-            Your organisation has shared {p.otherRootCount} {p.otherRootCount === 1 ? 'item' : 'items'}. Browse them, or start your own.
+            Your organization has shared {p.otherRootCount} {p.otherRootCount === 1 ? 'item' : 'items'}. Browse them, or start your own.
           </p>
           <div className={styles.emptyActions}>
             <Button variant="primary" onClick={p.onBrowseOtherRoot}>
-              Browse Organisation
+              Browse Organization
             </Button>
             <Button variant="secondary" onClick={() => p.onNew('skill')}>
               New skill
@@ -247,7 +247,7 @@ export function FolderView(p: FolderViewProps) {
           </span>
           <h2 className={styles.emptyTitle}>Nothing shared yet</h2>
           <p className={styles.emptyText}>
-            Items moved here are readable by everyone at your organisation, and only their owner edits them. Start in
+            Items moved here are readable by everyone at your organization, and only their owner edits them. Start in
             Private, then move what is worth sharing.
           </p>
           <div className={styles.emptyActions}>
@@ -267,7 +267,7 @@ export function FolderView(p: FolderViewProps) {
         <p className={styles.emptyText}>
           A skill is instructions the model follows for a chat. Import a Markdown file, such as the SKILL.md from a
           Claude skill or custom instructions you saved as text; only the instructions are kept, never scripts or other
-          files. It then works on any model your organisation runs. Context is reference text a chat starts with; a
+          files. It then works on any model your organization runs. Context is reference text a chat starts with; a
           tool is an MCP server the model may call.
         </p>
         <div className={styles.emptyActions}>
@@ -421,13 +421,11 @@ function ItemRow({ item, showPath = false, p }: { item: LibraryItem; showPath?: 
           )}
         </span>
         <span className={styles.rowMeta}>
-          <code className={styles.rowFile} title="The file in the bucket">{fileNameOf(item)}</code>
           <span className={styles.rowKind}>{KIND_LABEL[item.kind]}</span>
           {scope === 'org' && <span>{item.mine ? 'by you' : `by ${ownerName(item)}`}</span>}
           <time dateTime={item.updated_at} title={`Edited ${formatFull(item.updated_at)}`}>
             {formatRelative(item.updated_at)}
           </time>
-          <span className={styles.rowSize}>{formatSize(item.size_bytes)}</span>
         </span>
       </button>
       <RowMenu label={`Actions for ${item.name}`}>

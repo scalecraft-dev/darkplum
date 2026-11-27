@@ -6,7 +6,8 @@ import styles from '../LibraryPage.module.css'
 
 interface Props {
   trees: Record<LibraryScope, TreeNode[]>
-  current: { scope: LibraryScope; path: string }
+  /** The open folder, or null while search results are shown. */
+  current: { scope: LibraryScope; path: string } | null
   onNavigate: (scope: LibraryScope, path: string) => void
 }
 
@@ -22,8 +23,8 @@ export function LibraryTree({ trees, current, onNavigate }: Props) {
         <div key={scope} className={styles.treeRoot}>
           <button
             type="button"
-            className={`${styles.treeRow} ${styles.treeRootRow} ${current.scope === scope && current.path === '' ? styles.treeRowActive : ''}`}
-            aria-current={current.scope === scope && current.path === '' ? 'page' : undefined}
+            className={`${styles.treeRow} ${styles.treeRootRow} ${current?.scope === scope && current.path === '' ? styles.treeRowActive : ''}`}
+            aria-current={current?.scope === scope && current.path === '' ? 'page' : undefined}
             onClick={() => onNavigate(scope, '')}
           >
             {scope === 'private' ? <PrivateGlyph size={14} /> : <OrgGlyph size={14} />}
@@ -46,7 +47,7 @@ function TreeLevel({
   nodes: TreeNode[]
   depth: number
   scope: LibraryScope
-  current: { scope: LibraryScope; path: string }
+  current: { scope: LibraryScope; path: string } | null
   onNavigate: (scope: LibraryScope, path: string) => void
 }) {
   if (nodes.length === 0) return null
@@ -69,11 +70,11 @@ function TreeItem({
   node: TreeNode
   depth: number
   scope: LibraryScope
-  current: { scope: LibraryScope; path: string }
+  current: { scope: LibraryScope; path: string } | null
   onNavigate: (scope: LibraryScope, path: string) => void
 }) {
-  const onPath = current.scope === scope && isInside(current.path, node.path)
-  const active = current.scope === scope && current.path === node.path
+  const onPath = current?.scope === scope && isInside(current.path, node.path)
+  const active = current?.scope === scope && current.path === node.path
   // A folder on the way to the open one starts open; the person can fold it.
   const [open, setOpen] = useState<boolean | null>(null)
   const isOpen = open ?? onPath

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
 import {
@@ -26,14 +26,13 @@ import { LibraryTree } from './library/LibraryTree'
 import { MoveDialog } from './library/MoveDialog'
 import { ItemDrawer, type DrawerTarget } from './library/ItemDrawer'
 import { ImportModal } from './library/ImportModal'
-import { BucketGlyph, OrgGlyph, PrivateGlyph } from './library/LibraryGlyphs'
-import { KIND_LABEL, KIND_NOUN, errorText, libraryErrorText } from './library/libraryText'
+import { BucketGlyph, FolderGlyph, OrgGlyph, PrivateGlyph } from './library/LibraryGlyphs'
+import { KIND_LABEL, errorText, libraryErrorText } from './library/libraryText'
 import {
   SCOPE_LABEL,
   buildTree,
   displayPath,
   joinPath,
-  nameOf,
   parentOf,
   pathOf,
   scopeOf,
@@ -45,6 +44,9 @@ import styles from './LibraryPage.module.css'
 type KindFilter = LibraryKind | 'all'
 
 const KINDS: KindFilter[] = ['all', 'skill', 'context', 'tool']
+
+/** The filter names what the list will hold, so it reads as a plural. */
+const KIND_FILTER_LABEL: Record<LibraryKind, string> = { skill: 'Skills', context: 'Context', tool: 'Tools' }
 
 function scopeFromParam(v: string | null): LibraryScope {
   return v === 'org' ? 'org' : 'private'
@@ -64,7 +66,7 @@ function isValidPath(p: string): boolean {
 }
 
 /**
- * The library as a folder tree: two roots, Private and Organisation, that
+ * The library as a folder tree: two roots, Private and Organization, that
  * mirror the bucket the items are kept in. The URL is the state
  * (?root=&path=&kind=&q=&item=), so a folder can be linked to and the back
  * button walks up. On a wide screen a tree pane shows the whole shape; on a
@@ -347,6 +349,11 @@ export function LibraryPage() {
 
   const crumbs = segmentsOf(path)
   const searching = query.trim() !== ''
+  const shownResults = (results ?? []).filter((it) => kind === 'all' || it.kind === kind).length
+  /** Organization's folders and its sync belong to administrators. */
+  const orgRefused = scope === 'org' && !isAdmin
+  /** Set when the New menu starts an inline field that must keep the focus. */
+  const keepFocus = useRef(false)
 
   return (
     <div className={styles.page}>
@@ -354,33 +361,105 @@ export function LibraryPage() {
         <div className={styles.headerText}>
           <h1 className={styles.display}>Library</h1>
           <p className={styles.lede}>
-            Skills, tools and context, kept as files in folders. Private is yours alone; Organisation is shared with
+            Skills, context and tools you can attach to any chat. Private is yours alone; Organization is shared with
             everyone.
           </p>
         </div>
         <div className={styles.headerActions}>
-          {hasBucket && (
-            <Button
-              variant="ghost"
-              size="sm"
-              onClick={() => void sync()}
-              disabled={syncing || (scope === 'org' && !isAdmin)}
-              title={
-                scope === 'org' && !isAdmin
-                  ? 'An administrator syncs the Organisation folder.'
-                  : 'Read files added or changed in the bucket into this root'
-              }
-            >
-              <BucketGlyph size={14} />
-              {syncing ? 'Syncing…' : 'Sync from bucket'}
-            </Button>
-          )}
-          <Button variant="ghost" size="sm" onClick={() => void exportAll()} disabled={exporting} title="Everything you can see, as a zip of .md and .json files in their folders">
-            {exporting ? 'Exporting…' : 'Export all'}
-          </Button>
+          <div className={styles.searchWrap}>
+            <svg className={styles.searchIcon} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+              <circle cx="11" cy="11" r="8" />
+              <line x1="21" y1="21" x2="16.65" y2="16.65" />
+            </svg>
+            <input
+              className={styles.searchInput}
+              type="search"
+              placeholder="Search the library"
+              aria-label="Search the library, in every folder"
+              value={query}
+              maxLength={100}
+              onChange={(e) => setParams({ q: e.target.value }, true)}
+            />
+          </div>
+          <DropdownMenu.Root modal={false}>
+            <DropdownMenu.Trigger asChild>
+              <Button variant="ghost" size="sm" aria-label="More library actions" title="More">
+                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <circle cx="12" cy="12" r="1" />
+                  <circle cx="19" cy="12" r="1" />
+                  <circle cx="5" cy="12" r="1" />
+                </svg>
+              </Button>
+            </DropdownMenu.Trigger>
+            <DropdownMenu.Portal>
+              <DropdownMenu.Content className={styles.menu} align="end" sideOffset={4} collisionPadding={8}>
+                <DropdownMenu.Item className={styles.menuItem} disabled={exporting} onSelect={() => void exportAll()}>
+                  {exporting ? 'Exporting…' : 'Export all as a zip'}
+                </DropdownMenu.Item>
+                {hasBucket && (
+                  <DropdownMenu.Item className={styles.menuItem} disabled={syncing || orgRefused} onSelect={() => void sync()}>
+                    <span>{syncing ? 'Syncing…' : `Sync ${SCOPE_LABEL[scope]} from the bucket`}</span>
+                    {orgRefused && <span className={styles.menuReason}>An administrator syncs the Organization folder.</span>}
+                  </DropdownMenu.Item>
+                )}
+              </DropdownMenu.Content>
+            </DropdownMenu.Portal>
+          </DropdownMenu.Root>
           <Button variant="secondary" size="sm" onClick={() => setImportOpen(true)}>
             Import
           </Button>
+          <DropdownMenu.Root modal={false}>
+            <DropdownMenu.Trigger asChild>
+              <Button variant="primary" size="sm">
+                New
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <polyline points="6 9 12 15 18 9" />
+                </svg>
+              </Button>
+            </DropdownMenu.Trigger>
+            <DropdownMenu.Portal>
+              <DropdownMenu.Content
+                className={styles.menu}
+                align="end"
+                sideOffset={4}
+                collisionPadding={8}
+                onCloseAutoFocus={(e) => {
+                  // The new folder's name field has just taken focus; handing it
+                  // back to this button would blur the field and cancel it.
+                  if (keepFocus.current) e.preventDefault()
+                  keepFocus.current = false
+                }}
+              >
+                {(['skill', 'context', 'tool'] as LibraryKind[]).map((k) => (
+                  <DropdownMenu.Item
+                    key={k}
+                    className={styles.menuItem}
+                    onSelect={() => {
+                      if (searching) setParams({ q: null })
+                      setDrawer({ mode: 'new', kind: k, scope, path })
+                    }}
+                  >
+                    <KindGlyph kind={k} size={14} />
+                    {KIND_LABEL[k]}
+                  </DropdownMenu.Item>
+                ))}
+                <div className={styles.menuSep} role="separator" />
+                <DropdownMenu.Item
+                  className={styles.menuItem}
+                  disabled={orgRefused || newFolder.active}
+                  onSelect={() => {
+                    keepFocus.current = true
+                    if (searching) setParams({ q: null })
+                    setNewFolder({ active: true, error: null })
+                  }}
+                >
+                  <FolderGlyph size={14} />
+                  <span>Folder</span>
+                  {orgRefused && <span className={styles.menuReason}>An administrator adds folders to Organization.</span>}
+                </DropdownMenu.Item>
+              </DropdownMenu.Content>
+            </DropdownMenu.Portal>
+          </DropdownMenu.Root>
         </div>
       </header>
 
@@ -392,140 +471,100 @@ export function LibraryPage() {
               ? `The bucket ${storeStatus.bucket || ''} cannot be reached. Items still work here; nothing is being written to the bucket until it is back.`
               : storeStatus.failing > 0
                 ? `${storeStatus.failing} ${storeStatus.failing === 1 ? 'item is' : 'items are'} not reaching the bucket. The api's log says why, by item id.`
-                : `${storeStatus.changed_in_bucket} ${storeStatus.changed_in_bucket === 1 ? 'file was' : 'files were'} changed in the bucket outside the app. Sync from bucket adopts them.`}
+                : `${storeStatus.changed_in_bucket} ${storeStatus.changed_in_bucket === 1 ? 'file was' : 'files were'} changed in the bucket outside the app. Syncing adopts them.`}
             {storeStatus.queue_depth > 0 ? ` ${storeStatus.queue_depth} waiting.` : ''}
           </span>
+          {storeStatus.reachable && storeStatus.failing === 0 && (
+            <Button variant="secondary" size="sm" onClick={() => void sync()} disabled={syncing}>
+              {syncing ? 'Syncing…' : `Sync ${SCOPE_LABEL[scope]} from the bucket`}
+            </Button>
+          )}
         </div>
       )}
 
-      <div className={styles.location}>
-        <div className={styles.segmented} role="group" aria-label="Root">
-          {(['private', 'org'] as LibraryScope[]).map((s) => (
-            <button
-              key={s}
-              type="button"
-              className={`${styles.segment} ${scope === s && !searching ? styles.segmentActive : ''}`}
-              aria-pressed={scope === s}
-              onClick={() => navigate(s, '')}
-            >
-              {s === 'private' ? <PrivateGlyph size={14} /> : <OrgGlyph size={14} />}
-              {SCOPE_LABEL[s]}
-            </button>
-          ))}
-        </div>
-        {searching ? (
-          <div className={styles.crumbs}>
-            <span className={styles.crumbCurrent}>
-              Results for “{query.trim()}” · {(results ?? []).filter((it) => kind === 'all' || it.kind === kind).length}
-            </span>
-            <button type="button" className={styles.crumbClear} onClick={() => setParams({ q: null })}>
-              Clear
-            </button>
-          </div>
-        ) : (
-          <nav className={styles.crumbs} aria-label="Folder path">
-            <ol>
-              {crumbs.map((seg, i) => {
-                const p = crumbs.slice(0, i + 1).join('/')
-                const last = i === crumbs.length - 1
-                return (
-                  <li key={p} className={styles.crumbPair}>
-                    <span className={styles.crumbSep} aria-hidden="true">
-                      /
-                    </span>
-                    {last ? (
-                      <span className={`${styles.crumb} ${styles.crumbCurrent}`} aria-current="page">
-                        {seg}
-                      </span>
-                    ) : (
-                      <Link className={styles.crumb} to={folderHref(scope, p)}>
-                        {seg}
-                      </Link>
-                    )}
-                  </li>
-                )
-              })}
-            </ol>
-            {path !== '' && (
-              <Link className={styles.crumbUp} to={folderHref(scope, parentOf(path))} aria-label={`Back to ${nameOf(parentOf(path)) || SCOPE_LABEL[scope]}`}>
-                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                  <polyline points="15 18 9 12 15 6" />
-                </svg>
-              </Link>
-            )}
-          </nav>
-        )}
-      </div>
-
-      <div className={styles.toolbar}>
-        <div className={styles.kinds} role="group" aria-label="Kind">
-          {KINDS.map((k) => (
-            <button
-              key={k}
-              type="button"
-              className={`${styles.chip} ${kind === k ? styles.chipActive : ''}`}
-              aria-pressed={kind === k}
-              onClick={() => setParams({ kind: k === 'all' ? null : k })}
-            >
-              {k === 'all' ? 'All kinds' : KIND_LABEL[k]}
-            </button>
-          ))}
-        </div>
-        <div className={styles.searchWrap}>
-          <svg className={styles.searchIcon} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-            <circle cx="11" cy="11" r="8" />
-            <line x1="21" y1="21" x2="16.65" y2="16.65" />
-          </svg>
-          <input
-            className={styles.searchInput}
-            type="search"
-            placeholder="Search all folders"
-            aria-label="Search all folders"
-            value={query}
-            maxLength={100}
-            onChange={(e) => setParams({ q: e.target.value }, true)}
-          />
-        </div>
-        <Button variant="secondary" size="sm" onClick={() => setNewFolder({ active: true, error: null })} disabled={searching || newFolder.active || (scope === 'org' && !isAdmin)}>
-          New folder
-        </Button>
-        {kind !== 'all' ? (
-          <Button
-            variant="primary"
-            size="sm"
-            onClick={() => setDrawer({ mode: 'new', kind, scope, path })}
-            disabled={searching}
-            title={searching ? 'Clear the search to add here' : undefined}
-          >
-            New {KIND_NOUN[kind]}
-          </Button>
-        ) : (
-          <DropdownMenu.Root modal={false}>
-            <DropdownMenu.Trigger asChild>
-              <Button variant="primary" size="sm" disabled={searching} title={searching ? 'Clear the search to add here' : undefined}>
-                New
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                  <polyline points="6 9 12 15 18 9" />
-                </svg>
-              </Button>
-            </DropdownMenu.Trigger>
-            <DropdownMenu.Portal>
-              <DropdownMenu.Content className={styles.menu} align="end" sideOffset={4}>
-                {(['skill', 'context', 'tool'] as LibraryKind[]).map((k) => (
-                  <DropdownMenu.Item key={k} className={styles.menuItem} onSelect={() => setDrawer({ mode: 'new', kind: k, scope, path })}>
-                    <KindGlyph kind={k} size={14} />
-                    New {KIND_NOUN[k]}
-                  </DropdownMenu.Item>
-                ))}
-              </DropdownMenu.Content>
-            </DropdownMenu.Portal>
-          </DropdownMenu.Root>
-        )}
-      </div>
-
       <div className={styles.body}>
-        <LibraryTree trees={trees} current={{ scope, path }} onNavigate={navigate} />
+        <LibraryTree trees={trees} current={searching ? null : { scope, path }} onNavigate={navigate} />
         <div className={styles.main}>
+          <div className={styles.bar}>
+            {searching ? (
+              <div className={styles.crumbs}>
+                <span className={styles.crumbCurrent}>
+                  {shownResults} {shownResults === 1 ? 'result' : 'results'} for “{query.trim()}”
+                </span>
+                <button type="button" className={styles.crumbClear} onClick={() => setParams({ q: null })}>
+                  Clear search
+                </button>
+              </div>
+            ) : (
+              <>
+                {/* Without the tree (a narrower screen) this is the only way to the other root. */}
+                <div className={`${styles.segmented} ${styles.rootSwitch}`} role="group" aria-label="Private or Organization">
+                  {(['private', 'org'] as LibraryScope[]).map((s) => (
+                    <button
+                      key={s}
+                      type="button"
+                      className={`${styles.segment} ${scope === s ? styles.segmentActive : ''}`}
+                      aria-pressed={scope === s}
+                      onClick={() => navigate(s, '')}
+                    >
+                      {s === 'private' ? <PrivateGlyph size={14} /> : <OrgGlyph size={14} />}
+                      {SCOPE_LABEL[s]}
+                    </button>
+                  ))}
+                </div>
+                <nav className={styles.crumbs} aria-label="Folder path">
+                  <ol>
+                    <li className={`${styles.crumbPair} ${styles.crumbRootItem} ${path === '' ? styles.crumbRootHere : ''}`}>
+                      {path === '' ? (
+                        <span className={`${styles.crumb} ${styles.crumbCurrent} ${styles.crumbRoot}`} aria-current="page">
+                          {scope === 'private' ? <PrivateGlyph size={14} /> : <OrgGlyph size={14} />}
+                          {SCOPE_LABEL[scope]}
+                        </span>
+                      ) : (
+                        <Link className={`${styles.crumb} ${styles.crumbRoot}`} to={folderHref(scope, '')}>
+                          {scope === 'private' ? <PrivateGlyph size={14} /> : <OrgGlyph size={14} />}
+                          {SCOPE_LABEL[scope]}
+                        </Link>
+                      )}
+                    </li>
+                    {crumbs.map((seg, i) => {
+                      const p = crumbs.slice(0, i + 1).join('/')
+                      const last = i === crumbs.length - 1
+                      return (
+                        <li key={p} className={styles.crumbPair}>
+                          <span className={styles.crumbSep} aria-hidden="true">
+                            /
+                          </span>
+                          {last ? (
+                            <span className={`${styles.crumb} ${styles.crumbCurrent}`} aria-current="page">
+                              {seg}
+                            </span>
+                          ) : (
+                            <Link className={styles.crumb} to={folderHref(scope, p)}>
+                              {seg}
+                            </Link>
+                          )}
+                        </li>
+                      )
+                    })}
+                  </ol>
+                </nav>
+              </>
+            )}
+            <div className={styles.kinds} role="group" aria-label="Show">
+              {KINDS.map((k) => (
+                <button
+                  key={k}
+                  type="button"
+                  className={`${styles.chip} ${kind === k ? styles.chipActive : ''}`}
+                  aria-pressed={kind === k}
+                  onClick={() => setParams({ kind: k === 'all' ? null : k })}
+                >
+                  {k === 'all' ? 'All' : KIND_FILTER_LABEL[k]}
+                </button>
+              ))}
+            </div>
+          </div>
           <FolderView
             scope={scope}
             path={path}
@@ -598,7 +637,7 @@ export function LibraryPage() {
           toast(
             from.scope !== to
               ? to === 'org'
-                ? `Shared ${next.name} with your organisation.`
+                ? `Shared ${next.name} with your organization.`
                 : `Unshared ${next.name}.`
               : `Moved ${next.name}.`,
             'success',

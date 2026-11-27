@@ -39,19 +39,9 @@
 
 .headerActions {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
   gap: var(--space-2);
-}
-
-.toolbar {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--space-3);
-  /* The folder view sits below; without this the search field's border and
-     the first row's border touch. Same step as .location above it. */
-  margin-bottom: var(--space-4);
+  min-width: 0;
 }
 
 /* The segmented filter: ActivityTab's log toggle. */
@@ -88,12 +78,13 @@
   box-shadow: var(--shadow-sm);
 }
 
-/* The search field: ApiKeysTab's. */
+/* The search field: ApiKeysTab's. It searches every folder, so it sits with
+   the page's actions, not with the open folder's. */
 .searchWrap {
   position: relative;
-  flex: 1;
-  min-width: 160px;
-  max-width: 320px;
+  flex: 0 1 16rem;
+  width: 16rem;
+  min-width: 8rem;
 }
 
 .searchIcon {
@@ -222,11 +213,6 @@
   color: var(--brand-fg);
 }
 
-.rowSize {
-  min-width: 3.5rem;
-  text-align: right;
-}
-
 /* --- States --- */
 
 .skeletons {
@@ -321,9 +307,14 @@
 /* --- Responsive --- */
 
 @media (max-width: 767px) {
+  .headerActions {
+    flex: 1 1 100%;
+    flex-wrap: wrap;
+  }
+
   .searchWrap {
-    max-width: none;
-    flex-basis: 100%;
+    flex: 1 1 8rem;
+    width: auto;
   }
 
   /* The meta line drops under the name rather than squeezing it. */
@@ -337,11 +328,6 @@
     flex-wrap: wrap;
     gap: var(--space-1) var(--space-3);
     white-space: normal;
-  }
-
-  .rowSize {
-    min-width: 0;
-    text-align: left;
   }
 
   .empty {
@@ -358,15 +344,38 @@
 }
 
 /* ============================================================
-   Folders: location row, breadcrumbs, the tree pane, row menus
+   Folders: the bar over the list, breadcrumbs, the tree pane, row menus
    ============================================================ */
 
-.location {
+/* Where you are on the left, what is shown on the right. One line, above the
+   list it describes. */
+.bar {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: var(--space-3);
-  margin-bottom: var(--space-4);
+  justify-content: space-between;
+  gap: var(--space-2) var(--space-3);
+  min-height: var(--space-8);
+}
+
+/* The tree carries both roots when it is on screen; this stands in for it
+   when it is not. */
+.rootSwitch {
+  flex: 0 0 auto;
+}
+
+@media (min-width: 1200px) {
+  .rootSwitch {
+    display: none;
+  }
+}
+
+/* At the root the switch already says where you are. Inside a folder the
+   root crumb stays: without the tree it is the way back up. */
+@media (max-width: 1199px) {
+  .crumbs .crumbRootHere {
+    display: none;
+  }
 }
 
 .segment svg {
@@ -378,6 +387,7 @@
   display: flex;
   align-items: center;
   gap: var(--space-1);
+  flex: 1 1 auto;
   min-width: 0;
   font-size: var(--fs-base);
 }
@@ -423,19 +433,22 @@ a.crumb:hover {
   color: var(--fg-subtle);
 }
 
-.crumbUp {
+.crumbRoot {
   display: inline-flex;
-  width: 28px;
-  height: 28px;
   align-items: center;
-  justify-content: center;
-  border-radius: var(--radius-sm);
-  color: var(--fg-subtle);
+  gap: var(--space-2);
+  overflow: visible;
 }
 
-.crumbUp:hover {
-  color: var(--fg-default);
-  background: var(--bg-surface-hover);
+/* The first crumb starts on the list's left edge. */
+.crumbRootItem .crumb {
+  padding-left: 0;
+}
+
+a.crumb:focus-visible,
+.crumbClear:focus-visible {
+  outline: 2px solid var(--border-focus);
+  outline-offset: 2px;
 }
 
 .crumbClear {
@@ -718,6 +731,7 @@ a.crumb:hover {
 /* The dropdown menus (rows, New). */
 .menu {
   min-width: 200px;
+  max-width: 20rem;
   padding: var(--space-1);
   background: var(--bg-surface-raised);
   border: 1px solid var(--border-default);
@@ -816,16 +830,6 @@ a.crumb:hover {
   .syncDot {
     animation: none;
   }
-}
-
-.rowFile {
-  font-family: var(--font-mono);
-  font-size: var(--fs-xs);
-  color: var(--fg-subtle);
-  max-width: 28ch;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 /* Admin: the bucket or the sync worker needs attention. */
